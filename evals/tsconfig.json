@@ -9,6 +9,7 @@
     "cards/*.ts",
     "context-quality/*.ts",
     "agentdojo/*.ts",
+    "bench/*.ts",
     "arms/*.ts",
     "edit/*.ts",
     "read/*.ts",

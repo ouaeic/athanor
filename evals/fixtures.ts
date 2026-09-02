@@ -495,18 +495,49 @@ interface WiredControl {
 
 const CONTROLS: readonly WiredControl[] = [
   {
-    what: '`cited_count`, which is 20 per cent of the memory salience score',
+    what: 'the citation term of the memory salience score, `MEMORY_SALIENCE_CITE_WEIGHT` of it',
     reader: {
       file: 'packages/data/src/store/memory.ts',
-      // The term itself, out of the UPDATE that recomputes salience.
-      find: /0\.20 \* COALESCE\(\(g\.cites - m\.mc\)/
+      /*
+       * The standardised citation term itself, out of the UPDATE that recomputes salience.
+       *
+       * This pattern was `/0\.20 \* COALESCE\(\(g\.cites - m\.mc\)/` and it stopped matching when
+       * the formula was rewritten: the raw `mem.item.cited_count` became `b_cite`, a time-decayed
+       * sum over the `cited` flag on `mem.item_use` plus the folded tail, and the literal `0.20`
+       * became `$6`, bound from `MEMORY_SALIENCE_CITE_WEIGHT`. Both halves of the old pattern were
+       * details of how the weight and the count happened to be written rather than of what the
+       * control is, so both moved and the pattern followed neither - and because a reader that
+       * stops matching reports "this check is not running" rather than a finding, the whole row
+       * went red saying so and the writer half was never even reached. It stayed that way through
+       * every wave since, because `pnpm check` has never run this suite.
+       *
+       * So the pattern now pins the smallest thing that IS the control: a citation count,
+       * standardised against the pool's own moments, added to salience. The weight is deliberately
+       * out of it - the number lives in `packages/core/src/memory.ts` and a wave that retunes it
+       * is not a wave that unwired anything - and so is the parameter position, which renumbers
+       * whenever a term is added beside it.
+       */
+      find: /COALESCE\(\(g\.b_cite - m\.mc\) \/ NULLIF\(m\.sc,0\), 0\)/
     },
-    // The only writer is `recordMemoryUse`, and the only thing that makes it write is `cited`.
-    // Matched as a property inside a call, so the store's own parameter declaration is not a
-    // caller and neither is a comment about one.
+    /*
+     * The only writer is `recordMemoryUse`, and the only thing that makes it write is `cited`.
+     * Matched as a property inside a call, so the store's own parameter declaration is not a
+     * caller and neither is a comment about one.
+     *
+     * `memory-eval.ts` is excluded beside it and the exclusion is the whole arm rather than a
+     * tidy-up. `productionSources` above drops `.test.ts` and says why: a caller in a test proves
+     * the reader reads what it is handed, which is the shape of the defect and not evidence
+     * against it. That file is the retrieval-eval corpus - its one importer in the whole tree is
+     * `memory-eval.test.ts` - and it seeds `cited` rows to score recall, so it satisfied this arm
+     * on the strength of a filename that happens not to end in `.test.ts`. Measured, not argued:
+     * with `cited:` deleted from BOTH production call sites in `apps/worker/src/memory-runtime.ts`
+     * this row stayed green until this line existed, which is the check reporting a wire that was
+     * no longer there. What it still cannot tell apart is an eval corpus that does end up with a
+     * product importer; that would need a reachability walk rather than a path list.
+     */
     writer: {
       find: /recordMemoryUse\(\{[^}]*\bcited:/s,
-      exclude: /packages\/data\/src\/store\/memory\.ts$/
+      exclude: /packages\/data\/src\/(store\/memory|memory-eval)\.ts$/
     }
   },
   {

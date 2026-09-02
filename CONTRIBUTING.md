@@ -39,7 +39,15 @@ one that costs least to run:
    toolchain, so a document route that has stopped producing bytes fails here rather than in front of
    an owner.
 4. `pnpm format:check`, `pnpm lint`, `pnpm typecheck`, `pnpm test`.
-5. `pnpm eval:rigs` — the six rigs that hold a committed baseline: context quality, prompt
+5. `pnpm eval:gate` — the 73-fixture behavioural suite, run for its claims and not for its numbers.
+   It fails when a fixture did not really run — a route the harness stub does not model, a warning
+   the loop had to survive, a tool that threw — or when a stated expectation broke. It does **not**
+   fail when a committed token count or step count moved; those belong to `pnpm eval` below, and
+   putting them here is what would make this the gate everybody bypasses. It takes about nine
+   seconds. It is here because the suite spent two separate waves red at 71 of 73 fixtures with
+   `pnpm check` green beside it, the second time after the first had been written down in
+   `evals/harness.ts` as a comment nobody re-read.
+6. `pnpm eval:rigs` — the six rigs that hold a committed baseline: context quality, prompt
    injection, the arm comparison, approval cards, edit-format conformance, and read cost. They are
    offline, need no key, and finish in about fourteen seconds between them. They are here rather than
    nightly because each one answers "did this change cross a floor", and a floor that quietly stops
@@ -49,20 +57,25 @@ one that costs least to run:
    into a refusal fails here rather than being discovered as a bill. Each of them commits only rows
    it constructs itself: the read rig runs the whole fixture corpus and deliberately leaves it out
    of its baseline, because those rows belong to `pnpm eval` and gating them here would move that
-   suite into `pnpm check` without anybody deciding to.
-6. `pnpm build`.
+   suite's numbers into `pnpm check` without anybody deciding to.
+7. `pnpm build`.
 
 That list is checked against `package.json` by `scripts/check-repository.mjs`, in both directions and
 in order, so a gate added to the script and not to this page fails the build rather than going
 unmentioned.
 
-`pnpm eval` is deliberately **not** part of `pnpm check`, and the reason is not cost. It is offline
-and deterministic — a scripted model, a stubbed workspace runner, a stubbed media provider, no
-provider key and no network — and it takes seconds. It is kept out because a behavioural suite that
-blocks every commit is a suite somebody deletes the first week it disagrees with them, and these
-fixtures are meant to be argued with: a change to a step count is a decision to make, not a build to
-fix. Run it before and after any change to `apps/worker/src/agent.ts`, `context.ts` or `tools.ts`,
-and read `docs/EVALUATION.md` first.
+`pnpm eval` is the same run as the gate above with the committed baseline switched on, and that half
+is deliberately **not** part of `pnpm check`. The reason is not cost — the suite is offline and
+deterministic, a scripted model, a stubbed workspace runner, a stubbed media provider, no provider
+key and no network, and it takes about nine seconds. It is that a token count which moved is a
+decision to make, not a build to fix, and a gate that refuses every commit until somebody re-accepts
+a row is the gate that gets bypassed. Run it before and after any change to
+`apps/worker/src/agent.ts`, `context.ts` or `tools.ts`, and read `docs/EVALUATION.md` first.
+
+This page used to say the whole suite was kept out for that reason, and that was one argument doing
+two jobs. It is true about the numbers and it was false about the claims: a fixture refused by an
+unmodelled route reports no number worth arguing with, because every figure on that row came out of
+a failure branch.
 
 The server's shell is not covered by the TypeScript suites, so a set of drills runs it against
 fixtures. They need no root, no network and no server, and they finish in seconds:

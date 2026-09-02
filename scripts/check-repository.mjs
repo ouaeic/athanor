@@ -149,6 +149,30 @@ if (systemPackages.status !== 0)
   );
 else say(`Root package helper: ${(systemPackages.stdout.match(/^ok /gm) ?? []).length} checks.`);
 
+/**
+ * And the second one, for the same reason. `athanor task` is how a script drives athanor, so its
+ * exit codes are a contract rather than a convenience: the caller's whole reason for existing is
+ * that a wrapper which returns 0 while the work died has bitten this repository twice, and one
+ * shared non-zero for every kind of ending is the same defect a step along.
+ *
+ * `scripts/test-task-cli.mjs` runs the real subcommand against a stand-in API on a loopback port
+ * and checks that each way a run can end has its own number, that the outcome is the documented
+ * object rather than prose, and that nothing answers an approval on the owner's behalf. It needs no
+ * token, no model and no network beyond localhost, and costs a few seconds.
+ *
+ * What it cannot do is notice the API changing shape underneath it - that is what
+ * `scripts/live-drill.mjs` is for, and that one costs money.
+ */
+const taskCli = spawnSync(process.execPath, ['scripts/test-task-cli.mjs'], {
+  cwd: repositoryRoot,
+  encoding: 'utf8'
+});
+if (taskCli.status !== 0)
+  fail(
+    `athanor task does not keep its contract:\n${[taskCli.stdout, taskCli.stderr].join('\n').trim()}`
+  );
+else say(taskCli.stdout.trim());
+
 say(
   `Shipped programs: ${byInterpreter.shell.length} shell, ${byInterpreter.python.length} Python, ${byInterpreter.node.length} Node parse.`
 );
@@ -703,17 +727,51 @@ const dispatchArms = new Set(
 const shippedCommands = new Set(dispatchArms);
 // `help` is the fallback arm and `install` is run by the installer, not by an owner reading this.
 for (const internal of ['help', 'install']) shippedCommands.delete(internal);
+/*
+ * The README plus the pages beside it, rather than the README alone.
+ *
+ * The rule being kept is "no command ships undocumented", and any page an owner reads answers it.
+ * What forced the widening: `athanor task` is not a host operation like the rest of this dispatch -
+ * it drives work over HTTP with an API token and belongs on a page about doing that, not in the
+ * list of things typed to keep the box alive. Insisting on the README would have put it in the
+ * wrong place or left it undocumented, which is what a gate that names a location instead of an
+ * audience buys every time.
+ *
+ * What this no longer catches, said plainly: the README is no longer required to be the complete
+ * list, so a command documented only under docs/ now passes here. The gate below is what still
+ * holds the line that matters - a name any document teaches has to be one the script offers in its
+ * own usage line.
+ *
+ * Read off disk rather than out of `publishedText`, because that list comes from `git ls-files`,
+ * and the page that documents a new command is not in the index while the change is being written.
+ */
+const ownerFacingPages = [
+  'README.md',
+  ...readdirSync(path.join(repositoryRoot, 'docs'))
+    .filter((entry) => entry.endsWith('.md'))
+    .sort()
+    .map((entry) => `docs/${entry}`)
+];
 const documented = new Set(
-  [...read('README.md').matchAll(/^sudo athanor ([a-z][a-z-]*)/gm)].map((match) => match[1])
+  ownerFacingPages
+    .flatMap((relativePath) => [...read(relativePath).matchAll(/^sudo athanor ([a-z][a-z-]*)/gm)])
+    .map((match) => match[1])
 );
 const undocumented = [...shippedCommands].filter((name) => !documented.has(name)).sort();
 const imaginary = [...documented].filter((name) => !shippedCommands.has(name)).sort();
 if (!shippedCommands.size) fail('scripts/athanor no longer has a recognisable command dispatch');
 else if (undocumented.length)
-  fail(`scripts/athanor answers to ${undocumented.join(', ')}, which the README never mentions`);
+  fail(
+    `scripts/athanor answers to ${undocumented.join(', ')}, which the README and the pages in docs/ never mention`
+  );
 else if (imaginary.length)
-  fail(`README documents ${imaginary.join(', ')}, which scripts/athanor does not answer to`);
-else say(`Server commands: ${shippedCommands.size} shipped, all of them documented.`);
+  fail(
+    `the README or a page in docs/ documents ${imaginary.join(', ')}, which scripts/athanor does not answer to`
+  );
+else
+  say(
+    `Server commands: ${shippedCommands.size} shipped, all of them documented across ${ownerFacingPages.length} owner-facing pages.`
+  );
 
 /**
  * And every command any document tells an owner to type is one the box still offers under that

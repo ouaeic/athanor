@@ -14,6 +14,20 @@
  *
  * Its database is its own, thrown away at the end. The instance's own database, its owner and
  * its passkeys are never touched, so this can run against a box already in use.
+ *
+ * It cannot be pointed at a deployed box, and that is not an oversight to fix here: it builds the
+ * server it drives and signs in through `POST /v1/auth/dev` at line 158, which is refused unless
+ * ALLOW_INSECURE_DEV_AUTH is on AND DEPLOYMENT_MODE is development. The over-the-wire equivalent of
+ * `runJob` below is `athanor task run` in `scripts/athanor`: the same routes, a bearer token, an
+ * honest exit code and one documented JSON object, from anywhere that can reach the server. See
+ * docs/HEADLESS.md. It does not replace this file - what this one has and that one cannot is a real
+ * model, a real runner and a score taken from the artefact rather than from the agent's claim.
+ *
+ * One thing that file fixed and this one still does: `harnessRan` recovers whether the harness ran by
+ * lower-casing the whole completed event and looking for the string 'exit 0'. The payload that
+ * event carries has a summary, a verification record and what the turn left open, all of them
+ * readable as fields. Changing it here was not attempted, because this rig cannot be run without
+ * spending the owner's money and an unproven edit to a paid rig is worth less than the tea leaves.
  */
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';

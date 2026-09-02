@@ -34,6 +34,7 @@ by a turn that thought for two and sent two missions.
 
 ```
 pnpm eval                     # the whole suite and the report
+pnpm eval:gate                # the same run, failing on claims only; this is what pnpm check runs
 pnpm eval --filter research   # only fixtures whose id or shape matches
 pnpm eval --trace             # also print what the loop said back to the model
 pnpm eval --json out.json     # write the raw results as well
@@ -68,14 +69,28 @@ a quality regression is damage, and the two together are the only way to tell th
 This suite is offline and deterministic: no provider key, no network, no workspace runner, nothing to
 set up. A run takes a few seconds.
 
-`pnpm eval` exits non-zero when a fixture's expectations fail. It is **not** part of `pnpm check`,
-and it should not become part of it. A behavioural suite that blocks every commit is a suite
-somebody deletes the first week it disagrees with them, and these fixtures are meant to be argued
-with — a change to a step count is a decision to make, not a build to fix. Run it before and after
-any change to `apps/worker/src/agent.ts`, `context.ts` or `tools.ts`, and in CI on its own schedule.
+There are two reasons this suite exits non-zero and they are not the same kind of thing, so they are
+now gated separately.
 
-The types are checked by `pnpm typecheck`, and the code is linted by `pnpm lint`, both of which do
-gate commits. Only the behaviour is kept out.
+**A stated claim failed, or a fixture never really ran.** A route the harness stub does not model
+and therefore answered 404, a warning the loop had to survive, a tool that threw, a status or a step
+count a row states outright. None of these is a decision. Every one means the row's numbers came out
+of a failure branch, so nothing on that line is measuring what it says it is. `pnpm eval:gate` fails
+on these and only these, and it runs inside `pnpm check`.
+
+**A committed number moved.** That one is a decision, it stays out of `pnpm check`, and it is why
+this page used to say the whole suite should never become part of it. A behavioural suite whose token
+counts block every commit is a suite somebody bypasses the first week it disagrees with them, and
+these fixtures are meant to be argued with — a change to a step count is a conversation, not a build
+to fix. Run `pnpm eval` before and after any change to `apps/worker/src/agent.ts`, `context.ts` or
+`tools.ts`.
+
+The split was not a preference. Kept out of `pnpm check` entirely, this suite went red at 71 of its
+73 fixtures and stayed red for a whole wave — twice, the second time after the first had been written
+down in `evals/harness.ts` as a comment nobody re-read — because `pnpm check` ran `pnpm eval:rigs`
+and never ran this. Six specialised rigs were green beside a dead suite, and every efficiency claim
+made from those rows in between was a claim about failure branches. The gate costs about nine seconds
+against the six minutes `pnpm check` already spends on `pnpm test`.
 
 ## Every number on this page, and where it comes from
 
@@ -92,16 +107,16 @@ is re-derived, naming the value it should now carry. The instruction is no longe
 ```baseline
 fixtures                                                                             73
 long-a-finished-phase-is-never-declared.modelCalls                                   38
-long-a-finished-phase-is-never-declared.promptTokens                          1,450,947
-long-a-finished-phase-is-never-declared.catalogueTokens                         475,304
+long-a-finished-phase-is-never-declared.promptTokens                          1,459,641
+long-a-finished-phase-is-never-declared.catalogueTokens                         477,318
 long-a-finished-phase-is-never-declared.cachePrefix                                  95
 long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.modelCalls           40
-long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.promptTokens  1,397,202
-long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.catalogueTokens 487,813
+long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.promptTokens  1,406,126
+long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.catalogueTokens 489,880
 long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.cachePrefix          94
 long-finished-phases-condense-rather-than-shred.cachePrefix                          66
 compaction.extraModelCalls                                                            2
-compaction.tokensSaved                                                           53,745
+compaction.tokensSaved                                                           53,515
 compaction.cachePointsGivenUp                                                         1
 floorWalk.cachePointsLost                                                            28
 ```

@@ -2538,9 +2538,541 @@ SQL
   esac
 }
 
+# --- driving work from a script -----------------------------------------------------------------
+#
+# `athanor task` is athanor's whole headless surface. It drives the same HTTP API a browser drives,
+# with an API token in place of a passkey session, and not one route below is new: creating a task,
+# reading it, listing what it stopped to ask and answering those questions have all been reachable
+# with a bearer token today, on the scopes `requiredApiTokenScope` already assigns them. What did
+# not exist was a caller that turns them into an exit code and one object of data, which is the part
+# a script written by hand gets wrong.
+#
+# It adds nothing to what the model is sent. This is a command an operator types, not a tool the
+# agent can see, so the catalogue is the same byte-for-byte with it and without it.
+#
+# Three promises, in the order they matter:
+#   - the exit code says how the WORK ended, and a run whose task died never exits 0;
+#   - the outcome is one JSON object on stdout on the contract in docs/HEADLESS.md, so nothing has
+#     to grep a transcript for a string the way scripts/live-drill.mjs still does;
+#   - a task that stopped to ask is reported as having stopped to ask. Nothing here answers an
+#     approval on the owner's behalf. How much gets asked is the workspace's security mode and this
+#     command cannot loosen it; `athanor task approvals` and `approve` are separate, deliberate acts
+#     so that a run which answered its own questions is a run whose log says it did.
+#
+# No token is minted here and none can be. `POST /v1/api-tokens` wants a passkey ceremony from
+# inside the step-up window, and no scope in `requiredApiTokenScope` reaches that route at all, so a
+# token cannot mint a second one. docs/HEADLESS.md says what an operator does instead, and why that
+# refusal is kept rather than fixed.
+
+# What an exit code means. A wrapper that reports success while the work died is the defect this
+# subcommand exists to make impossible, so every way a run can end has a number of its own. `run`,
+# `wait`, `show` and `cancel` answer with these; `approvals`, `approve` and `deny` describe a
+# request about work that is still going, so they answer 0 or 1 and print what happened.
+task_exit_ok=0
+task_exit_failed=2
+task_exit_asked=3
+task_exit_timeout=4
+task_exit_cancelled=5
+task_exit_blocked=6
+task_exit_running=7
+
+# How long one HTTP call may take. Generous, because creating a task waits on a model catalogue
+# read and a workspace check, and because a slow answer is not a lost one.
+task_http_seconds="${ATHANOR_TASK_HTTP_SECONDS:-30}"
+# How often the wait asks. Two seconds rather than the half-second `scripts/live-drill.mjs` uses,
+# because that one polls in-process and this one crosses a socket: at half a second a twenty-minute
+# job costs 2,400 requests to watch a status field that changes a handful of times. Two seconds
+# costs 600 and delays the answer by at most two seconds.
+task_poll_seconds="${ATHANOR_TASK_POLL_SECONDS:-2}"
+# The default wait. Half an hour was chosen rather than measured - nothing in this repository
+# records how long an ordinary job takes - so it is a number picked to be wrong in the cheap
+# direction. Running out is exit 4 and the task carries on running and spending; it is not a kill.
+# The cost of this being too short is a caller that has to run `wait` again, not work thrown away.
+task_default_wait_seconds="${ATHANOR_TASK_TIMEOUT:-1800}"
+
+task_scratch=''
+
+task_cleanup() {
+  if [ -n "$task_scratch" ]; then
+    rm -rf -- "$task_scratch"
+  fi
+  task_scratch=''
+}
+
+# Everything the calls below share: the tools, the address, the token, and a private directory to
+# put bodies in.
+task_setup() {
+  command -v curl >/dev/null 2>&1 || fail "athanor task needs curl"
+  command -v jq >/dev/null 2>&1 || fail "athanor task needs jq"
+  task_api="${ATHANOR_API:-http://127.0.0.1:4100}"
+  task_token="${ATHANOR_TOKEN:-}"
+  # Where a token lives on the box itself, beside the runner's shared secret and owned the same way.
+  # An operator puts one there once and it is never in a shell history, an environment or a process
+  # list; `sudo athanor task ...` is then the ordinary invocation on the server. ATHANOR_TOKEN is
+  # for a caller on another machine, where there is no /etc/athanor to read.
+  task_token_file="${ATHANOR_TOKEN_FILE:-$athanor_config/api-token}"
+  if [ -z "$task_token" ] && [ -r "$task_token_file" ]; then
+    task_token=$(cat "$task_token_file")
+  fi
+  [ -n "$task_token" ] ||
+    fail "no API token. Mint one in Settings, then either put it in $task_token_file or export ATHANOR_TOKEN"
+  # The server's own pattern, checked here rather than at the far end, for two reasons: a typo
+  # should not cost a round trip and an authentication failure the operator has to interpret, and
+  # a value that matches this cannot contain a quote or a backslash - which is what makes it safe
+  # to write into the curl configuration file below without escaping anything.
+  task_token_body="${task_token#oc_live_}"
+  case "$task_token" in
+    oc_live_*) ;;
+    *) fail "that is not an athanor API token: they begin oc_live_" ;;
+  esac
+  case "$task_token_body" in
+    *[!A-Za-z0-9_-]*) fail "that API token has characters an athanor token cannot contain" ;;
+  esac
+  if [ "${#task_token_body}" -lt 40 ] || [ "${#task_token_body}" -gt 80 ]; then
+    fail "that API token is the wrong length for an athanor token"
+  fi
+  task_scratch=$(mktemp -d) || fail "could not create a working directory"
+  trap task_cleanup EXIT INT TERM
+  task_config="$task_scratch/curl.conf"
+  task_body="$task_scratch/body.json"
+  task_record="$task_scratch/task.json"
+  task_trail="$task_scratch/events.json"
+  task_pending="$task_scratch/approvals.json"
+  task_payload="$task_scratch/payload.json"
+  printf 'header = "Authorization: Bearer %s"\n' "$task_token" >"$task_config"
+  # Read by the outcome builder whether or not the call that fills them was made or answered, so
+  # `null` is what an unmade call leaves behind rather than a parse error.
+  for task_file in "$task_record" "$task_trail" "$task_pending"; do
+    printf 'null\n' >"$task_file"
+  done
+  task_outcome=''
+  task_result_code="$task_exit_ok"
+  task_waited=0
+  task_transcript="unavailable"
+}
+
+# One request. The body lands in $task_body and the HTTP status in $task_code.
+#
+# The token goes in a curl configuration file rather than on the command line because the wait loop
+# runs a curl every couple of seconds for as long as the work lasts, and an argument list is
+# readable out of /proc by anything else on the box for as long as the process is alive.
+#
+# A third argument means "this is a write": it carries the Idempotency-Key, which every write on
+# this API requires, and $task_payload is sent as the body.
+task_call() {
+  if [ "$#" -ge 3 ]; then
+    task_code=$(
+      curl --silent --show-error --config "$task_config" --max-time "$task_http_seconds" \
+        --request "$1" --output "$task_body" --write-out '%{http_code}' \
+        --header 'Content-Type: application/json' --header "Idempotency-Key: $3" \
+        --data-binary "@$task_payload" "$task_api$2"
+    ) || task_code=000
+  else
+    task_code=$(
+      curl --silent --show-error --config "$task_config" --max-time "$task_http_seconds" \
+        --request "$1" --output "$task_body" --write-out '%{http_code}' \
+        "$task_api$2"
+    ) || task_code=000
+  fi
+}
+
+# Stop on anything but success, saying what the server said rather than a status number on its own.
+# $1 is what was being attempted, $2 the scope the token needed for it - the refusal an operator
+# actually hits is a token minted without the scope this call wanted, and a 403 that does not name
+# it leaves them guessing between four possibilities.
+task_expect() {
+  case "$task_code" in
+    2??) return 0 ;;
+    000)
+      fail "$task_api did not answer while $1. Is athanor running, and is ATHANOR_API right?"
+      ;;
+    401 | 403)
+      fail "the API token was refused while $1 (HTTP $task_code). It needs the $2 scope and must not have expired"
+      ;;
+  esac
+  task_message=$(jq -r '.error.message // empty' "$task_body" 2>/dev/null || true)
+  task_reason=$(jq -r '.error.code // empty' "$task_body" 2>/dev/null || true)
+  fail "$1 failed: HTTP $task_code ${task_reason:-unknown} ${task_message:-}"
+}
+
+# The task record and the tail of its transcript, rendered as the one object this command promises.
+#
+# The answer is read out of the `completed` event's payload rather than searched for in prose. That
+# payload has carried the model's own account of the turn, the completion contract's verification
+# and whatever it left open since the finish gate existed; nothing exposed it, so every caller so
+# far has filtered the event list by hand and then grepped the JSON for a string. A failure's reason
+# comes from the last event the worker addressed to the owner the same way.
+#
+# Which event that is took two corrections, both of them measured against the worker rather than
+# assumed. Reading "the last `error` event" was wrong in both directions at once:
+#
+#   - too narrow. `agent.ts` writes the sentence that ends a run as kind `warning`, not `error`,
+#     whenever the code contains "provider" (agent.ts:2157), and only three provider codes park the
+#     task instead of failing it (PARKABLE_PROVIDER_WALLS, agent.ts:144). So a run that died of
+#     `provider_stream_unparsed` or `provider_request_failed` came back as exit 2 with `reason` and
+#     `reasonCode` null - no reason at all for the commonest class of failure there is.
+#   - too wide. `tool-recording.ts:170` writes an `error` event for every tool call that throws,
+#     mid-run. A task that recovered and finished came back `completed`, with an answer, and with
+#     `reason: "shell failed"` beside it. A caller treating a non-null reason as "something went
+#     wrong" would have scored that run as broken.
+#
+# So: only on an ending that has a reason, and only an event the worker marked `owner: true`, which
+# is what its two terminal writes set and what a tool failure does not. The fallback to any `error`
+# event is there for a transcript written before that flag existed.
+task_emit() {
+  jq -n \
+    --arg outcome "$task_outcome" \
+    --arg transcript "$task_transcript" \
+    --argjson exitCode "$task_result_code" \
+    --argjson waitedSeconds "$task_waited" \
+    --slurpfile task "$task_record" \
+    --slurpfile trail "$task_trail" \
+    --slurpfile pending "$task_pending" \
+    '
+      ($task[0] // {}) as $t
+      | (($trail[0].events // [])) as $events
+      | ($events | map(select(.kind == "completed")) | last) as $done
+      | (if ($outcome == "failed" or $outcome == "blocked")
+         then (($events
+                | map(select(((.kind == "error") or (.kind == "warning"))
+                             and ((.payload.owner // false) == true))
+                  )
+                | last)
+               // ($events | map(select(.kind == "error")) | last))
+         else null end) as $bad
+      | {
+          contract: "athanor.task.outcome/1",
+          outcome: $outcome,
+          exitCode: $exitCode,
+          taskId: ($t.id // null),
+          workspaceId: ($t.workspaceId // null),
+          status: ($t.status // null),
+          securityMode: ($t.securityMode // null),
+          modelId: ($t.modelId // null),
+          spentUsd: ($t.spentUsd // null),
+          computeCredits: {
+            used: ($t.actualComputeCredits // null),
+            max: ($t.maxComputeCredits // null)
+          },
+          waitedSeconds: $waitedSeconds,
+          transcript: $transcript,
+          answer: ($done.payload.summary // $done.summary // null),
+          verification: ($done.payload.verification // null),
+          outstanding: ($done.payload.outstanding // []),
+          reason: ($bad.summary // null),
+          reasonCode: ($bad.payload.code // null),
+          pendingApprovals: (($pending[0] // []) | map({ id, taskId, action, preview })),
+          lastEventSequence: ($events | last | .sequence)
+        }
+    '
+}
+
+# Ask until the work stops, or until the deadline. $2 and $3 are what to call it when the deadline
+# arrives first, because that is the one thing `run` and `show` disagree about: for a run it is a
+# wait that ran out, for a look at a task it is a task that is still going.
+#
+# `paused` and `awaiting_resource` both end the wait. The second one reads like it will clear on its
+# own and does not: it is where a provider wall, a disconnected provider or an unreachable model
+# parks a task, and nothing picks it up again without a resume. Waiting on it is waiting forever.
+task_wait_for() {
+  task_id="$1"
+  task_started=$(date +%s)
+  task_deadline=$((task_started + task_wait_seconds))
+  while :; do
+    task_call GET "/v1/tasks/$task_id"
+    task_expect "reading the task" "tasks:read"
+    cp "$task_body" "$task_record"
+    task_waited=$(($(date +%s) - task_started))
+    case "$(jq -r '.status // "unknown"' "$task_record")" in
+      completed)
+        task_outcome=completed
+        task_result_code="$task_exit_ok"
+        return 0
+        ;;
+      failed)
+        task_outcome=failed
+        task_result_code="$task_exit_failed"
+        return 0
+        ;;
+      cancelled)
+        task_outcome=cancelled
+        task_result_code="$task_exit_cancelled"
+        return 0
+        ;;
+      awaiting_user)
+        task_outcome=awaiting_approval
+        task_result_code="$task_exit_asked"
+        return 0
+        ;;
+      paused | awaiting_resource)
+        task_outcome=blocked
+        task_result_code="$task_exit_blocked"
+        return 0
+        ;;
+    esac
+    if [ "$(date +%s)" -ge "$task_deadline" ]; then
+      task_outcome="$2"
+      task_result_code="$3"
+      return 0
+    fi
+    sleep "$task_poll_seconds"
+  done
+}
+
+# The tail of the transcript, and - only when the task stopped to ask - what it stopped to ask.
+# Fifty is the newest window the events route pages; a turn's ending is at the end of it by
+# construction, and a task that has not ended yet has no ending to find.
+task_collect() {
+  task_call GET "/v1/tasks/$1/events?page=1&limit=50"
+  if [ "$task_code" = 200 ]; then
+    cp "$task_body" "$task_trail"
+    task_transcript="read"
+  else
+    # Said out loud rather than left to be inferred. Without this an `answer` of null on a completed
+    # task means either "the turn wrote nothing" or "the transcript could not be read", and a caller
+    # scoring on the answer cannot tell those apart - which is the same shape of quiet wrong the
+    # exit codes above exist to prevent.
+    task_transcript="unavailable"
+  fi
+  if [ "$task_outcome" = awaiting_approval ]; then
+    task_call GET "/v1/approvals?status=pending"
+    if [ "$task_code" = 200 ]; then
+      cp "$task_body" "$task_pending"
+    fi
+  fi
+  # Guarded, because jq's own failure exit is 5 and 5 is this contract's word for "cancelled". A
+  # 200 carrying something that is not JSON - a proxy's courtesy page is the way that happens - made
+  # the whole command exit 5 under `set -e`, so a caller reading only the status saw a task the
+  # owner had stopped. It could not do its job, which is 1.
+  task_emit ||
+    fail "the server answered $task_api but not with JSON this could read, so there is no outcome"
+  exit "$task_result_code"
+}
+
+task_run() {
+  task_workspace=''
+  task_prompt=''
+  task_prompt_file=''
+  task_model=''
+  task_privacy='provider_zdr'
+  task_credits=''
+  task_spend=''
+  task_wait_seconds="$task_default_wait_seconds"
+  task_key=''
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --workspace)
+        [ "$#" -ge 2 ] || fail "athanor task run --workspace needs a workspace id"
+        task_workspace="$2"
+        shift 2
+        ;;
+      --prompt)
+        [ "$#" -ge 2 ] || fail "athanor task run --prompt needs the words to send"
+        task_prompt="$2"
+        shift 2
+        ;;
+      --prompt-file)
+        [ "$#" -ge 2 ] || fail "athanor task run --prompt-file needs a path, or - for standard input"
+        task_prompt_file="$2"
+        shift 2
+        ;;
+      --model)
+        [ "$#" -ge 2 ] || fail "athanor task run --model needs a model id"
+        task_model="$2"
+        shift 2
+        ;;
+      --privacy-route)
+        [ "$#" -ge 2 ] || fail "athanor task run --privacy-route needs a route"
+        task_privacy="$2"
+        shift 2
+        ;;
+      --credits)
+        [ "$#" -ge 2 ] || fail "athanor task run --credits needs a number"
+        task_credits="$2"
+        shift 2
+        ;;
+      --spend-usd)
+        [ "$#" -ge 2 ] || fail "athanor task run --spend-usd needs a number"
+        task_spend="$2"
+        shift 2
+        ;;
+      --timeout)
+        [ "$#" -ge 2 ] || fail "athanor task run --timeout needs a number of seconds"
+        task_wait_seconds="$2"
+        shift 2
+        ;;
+      --key)
+        [ "$#" -ge 2 ] || fail "athanor task run --key needs an idempotency key"
+        task_key="$2"
+        shift 2
+        ;;
+      *) fail "athanor task run: unknown option $1" ;;
+    esac
+  done
+  if [ -n "$task_prompt_file" ]; then
+    if [ "$task_prompt_file" = "-" ]; then
+      task_prompt=$(cat)
+    else
+      [ -r "$task_prompt_file" ] || fail "cannot read $task_prompt_file"
+      task_prompt=$(cat "$task_prompt_file")
+    fi
+  fi
+  [ -n "$task_workspace" ] || fail "athanor task run needs --workspace ID"
+  [ -n "$task_prompt" ] || fail "athanor task run needs --prompt TEXT or --prompt-file PATH"
+  case "$task_wait_seconds" in
+    '' | *[!0-9]*) fail "athanor task run --timeout takes whole seconds" ;;
+  esac
+  # There is deliberately no --security-mode here. What a run stops to ask is the workspace's
+  # setting, and a flag on the command that started the work could quietly answer questions the
+  # owner asked to be shown. The mode is reported in every outcome instead, so a result always
+  # carries the terms it was produced under. docs/HEADLESS.md gives the one call that changes it.
+  jq -n \
+    --arg workspaceId "$task_workspace" \
+    --arg prompt "$task_prompt" \
+    --arg modelId "$task_model" \
+    --arg privacyRoute "$task_privacy" \
+    --arg credits "$task_credits" \
+    --arg spend "$task_spend" \
+    '{ workspaceId: $workspaceId, prompt: $prompt, privacyRoute: $privacyRoute }
+      + (if $modelId == "" then {} else { modelId: $modelId } end)
+      + (if $credits == "" then {} else { maxComputeCredits: ($credits | tonumber) } end)
+      + (if $spend == "" then {} else { maxSpendUsd: ($spend | tonumber) } end)' \
+    >"$task_payload" ||
+    fail "could not build the request - are --credits and --spend-usd numbers?"
+  # A generated key is unique per invocation, so a retry of the whole command starts a second task
+  # rather than replaying the first. A caller that wants a retry to be free rather than doubled
+  # passes --key and keeps it across attempts; that is what the header is for and it is the only
+  # protection against paying twice for one job.
+  if [ -z "$task_key" ]; then
+    task_key="athanor-task-$(date +%s)-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+  fi
+  task_call POST "/v1/tasks" "$task_key"
+  task_expect "starting the task" "tasks:write"
+  task_started_id=$(jq -r '.id // empty' "$task_body")
+  [ -n "$task_started_id" ] || fail "the server accepted the task but returned no id"
+  task_wait_for "$task_started_id" timed_out "$task_exit_timeout"
+  task_collect "$task_started_id"
+}
+
+task_wait() {
+  task_wait_seconds="$task_default_wait_seconds"
+  task_target=''
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --timeout)
+        [ "$#" -ge 2 ] || fail "athanor task wait --timeout needs a number of seconds"
+        task_wait_seconds="$2"
+        shift 2
+        ;;
+      -*) fail "athanor task wait: unknown option $1" ;;
+      *)
+        task_target="$1"
+        shift
+        ;;
+    esac
+  done
+  [ -n "$task_target" ] || fail "athanor task wait needs a task id"
+  case "$task_wait_seconds" in
+    '' | *[!0-9]*) fail "athanor task wait --timeout takes whole seconds" ;;
+  esac
+  task_wait_for "$task_target" timed_out "$task_exit_timeout"
+  task_collect "$task_target"
+}
+
+task_show() {
+  [ "$#" -ge 1 ] || fail "athanor task show needs a task id"
+  task_wait_seconds=0
+  task_wait_for "$1" running "$task_exit_running"
+  task_collect "$1"
+}
+
+task_cancel() {
+  [ "$#" -ge 1 ] || fail "athanor task cancel needs a task id"
+  printf '{}\n' >"$task_payload"
+  task_call POST "/v1/tasks/$1/cancel" "athanor-cancel-$1"
+  task_expect "cancelling the task" "tasks:write"
+  cp "$task_body" "$task_record"
+  # The number describes the work, not the request: a script that cancels a run and then logs a
+  # zero has recorded the same thing a run that finished would have recorded.
+  task_outcome=cancelled
+  task_result_code="$task_exit_cancelled"
+  task_collect "$1"
+}
+
+task_approvals() {
+  task_call GET "/v1/approvals?status=pending"
+  task_expect "listing approvals" "approvals:read"
+  # Guarded for the same reason `task_collect` guards its own: jq exits 5 on a body it cannot read,
+  # and letting that out of here would answer with a number this command has never promised.
+  if [ "$#" -ge 1 ]; then
+    jq --arg taskId "$1" '[ .[] | select((.taskId | tostring) == $taskId) ]' "$task_body" ||
+      fail "the approvals list came back as something this could not read"
+  else
+    jq '.' "$task_body" || fail "the approvals list came back as something this could not read"
+  fi
+  exit "$task_exit_ok"
+}
+
+task_decide() {
+  [ "$#" -ge 2 ] || fail "athanor task $1 needs an approval id"
+  printf '{}\n' >"$task_payload"
+  # The key names the decision as well as the approval, so answering yes and then no is two
+  # operations rather than a replay of the first one.
+  task_call POST "/v1/approvals/$2/$1" "athanor-$1-$2"
+  task_expect "answering the approval" "approvals:write"
+  jq -n --arg approvalId "$2" --arg decision "$1" \
+    '{ contract: "athanor.approval.decision/1", approvalId: $approvalId, decision: $decision }'
+  exit "$task_exit_ok"
+}
+
+task_usage() {
+  printf '%s\n' \
+    'Usage: athanor task {run|wait|show|cancel|approvals|approve|deny}' \
+    '' \
+    '  run --workspace ID (--prompt TEXT | --prompt-file PATH)' \
+    '      [--model ID] [--privacy-route ROUTE] [--credits N] [--spend-usd N]' \
+    '      [--timeout SECONDS] [--key IDEMPOTENCY-KEY]' \
+    '  wait TASK_ID [--timeout SECONDS]' \
+    '  show TASK_ID' \
+    '  cancel TASK_ID' \
+    '  approvals [TASK_ID]' \
+    '  approve APPROVAL_ID' \
+    '  deny APPROVAL_ID' \
+    '' \
+    'The outcome is JSON on standard output. The exit code is 0 completed, 2 failed,' \
+    '3 stopped to ask, 4 the wait ran out, 5 cancelled, 6 stopped and needing a resume,' \
+    '7 still running. See docs/HEADLESS.md.'
+}
+
+task_command() {
+  task_action="${1:-}"
+  if [ "$#" -gt 0 ]; then shift; fi
+  case "$task_action" in
+    run | wait | show | cancel | approvals | approve | deny) task_setup ;;
+    help | '')
+      task_usage
+      exit 0
+      ;;
+    *)
+      printf 'athanor task: unknown command: %s\n' "$task_action" >&2
+      task_usage >&2
+      exit 64
+      ;;
+  esac
+  case "$task_action" in
+    run) task_run "$@" ;;
+    wait) task_wait "$@" ;;
+    show) task_show "$@" ;;
+    cancel) task_cancel "$@" ;;
+    approvals) task_approvals "$@" ;;
+    approve) task_decide approve "$@" ;;
+    deny) task_decide deny "$@" ;;
+  esac
+}
+
 usage() {
   printf '%s\n' \
-    'Usage: athanor {install|start|stop|restart|status|logs [api|worker|runner|registry|notifications|nginx]|doctor|connect|pairing-code|set-hostname HOST|price-ceiling [show|set INPUT OUTPUT|clear]|spend-cap [show|set DAILY MONTHLY|clear]|backup [dir]|backup auto on|off|status|restore DIR --yes|update|rollback [dir]|auto-update on|off|status|relay status|on|off|uninstall|certificate ...|ddns ...}' \
+    'Usage: athanor {install|start|stop|restart|status|logs [api|worker|runner|registry|notifications|nginx]|doctor|connect|pairing-code|set-hostname HOST|price-ceiling [show|set INPUT OUTPUT|clear]|spend-cap [show|set DAILY MONTHLY|clear]|backup [dir]|backup auto on|off|status|restore DIR --yes|update|rollback [dir]|auto-update on|off|status|relay status|on|off|uninstall|certificate ...|ddns ...|task ...}' \
     '' \
     'Browser sign-in needs a hostname: a passkey is bound to a domain name and the WebAuthn' \
     'standard does not allow an IP address. If this server has no name, run:' \
@@ -2621,6 +3153,10 @@ case "$command_name" in
     need_root ddns "$@"
     exec /bin/sh "$athanor_root/scripts/athanor-ddns" "$@"
     ;;
+  # The one command here that is not a host operation and does not want root of its own. It talks to
+  # the running API over HTTP with an API token, so it works from this box or from anywhere else
+  # that can reach it; root only matters because that is who may read a token out of /etc/athanor.
+  task) task_command "$@" ;;
   help)
     usage
     ;;

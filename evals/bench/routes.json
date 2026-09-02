@@ -1,0 +1,151 @@
+{
+  "recordedAt": "2026-09-02T06:30:18.873Z",
+  "athanor": "athanor 0.1.1 at 8d701a0, rig 0f46e9d2369e",
+  "surfaces": {
+    "browser": "available",
+    "desktop": "available"
+  },
+  "fixtures": [
+    "answer-conversational-no-tools",
+    "answer-document-question",
+    "answer-a-remembering-workspace-pays-for-its-preamble-once",
+    "answer-not-applicable-after-tools-is-refused",
+    "answer-missing-file-is-not-a-dead-turn",
+    "files-prose-write-needs-no-acceptance",
+    "files-code-holds-for-acceptance",
+    "files-code-declares-acceptance-first",
+    "files-a-move-crosses-the-wire-once",
+    "files-an-edit-outside-what-the-read-showed-is-refused",
+    "files-one-patch-addresses-the-numbers-that-were-read",
+    "answer-a-procedure-opened-twice-is-sent-once",
+    "files-stale-evidence-is-refused",
+    "files-open-plan-steps-hold-the-finish",
+    "files-a-silent-turn-is-asked-to-speak",
+    "files-parallel-reads-cost-one-call",
+    "verify-shell-observes-its-own-change",
+    "verify-failed-check-refuses-the-finish",
+    "verify-checks-that-already-pass-are-refused",
+    "verify-step-ceiling-hands-off",
+    "verify-output-limit-is-continued",
+    "verify-output-limit-forever-still-ends",
+    "research-search-then-read",
+    "research-a-thin-search-is-requeried",
+    "research-identical-read-is-not-paid-twice",
+    "research-untrusted-page-cannot-lower-the-floor",
+    "research-a-specialist-reads-and-the-turn-inherits-it",
+    "research-a-long-mission-holds-its-own-window-down",
+    "ambiguous-question-finished-cheaply",
+    "ambiguous-question-without-finish-is-nagged",
+    "ambiguous-question-after-a-read-costs-a-round-trip",
+    "ambiguous-a-real-blocker-parks-the-conversation",
+    "ambiguous-a-question-before-looking-is-refused",
+    "refusal-declined-in-one-call",
+    "refusal-public-publish-stops-for-the-owner",
+    "refusal-git-push-stops-for-the-owner",
+    "refusal-approval-defers-the-rest-of-the-batch",
+    "small-haiku-writes-no-plan",
+    "small-third-call-writes-a-plan-nobody-asked-for",
+    "small-one-look-and-an-answer",
+    "media-logo-set-holds-for-acceptance",
+    "media-logo-set-declares-its-own-done",
+    "media-one-generation-is-not-re-rolled",
+    "files-helper-script-then-run",
+    "small-repeating-answer-is-stopped",
+    "small-a-cut-off-answer-is-not-asked-for-again",
+    "small-deliberation-without-action-is-broken-out-of",
+    "small-long-thinking-that-keeps-moving-is-not-interrupted",
+    "small-reasoning-between-commands-is-not-called-a-stall",
+    "small-deliberation-that-ignores-the-break-is-stopped",
+    "small-hunks-that-miss-in-different-places-are-a-search",
+    "small-the-same-call-failing-the-same-way-is-stopped",
+    "long-a-full-window-condenses-rather-than-stubbing-itself",
+    "long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly",
+    "long-a-finished-phase-is-never-declared",
+    "long-finished-phases-condense-rather-than-shred",
+    "schema-every-catalogued-tool-has-a-handler",
+    "answer-the-catalogue-is-one-list-for-the-whole-run",
+    "media-a-picture-the-lead-cannot-see-is-routed-to-a-specialist",
+    "media-a-picture-priced-above-the-ceiling-is-not-routed",
+    "small-the-compute-ceiling-ends-the-turn",
+    "small-a-provider-blip-is-retried-and-the-turn-finishes",
+    "small-a-generation-that-ran-out-of-time-is-carried-on",
+    "small-a-generation-too-slow-to-finish-is-not-carried-on",
+    "small-a-correction-survives-a-provider-blip",
+    "research-a-browser-page-taints-the-turn-by-where-it-came-from",
+    "research-a-desktop-observation-is-not-treated-as-untrusted",
+    "long-a-finished-phase-is-condensed-on-the-larger-window",
+    "long-a-finished-phase-is-never-declared-on-the-larger-window",
+    "small-a-warned-spending-cap-narrates-once-and-carries-on",
+    "small-a-spent-ceiling-halts-the-turn-and-sends-nothing-after-it",
+    "answer-a-remembered-fact-the-answer-used-is-recorded-as-cited",
+    "schema-a-control-the-product-reads-has-a-writer"
+  ],
+  "observed": [
+    {
+      "route": "GET /v1/workspaces/:workspaceId/file",
+      "fixtures": 71
+    },
+    {
+      "route": "GET /v1/workspaces/:workspaceId/files",
+      "fixtures": 12
+    },
+    {
+      "route": "GET /v1/workspaces/:workspaceId/image",
+      "fixtures": 4
+    },
+    {
+      "route": "GET /v1/workspaces/:workspaceId/machine",
+      "fixtures": 71
+    },
+    {
+      "route": "GET /v1/workspaces/:workspaceId/surfaces",
+      "fixtures": 71
+    },
+    {
+      "route": "GET /v1/workspaces/:workspaceId/toolchain",
+      "fixtures": 71
+    },
+    {
+      "route": "GET /v1/workspaces/:workspaceId/usage",
+      "fixtures": 25
+    },
+    {
+      "route": "POST /v1/workspaces/:workspaceId/browser/read-many",
+      "fixtures": 5
+    },
+    {
+      "route": "POST /v1/workspaces/:workspaceId/browser/search",
+      "fixtures": 2
+    },
+    {
+      "route": "POST /v1/workspaces/:workspaceId/browser/snapshot",
+      "fixtures": 1
+    },
+    {
+      "route": "POST /v1/workspaces/:workspaceId/checkpoints",
+      "fixtures": 32
+    },
+    {
+      "route": "POST /v1/workspaces/:workspaceId/desktop/snapshot",
+      "fixtures": 1
+    },
+    {
+      "route": "POST /v1/workspaces/:workspaceId/exec",
+      "fixtures": 27
+    },
+    {
+      "route": "POST /v1/workspaces/:workspaceId/toolchain/probe",
+      "fixtures": 4
+    },
+    {
+      "route": "PUT /v1/workspaces/:workspaceId/file",
+      "fixtures": 20
+    }
+  ],
+  "unstubbed": [],
+  "declaredButUnobserved": [
+    "/v1/workspaces/:workspaceId",
+    "/v1/workspaces/:workspaceId/audio/prepare",
+    "/v1/workspaces/:workspaceId/processes/stop-owner"
+  ]
+}

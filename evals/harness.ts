@@ -64,6 +64,10 @@ import {
 import { forgetReads } from '../apps/worker/src/edit/index.js';
 // The runner's own display-prefix function, imported rather than modelled. See `fileDisplay`.
 import { displayablePrefix, type DisplayBudget } from '../services/workspace-runner/src/files.js';
+// The runner's own per-command memory ceiling and the wording of the machine line. See
+// `MACHINE_REPORT`, which states the box's measured figures and lets these two derive the rest.
+import { defaultMemoryLimitBytes } from '../services/workspace-runner/src/limits.js';
+import { machineSummary } from '../services/workspace-runner/src/machine.js';
 import { memoryItemAad, memorySourceAad } from '../apps/worker/src/memory-runtime.js';
 import { builtinSkillLibrary } from '../apps/worker/src/skills.js';
 
@@ -706,6 +710,79 @@ const TOOLCHAIN_CAPABILITIES = [
   'media'
 ] as const;
 
+/**
+ * What the box answers `/machine` with: the three numbers a model has to have before it sizes a
+ * job, and the sentence the runtime block states them in.
+ *
+ * ── WHICH BOX ─────────────────────────────────────────────────────────────────────────────────
+ *
+ * The owner's own, which is the box every measured figure in this repository is measured on and
+ * the box the two probes above already describe: `/toolchain` answers "a workspace the installer
+ * finished" and `/surfaces` answers a machine with a browser and a screen. A machine line for some
+ * other computer beside those two would price a box that does not exist.
+ *
+ * ── WHY EACH NUMBER ───────────────────────────────────────────────────────────────────────────
+ *
+ * `TOTAL_MEMORY_BYTES` and `CORES` are measured and stated. 31.34 GiB is the figure
+ * `defaultMemoryLimitBytes` in `services/workspace-runner/src/limits.ts` is documented against,
+ * and sixteen cores is the count `services/workspace-runner/src/machine.ts` opens by naming. The
+ * per-command ceiling is NOT stated beside them: it is put through the runner's own
+ * `defaultMemoryLimitBytes`, so that the fraction this rig prices is the fraction production
+ * applies rather than a second copy of it that can drift. The same argument runs for the sentence,
+ * which is `machineSummary`'s own wording rather than a transcription of it.
+ *
+ * `FREE_DISK_BYTES` is the one figure nothing here can derive, because it is a property of a
+ * filesystem rather than of a limit, so it is stated: 730.1 GiB is what the owner's box had free
+ * above the host storage floor when the machine route was built.
+ *
+ * ── WHAT THE ANSWER COSTS, WHICH IS WHY THE NUMBERS ARE WORTH ARGUING ABOUT ───────────────────
+ *
+ * Measured by accepting the baseline with this route answered and again with the summary empty:
+ * about 36 tokens on EVERY request of every turn, and they are dear ones. The runtime block sits
+ * at the END of the window - that is the reason `cachePrefix` is rounded to a whole point twelve
+ * hundred lines below - so these bytes land after the cached prefix breaks and are re-billed in
+ * full on every step rather than read back. The committed share fell one whole point on 20 of the
+ * 73 rows and two on one; nothing crossed its band, and the line is worth its price, but it is not
+ * free and the rows now say so.
+ *
+ * It also moved behaviour once, which is the finding worth reading twice:
+ * `small-the-compute-ceiling-ends-the-turn` now ends after 5 model calls instead of 6. That turn is
+ * given a budget it cannot finish inside, so a request that costs more reaches the ceiling sooner.
+ * The row still measures what it was written to measure - the ceiling fires, the loop says so, the
+ * turn comes back with what it has - and it does so one step earlier because the window it prices
+ * is the window production sends.
+ *
+ * ── WHAT THIS DOES NOT DO ─────────────────────────────────────────────────────────────────────
+ *
+ * It does not model a box that cannot answer. `machineReport` withholds a field it cannot
+ * establish honestly and answers the empty summary when it can establish none, and a run under an
+ * unreadable cgroup therefore gets a shorter runtime block than every number below assumes. No
+ * fixture asks for that box, so no fixture measures it - the negative arm is proved instead at the
+ * production call site, in `apps/worker/src/agent-run.test.ts`, which drives the real worker
+ * against a runner with no such route at all.
+ *
+ * That same file states this box's three numbers a second time, as the string it expects on the
+ * wire. Nothing compares the two copies: a wave that re-measures the owner's box has to change
+ * both, and if it changes only one the eval baseline moves while that test stays green, or the
+ * reverse. Said out loud rather than left to be discovered, because it is the shape of defect this
+ * lane exists to close.
+ */
+const MACHINE = (() => {
+  const GIB = 1024 ** 3;
+  /** Measured on the owner's box; see `defaultMemoryLimitBytes`, documented against this figure. */
+  const TOTAL_MEMORY_BYTES = 31.34 * GIB;
+  /** Measured on the owner's box; the count `machine.ts` names in its first paragraph. */
+  const CORES = 16;
+  /** Measured: headroom above `hostStorageFloorBytes`, which is what the route reports. */
+  const FREE_DISK_BYTES = 730.1 * GIB;
+  const report = {
+    cores: CORES,
+    memoryBytes: defaultMemoryLimitBytes(TOTAL_MEMORY_BYTES),
+    diskBytes: FREE_DISK_BYTES
+  };
+  return { ...report, summary: machineSummary(report) };
+})();
+
 /** What the workspace has been made to do so far, which is the only state the stub carries. */
 interface RunnerState {
   execs: number;
@@ -728,6 +805,24 @@ interface RunnerState {
    * failure branch is still a branch and the numbers it produces are still numbers.
    */
   unstubbed: string[];
+  /**
+   * Every runner route this run reached, modelled or not, in the order they were first asked for.
+   *
+   * `unstubbed` above is the complement of this list against what the stub answers, and the
+   * complement is not the same evidence. A benchmark shim built from `unstubbed` alone would
+   * implement nothing, because the stub already answers everything these fixtures reach - and a
+   * shim that is missing a route athanor needs does not throw: the tool returns the failure branch,
+   * the turn works around it, and the task scores 0 with no error anywhere. That is the exact
+   * defect shape `evals/bench` exists to make impossible, so the set of routes the loop ACTUALLY
+   * requests has to be recorded rather than inferred from a route list somebody read.
+   *
+   * Recorded for every run and never gated on a flag: the cost is one string per runner call
+   * against fixtures that already send megabyte windows, and a record kept only under a flag is a
+   * record nobody has when they need it. Nothing in `report.ts` reads it, so no committed row can
+   * move because this exists - and `evals/bench/selftest.ts` asserts that `report.ts` stays that
+   * way rather than leaving the claim to a comment.
+   */
+  observed: string[];
 }
 
 /**
@@ -864,6 +959,9 @@ const runnerResponse = (
   init?: RequestInit
 ): Response => {
   const body = bodyOf(init);
+  // Before any branch decides what to answer, because the question this record answers is what the
+  // loop ASKED for, and a route recorded inside a branch is a route somebody already modelled.
+  state.observed.push(routeName(url, init));
   if (url.includes('/exec') || url.includes('/processes/start')) {
     // document_read and document_search are shell calls too, and they parse their own stdout as
     // JSON. They are answered off to one side so they do not consume the exit codes a fixture wrote
@@ -1104,6 +1202,27 @@ const runnerResponse = (
       missing: [],
       summary: `Available on this computer: ${TOOLCHAIN_CAPABILITIES.join(', ')}.`
     });
+  /*
+   * What machine this is, in the three numbers that decide how a job is sized. Read once at the
+   * start of every run and folded into the frozen runtime block, exactly as the toolchain line
+   * above is, so until this route existed the block that tells the model how many cores it may
+   * spend and how much memory one command may commit was absent from every eval prompt and
+   * therefore from every committed baseline row.
+   *
+   * It is here because it was not, for the second time on this rig and with a different route: the
+   * loop began asking at 89185c6 and 71 of the 72 fixtures went red with "this run measured a 404"
+   * on every wave after it, while `pnpm check` reported green because `check` runs `eval:rigs` and
+   * has never run `eval`. See `MACHINE` for which box the answer describes and why.
+   *
+   * What now catches the third time is `pnpm eval:gate`, which is this whole suite run for its
+   * claims only and wired into `pnpm check` in `package.json`. There is deliberately NO static
+   * census of the loop's routes anywhere - not in `scripts/check-repository.mjs`, not anywhere
+   * else - and `evals/run.ts` says why: a census cannot see the two store methods that refused
+   * more rows than this route did, and it can only under-approximate a suffix built from a
+   * variable, so the day it misses one it reports green. The cost of catching it here instead is
+   * that a wave adding a runner route has to stub it before `pnpm check` will pass.
+   */
+  if (url.endsWith('/machine')) return json(MACHINE);
   /*
    * Whether this box has a browser and a screen, which is what decides whether seven tool schemas
    * are described to the model at all.
@@ -2234,6 +2353,14 @@ export interface RunOutcome {
    * failure branch wearing the result's clothes.
    */
   readonly unstubbedRoutes: readonly string[];
+  /**
+   * Every runner route this fixture reached, modelled or not, de-duplicated, in first-asked order.
+   *
+   * Read by `evals/bench`, which unions it across the suite into the route set a benchmark shim
+   * must implement. Not read by `report.ts` and not part of any committed baseline row: it is
+   * evidence about the loop's demands on a workspace, not a number about this fixture.
+   */
+  readonly observedRoutes: readonly string[];
   /** Anything that escaped the loop, which is a fixture that ran off its own script. */
   readonly error: string | null;
 }
@@ -2522,6 +2649,7 @@ const schemaOutcome = (findings: readonly string[]): RunOutcome => ({
   toolFailures: [],
   warnings: [...findings],
   unstubbedRoutes: [],
+  observedRoutes: [],
   filesAfter: {},
   error: null
 });
@@ -2640,6 +2768,21 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
     listModels: async () => (fixture.visionSpecialist ? [model, visionRelease] : [model]),
     getManagedProviderCredential: async () => null,
     listWorkspaceMemories: async () => knowledgeRows,
+    /*
+     * The owner's own standing words, which the window reads whole on every single turn.
+     *
+     * `null` is "this person has written nothing", which is what every fixture here is: no fixture
+     * declares owner prose, and the window installs no message for an empty block, so this answer
+     * moves not one prompt byte. That is the point of answering it rather than leaving it absent -
+     * absent, it threw `deps.store.readOwnerBlock is not a function` on all 72 fixtures and the
+     * window reported "What you have written about yourself could not be read for this task" on
+     * every one of them, which is a warning about a broken store rather than about an empty one.
+     *
+     * What it does NOT model: a fixture cannot give itself an owner block. Doing so would need a
+     * second key on this stub - the block is sealed under `userMemoryKey`, not the workspace data
+     * key - and nothing here asks the question that would need.
+     */
+    readOwnerBlock: async () => null,
     // A no-op, and it has to be said why rather than left looking like the rest of them. The real
     // one is a sweep that marks a skill stale at thirty days unused and archived at ninety; every
     // row here is minted at the task's own creation instant with no use history, so there is
@@ -2777,6 +2920,23 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
     createMemoryItem: async () => ({ id: 'item' }),
     createMemorySource: async () => ({ id: 'source' }),
     attachMemoryEvidence: async () => undefined,
+    /*
+     * The second provenance edge, which cites the tool calls a `finish` named.
+     *
+     * Missing from this stub, and it threw `input.store.attachMemoryCitedCalls is not a function`
+     * on every fixture whose completion cited a call - 49 of the 72 - where the loop swallowed it
+     * into "This turn was not recorded in memory, so it will not be recalled later" and carried
+     * on. It is the same shape as `recallMemoryCandidates` below and as the `/machine` route
+     * above, three occurrences of one defect: a production surface this stub does not answer looks
+     * exactly like a product that degrades gracefully, because the loop is deliberately written to
+     * survive a store it cannot write to.
+     *
+     * Nothing is stored, and the count returned is what the real one returns for the same call: a
+     * row per cited call, all of them new. No fixture reads a citation back - `listMemoryCitedCalls`
+     * is the reach's reader and belongs to `evals/reach` - so a store here would be state nothing
+     * asks about.
+     */
+    attachMemoryCitedCalls: async (_itemId: string, calls: readonly unknown[]) => calls.length,
     observeMemoryFactCandidate: async () => undefined,
     promoteMemoryFactCandidates: async () => [],
     getMemoryPack: async () => memoryPack,
@@ -2937,7 +3097,8 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
     written: new Map(),
     media: 0,
     mediaModels: [],
-    unstubbed: []
+    unstubbed: [],
+    observed: []
   };
   /** Requests that carried this machine's checkout path; see `CHECKOUT_ROOT`. */
   let checkoutPathLeaks = 0;
@@ -3442,6 +3603,7 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
       }),
     warnings: events.filter((entry) => entry.kind === 'warning').map((entry) => entry.summary),
     unstubbedRoutes: [...new Set(execState.unstubbed)],
+    observedRoutes: [...new Set(execState.observed)],
     error
   };
 };
