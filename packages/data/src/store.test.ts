@@ -6876,7 +6876,8 @@ describe('the upgrade path onto rows an older athanor wrote', () => {
     55: 1,
     57: 2,
     62: 1,
-    76: 1
+    76: 1,
+    78: 1
   };
 
   /**
@@ -6938,6 +6939,70 @@ describe('the upgrade path onto rows an older athanor wrote', () => {
     expect(after[erased]?.len).toBe(0);
     // And the row that was never archived is untouched, to the byte.
     expect(after[live]).toEqual(before[live]);
+  });
+
+  /**
+   * Migration 78 teaches the folded tail which of its uses were graded.
+   *
+   * `mem.item_use_fold` arrived at 75 holding `uses`, `cites` and `fails`, and the salience
+   * statement recovered the positive block from it as `uses - fails`. The per-use rows behind a
+   * folded block are gone, so which of those uses the harness actually watched is unrecoverable
+   * from anything the database holds - and the backfill is therefore deliberately the OLD meaning,
+   * `uses - fails`, so a block that folded before this applied scores exactly what it scored the
+   * day before. Zero would have been the other choice and it would have deleted the positive
+   * history of every already-folded row on no evidence at all, at the moment of an upgrade.
+   *
+   * Both directions, because a backfill that overshoots is as wrong as one that undershoots: a
+   * block whose every use failed must come out at `oks = 0` rather than at its own `uses`.
+   */
+  it('gives a folded block the graded count it was written before there was one', async () => {
+    await migrateBelow(78);
+    await seedOwner();
+    const item = async (id: string) =>
+      database.query(
+        `INSERT INTO mem.item(id,user_id,workspace_id,kind,trust,document_ciphertext,dedupe_key)
+         VALUES ($1,$2,$3,'episode','stated',$4::jsonb,$5)`,
+        [id, OWNER_ID, SPACE_ID, sealed, `dedupe-${id}`]
+      );
+    const mixed = '00000000-0000-4000-8000-0000000000e1';
+    const allFailed = '00000000-0000-4000-8000-0000000000e2';
+    const none = '00000000-0000-4000-8000-0000000000e3';
+    for (const id of [mixed, allFailed, none]) await item(id);
+    // Written the way the box at 75 wrote them: the three columns that existed then, and no
+    // fourth. Asserted rather than assumed, so this cannot pass against a database already at 78.
+    expect(await hasColumn('mem.item_use_fold', 'oks')).toBe(false);
+    for (const [id, uses, cites, fails] of [
+      [mixed, 40, 9, 6],
+      [allFailed, 12, 0, 12],
+      [none, 5, 0, 0]
+    ] as const)
+      await database.query(
+        `INSERT INTO mem.item_use_fold(item_id,uses,cites,fails,first_at,last_at)
+         VALUES ($1,$2,$3,$4,NOW() - INTERVAL '400 days',NOW() - INTERVAL '200 days')`,
+        [id, uses, cites, fails]
+      );
+
+    await apply(78);
+
+    const folds = await database.query<{ item_id: string; uses: number; oks: number }>(
+      'SELECT item_id, uses, oks FROM mem.item_use_fold ORDER BY item_id'
+    );
+    const byId = new Map(folds.rows.map((row) => [row.item_id, row]));
+    // What the score read before this migration, now written down where the score can keep
+    // reading it: the graded-positive block is what is left after the failures.
+    expect(byId.get(mixed)!.oks).toBe(34);
+    // And nothing is invented for a block that has no positives to recover.
+    expect(byId.get(allFailed)!.oks).toBe(0);
+    expect(byId.get(none)!.oks).toBe(5);
+
+    // The constraint arrives with the column and it is the partition, not a bound on one count:
+    // `ok`, `fail` and `unknown` are the three outcomes, so the two graded counts cannot together
+    // exceed the total and the slack between them is the ungraded tail.
+    await expect(
+      database.query('UPDATE mem.item_use_fold SET oks = uses - fails + 1 WHERE item_id=$1', [
+        mixed
+      ])
+    ).rejects.toThrow();
   });
 
   it('has an upgrade test for every migration that rewrites rows rather than reshaping them', () => {

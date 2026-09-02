@@ -13,6 +13,7 @@ import { textValue } from './values.js';
 import {
   callDestinations,
   commandInterpreters,
+  commandCarriedIntoAnotherBox,
   commandsChangeDirectory,
   commandScript,
   consequentialExecutables,
@@ -33,12 +34,14 @@ import {
   packageRemovalCommands,
   packageRemovalExecutables,
   publishingOperation,
+  RELOCATING_EXECUTABLES,
   removalTargets,
   removesUncoveredFile,
   safeNetworkExecutables,
   scriptDestroysAStore,
   sendsDataOverNetwork,
-  signalStopsThisComputer
+  signalStopsThisComputer,
+  type DestructionOperation
 } from './command-classification.js';
 import {
   deferredExecutionPaths,
@@ -1205,7 +1208,23 @@ const ordinaryRequirement = (
           lowerArgs.some((argument) => ['-exec', '-execdir', '-ok'].includes(argument)))) &&
       commandArgs.some((argument) => {
         const name = argument.split('/').pop() ?? '';
-        return consequentialExecutables.has(name) || name.startsWith('mkfs');
+        return (
+          consequentialExecutables.has(name) ||
+          // `find . -exec mv {} /tmp/x \;` empties every path it finds, and `removalTargets` cannot
+          // place any of them - the same answer this arm already gives `find . -exec rm`. Read here
+          // and NOT in `mayRemoveSomething`'s token scan, which sees every word of a script: adding
+          // it there would have carded `bash -lc 'rm -rf dist && git commit -m "mv the old files"'`
+          // on the word inside the commit message, and `git` is not a runner this arm looks at.
+          //
+          // IT COSTS A CARD ON A WRAPPED MOVE THAT LANDS INSIDE THE WORKSPACE. Measured after the
+          // change: `sudo mv dist dist.old`, `timeout 5 mv a b` and
+          // `find . -name '*.tmp' -exec mv {} old/ \;` were free before it and card now. That is
+          // the standing cost `sudo rm -rf dist` has carried since the wave before - a path behind
+          // a wrapper is a path this file cannot place - and DESTRUCTION.md lists it as a card that
+          // fires on work destroying nothing rather than leaving it to be rediscovered.
+          RELOCATING_EXECUTABLES.has(name) ||
+          name.startsWith('mkfs')
+        );
       });
     const packageRemoval =
       packageRemovalExecutables.has(executable) &&
@@ -1224,10 +1243,25 @@ const ordinaryRequirement = (
         action: `Stop this computer with ${executable}`,
         preview: `Run ${[executable, ...commandArgs].join(' ')}. PID 1 is this computer's init process and -1 is every process on it: signalling either ends everything running here, this turn included, and nothing on this computer starts it again.`
       };
+    /*
+     * A move is a delete of the place it moves from, and it was the largest hole three verifiers in
+     * a row have named without closing. Measured through this function at 59d3e67 in AUTONOMOUS
+     * with `{ undoPoint: { id: 'cp-1', uncovered: [] } }`: `mv ~/.ssh /tmp/x` raised NOTHING, and so
+     * did `mv -t /tmp/x ~/.ssh` and `bash -lc 'mv ~/.ssh /tmp/x'` - the agent's own keys out of
+     * reach of everything that looks for them, with no byte deleted and no card shown.
+     *
+     * It is not a membership of `consequentialExecutables` and that is the measured part. `mv` is
+     * ordinary work several times an hour, so it goes through the location rule below exactly as
+     * `rm` does: `removalTargets` resolves its SOURCE operands, `mv dist old` inside `workspace/` is
+     * free because the rewind holds the source, and a move whose source is anywhere else is not.
+     * @see `RELOCATING_EXECUTABLES` for the argument shapes and for what it does not ask.
+     */
+    const relocation = RELOCATING_EXECUTABLES.has(executable);
     if (
       !(
         consequentialExecutables.has(executable) ||
         executable.startsWith('mkfs') ||
+        relocation ||
         gitDestructive ||
         findDelete ||
         rsyncDelete ||
@@ -1310,6 +1344,16 @@ const ordinaryRequirement = (
       )
     )
       return null;
+    /*
+     * Its own sentence, because the generic one below is false of it twice over: a move deletes
+     * nothing, and "in the workspace" is exactly what this card is raised for NOT being true. What
+     * the owner needs told is that the place the file is leaving is outside the rewind's reach.
+     */
+    if (relocation)
+      return {
+        action: `Move data out of reach with ${executable}`,
+        preview: `Run ${[executable, ...commandArgs].join(' ')}. This empties the place it moves from, and that place is outside the turn's undo point - which covers workspace/ and .athanor/artifacts and nothing else - so rewinding this turn does not put it back. Nothing has to be deleted for this computer to lose the agent's own keys or its shell configuration this way.`
+      };
     return {
       action: `Run ${executable}`,
       preview: `Run ${[executable, ...commandArgs].join(' ')} in the workspace. This can remove or overwrite data.`
@@ -1374,6 +1418,23 @@ const ordinaryRequirement = (
     };
     const commands = effectiveCommands(args);
     const rebased = commandsChangeDirectory(commands);
+    /*
+     * What each command hands to another box, kept SEPARATE from the commands that run here.
+     *
+     * `docker exec pg psql -c "DROP DATABASE x"` and `kubectl exec pg -- psql -c "DROP …"` were two
+     * of the four shapes DESTRUCTION.md recorded under one sentence - a command that runs another
+     * command on the far side of something this file can name - and both were free in balanced and
+     * autonomous at 59d3e67, because the walk stops at `docker`.
+     *
+     * Separate and not merged into `commands`, for the reason `commandCarriedIntoAnotherBox` states
+     * at length: the paths in an inner command are the OTHER box's, so every one of them is judged
+     * `rebased`, which makes `removalTargets` unplaceable and keeps the card. Merging them would
+     * have let `docker exec pg rm -rf dist` resolve `dist` against this machine's `workspace/` and
+     * be freed by the location rule for a delete no checkpoint here can undo.
+     */
+    const carried = commands
+      .map((command) => commandCarriedIntoAnotherBox(command))
+      .filter((inner): inner is NonNullable<typeof inner> => inner !== null);
     const destructive =
       destructiveCommand(executable, commandArgs) ??
       commands
@@ -1416,23 +1477,48 @@ const ordinaryRequirement = (
      * all three.
      */
     const inScript = scriptDestroysAStore(commandScript(args), executable);
+    /*
+     * The same two questions asked of the inner command, and a third answer when either says yes.
+     *
+     * `destructionOperation` on the inner tokens finds the store this file already knows how to
+     * name - `psql DROP DATABASE`, `redis-cli flushall`, `dropdb` - and `destructiveCommand` with
+     * `rebased` forced TRUE finds the deletes, unplaceably, because a path inside a container is
+     * not a path this computer checkpoints. The card carries the carrier as well as the operation,
+     * so it reads "docker exec psql DROP DATABASE" rather than leaving the owner to work out which
+     * machine the statement was going to land on.
+     */
+    const inAnotherBox = carried
+      .map(({ carrier, command }): DestructionOperation | null => {
+        const found = destructionOperation(command);
+        if (found) return { kind: 'carried', operation: `${carrier} ${found.operation}` };
+        const [head = '', ...rest] = command;
+        return destructiveCommand(head, rest, true)
+          ? { kind: 'carried', operation: `${carrier} ${head}` }
+          : null;
+      })
+      .find(Boolean);
     const destruction =
       commands.map((command) => destructionOperation(command)).find(Boolean) ??
       (commands.length === 0 && commandInterpreters.has(executable)
         ? destructionOperation(commandArgs)
         : null) ??
-      (inScript ? ({ kind: 'store', operation: inScript } as const) : null);
+      (inScript ? ({ kind: 'store', operation: inScript } as const) : null) ??
+      inAnotherBox;
     if (destruction)
       return {
         sideEffect: 'external_consequential',
         action:
           destruction.kind === 'store'
             ? `Destroy stored data with ${destruction.operation}`
-            : `Install work that outlives this turn with ${destruction.operation}`,
+            : destruction.kind === 'carried'
+              ? `Destroy data in another container with ${destruction.operation}`
+              : `Install work that outlives this turn with ${destruction.operation}`,
         preview:
           destruction.kind === 'store'
             ? `Run ${invocation}. What this removes is not in the workspace - a database, a cache, a bucket or a container volume all live outside it - so rewinding this turn does not put it back. The turn's undo point covers workspace/ and .athanor/artifacts and nothing else.`
-            : `Run ${invocation}. This installs something that runs after this task and every card in it is over, under a process no approval here governs, and it is not inside the turn's undo point either - rewinding this turn leaves it running.`
+            : destruction.kind === 'carried'
+              ? `Run ${invocation}. This carries the command into another container or pod and runs it there. The turn's undo point covers workspace/ and .athanor/artifacts on this computer and nothing on the other side of that boundary, so rewinding this turn leaves whatever it did there done.`
+              : `Run ${invocation}. This installs something that runs after this task and every card in it is over, under a process no approval here governs, and it is not inside the turn's undo point either - rewinding this turn leaves it running.`
       };
     /*
      * A version that goes to a registry, which is the one act the owner named and the floor did not

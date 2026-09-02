@@ -3000,5 +3000,53 @@ export const migrations = [
       ALTER TABLE task_schedules ADD COLUMN IF NOT EXISTS consecutive_failures
         INTEGER NOT NULL DEFAULT 0;
     `
+  },
+  {
+    version: 78,
+    name: 'the_folded_tail_remembers_which_uses_were_graded',
+    /*
+     * `mem.item_use_fold.oks` - the half of the folded block that a use actually earned.
+     *
+     * The live half of the usage score partitions `mem.item_use` on `outcome`, and the fold has
+     * only ever held two of the three counts it needs: `uses` (all of them), `cites` and `fails`.
+     * The salience statement recovered the positive block as `uses - fails`, which is every use the
+     * harness did not watch fail - and `unknown` is not a use the harness watched at all. It is the
+     * row `recallMemory` writes for something it merely returned and the row `recordMemoryPackOutcome`
+     * writes for a packed entry the finished turn never touched.
+     *
+     * With the live half of the score no longer crediting an ungraded use (see the salience
+     * recompute in `packages/data/src/store/memory.ts`), the fold has to be able to say the same
+     * thing about the tail, or the discipline would expire at the retention horizon and 181-day-old
+     * self-agreement would count as success while yesterday's does not. That is the same class of
+     * cliff migration 75 removed from the count, arriving through the outcome instead.
+     *
+     * THE BACKFILL IS DELIBERATELY THE OLD MEANING, not the new one. A folded block has already
+     * thrown its per-use rows away, so which of its uses were graded is unrecoverable from anything
+     * this database holds - any value here is a guess, and `uses - fails` is the guess that leaves
+     * every already-folded block scoring exactly what it scored the day before this applied. The
+     * alternative, zero, would silently delete the positive history of every row that had folded,
+     * on no evidence, at the moment of an upgrade. Rows folded from here on are counted honestly by
+     * the fold statement itself.
+     *
+     * The CHECK is `oks + fails <= uses` rather than `oks <= uses`, because `ok`, `fail` and
+     * `unknown` partition the outcomes: the two graded counts cannot together exceed the total, and
+     * the slack between them is exactly the ungraded tail. `cites` keeps its own separate bound
+     * because a citation is a subset of the graded uses rather than a fourth class.
+     *
+     * One added column with a default, one backfill over it, one constraint. Postgres adds a
+     * defaulted column without rewriting the table, and the fold holds one row per item that has
+     * outlived the retention horizon, so this is short on any box. It rewrites rows, so it has an
+     * entry in `REWRITING_MIGRATIONS` and an upgrade test in `store.test.ts`.
+     */
+    sql: `
+      ALTER TABLE mem.item_use_fold ADD COLUMN IF NOT EXISTS oks
+        INTEGER NOT NULL DEFAULT 0 CHECK (oks >= 0);
+
+      UPDATE mem.item_use_fold SET oks = uses - fails WHERE oks = 0 AND uses > fails;
+
+      ALTER TABLE mem.item_use_fold DROP CONSTRAINT IF EXISTS mem_item_use_fold_graded_check;
+      ALTER TABLE mem.item_use_fold ADD CONSTRAINT mem_item_use_fold_graded_check
+        CHECK (oks + fails <= uses);
+    `
   }
 ] as const;

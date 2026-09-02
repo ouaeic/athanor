@@ -2397,9 +2397,74 @@ export class MemoryStore {
      * `B = ln(1 + SUM_j max(age_days, floor)^-d)` per signal, exactly the ACT-R base-level
      * activation `MEMORY_USE_DECAY_EXPONENT` documents, plus the closed-form contribution of
      * whatever the retention fold has already taken out of `mem.item_use` (below). `s_use` and
-     * `s_fail` partition the uses on the outcome the harness watched, and `s_cite` is the subset
-     * the model reached for - so all three are the same construction on the same clock, which is
-     * what makes their weights comparable to each other.
+     * `s_fail` are the two graded outcomes and `s_cite` is the subset the model reached for - so
+     * all three are the same construction on the same clock, which is what makes their weights
+     * comparable to each other.
+     *
+     * AN UNGRADED USE IS NOT A SUCCESS, AND `s_use` USED TO SAY IT WAS. The filter here read
+     * `outcome <> 'fail'`, which is every outcome the harness did not watch fail - and that
+     * includes `unknown`, which is the outcome nobody watched at all. Both of this score's
+     * production writers emit it: `recallMemory` writes `unknown` for every row it merely
+     * RETURNED, and `recordMemoryPackOutcome` writes `unknown` for every packed entry the
+     * finished turn never touched, its comment saying in as many words that such an entry must be
+     * left "ungraded, both directions". It was not: under `<> 'fail'` a history of ten ungraded
+     * uses and a history of ten graded ones are the same activation to the last bit, so no ranking
+     * downstream of this could tell a use the model cited from a row the ranker had handed itself.
+     * @see the `an ungraded use` cases in `memory-decay.test.ts`, which compute both filters over
+     * the same rows.
+     *
+     * So the ranking was reading its own output as evidence. A row the ranker returned got a use
+     * worth exactly as much as one the model cited, which made it likelier to be returned, which
+     * bought it another. `MEMORY_USE_DECAY_EXPONENT` records what that cost when it was first
+     * noticed: two rows alike in everything, the one an `ORDER BY score DESC, id` tie-break
+     * happened to put first held 70 uses against 10 sixty turns later, on nothing but a UUID. That
+     * is a rich-get-richer sort on a coin flip, and it is why the owner's "usage-weighted
+     * retrieval WITH positive and negative reinforcement" could not be built on the old filter:
+     * the loop drowns the reinforcement.
+     *
+     * ZERO, NOT A DISCOUNT, and the reason is that a discount does not work. A uniform weight `w`
+     * on ungraded uses scales the activation the loop manufactures by `w`, and salience is a
+     * z-score against the workspace's own moments - so for two rows whose only difference IS that
+     * activation, `w` largely divides back out and the pair still separates, for every `w > 0`,
+     * just further down the decimals. Only `w = 0` breaks the path, because only `w = 0` makes the
+     * ranker's own selection carry no evidence at all. Measured the other way round, on the loop
+     * itself: thirty rounds, thirty ungraded uses against nought, and the pair ends where the text
+     * put it - while the same thirty rounds graded `ok`, which is exactly what the old filter
+     * scored them as, leave the leader a whole salience ahead.
+     *
+     * `mem.item_use` still gets the row; `use_count`, `last_used_at`, procedure health and the
+     * audit trail are all unaffected. What changes is that being chosen is no longer a reason to
+     * be chosen again.
+     *
+     * IT IS ALSO WHAT THE OTHER READER OF THIS COLUMN ALREADY DID. `listStaleMemoryProcedures`
+     * counts `graded_recent` as `outcome <> 'unknown'` and has since it was written, so the
+     * procedure-health tier and the salience tier disagreed about what `unknown` meant, and the
+     * health tier was right.
+     *
+     * WHAT IT COSTS, TRACED THROUGH THE WRITER RATHER THAN ARGUED. `s_use` is now the uses graded
+     * `ok`, and the only production writer of `ok` is the attributable path of
+     * `recordMemoryPackOutcome`, which grades an entry only if it was cited. Run against a real
+     * store, that writer produces exactly two shapes of row: `cited=true, outcome='ok'` for what
+     * the turn used, and `cited=false, outcome='unknown'` for the rest. So on that path
+     * `FILTER (WHERE u.outcome = 'ok')` and `FILTER (WHERE u.cited)` select THE SAME ROWS, `s_use`
+     * and `s_cite` are one number, and the two positive terms of this formula are one signal
+     * carried at 0.5 + 0.2 rather than two signals compared.
+     *
+     * The one thing left that separates them is the unattributable path - a pack whose data key
+     * will not open, or a turn with nothing to attribute against - which grades the whole pack
+     * with no citation at all. `fail` does NOT separate them, because nothing writes it: the only
+     * caller of `recordMemoryPackOutcome` in the product, `apps/worker/src/memory-capture.ts`,
+     * passes the literal `outcome: 'ok'` and only when the turn was not interrupted, so no turn on
+     * this box has ever written `outcome='fail'` and `s_fail` is empty in production. That was
+     * already true before this change and it is not this statement's to repair, but it is what
+     * makes the overlap above total rather than partial.
+     *
+     * `MEMORY_SALIENCE_USE_WEIGHT` and `MEMORY_SALIENCE_CITE_WEIGHT` were chosen against a
+     * measured r = 0.9344 between two signals that were then distinct. On the ordinary path they
+     * now weigh one signal twice, and whoever next reads their ratio needs that first. The
+     * decision - collapse the two weights, or wire the grade in `memory-capture.ts` so a turn that
+     * failed marks down what it cited - belongs with `packages/core/src/memory.ts`, where both
+     * constants live and where neither this file nor this lane can reach.
      *
      * THE `+ 1` IS NOT A FUDGE. `SUM` is zero for a row that has never been used and `ln 0` has no
      * value to rank, so one pseudo-use is added at the unit of the clock - one day, where
@@ -2426,7 +2491,7 @@ export class MemoryStore {
          SELECT i.id, i.pin,
                 COALESCE(SUM(power(GREATEST(
                   EXTRACT(EPOCH FROM c.t_now - u.used_at)::float8/86400.0, $3::float8), -$4::float8))
-                  FILTER (WHERE u.outcome <> 'fail'), 0) AS s_use,
+                  FILTER (WHERE u.outcome = 'ok'), 0) AS s_use,
                 COALESCE(SUM(power(GREATEST(
                   EXTRACT(EPOCH FROM c.t_now - u.used_at)::float8/86400.0, $3::float8), -$4::float8))
                   FILTER (WHERE u.cited), 0) AS s_cite,
@@ -2441,7 +2506,10 @@ export class MemoryStore {
        ),
        usage AS (
          SELECT l.id, l.pin,
-                ln(1 + l.s_use  + COALESCE((f.uses - f.fails) * f.unit, 0)) AS b_use,
+                -- f.oks, not f.uses - f.fails: the fold's ungraded tail is excluded here for the
+                -- same reason the live half excludes it, and migration 78 is what gave the fold a
+                -- column able to say which of its uses were graded.
+                ln(1 + l.s_use  + COALESCE(f.oks * f.unit, 0)) AS b_use,
                 ln(1 + l.s_cite + COALESCE(f.cites * f.unit, 0)) AS b_cite,
                 ln(1 + l.s_fail + COALESCE(f.fails * f.unit, 0)) AS b_fail
          FROM live l
@@ -2451,7 +2519,7 @@ export class MemoryStore {
            -- mean of t^-d over that span; n uses are worth n times it. Exact for a block whose
            -- uses are uniform in their own window, and exact in the limit b -> a, which is the
            -- branch below. Both ages are floored, so a clock behind the fold cannot diverge.
-           SELECT g.uses, g.cites, g.fails,
+           SELECT g.oks, g.cites, g.fails,
                   CASE WHEN g.last_at > g.first_at THEN
                     (power(GREATEST(EXTRACT(EPOCH FROM c.t_now - g.first_at)::float8/86400.0,
                                     $3::float8), 1 - $4::float8)
@@ -2616,6 +2684,7 @@ export class MemoryStore {
       `WITH stale AS (
          SELECT u.item_id,
                 count(*)::int AS uses,
+                count(*) FILTER (WHERE u.outcome='ok')::int AS oks,
                 count(*) FILTER (WHERE u.cited)::int AS cites,
                 count(*) FILTER (WHERE u.outcome='fail')::int AS fails,
                 min(u.used_at) AS first_at, max(u.used_at) AS last_at
@@ -2625,10 +2694,11 @@ export class MemoryStore {
          GROUP BY u.item_id
        ),
        folded AS (
-         INSERT INTO mem.item_use_fold(item_id,uses,cites,fails,first_at,last_at)
-         SELECT item_id,uses,cites,fails,first_at,last_at FROM stale
+         INSERT INTO mem.item_use_fold(item_id,uses,oks,cites,fails,first_at,last_at)
+         SELECT item_id,uses,oks,cites,fails,first_at,last_at FROM stale
          ON CONFLICT (item_id) DO UPDATE SET
            uses  = mem.item_use_fold.uses  + EXCLUDED.uses,
+           oks   = mem.item_use_fold.oks   + EXCLUDED.oks,
            cites = mem.item_use_fold.cites + EXCLUDED.cites,
            fails = mem.item_use_fold.fails + EXCLUDED.fails,
            first_at = LEAST(mem.item_use_fold.first_at, EXCLUDED.first_at),

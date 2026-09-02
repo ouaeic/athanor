@@ -365,6 +365,38 @@ const RUNNER_VALUE_OPTIONS = new Map<string, ReadonlySet<string>>([
   // carrying a value is the true statement: what follows them is a name to look up, not a command.
   ['command', new Set(['-v', '-V'])],
   ['conda run', new Set(['-n', '--name', '-p', '--prefix'])],
+  /*
+   * The container and pod runners, read by `commandCarriedIntoAnotherBox` below rather than by
+   * `withoutRunners`. They are NOT in `RUNNER_SUBCOMMANDS`, and the difference is the whole care:
+   * stripping `docker exec pg` outright would hand every reader here the inner command with this
+   * machine's working directory attached, and `docker exec pg rm -rf dist` would then resolve
+   * `dist` to `workspace/dist` and be FREED by the location rule for a delete inside a container
+   * that no checkpoint on this computer walks.
+   */
+  ['docker compose exec', new Set(['-e', '--env', '-u', '--user', '-w', '--workdir', '--index'])],
+  [
+    'docker exec',
+    new Set(['-e', '--env', '-u', '--user', '-w', '--workdir', '--env-file', '--detach-keys'])
+  ],
+  ['docker-compose exec', new Set(['-e', '--env', '-u', '--user', '-w', '--workdir', '--index'])],
+  [
+    'kubectl exec',
+    new Set([
+      '-c',
+      '--container',
+      '-n',
+      '--namespace',
+      '--context',
+      '--kubeconfig',
+      '--pod-running-timeout',
+      '--request-timeout'
+    ])
+  ],
+  ['podman compose exec', new Set(['-e', '--env', '-u', '--user', '-w', '--workdir'])],
+  [
+    'podman exec',
+    new Set(['-e', '--env', '-u', '--user', '-w', '--workdir', '--env-file', '--detach-keys'])
+  ],
   ['env', new Set(['-u', '--unset', '-C', '--chdir'])],
   ['flock', new Set(['-w', '--wait', '--timeout', '-E', '--conflict-exit-code'])],
   ['ionice', new Set(['-c', '-n', '-p', '-P', '-u', '--class', '--classdata', '--pid'])],
@@ -437,7 +469,15 @@ const RUNNER_SCRIPT_OPTIONS = new Map<string, ReadonlySet<string>>([
  */
 const RUNNER_POSITIONALS = new Map<string, number>([
   ['direnv exec', 1],
+  // The container, the compose service and the pod: one operand each, and the command begins after
+  // it. `kubectl exec pod -- psql …` reaches the same answer through the `--` rule instead.
+  ['docker compose exec', 1],
+  ['docker exec', 1],
+  ['docker-compose exec', 1],
   ['flock', 1],
+  ['kubectl exec', 1],
+  ['podman compose exec', 1],
+  ['podman exec', 1],
   ['setarch', 1]
 ]);
 
@@ -868,6 +908,63 @@ export const effectiveCommands = (args: Record<string, unknown>): string[][] => 
 };
 
 /**
+ * The runners that carry a command across a boundary this computer's rewind does not cross.
+ *
+ * Written longest-first so `docker compose exec` is read as itself rather than as a `docker` whose
+ * second word happens not to be `exec`. Every other subcommand of these tools is untouched, which
+ * is the same reason `RUNNER_SUBCOMMANDS` is keyed on a pair: `docker volume rm` and
+ * `docker compose down -v` are their own cards one table below, and stripping the head would have
+ * taken them with it.
+ */
+const BOX_EXEC_RUNNERS: readonly (readonly string[])[] = [
+  ['docker', 'compose', 'exec'],
+  ['podman', 'compose', 'exec'],
+  ['docker-compose', 'exec'],
+  ['docker', 'exec'],
+  ['kubectl', 'exec'],
+  ['podman', 'exec']
+];
+
+/**
+ * The command a container or pod runner hands to the other side, with the runner's own words off.
+ *
+ * DESTRUCTION.md recorded four shapes under one sentence - "a command that runs another command on
+ * the far side of something this file can name" - and named `docker exec pg psql -c "DROP DATABASE
+ * x"` and `kubectl exec pg -- psql -c "DROP …"` as the two of them that stay on this box's network.
+ * Measured through the shipped `approvalRequirement` at 59d3e67: both FREE in balanced and
+ * autonomous, along with `docker exec r redis-cli flushall` and `kubectl exec p -- rm -rf /data`.
+ * The walk stops at `docker`, which `placeableExecutable` names, and never reaches the client.
+ *
+ * NOT A `RUNNER_SUBCOMMANDS` ENTRY, and that is the load-bearing decision. `withoutRunners` exists
+ * to say "this is really the command that runs HERE", and these do not run here: the paths after
+ * them belong to the other box's filesystem. Stripping `docker exec pg` in that function would have
+ * handed `rm -rf dist` to the location rule with this machine's working directory attached, which
+ * resolves to `workspace/dist`, which a rewind restores - and the delete would have been freed for
+ * a directory inside a container that no checkpoint here has ever walked. So the inner command is
+ * returned separately and its caller judges it as unplaceable, the way `commandsChangeDirectory`
+ * already refuses a line that re-bases itself.
+ *
+ * The runner's own operands come off through `runnerBody`, the same reader that already gets
+ * `sudo -u root` and `xargs -I {}` right, with the container or pod declared as one positional and
+ * the value-taking options declared per runner. An option this file has not enumerated makes the
+ * runner eat the container name instead, so the command read is the container's - a name no table
+ * here matches, which is a MISS and not a false card. `docker run` is deliberately absent: its
+ * operand is an image rather than a running box, its option surface is far wider, and
+ * docs/design/gaps/BYPASS.md holds it as the open shape it remains.
+ */
+export const commandCarriedIntoAnotherBox = (
+  tokens: readonly string[]
+): { readonly carrier: string; readonly command: readonly string[] } | null => {
+  const named = tokens.map((token) => (unquoted(token).split('/').pop() ?? '').toLowerCase());
+  for (const runner of BOX_EXEC_RUNNERS) {
+    if (!runner.every((word, at) => named[at] === word)) continue;
+    const inner = runnerBody(runner.join(' '), tokens.slice(runner.length));
+    return inner.length ? { carrier: runner.join(' '), command: inner } : null;
+  }
+  return null;
+};
+
+/**
  * Commands that answer a question about a file and change nothing in it.
  *
  * Not a security boundary and deliberately not exhaustive: it is the way *out* of the wide net in
@@ -1252,6 +1349,86 @@ export const removesUncoveredFile = (
  */
 const PATH_SCOPED_REMOVERS = new Set(['rm', 'rmdir', 'unlink', 'shred', 'truncate']);
 
+/**
+ * The mover, whose damage is exactly the paths it moves FROM.
+ *
+ * `mv` is in no destructive set, and three verifiers in a row flagged what that costs. Measured
+ * through the shipped `approvalRequirement` at 59d3e67 with `{ undoPoint: { id: 'cp-1',
+ * uncovered: [] } }`: `mv ~/.ssh /tmp/x` was FREE in balanced and autonomous, and so was the
+ * `bash -lc` spelling and the `-t` spelling. Nothing is deleted and the agent's own keys are gone
+ * from where anything looks for them, which is the same loss `rm -rf ~/.ssh` gets a card for.
+ *
+ * A BLANKET CARD WAS THE WRONG REPAIR and it is why this is not simply a sixth name in the set
+ * above. Moving a file is ordinary work several times an hour - `mv dist old`, `mv a.md docs/` -
+ * and a card in front of ordinary work is the clunk this whole rule exists to remove. So `mv` gets
+ * the treatment `rm` already has: the SOURCE operands are resolved and the card is dropped when
+ * every one of them is strictly inside `CHECKPOINT_CONTENT` and none is a file the checkpoint
+ * walked past, exactly as `insideCheckpointContent` and `removesUncoveredFile` decide for a delete.
+ * A move out of `workspace/` is free because a rewind puts the source back; a move of anything
+ * else is not.
+ *
+ * WHAT IT DOES NOT ASK IS THE DESTINATION. `mv a b` also overwrites whatever `b` was, and this rule
+ * says nothing about that. Two reasons, and both were checked rather than assumed. The destinations
+ * that matter most already card on their own arm: `mv payload ~/.bashrc` and
+ * `mv job /etc/cron.d/job` both raise "Change a file this computer runs on its own" today, because
+ * `shellWriteTargets` hands every `mv` operand to the durable-instruction and scheduled-path rules
+ * and `mv` has been in `FILE_WRITING_EXECUTABLES` all along. And testing the destination as well
+ * would card `mv workspace/build.tgz /tmp/keep` - carrying something OUT of the workspace, which
+ * destroys nothing and is ordinary. So an ordinary file outside the checkpoint, overwritten by a
+ * move onto it, is a residue this rule leaves open and DESTRUCTION.md records as open.
+ *
+ * `cp`, `install`, `ln` and `rename` are deliberately absent. `cp` and `install` leave the source
+ * where it was; `ln` adds a name; `rename` is a batch regex over basenames within a directory,
+ * which moves nothing between places. Only `mv` empties the place it reads from.
+ */
+export const RELOCATING_EXECUTABLES = new Set(['mv']);
+
+/**
+ * `mv`'s own options that carry a value, and the one that inverts which operand is the destination.
+ *
+ * `mv SOURCE... DIRECTORY` puts the destination LAST, and `mv -t DIR SOURCE...` puts it first, so a
+ * reader that always dropped the last operand would drop a real source on the `-t` spelling and
+ * free it. `-S`/`--suffix` takes a value that is not a path at all and would otherwise be read as
+ * one. The `=` spellings carry their value inside the token and consume nothing after them.
+ */
+const RELOCATION_INTO_A_DIRECTORY = new Set(['-t', '--target-directory']);
+const RELOCATION_VALUE_OPTIONS = new Set(['-t', '--target-directory', '-S', '--suffix']);
+
+/**
+ * The places a move empties, or null when which operand is which cannot be shown.
+ *
+ * Null keeps the card, as it does everywhere else in this file. It is the answer for a move with
+ * fewer than two operands - `mv a` is an error, and `mv` with none is `find … | xargs mv`, whose
+ * paths are not in the command text.
+ *
+ * A bundled short option that ENDS in a value-taking letter - `mv -ft /tmp a b` - is not
+ * enumerated, so its value is read as an operand instead. That over-names, and over-naming here can
+ * only add a constraint: an extra operand is one more path that has to be inside the checkpoint for
+ * the card to be dropped. Measured on that exact spelling: `/tmp` is absolute, `rootRelative`
+ * answers null for it, and the card stands.
+ */
+const relocationSources = (commandArgs: readonly string[]): string[] | null => {
+  const operands: string[] = [];
+  let intoADirectory = false;
+  let endOfOptions = false;
+  for (let at = 0; at < commandArgs.length; at += 1) {
+    const argument = commandArgs[at] ?? '';
+    if (!endOfOptions && argument === '--') {
+      endOfOptions = true;
+      continue;
+    }
+    if (!endOfOptions && argument.startsWith('-') && argument !== '-') {
+      const named = argument.split('=')[0] ?? argument;
+      if (RELOCATION_INTO_A_DIRECTORY.has(named)) intoADirectory = true;
+      if (!argument.includes('=') && RELOCATION_VALUE_OPTIONS.has(argument)) at += 1;
+      continue;
+    }
+    operands.push(argument);
+  }
+  if (intoADirectory) return operands.length ? operands : null;
+  return operands.length >= 2 ? operands.slice(0, -1) : null;
+};
+
 /** Everything a command names that is not an option. Over-naming here can only add a constraint. */
 const operandsOf = (commandArgs: readonly string[]): string[] =>
   commandArgs.filter((argument) => !argument.startsWith('-'));
@@ -1268,7 +1445,12 @@ const RUNTIME_DELETE_NAME = /(?:shutil\.rmtree|os\.(?:remove|removedirs|rmdir|un
  * all name their remover in a non-head position and their paths nowhere in the command text.
  */
 const mayRemoveSomething = (name: string, tokens: readonly string[]): boolean => {
-  if (consequentialExecutables.has(name) || name.startsWith('mkfs')) return true;
+  if (
+    consequentialExecutables.has(name) ||
+    RELOCATING_EXECUTABLES.has(name) ||
+    name.startsWith('mkfs')
+  )
+    return true;
   const lower = tokens.map((token) => token.toLowerCase());
   if (name === 'find')
     return lower.some((token) => ['-delete', '-exec', '-execdir', '-ok'].includes(token));
@@ -1360,6 +1542,9 @@ export const removalTargets = (
     const operands = operandsOf(commandArgs);
     return operands.length ? operands : null;
   }
+  // A move empties the place it moves FROM, so the sources are its removal targets and the
+  // destination is not one. @see `RELOCATING_EXECUTABLES` for what this deliberately does not ask.
+  if (RELOCATING_EXECUTABLES.has(executable)) return relocationSources(commandArgs);
   if (executable === 'find') {
     const lower = commandArgs.map((argument) => argument.toLowerCase());
     if (!lower.includes('-delete')) return null;
@@ -3332,7 +3517,14 @@ export const publishingOperation = (
  * `forcedGitPush`. All of this is written down in docs/design/itself/DESTRUCTION.md rather than
  * left to be rediscovered as a hole.
  */
-export type DestructionKind = 'store' | 'persistence';
+/**
+ * `carried` is the third because the sentence a card prints is different, not because the rule is.
+ * A destruction inside a container or a pod is outside the checkpoint for a reason the other two
+ * previews do not state - the boundary, rather than the kind of store - and the store preview's
+ * "a database, a cache, a bucket or a container volume" is the wrong list to read over
+ * `docker exec pg rm -rf /var/lib/postgresql`.
+ */
+export type DestructionKind = 'store' | 'persistence' | 'carried';
 
 /** What this command destroys or leaves running, and which of the two it is. */
 export interface DestructionOperation {
@@ -3362,6 +3554,10 @@ const DESTROYING_EXECUTABLES = new Set(['dropdb', 'dropuser']);
 const SQL_CLIENTS = new Set([
   'clickhouse-client',
   'cockroach',
+  // Cassandra's client, whose `-e` is the same evidence every other name here gives. It brings one
+  // word with it: a keyspace is Cassandra's database and `DROP KEYSPACE` is `DROP DATABASE` spelled
+  // its way, so the word is in `SQL_DROP` rather than in a second pattern.
+  'cqlsh',
   'duckdb',
   'mariadb',
   'mysql',
@@ -3371,9 +3567,32 @@ const SQL_CLIENTS = new Set([
   'usql'
 ]);
 
-/** The administrative client whose subcommand is the act: `mysqladmin drop app`. */
+/**
+ * The tools whose SUBCOMMAND is the act, rather than a statement it is handed.
+ *
+ * `mysqladmin drop app` was the first, and DESTRUCTION.md filed the rest of this shape under "the
+ * operation is in a recipe", which was the wrong reason and is why they went unclosed: `make
+ * db-reset` really is a recipe and nothing in the command names the act, but `rails db:drop`,
+ * `prisma migrate reset` and `typeorm schema:drop` name it exactly, in the tool's own vocabulary.
+ * Measured through the shipped `approvalRequirement` at 59d3e67: all four FREE in balanced and
+ * autonomous.
+ *
+ * Each row drops a whole database or schema and each lands outside `CHECKPOINT_CONTENT` - the
+ * server's own data directory, or a hosted one - so a rewind of the turn puts none of it back.
+ * `rails db:migrate`, `prisma migrate dev`, `prisma migrate deploy` and `prisma db push` are
+ * pointedly absent: those apply a migration, which is the owner's own build step, and this section
+ * has already measured once what keying on the tool instead of the operation costs.
+ *
+ * `make`, `npm run`, `just` and `task` remain open and are written down as open. The act is behind a
+ * target name the author chose, `npm run db:reset` and `npm run build` are one word apart in the
+ * only place a classifier can look, and nothing here can open the Makefile.
+ */
 const ADMIN_STORE_OPERATIONS: Record<string, readonly (readonly string[])[]> = {
-  mysqladmin: [['drop']]
+  heroku: [['pg:reset']],
+  mysqladmin: [['drop']],
+  prisma: [['migrate', 'reset']],
+  rails: [['db:drop'], ['db:reset']],
+  typeorm: [['schema:drop']]
 };
 
 /**
@@ -3403,7 +3622,7 @@ const ADMIN_STORE_OPERATIONS: Record<string, readonly (readonly string[])[]> = {
  * multi-statement body still reaches every one of its statements through the `;`.
  */
 const SQL_DROP =
-  /\bdrop\s+(database|schema|table|tablespace|role|user|index|sequence|materialized\s+view|view)\b/i;
+  /\bdrop\s+(database|keyspace|schema|table|tablespace|role|user|index|sequence|materialized\s+view|view)\b/i;
 const SQL_TRUNCATE = /\btruncate\s+\S/i;
 const SQL_UNQUALIFIED_DELETE = /\bdelete\s+from\s+[^\s;'"]+\s*(?:;|['"]?\s*$)/i;
 
@@ -3431,6 +3650,23 @@ export const destructiveSqlOperation = (statement: string): string | null => {
  */
 const KEY_VALUE_CLIENTS = new Set(['keydb-cli', 'redis-cli', 'valkey-cli']);
 const KEY_VALUE_DESTRUCTION = new Set(['flushall', 'flushdb']);
+
+/**
+ * The same two commands one layer in, inside the Lua the client hands the server.
+ *
+ * DESTRUCTION.md recorded `redis-cli eval "return redis.call('flushall')" 0` as open and called
+ * reading it "a Lua reader". It is not: this is the shape `DESTRUCTIVE_DOCUMENT_CALL` already has
+ * for mongosh, where a destructive verb arrives as a line of JavaScript and is matched on the CALL
+ * rather than by evaluating the language. `redis.call` and `redis.pcall` are the only two ways a
+ * script reaches a command, and the command is a quoted literal beside them. Measured at 59d3e67:
+ * free in balanced and autonomous, while the bare `redis-cli flushall` beside it carded in all
+ * three.
+ *
+ * What it does NOT read is a script built at runtime - `redis.call(cmd)` where `cmd` came from an
+ * argument - and `--eval script.lua`, whose body is on the far side of a path this function cannot
+ * open. That is the same bound `psql -f` has and it is recorded as open in the same place.
+ */
+const KEY_VALUE_SCRIPT_DESTRUCTION = /\bredis\.p?call\s*\(\s*['"]?(flushall|flushdb)\b/i;
 
 /**
  * The document clients, whose destructive verbs arrive as a line of JavaScript.
@@ -3466,6 +3702,22 @@ const DESTRUCTIVE_DOCUMENT_CALL =
  * the whole of `docker volume prune` and more, so it is in `STORE_DESTRUCTION_PAIRS` below, which
  * is the table that exists for exactly this distinction.
  */
+/*
+ * THE NEXT RING OUT, which the last wave named and did not close. `aws dynamodb delete-table` was a
+ * row and `aws rds delete-db-instance` was not, because the tables were written from the object
+ * stores outward and stopped there - so DESTRUCTION.md recorded the managed-database control planes
+ * as open, and measured through the shipped `approvalRequirement` at 59d3e67 they were: `aws rds
+ * delete-db-instance --skip-final-snapshot`, `aws elasticache delete-cache-cluster`, `gcloud sql
+ * instances delete` and `az postgres server delete` were all FREE in balanced and autonomous.
+ *
+ * These are the furthest thing from the checkpoint's reach in this whole file: the data is on
+ * somebody else's machine, `--skip-final-snapshot` is a spelling the model can simply write, and
+ * nothing on this computer can put any of it back. The rows below are the managed relational, cache
+ * and warehouse planes of the three vendors this file already knows, listed by the delete verbs
+ * those vendors actually spell. It is a ring and not a closure: a vendor absent from this file
+ * (DigitalOcean, Linode, Supabase, PlanetScale) is absent from it here too, and every read, list,
+ * describe and create verb is absent by construction, as everywhere else in this table.
+ */
 const STORE_DESTRUCTION_OPERATIONS: Record<string, readonly (readonly string[])[]> = {
   aws: [
     ['s3', 'rm'],
@@ -3473,13 +3725,28 @@ const STORE_DESTRUCTION_OPERATIONS: Record<string, readonly (readonly string[])[
     ['s3api', 'delete-object'],
     ['s3api', 'delete-objects'],
     ['s3api', 'delete-bucket'],
-    ['dynamodb', 'delete-table']
+    ['dynamodb', 'delete-table'],
+    ['rds', 'delete-db-instance'],
+    ['rds', 'delete-db-cluster'],
+    ['rds', 'delete-db-snapshot'],
+    ['rds', 'delete-db-cluster-snapshot'],
+    ['elasticache', 'delete-cache-cluster'],
+    ['elasticache', 'delete-replication-group'],
+    ['redshift', 'delete-cluster']
   ],
   az: [
     ['storage', 'blob', 'delete'],
     ['storage', 'blob', 'delete-batch'],
     ['storage', 'container', 'delete'],
-    ['storage', 'fs', 'delete']
+    ['storage', 'fs', 'delete'],
+    ['postgres', 'server', 'delete'],
+    ['postgres', 'flexible-server', 'delete'],
+    ['mysql', 'server', 'delete'],
+    ['mysql', 'flexible-server', 'delete'],
+    ['sql', 'server', 'delete'],
+    ['sql', 'db', 'delete'],
+    ['redis', 'delete'],
+    ['cosmosdb', 'delete']
   ],
   docker: [
     ['volume', 'rm'],
@@ -3487,7 +3754,13 @@ const STORE_DESTRUCTION_OPERATIONS: Record<string, readonly (readonly string[])[
   ],
   gcloud: [
     ['storage', 'rm'],
-    ['storage', 'buckets', 'delete']
+    ['storage', 'buckets', 'delete'],
+    ['sql', 'instances', 'delete'],
+    ['sql', 'databases', 'delete'],
+    ['redis', 'instances', 'delete'],
+    ['spanner', 'instances', 'delete'],
+    ['spanner', 'databases', 'delete'],
+    ['bigtable', 'instances', 'delete']
   ],
   gsutil: [['rm'], ['rb']],
   mc: [['rm'], ['rb']],
@@ -3524,6 +3797,17 @@ const STORE_DESTRUCTION_PAIRS: Record<
     { operation: ['system', 'prune'], options: new Set(['--volumes']) }
   ],
   'docker-compose': [{ operation: ['down'], options: new Set(['-v', '--volumes']) }],
+  /*
+   * A delete carried by an upload verb, which DESTRUCTION.md recorded as open. `mc mirror` copies
+   * and removes nothing; `mc mirror --remove` deletes everything in the destination that is not in
+   * the source, which is how a bucket empties itself by being synced from the wrong place. The
+   * bare verb stays free for the same reason `docker compose down` does - it is ordinary work.
+   *
+   * `aws s3 sync --delete` is the same act and is deliberately NOT here: it already stops in every
+   * mode through the egress arm, because `s3://…` parses as an address, and a second card on a
+   * command that already cards is a change with no effect and a new way to be wrong.
+   */
+  mc: [{ operation: ['mirror'], options: new Set(['--remove']) }],
   podman: [
     { operation: ['compose', 'down'], options: new Set(['-v', '--volumes']) },
     { operation: ['system', 'prune'], options: new Set(['--volumes']) }
@@ -3559,7 +3843,18 @@ const STORE_DRY_RUN_OPTIONS = new Map<string, RegExp>([
  * service. `enable`, `disable`, `mask` and `link` are the ones that write a link into the unit tree.
  */
 const PERSISTENCE_OPERATIONS: Record<string, readonly (readonly string[])[]> = {
-  launchctl: [['load'], ['unload'], ['bootstrap'], ['bootout'], ['enable'], ['disable']],
+  // `remove` was the third spelling of `unload` and it was the one missing: DESTRUCTION.md recorded
+  // it as open and it measured FREE in balanced and autonomous at 59d3e67. It unloads a job and
+  // takes the label out of the manager, which is a change to what runs after this turn either way.
+  launchctl: [
+    ['load'],
+    ['unload'],
+    ['remove'],
+    ['bootstrap'],
+    ['bootout'],
+    ['enable'],
+    ['disable']
+  ],
   systemctl: [
     ['enable'],
     ['disable'],
@@ -3698,6 +3993,18 @@ const destructionForCommand = (
   if (KEY_VALUE_CLIENTS.has(executable)) {
     const flush = words.find((word) => KEY_VALUE_DESTRUCTION.has(word));
     if (flush) return store(`${executable} ${flush}`);
+    /*
+     * The RAW argument, and the quote is optional, because `unquoted` strips every quote in a token
+     * and would leave `redis.call(flushall)` behind - a shape a pattern requiring the quote cannot
+     * see. Both spellings reach here: the array form keeps its quotes, and a token pulled out of a
+     * `bash -lc` script may have lost them.
+     */
+    const scripted = commandArgs
+      .map((argument) => KEY_VALUE_SCRIPT_DESTRUCTION.exec(argument)?.[1])
+      .find(Boolean);
+    // Lowercased for the same reason the arm above reads `words`: the card names the act, and
+    // `FLUSHALL` and `flushall` are one act spelled two ways.
+    if (scripted) return store(`${executable} eval calling ${scripted.toLowerCase()}`);
   }
   if (
     DOCUMENT_CLIENTS.has(executable) &&
@@ -3714,9 +4021,15 @@ const destructionForCommand = (
       words
     );
     if (matched) return store(`${executable} ${matched.join(' ')}`);
-    for (const pair of ownEntry(STORE_DESTRUCTION_PAIRS, executable) ?? [])
-      if (operationNamed([pair.operation], words) && optionNamed(options, pair.options))
-        return store(`${executable} ${pair.operation.join(' ')} --volumes`);
+    for (const pair of ownEntry(STORE_DESTRUCTION_PAIRS, executable) ?? []) {
+      // The option AS WRITTEN, not a constant. This printed `--volumes` unconditionally, which was
+      // true while every row in this table was a volume flag and became false the moment one was
+      // not: `mc mirror --remove` would have carded as "mc mirror --volumes", a card naming a flag
+      // the owner did not type on a command that has no such flag.
+      const flag = options.find((option) => pair.options.has(option.split('=')[0] ?? option));
+      if (flag && operationNamed([pair.operation], words))
+        return store(`${executable} ${pair.operation.join(' ')} ${flag}`);
+    }
   }
   const persisting = operationNamed(ownEntry(PERSISTENCE_OPERATIONS, executable) ?? [], words);
   if (persisting) return persistence(`${executable} ${persisting.join(' ')}`);
@@ -3819,8 +4132,30 @@ const STDIN_FLUSH = /^[ \t]*(flushall|flushdb)\b/im;
 
 export const scriptDestroysAStore = (body: string, consumer = ''): string | null => {
   const consuming = (unquoted(consumer).split('/').pop() ?? '').toLowerCase();
+  const commands = scriptCommands(body);
   const heads = [
-    ...scriptCommands(body).map(([command = '']) => command),
+    ...commands.map(([command = '']) => command),
+    /*
+     * The client on the far side of `docker exec`, which is a head this reader could not see and
+     * had to. The pair rule here is "a client somewhere in the script AND a statement somewhere in
+     * it", and a script's whitespace split is exactly what takes `-c "DROP DATABASE production"`
+     * apart - so `bash -lc 'docker exec pg psql -c "DROP DATABASE production"'` had a statement
+     * this function could read and no head to credit it to. Measured as a `DESTROYS` failure in
+     * balanced and autonomous while the unwrapped `docker exec` spelling beside it carded.
+     *
+     * It inherits this function's stated bound rather than adding one: a client on one line and a
+     * statement on another are credited to each other, over the width of a script.
+     */
+    ...commands.flatMap((command) => {
+      const carried = commandCarriedIntoAnotherBox(command);
+      return carried
+        ? [
+            unquoted(carried.command[0] ?? '')
+              .split('/')
+              .pop() ?? ''
+          ]
+        : [];
+    }),
     ...(consuming ? [consuming] : [])
   ];
   const sql = heads.find((head) => SQL_CLIENTS.has(head));

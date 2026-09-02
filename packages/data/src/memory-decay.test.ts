@@ -419,3 +419,461 @@ describe('the usage term', () => {
     expect(MEMORY_SALIENCE_FAIL_WEIGHT).toBe(MEMORY_SALIENCE_USE_WEIGHT);
   });
 });
+
+/**
+ * The recall feedback loop, run rather than described.
+ *
+ * `recallMemory` writes a `mem.item_use` row for every row it RETURNS - uncited, outcome
+ * `unknown` - and `recordMemoryPackOutcome` writes the same row for every packed entry the
+ * finished turn never touched, its comment saying such an entry must be left ungraded in both
+ * directions. The salience recompute did not leave it ungraded: `s_use` filtered on
+ * `outcome <> 'fail'`, which admits `unknown`, so the ranking read its own selections back as
+ * evidence at exactly the weight of a use the model had cited.
+ *
+ * Everything here runs the loop through the two methods the worker calls - `recallMemoryCandidates`
+ * to choose, `recordMemoryUse` to record, `consolidateMemory` to score - against a real PGlite
+ * database with the shipped SQL. Nothing reimplements the score.
+ */
+describe('an ungraded use', () => {
+  let database: Database;
+  let store: DataStore;
+  let userId: string;
+  let workspaceId: string;
+
+  beforeEach(async () => {
+    database = createDatabase({ driver: 'pglite', pglitePath: ':memory:' });
+    await migrateDatabase(database);
+    store = new DataStore(database);
+    await store.syncMemoryPredicates();
+    const user = await store.createUser({ username: 'owner', displayName: 'Owner' });
+    userId = user.id;
+    const workspace = await store.createWorkspace({
+      userId,
+      name: 'computer',
+      storageLimitBytes: 10 * 1024 ** 3,
+      imageRevision: 'dev',
+      region: 'auto',
+      wrappedKey: 'wrapped'
+    });
+    workspaceId = workspace.id;
+  });
+
+  afterEach(async () => database.close());
+
+  const add = async (subject: string, body: string): Promise<string> =>
+    (
+      await store.createMemoryItem({
+        id: randomUUID(),
+        userId,
+        workspaceId,
+        kind: 'fact',
+        trust: 'stated',
+        documentCiphertext: { v: 1, iv: 'x', tag: 'x', ciphertext: body },
+        index: buildMemoryItemIndex(
+          { title: subject, tags: [], body, subject, object: 'value' },
+          key
+        ),
+        predicate: 'related_to',
+        // One observation date across every row, so the decay term in `mem.prior` that is not
+        // under test here is identical for everything being compared.
+        observedAt: at(400),
+        validFrom: at(400),
+        pin: false
+      })
+    ).id;
+
+  const scores = async (): Promise<Map<string, { salience: number; prior: number }>> => {
+    await store.consolidateMemory(workspaceId, { now: NOW, useRetentionDays: NEVER_FOLD });
+    const rows = await database.query<{ id: string; salience: number; prior: number }>(
+      `SELECT id, salience,
+              mem.prior(kind,trust,valid_to,observed_at,salience,pin,$2::timestamptz,FALSE) AS prior
+       FROM mem.item WHERE workspace_id=$1`,
+      [workspaceId, NOW]
+    );
+    return new Map(
+      rows.rows.map((row) => [row.id, { salience: Number(row.salience), prior: Number(row.prior) }])
+    );
+  };
+
+  /**
+   * The positive activation under the filter this replaces, computed over the same rows.
+   *
+   * `outcome <> 'fail'` is the shipped statement's `s_use` filter verbatim; `= 'ok'` is what it
+   * is now. Every case below has to separate the two, or it is not testing the change.
+   */
+  const activations = async (): Promise<Map<string, { was: number; now: number }>> => {
+    const rows = await database.query<{ id: string; was: number; s_now: number }>(
+      `SELECT i.id,
+              COALESCE(SUM(power(GREATEST(
+                EXTRACT(EPOCH FROM $2::timestamptz - u.used_at)::float8/86400.0, $3::float8),
+                -$4::float8)) FILTER (WHERE u.outcome <> 'fail'), 0) AS was,
+              COALESCE(SUM(power(GREATEST(
+                EXTRACT(EPOCH FROM $2::timestamptz - u.used_at)::float8/86400.0, $3::float8),
+                -$4::float8)) FILTER (WHERE u.outcome = 'ok'), 0) AS s_now
+       FROM mem.item i LEFT JOIN mem.item_use u ON u.item_id=i.id
+       WHERE i.workspace_id=$1 GROUP BY i.id`,
+      [workspaceId, NOW, MEMORY_USE_AGE_FLOOR_DAYS, MEMORY_USE_DECAY_EXPONENT]
+    );
+    return new Map(
+      rows.rows.map((row) => [row.id, { was: Number(row.was), now: Number(row.s_now) }])
+    );
+  };
+
+  it('scores as nothing, where it used to score as a success', async () => {
+    const never = await add('alpha', 'never used at all');
+    const graded = await add('bravo', 'ten uses the harness watched succeed');
+    // Exactly what `recallMemory` writes: the ids it returned, no `cited`, no `outcome`. Written
+    // through the production writer with its own defaults rather than by naming `unknown` here,
+    // so a change to those defaults breaks this case.
+    const echo = await add('charlie', 'ten uses nobody graded');
+    for (let i = 0; i < 10; i += 1)
+      await store.recordMemoryUse({
+        workspaceId,
+        itemIds: [graded],
+        usedAt: at(10 - i),
+        outcome: 'ok'
+      });
+    for (let i = 0; i < 10; i += 1)
+      await store.recordMemoryUse({ workspaceId, itemIds: [echo], usedAt: at(10 - i) });
+
+    const stored = await database.query<{ n: string }>(
+      "SELECT count(*) AS n FROM mem.item_use WHERE item_id=$1 AND outcome='unknown' AND NOT cited",
+      [echo]
+    );
+    expect(Number(stored.rows[0]!.n)).toBe(10);
+
+    const score = await scores();
+    // Ungraded is worth what no history at all is worth. Not approximately: the two rows have the
+    // same empty positive sum, the same empty citation sum and the same empty failure sum, so
+    // every z-score they enter is the same z-score.
+    expect(score.get(echo)!.salience).toBe(score.get(never)!.salience);
+    expect(score.get(echo)!.prior).toBe(score.get(never)!.prior);
+    // And a use somebody actually watched still counts, or this would be a way of switching the
+    // usage tier off rather than of cleaning it.
+    expect(score.get(graded)!.salience).toBeGreaterThan(score.get(echo)!.salience);
+    expect(score.get(graded)!.prior).toBeGreaterThan(score.get(echo)!.prior);
+
+    // AND THE FILTER THIS REPLACES GETS IT WRONG. Under `outcome <> 'fail'` the ungraded history
+    // and the graded one are the same activation to the last bit, so no ranking downstream of it
+    // could tell a use the model cited from a row the ranker had merely handed itself.
+    const raw = await activations();
+    expect(raw.get(echo)!.was).toBe(raw.get(graded)!.was);
+    expect(raw.get(echo)!.was).toBeGreaterThan(0);
+    expect(raw.get(echo)!.now).toBe(0);
+    expect(raw.get(graded)!.now).toBe(raw.get(graded)!.was);
+  });
+
+  it('stops the ranker reading its own choice back as a reason to choose again', async () => {
+    /*
+     * Two pairs of rows. Within a pair the two answer the same question, were observed on the same
+     * day and differ in one word the question does not mention, so their fusion scores start a
+     * fraction apart and `ORDER BY score DESC, id` hands the top slot to one of them for reasons
+     * that have nothing to do with use. Byte-identical bodies would be a cleaner tie and are the
+     * wrong fixture: they share a `dedupe_key`, the `DISTINCT ON (dedupe_key)` in the fusion query
+     * collapses them to one row, and the loop then has nothing to compound.
+     *
+     * Then the loop, through the two methods the worker calls: ask, record a use for what came
+     * back, consolidate, ask again. Thirty rounds, one a day, and only the leader is ever asked
+     * about. The `relay` pair records the use the way `recallMemory` records it - defaults, so
+     * uncited and `unknown`. The `printer` pair records the same use graded `ok`, which is exactly
+     * what the old `outcome <> 'fail'` filter scored an ungraded use as - so the second pair is
+     * the first pair under the rule this replaces, run through the same statements.
+     *
+     * What is measured is the GAP between the pair, before the loop and after it. A ranking that
+     * reads its own output back as evidence widens it; one that does not leaves it where the text
+     * put it.
+     */
+    const relayA = await add('relay', 'the relay listens on port 8443 in the amber deployment');
+    const relayB = await add('relay', 'the relay listens on port 8443 in the beryl deployment');
+    const printA = await add(
+      'printer',
+      'the printer feeds from the upper tray in the amber office'
+    );
+    const printB = await add(
+      'printer',
+      'the printer feeds from the upper tray in the beryl office'
+    );
+    const RELAY = 'which port does the relay listen on';
+    const PRINTER = 'which tray does the printer feed from';
+
+    /*
+     * How far apart a pair sits in the shipped fusion query, as the RATIO of the two scores rather
+     * than their difference.
+     *
+     * `score` is `rrf * mem.prior(...)`, and the prior carries the whole workspace's salience
+     * moments - so a use recorded against ANY row rescales every score in the workspace, including
+     * a pair that has not moved relative to each other. A difference reads that rescaling as
+     * movement; a ratio divides it out and leaves exactly the question being asked, which is
+     * whether one row of the pair has gained on the other.
+     */
+    const spread = async (question: string, pair: readonly [string, string]): Promise<number> => {
+      const ranked = await store.recallMemoryCandidates({
+        workspaceId,
+        plan: planMemoryQuery(question, key),
+        now: NOW,
+        order: 'relevance'
+      });
+      const byId = new Map(ranked.map((row) => [row.id, row.score]));
+      // Both rows have to be in the answer, or a spread between them is not a thing this can read.
+      expect(byId.has(pair[0]) && byId.has(pair[1])).toBe(true);
+      const [high, low] = [byId.get(pair[0])!, byId.get(pair[1])!].sort((l, r) => r - l);
+      return high! / low!;
+    };
+
+    await store.consolidateMemory(workspaceId, { now: NOW, useRetentionDays: NEVER_FOLD });
+    const relayBefore = await spread(RELAY, [relayA, relayB]);
+    const printerBefore = await spread(PRINTER, [printA, printB]);
+    // The starting spread is the text and nothing else: no row here has ever been used.
+    expect(relayBefore).toBeGreaterThan(1);
+    expect(printerBefore).toBeGreaterThan(1);
+
+    const round = async (
+      question: string,
+      pair: readonly [string, string],
+      graded: boolean,
+      day: number
+    ): Promise<string> => {
+      await store.consolidateMemory(workspaceId, { now: at(day), useRetentionDays: NEVER_FOLD });
+      const top = await store.recallMemoryCandidates({
+        workspaceId,
+        plan: planMemoryQuery(question, key),
+        now: at(day),
+        maxItems: 1,
+        order: 'relevance'
+      });
+      const won = top[0]!.id;
+      // The loop only means anything if the pair is what the question reaches.
+      expect(pair).toContain(won);
+      await (graded
+        ? store.recordMemoryUse({
+            workspaceId,
+            itemIds: [won],
+            usedAt: at(day),
+            cited: true,
+            outcome: 'ok'
+          })
+        : // Defaults, as `recallMemory` calls it: no `cited`, no `outcome`.
+          store.recordMemoryUse({ workspaceId, itemIds: [won], usedAt: at(day) }));
+      return won;
+    };
+
+    const ROUNDS = 30;
+    const ungraded: string[] = [];
+    const gradedRun: string[] = [];
+    for (let day = ROUNDS; day > 0; day -= 1) {
+      ungraded.push(await round(RELAY, [relayA, relayB], false, day));
+      gradedRun.push(await round(PRINTER, [printA, printB], true, day));
+    }
+
+    // Each loop locks onto one row - it has to, because only the top slot is ever asked for - and
+    // the whole question is whether that is a fact about the text or a fact the loop manufactured.
+    expect(new Set(ungraded).size).toBe(1);
+    expect(new Set(gradedRun).size).toBe(1);
+    const echoWinner = ungraded[0]!;
+    const echoLoser = echoWinner === relayA ? relayB : relayA;
+    const gradedWinner = gradedRun[0]!;
+    const gradedLoser = gradedWinner === printA ? printB : printA;
+
+    const counted = await database.query<{ item_id: string; n: string }>(
+      `SELECT i.id AS item_id, count(u.id) AS n FROM mem.item i
+       LEFT JOIN mem.item_use u ON u.item_id=i.id WHERE i.workspace_id=$1 GROUP BY i.id`,
+      [workspaceId]
+    );
+    const uses = new Map(counted.rows.map((row) => [row.item_id, Number(row.n)]));
+    expect(uses.get(echoWinner)).toBe(ROUNDS);
+    expect(uses.get(echoLoser)).toBe(0);
+    expect(uses.get(gradedWinner)).toBe(ROUNDS);
+    expect(uses.get(gradedLoser)).toBe(0);
+
+    const score = await scores();
+    // THE POINT. Thirty rounds of self-agreement, thirty uses against nought, and the two rows
+    // still carry the same salience and the same prior - so the pair sits exactly as far apart in
+    // the pack as the text alone put them, and the leader's thirty rounds bought nothing.
+    expect(score.get(echoWinner)!.salience).toBe(score.get(echoLoser)!.salience);
+    expect(score.get(echoWinner)!.prior).toBe(score.get(echoLoser)!.prior);
+    expect(await spread(RELAY, [relayA, relayB])).toBeCloseTo(relayBefore, 12);
+
+    // AND THE SAME LOOP UNDER THE RULE THIS REPLACES DIVERGES. Identical construction, identical
+    // thirty rounds, the only difference being the grade the old filter handed an ungraded use for
+    // free - and the row that happened to start ahead ends a whole salience ahead, sitting further
+    // apart in the pack than the text alone ever put it.
+    expect(score.get(gradedWinner)!.salience).toBeGreaterThan(score.get(gradedLoser)!.salience);
+    expect(score.get(gradedWinner)!.prior).toBeGreaterThan(score.get(gradedLoser)!.prior);
+    expect(await spread(PRINTER, [printA, printB])).toBeGreaterThan(printerBefore);
+  }, 120_000);
+
+  it('stays ungraded across the retention horizon, where the fold could only count uses', async () => {
+    // `mem.item_use_fold` held `uses`, `cites` and `fails`, and the score recovered the positive
+    // block as `uses - fails` - every use the harness did not watch fail, which is the same
+    // mistake the live half was making, arriving a hundred and eighty days later. Migration 78
+    // adds `oks` so the fold can say which of its uses were graded.
+    const never = await add('delta', 'never used at all');
+    const echo = await add('echo', 'forty ungraded uses, all of them past the horizon');
+    const graded = await add('foxtrot', 'forty graded uses, all of them past the horizon');
+    for (let i = 0; i < 40; i += 1) {
+      await store.recordMemoryUse({ workspaceId, itemIds: [echo], usedAt: at(365 - i * 4) });
+      await store.recordMemoryUse({
+        workspaceId,
+        itemIds: [graded],
+        usedAt: at(365 - i * 4),
+        outcome: 'ok'
+      });
+    }
+
+    await store.consolidateMemory(workspaceId, { now: NOW, useRetentionDays: 180 });
+    const folds = await database.query<{
+      item_id: string;
+      uses: number;
+      oks: number;
+      fails: number;
+    }>('SELECT item_id,uses,oks,fails FROM mem.item_use_fold ORDER BY item_id');
+    const fold = new Map(folds.rows.map((row) => [row.item_id, row]));
+    // Every use here is between 209 and 365 days old, so both histories fold whole and the two
+    // blocks are the same size by construction - which is what leaves the outcome as the only
+    // thing that can separate them.
+    expect(fold.get(echo)!.uses).toBe(40);
+    expect(fold.get(graded)!.uses).toBe(40);
+    expect(fold.get(echo)!.oks).toBe(0);
+    expect(fold.get(graded)!.oks).toBe(fold.get(graded)!.uses);
+    // `uses - fails` is what the score used to read, and it cannot tell the two blocks apart.
+    expect(fold.get(echo)!.uses - fold.get(echo)!.fails).toBe(
+      fold.get(graded)!.uses - fold.get(graded)!.fails
+    );
+
+    const score = await scores();
+    expect(score.get(echo)!.salience).toBe(score.get(never)!.salience);
+    expect(score.get(graded)!.salience).toBeGreaterThan(score.get(echo)!.salience);
+  }, 120_000);
+});
+
+/**
+ * Volume against age, which is the other thing this owner said was broken.
+ *
+ * "110 uses three years ago beats 5 uses this week" was measured on this computer and filed as a
+ * defect: volume buying age without bound. It was measured against a lifetime `use_count`, and it
+ * is not what the shipped score does - so this case exists to hold the repair rather than to make
+ * one, and to leave the number where the next person can re-read it instead of re-measuring it.
+ *
+ * The claim is bounded dominance, not absence. ACT-R's sum is linear in the number of uses and
+ * `t^-d` in each one's age, so enough ancient uses will always out-activate a few recent ones;
+ * what matters is the exchange rate and whether the term that is supposed to answer age - recency
+ * in `mem.prior` - can still overturn it. Both are measured below.
+ */
+describe('a large old history', () => {
+  let database: Database;
+  let store: DataStore;
+  let userId: string;
+  let workspaceId: string;
+
+  beforeEach(async () => {
+    database = createDatabase({ driver: 'pglite', pglitePath: ':memory:' });
+    await migrateDatabase(database);
+    store = new DataStore(database);
+    await store.syncMemoryPredicates();
+    const user = await store.createUser({ username: 'owner', displayName: 'Owner' });
+    userId = user.id;
+    const workspace = await store.createWorkspace({
+      userId,
+      name: 'computer',
+      storageLimitBytes: 10 * 1024 ** 3,
+      imageRevision: 'dev',
+      region: 'auto',
+      wrappedKey: 'wrapped'
+    });
+    workspaceId = workspace.id;
+  });
+
+  afterEach(async () => database.close());
+
+  /** Unlike the helpers above, the observation date is the variable: it is what recency reads. */
+  const add = async (subject: string, body: string, observedDaysAgo: number): Promise<string> =>
+    (
+      await store.createMemoryItem({
+        id: randomUUID(),
+        userId,
+        workspaceId,
+        kind: 'fact',
+        trust: 'stated',
+        documentCiphertext: { v: 1, iv: 'x', tag: 'x', ciphertext: body },
+        index: buildMemoryItemIndex(
+          { title: subject, tags: [], body, subject, object: 'value' },
+          key
+        ),
+        predicate: 'related_to',
+        observedAt: at(observedDaysAgo),
+        validFrom: at(observedDaysAgo),
+        pin: false
+      })
+    ).id;
+
+  it('buys a few percent of activation with twenty-two times the volume, and loses to recency', async () => {
+    // A hundred and ten uses spread across a month three years ago, against five uses this week.
+    // Both rows observed when their history began, which is the honest arrangement: a fact used
+    // heavily three years ago was almost always learned three years ago.
+    const ancient = await add('golf', 'a hundred and ten uses three years ago', 1100);
+    const recent = await add('hotel', 'five uses this week', 30);
+    for (let i = 0; i < 110; i += 1)
+      await store.recordMemoryUse({
+        workspaceId,
+        itemIds: [ancient],
+        usedAt: at(1095 + (i % 30)),
+        outcome: 'ok'
+      });
+    for (let i = 0; i < 5; i += 1)
+      await store.recordMemoryUse({
+        workspaceId,
+        itemIds: [recent],
+        usedAt: at(1 + i),
+        outcome: 'ok'
+      });
+
+    const raw = await database.query<{ id: string; s: number; n: string }>(
+      `SELECT i.id, COALESCE(SUM(power(GREATEST(
+                EXTRACT(EPOCH FROM $2::timestamptz - u.used_at)::float8/86400.0, $3::float8),
+                -$4::float8)), 0) AS s, count(u.id) AS n
+       FROM mem.item i LEFT JOIN mem.item_use u ON u.item_id=i.id
+       WHERE i.workspace_id=$1 GROUP BY i.id`,
+      [workspaceId, NOW, MEMORY_USE_AGE_FLOOR_DAYS, MEMORY_USE_DECAY_EXPONENT]
+    );
+    const activation = new Map(raw.rows.map((row) => [row.id, Number(row.s)]));
+    const uses = new Map(raw.rows.map((row) => [row.id, Number(row.n)]));
+
+    // The volume ratio is 22:1 and the age ratio is about 300:1.
+    expect(uses.get(ancient)! / uses.get(recent)!).toBe(22);
+    // The old history does still out-activate the new one, and saying otherwise would be a claim
+    // ACT-R does not make: the sum is linear in the count. What it buys is 2.2%. Measured
+    // 3.3038 against 3.2317; the break-even is at 107 ancient uses, and to DOUBLE the recent
+    // row's activation the old one would need about 220. That is the exchange rate, and it is
+    // bounded in the sense that matters - sublinear once `ln` takes it, and a z-score after that.
+    expect(activation.get(ancient)!).toBeGreaterThan(activation.get(recent)!);
+    expect(activation.get(ancient)! / activation.get(recent)!).toBeLessThan(1.05);
+
+    // AND THE TERM THAT ANSWERS AGE OVERTURNS IT. Recency in `mem.prior` reads `observed_at`, and
+    // across three years it is worth 2.86x against the 0.94x-1.25x the salience factor can reach,
+    // so the row with five uses this week finishes strictly ahead of the row with a hundred and
+    // ten three years ago. Measured: 0.9200 against 0.7463.
+    await store.consolidateMemory(workspaceId, { now: NOW, useRetentionDays: NEVER_FOLD });
+    const priors = await database.query<{ id: string; salience: number; prior: number }>(
+      `SELECT id, salience,
+              mem.prior(kind,trust,valid_to,observed_at,salience,pin,$2::timestamptz,FALSE) AS prior
+       FROM mem.item WHERE workspace_id=$1`,
+      [workspaceId, NOW]
+    );
+    const prior = new Map(priors.rows.map((row) => [row.id, Number(row.prior)]));
+    const salience = new Map(priors.rows.map((row) => [row.id, Number(row.salience)]));
+    expect(salience.get(ancient)!).toBeGreaterThan(salience.get(recent)!);
+    expect(prior.get(recent)!).toBeGreaterThan(prior.get(ancient)!);
+
+    // AND THE RULE THIS REPLACES GETS IT WRONG. A lifetime count - `mem.item.use_count`, which is
+    // what the original measurement was taken against and which is still maintained for the review
+    // surface - puts the finished project twenty-two times ahead of the live one, with no term
+    // anywhere able to answer it.
+    const counters = await database.query<{ id: string; use_count: number }>(
+      'SELECT id, use_count FROM mem.item WHERE workspace_id=$1',
+      [workspaceId]
+    );
+    const lifetime = new Map(counters.rows.map((row) => [row.id, Number(row.use_count)]));
+    expect(lifetime.get(ancient)!).toBe(110);
+    expect(lifetime.get(recent)!).toBe(5);
+  }, 120_000);
+});

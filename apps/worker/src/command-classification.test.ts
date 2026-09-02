@@ -14,6 +14,7 @@ import {
   AGENT_HOME,
   callDestinations,
   CHECKPOINT_CONTENT,
+  commandCarriedIntoAnotherBox,
   consequentialExecutables,
   destructionOperation,
   effectiveCommands,
@@ -1488,6 +1489,36 @@ describe('destructionOperation', () => {
   });
 
   /*
+   * The card names the option the owner WROTE, and nothing pinned that until this test.
+   *
+   * `STORE_DESTRUCTION_PAIRS` printed the literal `--volumes` for every row, which was true while
+   * every row in the table was a volume flag and false the moment one was not: `mc mirror --remove`
+   * carded as "mc mirror --volumes", naming a flag the owner never typed on a command that has no
+   * such flag. The fix was made and left unpinned - reverting it to the literal kept the whole
+   * cards rig green and all of these files' tests green, because every other assertion on this
+   * table reads `kind` or `sideEffect` and none reads the sentence.
+   *
+   * Both spellings of the same row, because `optionNamed` matches on the token before its `=` and
+   * the card prints the token whole: `--remove=true` is what the owner typed and is what they read.
+   */
+  it('names the option as written rather than the one the first row happened to carry', () => {
+    expect(destructionOperation(['mc', 'mirror', '--remove', 'local/d', 'prod/b'])).toEqual({
+      kind: 'store',
+      operation: 'mc mirror --remove'
+    });
+    expect(
+      destructionOperation(['mc', 'mirror', '--remove=true', 'local/d', 'prod/b'])?.operation
+    ).toBe('mc mirror --remove=true');
+    // The volume rows still say the volume flag, and say the one of the two that was written.
+    expect(destructionOperation(['docker', 'compose', 'down', '-v'])?.operation).toBe(
+      'docker compose down -v'
+    );
+    expect(destructionOperation(['docker', 'compose', 'down', '--volumes'])?.operation).toBe(
+      'docker compose down --volumes'
+    );
+  });
+
+  /*
    * The clause is "nothing follows the table name", and the pattern carried the `m` flag, so `$`
    * meant end of LINE and a qualified delete written across two of them read as unqualified.
    */
@@ -2054,5 +2085,117 @@ describe('what the checkpoint walked past', () => {
     expect(removesUncoveredFile('$HOME/x', 'workspace', weights)).toBe(true);
     expect(removesUncoveredFile('workspace/x', '/etc', weights)).toBe(true);
     expect(removesUncoveredFile('', 'workspace', weights)).toBe(true);
+  });
+});
+
+/*
+ * A move, read as the delete of its source that it is.
+ *
+ * `removalTargets` answers the paths a command empties, and `mv` had no arm at all: the floor's
+ * destructive branch never reached it and `mv ~/.ssh /tmp/x` was free in balanced and autonomous.
+ * Asked here directly because the argument shapes are where this goes wrong - the destination is
+ * the LAST operand ordinarily and the FIRST after `-t`, and an option that carries a value is not
+ * a path.
+ */
+describe('the places a move empties', () => {
+  it('reads the sources and not the destination', () => {
+    expect(removalTargets('mv', ['~/.ssh', '/tmp/x'])).toEqual(['~/.ssh']);
+    expect(removalTargets('mv', ['a.md', 'b.md', 'docs'])).toEqual(['a.md', 'b.md']);
+    expect(removalTargets('mv', ['-f', 'dist', 'dist.old'])).toEqual(['dist']);
+    expect(removalTargets('mv', ['--', '-weird-name', 'docs/x'])).toEqual(['-weird-name']);
+  });
+
+  it('reads -t as inverting which operand is the destination', () => {
+    expect(removalTargets('mv', ['-t', '/tmp/x', '~/.ssh'])).toEqual(['~/.ssh']);
+    expect(removalTargets('mv', ['--target-directory', '/tmp/x', 'a', 'b'])).toEqual(['a', 'b']);
+    expect(removalTargets('mv', ['--target-directory=/tmp/x', '~/.ssh'])).toEqual(['~/.ssh']);
+  });
+
+  it('does not read an option value as a path', () => {
+    // `-S .bak` is the backup suffix. Read as an operand it becomes the destination, which makes
+    // `notes.md` the source and is right by accident here - and wrong the moment there is one more.
+    expect(removalTargets('mv', ['-S', '.bak', 'notes.md', 'docs/notes.md'])).toEqual(['notes.md']);
+    expect(removalTargets('mv', ['--suffix', '.bak', 'a', 'b', 'docs'])).toEqual(['a', 'b']);
+  });
+
+  /*
+   * Null keeps the card, as it does for every other shape this file cannot place. One operand is
+   * either an error or `find … | xargs mv`, whose paths are not in the command text at all.
+   */
+  it('answers null for a move it cannot place', () => {
+    expect(removalTargets('mv', ['a'])).toBeNull();
+    expect(removalTargets('mv', [])).toBeNull();
+    expect(removalTargets('mv', ['-t', '/tmp/x'])).toBeNull();
+  });
+
+  // A bundled short option ending in a value-taking letter is not enumerated, so its value is read
+  // as an operand. That over-names, and over-naming can only ADD a path that has to be inside the
+  // checkpoint before the card is dropped - here `/tmp/x`, which is absolute and keeps it.
+  it('over-names rather than under-names a bundle it cannot read', () => {
+    expect(removalTargets('mv', ['-ft', '/tmp/x', '~/.ssh'])).toEqual(['/tmp/x']);
+  });
+});
+
+/*
+ * The command a container or pod runner carries to the other side.
+ *
+ * The walk stops at `docker`, which `placeableExecutable` names, so nothing downstream ever reached
+ * the client: `docker exec pg psql -c "DROP DATABASE x"` was free in balanced and autonomous.
+ * Asked here directly because the runner's own operands are what this has to get past, and getting
+ * them wrong reads the CONTAINER name as the command - which matches no table, and is a miss.
+ */
+describe('a command carried into another box', () => {
+  const carried = (tokens: readonly string[]) => commandCarriedIntoAnotherBox(tokens);
+
+  it('takes the runner’s own words off', () => {
+    expect(carried(['docker', 'exec', 'pg', 'psql', '-c', 'DROP DATABASE x'])).toEqual({
+      carrier: 'docker exec',
+      command: ['psql', '-c', 'DROP DATABASE x']
+    });
+    expect(carried(['docker', 'exec', '-i', '-u', 'postgres', 'pg', 'dropdb', 'prod'])).toEqual({
+      carrier: 'docker exec',
+      command: ['dropdb', 'prod']
+    });
+    expect(carried(['docker', 'compose', 'exec', 'db', 'dropdb', 'prod'])).toEqual({
+      carrier: 'docker compose exec',
+      command: ['dropdb', 'prod']
+    });
+    expect(carried(['podman', 'exec', 'pg', 'dropdb', 'prod'])?.command).toEqual([
+      'dropdb',
+      'prod'
+    ]);
+  });
+
+  // `--` ends the runner's arguments outright, which is how `kubectl` is written and the only
+  // spelling in which the carried command may legitimately begin with a dash.
+  it('reads kubectl past its namespace and its --', () => {
+    expect(carried(['kubectl', 'exec', 'pg-0', '--', 'psql', '-c', 'DROP DATABASE x'])).toEqual({
+      carrier: 'kubectl exec',
+      command: ['psql', '-c', 'DROP DATABASE x']
+    });
+    expect(carried(['kubectl', 'exec', '-n', 'prod', '-it', 'pg-0', '--', 'dropdb', 'p'])).toEqual({
+      carrier: 'kubectl exec',
+      command: ['dropdb', 'p']
+    });
+  });
+
+  /*
+   * Every other subcommand of the same tools is untouched, which is why this is a pair of words
+   * rather than a set of names: `docker volume rm` and `docker compose down -v` are their own cards
+   * one table along, and a rule keyed on `docker` would have taken them with it.
+   */
+  it('is not any other subcommand of the same tools', () => {
+    for (const tokens of [
+      ['docker', 'volume', 'rm', 'pgdata'],
+      ['docker', 'compose', 'down', '-v'],
+      ['docker', 'ps', '-a'],
+      ['docker', 'run', 'img', 'npm', 'publish'],
+      ['kubectl', 'get', 'pods'],
+      ['psql', '-c', 'select 1'],
+      ['exec', 'psql', '-c', 'DROP DATABASE x']
+    ])
+      expect(carried(tokens), tokens.join(' ')).toBeNull();
+    // An exec with nothing after the container runs nothing and carries nothing.
+    expect(carried(['docker', 'exec', 'pg'])).toBeNull();
   });
 });

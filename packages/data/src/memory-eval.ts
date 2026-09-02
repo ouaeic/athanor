@@ -1431,7 +1431,27 @@ export const seedMemoryEvalCorpus = async (input: {
         itemIds: [id],
         usedAt: daysBefore(input.now, daysAgo),
         cited: index < cited,
-        outcome: index >= ordered.length - failed ? 'fail' : 'ok'
+        /*
+         * THREE OUTCOMES, BECAUSE THE SCORE PARTITIONS ON THREE. This read
+         * `index >= ordered.length - failed ? 'fail' : 'ok'`, so every use that was not cited and
+         * did not fail was graded a success - and `recordMemoryPackOutcome` writes exactly the
+         * opposite for that case: an entry the finished turn never touched is written `unknown`,
+         * ungraded in both directions, and only a cited entry carries the turn's grade. A fixture
+         * that never produces `unknown` cannot see what the score does with it, and what the score
+         * used to do with it was count it as a success.
+         *
+         * WHAT THIS FIXTURE STILL DOES NOT MATCH IS `fail`. The only caller of
+         * `recordMemoryPackOutcome` in the product passes the literal `outcome: 'ok'`, so no turn
+         * on this box writes `outcome='fail'` at all, and the `failedUses` histories below
+         * exercise a partition production cannot currently reach. They are kept because the
+         * negative weight is real SQL that something has to measure; they are not evidence that it
+         * fires. The two outcomes production does write are `ok` and `unknown`, and those are the
+         * two this now gets right.
+         *
+         * Changing this moved none of the committed numbers on the build it was written against,
+         * because `unknown` and `ok` scored identically there; it is what makes them move now.
+         */
+        outcome: index >= ordered.length - failed ? 'fail' : index < cited ? 'ok' : 'unknown'
       });
   }
   if (input.withUsage) await input.store.consolidateMemory(input.workspaceId, { now: input.now });

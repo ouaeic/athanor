@@ -13,13 +13,56 @@
  * Lifted out of `agent.ts` unchanged by Wave 7.1.
  */
 import type { ModelToolCall } from '@athanor/model-gateway';
-import { commandFingerprint } from './acceptance.js';
+import { acceptanceObservation, commandFingerprint, type AcceptanceResult } from './acceptance.js';
 import type { AgentState } from './agent-state.js';
 import { MAX_QUESTIONS_PER_TURN } from './turn-bounds.js';
 import { asRecord, textValue } from './values.js';
 
+/**
+ * The only two statuses the MODEL may write, and the list the validator below is held to.
+ *
+ * A constant rather than a literal in one `if`, because the type has since grown values the model
+ * must never be able to send and the difference between "what this field may hold" and "what a
+ * finish call may contain" is now load-bearing in two directions:
+ *
+ * - The wire. `tool-catalogue.ts` publishes `enum: ['verified','not_applicable']` on the finish
+ *   schema, and the catalogue has 27 bytes of headroom against the ceiling
+ *   `tool-catalogue.test.ts` enforces. A third enum value costs real bytes on every request of
+ *   every turn; a value only the harness ever writes costs nothing at all, because it is never in
+ *   anything the model is sent or the model returns.
+ * - The claim. A downgrade the model could declare is a downgrade the model could decline to
+ *   declare, and then it is not evidence about the checks - it is one more thing the model says
+ *   about itself, which is what this whole file exists not to believe.
+ */
+export const MODEL_DECLARED_VERIFICATION_STATUSES = ['verified', 'not_applicable'] as const;
+
+/**
+ * What athanor is willing to say about a completion.
+ *
+ * The first two are the model's own word for it. The second two are the harness's, computed in
+ * `turn/finish.ts` from what the declared acceptance checks actually did, and reachable no other
+ * way - see `MODEL_DECLARED_VERIFICATION_STATUSES` above.
+ *
+ * They exist because `verified` is a claim about evidence and there was a path that wrote it with
+ * none. MEASURED by driving a real turn against a real box: a task whose answer was WRONG reported
+ * `status=completed verification=verified`, byte-identical in both top-line fields to the correct
+ * run. The turn had declared acceptance checks, they ran in the box, and they failed four times -
+ * `MAX_ACCEPTANCE_FAILURES` - after which `turn/finish.ts` appended the failures to
+ * `remainingRisks` and left the status the model had declared. Only the external verifier told the
+ * two runs apart (evals/bench/selftest.ts, and the note at evals/bench/score.ts:159 that both
+ * fields "read EXACTLY as they do on the honest run").
+ *
+ * What ending the turn there gets right is not touched by any of this: past the ceiling the turn
+ * stops rather than spending the rest of the budget on the same failure, and the failures still
+ * travel in the risks. What changes is only the word in the field an owner or a script reads first.
+ */
+export type CompletionVerificationStatus =
+  | (typeof MODEL_DECLARED_VERIFICATION_STATUSES)[number]
+  | 'checks_failed'
+  | 'checks_did_not_run';
+
 export interface CompletionVerification {
-  status: 'verified' | 'not_applicable';
+  status: CompletionVerificationStatus;
   evidence: Array<{
     claim: string;
     source: 'tool_result' | 'published_artifact' | 'user_visible_result';
@@ -412,7 +455,13 @@ export const completionVerification = (
   if (!value || typeof value !== 'object')
     return { ok: false, reason: 'Finish requires a verification object.' };
   const input = value as Record<string, unknown>;
-  if (!['verified', 'not_applicable'].includes(textValue(input.status)))
+  // The model's two, and only the model's two. A finish that tries to declare one of the harness's
+  // own downgrades is refused here exactly as `{"status":"done"}` is: those values are what the
+  // harness concluded about the checks, and a model that could write them could write `verified`
+  // over a failure by choosing not to.
+  if (
+    !(MODEL_DECLARED_VERIFICATION_STATUSES as readonly string[]).includes(textValue(input.status))
+  )
     return { ok: false, reason: 'Verification status must be verified or not_applicable.' };
   const status = textValue(input.status) as CompletionVerification['status'];
   const rawEvidence = Array.isArray(input.evidence) ? input.evidence : [];
@@ -591,6 +640,42 @@ export const completionVerification = (
         : []
     }
   };
+};
+
+/**
+ * The status after the harness has read what the declared checks actually did.
+ *
+ * The other half of `completionVerification` above, and deliberately the opposite kind of function:
+ * that one judges what the model wrote, this one overrides it. Called from `turn/finish.ts` on the
+ * one path where a completion is written despite the record not passing - past
+ * `MAX_ACCEPTANCE_FAILURES`, where the turn stops rather than spending the rest of its budget on
+ * the same failure.
+ *
+ * Three rules, and the order of the first two is the judgement:
+ *
+ * - A check the harness watched fail outranks everything, including a check it could not run. A
+ *   failure is evidence against the work; a check that never started is the absence of evidence,
+ *   and the stronger fact wins the one word the field can hold. Nothing is lost by that ordering -
+ *   both lines are in `remainingRisks` either way, and the card prints each one verbatim.
+ * - A check that could not run is its own answer and is never folded into either neighbour. It is
+ *   not `verified`, because nothing was verified; it is not `checks_failed`, because nothing
+ *   failed. It reads as silence, which is what it is.
+ * - An empty record, or one where every check passed, returns what the model declared untouched.
+ *   A turn with no acceptance checks never reaches here at all, so `not_applicable` still means
+ *   exactly what it meant.
+ *
+ * It does NOT promote: a model that declared `not_applicable` and whose checks all passed is left
+ * saying `not_applicable`. The harness is entitled to withdraw a claim about evidence it can see
+ * was not made good; it is not entitled to make a claim on the model's behalf.
+ */
+export const harnessVerificationStatus = (
+  declared: CompletionVerificationStatus,
+  results: readonly AcceptanceResult[]
+): CompletionVerificationStatus => {
+  const observations = results.map(acceptanceObservation);
+  if (observations.includes('failed')) return 'checks_failed';
+  if (observations.includes('did_not_run')) return 'checks_did_not_run';
+  return declared;
 };
 
 /** A cited span the harness re-fetched and checked for itself. */

@@ -111,6 +111,61 @@ export interface AcceptanceResult {
   readonly detail: string;
 }
 
+/**
+ * What the harness actually learned from one check, which is three answers rather than the two
+ * `passed` can hold.
+ *
+ * `passed: false` is written for two different facts and they are not the same news. A command that
+ * exited 1 is the computer answering: the harness ran the check and the check says no. A command
+ * that timed out, or that never started because the runner refused or the suite's own clock ran
+ * out, is the harness failing to observe anything at all - and the post-edit diagnostics work in
+ * this tree settled the rule for that case already: a check that could not run reads as silence,
+ * not as health, and not as a verdict either.
+ *
+ * Both are still failures for the purpose of refusing a finish, and nothing here changes that: a
+ * job whose proof cannot be run is not a proven job. The distinction is for what the completion
+ * then *says*, where "your test failed" and "athanor never got to run your test" are different
+ * things to tell an owner.
+ *
+ * Read off `detail`, because that is the only place the difference exists. Adding a field to
+ * `AcceptanceResult` would be the honest shape and it needs `acceptance-runner.ts`, which writes
+ * every one of these; this reads what that file already writes, and the two openings below are
+ * exactly its two "I never saw an answer" branches.
+ */
+export type AcceptanceObservation = 'passed' | 'failed' | 'did_not_run';
+
+/**
+ * The two openings `acceptance-runner.ts` writes when it never got an answer.
+ *
+ * Exported so the coupling is one grep rather than a guess, and pinned by a test in
+ * `acceptance.test.ts` that drives the real `acceptanceChecks` over a refusing runner, a wedged
+ * command and a suite past its deadline. That test is the thing that keeps this from rotting: a
+ * reworded detail in the runner turns this classifier's answer from `did_not_run` into `failed`
+ * silently, and silence is the failure mode the whole three-way split exists to remove.
+ *
+ * @see acceptanceChecks in `acceptance-runner.ts`, the sole writer of `AcceptanceResult.detail`.
+ */
+export const ACCEPTANCE_NEVER_RAN_PREFIX = 'the check could not run: ';
+export const ACCEPTANCE_TIMED_OUT_PREFIX = 'timed out after ';
+
+/**
+ * The three-way reading of one result.
+ *
+ * Deliberately NOT `detail.startsWith('exit ')`, which is the rule `turn/finish.ts` used to carry
+ * inline for its dead-end memories and which is only correct there because that flatMap has already
+ * dropped every check that is not a command. An artifact check that ran perfectly well answers
+ * `workspace/out.csv does not exist` or `312 bytes (needs at least 4096)`, and reading the absence
+ * of an exit code as "the harness never looked" would file every missing deliverable as an
+ * unobserved check - which is the folding this function exists to prevent, pointed the other way.
+ */
+export const acceptanceObservation = (result: AcceptanceResult): AcceptanceObservation =>
+  result.passed
+    ? 'passed'
+    : result.detail.startsWith(ACCEPTANCE_NEVER_RAN_PREFIX) ||
+        result.detail.startsWith(ACCEPTANCE_TIMED_OUT_PREFIX)
+      ? 'did_not_run'
+      : 'failed';
+
 export const MAX_ACCEPTANCE_CHECKS = 8;
 /** Long enough for a real build or test suite, short enough that a wedged check ends the turn. */
 export const ACCEPTANCE_COMMAND_TIMEOUT_SECONDS = 900;

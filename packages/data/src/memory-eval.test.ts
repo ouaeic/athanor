@@ -743,15 +743,30 @@ describe('memory retrieval eval with a use history', () => {
   /**
    * Today's numbers on this corpus, committed the way the ones above are.
    *
-   * Recall and the pack size do not move: 100.0% and 364 tokens, identical to the arm with no
-   * usage at all, and no retired value leaks. MRR does - 0.469 with the salience factor switched
-   * off entirely, 0.427 under the `1 + 0.15*ln(1 + greatest(salience,0))` this replaced, 0.395
-   * under the shipped `exp(0.15*asinh(salience))`. All three were measured on THIS corpus by
-   * substituting the body of `mem.prior`, and they are the first numbers in this repository that
-   * say what the usage tier is worth. What they say is that on a fixture where usage carries no
-   * information about the question, the tier can only cost rank, and costs more the more of the
-   * salience range it exposes - which is the argument for leaving 0.15 where it is until somebody
-   * measures the other side of it.
+   * Recall does not move: 100.0%, identical to the arm with no usage at all, and no retired value
+   * leaks. MRR does - 0.469 with the salience factor switched off entirely, 0.427 under the
+   * `1 + 0.15*ln(1 + greatest(salience,0))` this replaced, 0.395 under the shipped
+   * `exp(0.15*asinh(salience))`. The first three were measured on THIS corpus by substituting the
+   * body of `mem.prior`, and they are the first numbers in this repository that say what the usage
+   * tier is worth. What they say is that on a fixture where usage carries no information about the
+   * question, the tier can only cost rank, and costs more the more of the salience range it
+   * exposes - which is the argument for leaving 0.15 where it is until somebody measures the other
+   * side of it.
+   *
+   * TODAY IT IS 0.398 AT 363 TOKENS, and the 0.003 is the whole of what stopping the score from
+   * crediting an ungraded use is worth on this fixture. That is a small number honestly reported
+   * rather than a headline: this corpus is uninformative about usage by construction, so ANY
+   * reduction in the salience spread moves MRR back toward the 0.469 of the arm with no usage at
+   * all, and this eval cannot tell a repair from a retreat. What it does establish is the
+   * direction and the size, and that nothing else moved: recall held at 100.0%, the retired value
+   * still does not leak, and the pack lost one token.
+   *
+   * The measurement that actually decides the change is in `memory-decay.test.ts`, where the
+   * feedback loop is run rather than described. Sequenced so the fixture and the score could not
+   * be confused with each other: writing the corpus's uncited, unfailed uses as `unknown` instead
+   * of `ok` - which is what the production writer does - moved 0.469 / 0.425 / 0.395 to
+   * 0.469 / 0.425 / 0.395, not a digit, because `unknown` and `ok` scored identically. The whole
+   * of the movement below belongs to the salience recompute.
    */
   const MIN_USAGE_PACK_RECALL = 1;
   const MIN_USAGE_MRR = 0.37;
@@ -801,12 +816,30 @@ describe('memory retrieval eval with a use history', () => {
     // And the history reached the fold: `shell-retired`'s ten uses are all more than a hundred and
     // eighty days old, so the retention pass moved them to `mem.item_use_fold` and their weight
     // survived the move. Under the DELETE this replaced they would be gone.
-    const folded = await database.query<{ item_id: string; uses: number }>(
-      'SELECT item_id, uses FROM mem.item_use_fold'
+    const folded = await database.query<{ item_id: string; uses: number; oks: number }>(
+      'SELECT item_id, uses, oks FROM mem.item_use_fold'
     );
     expect(folded.rows).toHaveLength(1);
     expect(folded.rows[0]!.item_id).toBe(seed.ids.get('shell-retired'));
     expect(folded.rows[0]!.uses).toBe(10);
+    // And none of the ten was graded. `shell-retired` is the heaviest history in this corpus and
+    // it is a retired value that must never come back, so it carries no citations at all - which
+    // under the production writer's own rules makes every one of its uses `unknown`. The fold now
+    // records that, and the score reads it: this is the row whose lead the old formula would have
+    // kept paying for out of nothing but the fact that it had once been packed.
+    expect(folded.rows[0]!.oks).toBe(0);
+
+    // THE CORPUS WRITES ALL THREE OUTCOMES, BECAUSE THE PRODUCTION WRITER DOES. It used to write
+    // two - every use that was not cited and did not fail was graded a success - and a fixture
+    // that never produces `unknown` cannot see what the score does with it. If this ever goes back
+    // to two, the arm below is measuring a store that no turn on this computer can produce.
+    const outcomes = await database.query<{ outcome: string; n: string }>(
+      `SELECT outcome, count(*)::int AS n FROM mem.item_use WHERE workspace_id=$1
+       GROUP BY outcome ORDER BY outcome`,
+      [workspaceId]
+    );
+    expect(outcomes.rows.map((row) => row.outcome)).toEqual(['fail', 'ok', 'unknown']);
+    for (const row of outcomes.rows) expect(Number(row.n)).toBeGreaterThan(0);
   }, 300_000);
 
   it('retrieves and ranks under a usage prior that knows nothing about the questions', () => {

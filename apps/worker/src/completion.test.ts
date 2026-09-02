@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import type { AcceptanceCheck } from './acceptance.js';
+import type { AcceptanceCheck, AcceptanceResult } from './acceptance.js';
 import { acceptanceAlreadyObserved } from './acceptance.js';
+import { agentTools } from './tools.js';
 import type { AgentState } from './agent-state.js';
 import {
+  MODEL_DECLARED_VERIFICATION_STATUSES,
   askOutcome,
   citableEvidence,
   completionVerification,
   evidenceFloor,
+  harnessVerificationStatus,
   observedCommands,
   parseDelegateReport,
   shellObservation,
@@ -897,5 +900,89 @@ describe('a command the harness answered instead of running', () => {
       passed: true,
       detail: 'exit 0, from athanor running this same command after the last change'
     });
+  });
+});
+
+/**
+ * The status the harness computes, and the wall that keeps the model on the other side of it.
+ *
+ * `CompletionVerification.status` now has four values and only two of them are the model's. The
+ * split is the whole point: a downgrade the model could declare is a downgrade the model could
+ * decline to declare, and it would then be one more thing the model says about itself rather than
+ * evidence about what the checks did. It is also what makes the third and fourth values free on the
+ * wire - neither appears in the finish schema, so the tool catalogue does not grow by a byte.
+ */
+describe('a status the harness writes and the model cannot', () => {
+  const result = (passed: boolean, detail: string): AcceptanceResult => ({
+    id: 'c1',
+    label: 'the suite passes',
+    passed,
+    detail
+  });
+  const passing = result(true, 'exit 0');
+  const failing = result(false, 'exit 1 (expected 0): 3 tests failed');
+  const unrun = result(false, 'the check could not run: runner refused (503)');
+
+  it('offers the model exactly two values, and they are the two the catalogue publishes', () => {
+    expect([...MODEL_DECLARED_VERIFICATION_STATUSES]).toEqual(['verified', 'not_applicable']);
+    const finish = agentTools.find((tool) => tool.name === 'finish');
+    const status = (
+      finish?.parameters as {
+        properties: { verification: { properties: { status: { enum: string[] } } } };
+      }
+    ).properties.verification.properties.status;
+    // The wire and this file, held together: the 27 bytes of catalogue headroom are only safe
+    // while the harness's own values stay out of the schema the model is sent.
+    expect(status.enum).toEqual([...MODEL_DECLARED_VERIFICATION_STATUSES]);
+  });
+
+  it('refuses a finish that tries to declare one of the harness’s own statuses', () => {
+    for (const status of ['checks_failed', 'checks_did_not_run']) {
+      const checked = completionVerification(
+        { messages: [], turnToolResults: {} } as unknown as AgentState,
+        { status, evidence: [] }
+      );
+      expect(checked, status).toMatchObject({ ok: false });
+      expect(!checked.ok && checked.reason).toContain('verified or not_applicable');
+    }
+  });
+
+  it('leaves a turn whose checks all passed saying exactly what it said', () => {
+    expect(harnessVerificationStatus('verified', [passing, passing])).toBe('verified');
+  });
+
+  /**
+   * A turn with no acceptance record never reaches this function at all - `turn/finish.ts` calls it
+   * only inside `if (state.acceptance)` and only past the failure ceiling - and the empty list is
+   * the same fact spelled here, so `not_applicable` still means what it means.
+   */
+  it('leaves a turn with no checks alone', () => {
+    expect(harnessVerificationStatus('not_applicable', [])).toBe('not_applicable');
+    expect(harnessVerificationStatus('verified', [])).toBe('verified');
+  });
+
+  it('withdraws the claim when a check the harness ran said no', () => {
+    expect(harnessVerificationStatus('verified', [passing, failing])).toBe('checks_failed');
+  });
+
+  it('says silence, not health and not a verdict, when a check could not run', () => {
+    expect(harnessVerificationStatus('verified', [passing, unrun])).toBe('checks_did_not_run');
+    // The one that would be the same defect wearing a different hat: folded into `verified`, an
+    // unrunnable check reads as a proof; folded into `checks_failed`, it reads as a disproof.
+    expect(harnessVerificationStatus('verified', [unrun])).not.toBe('verified');
+    expect(harnessVerificationStatus('verified', [unrun])).not.toBe('checks_failed');
+  });
+
+  /**
+   * An observed failure outranks an unobserved check, because a failure is evidence and an absence
+   * is not. Nothing is lost by the ordering: both lines are in `remainingRisks` either way.
+   */
+  it('reports the failure when one check said no and another never ran', () => {
+    expect(harnessVerificationStatus('verified', [unrun, failing])).toBe('checks_failed');
+    expect(harnessVerificationStatus('verified', [failing, unrun])).toBe('checks_failed');
+  });
+
+  it('never promotes: a claim the model did not make is not the harness’s to make', () => {
+    expect(harnessVerificationStatus('not_applicable', [passing])).toBe('not_applicable');
   });
 });

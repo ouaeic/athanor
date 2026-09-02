@@ -3927,3 +3927,305 @@ describe('where a delete lands, not what it is called', () => {
     }
   });
 });
+
+/*
+ * A move is a delete of the place it moves FROM, and the floor could not see one.
+ *
+ * Measured through this function at 59d3e67 in balanced and autonomous with
+ * `{ undoPoint: { id: 'cp-1', uncovered: [] } }`: `mv ~/.ssh /tmp/x` raised NOTHING. `mv` was in no
+ * destructive set and `PATH_SCOPED_REMOVERS` was rm, rmdir, unlink, shred and truncate, so nothing
+ * in the floor had an opinion about it - the agent's own keys out of reach of everything that looks
+ * for them, no byte deleted and no card shown. Three verifiers flagged it and none closed it.
+ *
+ * The two halves are one test on purpose. A blanket card on `mv` passes the first half and is the
+ * wrong repair: moving a file is ordinary work several times an hour, and the free half is what
+ * holds the location rule to the same shape `rm` already has.
+ */
+describe('a move out of the checkpoint is a delete', () => {
+  const modes = ['balanced', 'autonomous'] as const;
+  const undone = { undoPoint: { id: 'cp-1', uncovered: [] } } as const;
+
+  it('cards a move whose source a rewind cannot put back', () => {
+    const irreversible: Array<[string, Record<string, unknown>]> = [
+      ['the agent’s own keys', { executable: 'mv', args: ['~/.ssh', '/tmp/x'] }],
+      // The destination is the LAST operand ordinarily and the FIRST after `-t`. A reader that
+      // always dropped the last operand would drop `~/.ssh` here and free the move.
+      ['the -t spelling', { executable: 'mv', args: ['-t', '/tmp/x', '~/.ssh'] }],
+      ['the long -t spelling', { executable: 'mv', args: ['--target-directory=/tmp/x', '~/.ssh'] }],
+      ['several sources, one outside', { executable: 'mv', args: ['dist', '~/.ssh', '/tmp/x'] }],
+      ['a system directory', { executable: 'mv', args: ['/etc/nginx', '/tmp/nginx'] }],
+      ['somebody else’s files', { executable: 'mv', args: ['/home/other/photos', '/tmp/p'] }],
+      ['a source behind an expansion', { executable: 'mv', args: ['$HOME/.ssh', '/tmp/x'] }],
+      ['a source climbing out', { executable: 'mv', args: ['../secrets', '/tmp/s'] }],
+      ['a bare name under a cwd outside', { executable: 'mv', args: ['.ssh', '/tmp/x'], cwd: '.' }],
+      ['the wrapped spelling', { executable: 'bash', args: ['-lc', 'mv ~/.ssh /tmp/x'] }],
+      ['a cd earlier on the line', { executable: 'bash', args: ['-lc', 'cd ~ && mv .ssh /tmp/x'] }],
+      ['behind sudo', { executable: 'sudo', args: ['mv', '/etc/nginx', '/tmp/n'] }],
+      [
+        'a find that moves what it finds',
+        { executable: 'find', args: ['~', '-name', '*.pem', '-exec', 'mv', '{}', '/tmp/x', ';'] }
+      ],
+      // One operand is either an error or `find … | xargs mv`, whose paths are not in the text.
+      ['a move with nothing to place', { executable: 'mv', args: ['-t', '/tmp/x'] }]
+    ];
+    for (const mode of modes)
+      for (const [label, args] of irreversible)
+        expect(
+          approvalRequirement('shell', args, mode, undone),
+          `${label} in ${mode}`
+        ).toMatchObject({ sideEffect: 'external_consequential' });
+    // The card says what a move does. The generic removal preview is false of it twice: nothing is
+    // deleted, and "in the workspace" is exactly what this card is raised for not being true.
+    const card = approvalRequirement(
+      'shell',
+      { executable: 'mv', args: ['~/.ssh', '/tmp/x'] },
+      'autonomous',
+      undone
+    );
+    expect(card?.action).toBe('Move data out of reach with mv');
+    expect(card?.preview).toMatch(/empties the place it moves from/);
+  });
+
+  it('leaves a move the turn can undo by itself alone', () => {
+    const recoverable: Array<[string, Record<string, unknown>]> = [
+      ['aside', { executable: 'mv', args: ['dist', 'dist.old'] }],
+      ['into a directory', { executable: 'mv', args: ['a.md', 'b.md', 'workspace/docs'] }],
+      // One source, not two: with two the row passes even if `-t` is not read at all, because the
+      // skipped destination leaves a second operand behind. With one it leaves none, and a move
+      // this file cannot place keeps its card.
+      ['the -t spelling', { executable: 'mv', args: ['-t', 'workspace/docs', 'notes.md'] }],
+      ['-t out of the workspace', { executable: 'mv', args: ['-t', '/tmp/x', 'dist'] }],
+      // `-S` takes a value that is not a path at all, and reading it as one would card this.
+      ['a backup suffix', { executable: 'mv', args: ['-S', '.bak', 'notes.md', 'docs/notes.md'] }],
+      ['a workspace path', { executable: 'mv', args: ['workspace/tmp.log', 'workspace/l.log'] }],
+      [
+        'an artifact',
+        { executable: 'mv', args: ['.athanor/artifacts/a.png', '.athanor/artifacts/b.png'] }
+      ],
+      ['the wrapped spelling', { executable: 'bash', args: ['-lc', 'mv dist dist.old'] }],
+      // OUT of the workspace, which empties nothing outside it. This rule asks about the source and
+      // deliberately not about the destination - @see `RELOCATING_EXECUTABLES`.
+      ['out of the workspace', { executable: 'mv', args: ['workspace/build.tgz', '/tmp/keep.tgz'] }]
+    ];
+    for (const mode of modes)
+      for (const [label, args] of recoverable) {
+        expect(approvalRequirement('shell', args, mode, undone), `${label} in ${mode}`).toBeNull();
+        // And free ONLY because the turn has a rewind, which is the third direction the delete rule
+        // is held to as well: a workspace over CHECKPOINT_MAX_FILES gets no undo point at all.
+        expect(
+          approvalRequirement('shell', args, mode, {}),
+          `${label} with no undo point in ${mode}`
+        ).toMatchObject({ sideEffect: 'external_consequential' });
+      }
+  });
+});
+
+/*
+ * A command carried into another box, which the walk could not read past.
+ *
+ * `destructionOperation` stops at the first word this file can NAME, and `docker` is one - so
+ * `docker exec pg psql -c "DROP DATABASE x"` and `kubectl exec pg -- psql -c "DROP …"` were free in
+ * balanced and autonomous at 59d3e67, along with `docker exec r redis-cli flushall`.
+ * DESTRUCTION.md recorded all of it as open.
+ *
+ * The `rm -rf dist` row is the one that decides whether the repair was done the easy way. Adding
+ * `docker exec` to `RUNNER_SUBCOMMANDS` is one line and looks right; it hands the inner command to
+ * every reader here with THIS machine's working directory attached, so `dist` resolves to
+ * `workspace/dist`, the location rule frees it, and a delete inside a container that no checkpoint
+ * here has ever walked goes through with no card at all.
+ */
+describe('a destruction carried into another container', () => {
+  const modes = ['balanced', 'autonomous'] as const;
+  const undone = { undoPoint: { id: 'cp-1', uncovered: [] } } as const;
+
+  it('reads the command the runner hands to the other side', () => {
+    const carried: Array<[string, Record<string, unknown>]> = [
+      [
+        'docker exec and a DROP',
+        { executable: 'docker', args: ['exec', 'pg', 'psql', '-c', 'DROP DATABASE production'] }
+      ],
+      [
+        'options in front of the container',
+        {
+          executable: 'docker',
+          args: ['exec', '-i', '-u', 'postgres', 'pg', 'psql', '-c', 'TRUNCATE TABLE tenancies']
+        }
+      ],
+      [
+        'docker compose exec',
+        { executable: 'docker', args: ['compose', 'exec', 'db', 'dropdb', 'production'] }
+      ],
+      [
+        'kubectl exec past a --',
+        { executable: 'kubectl', args: ['exec', 'pg-0', '--', 'psql', '-c', 'DROP DATABASE x'] }
+      ],
+      [
+        'a namespace before the pod',
+        { executable: 'kubectl', args: ['exec', '-n', 'prod', 'pg-0', '--', 'dropdb', 'prod'] }
+      ],
+      [
+        'a flushall in a cache container',
+        { executable: 'docker', args: ['exec', 'cache', 'redis-cli', 'flushall'] }
+      ],
+      // The bare relative name, deliberately: an absolute path would card either way.
+      [
+        'a delete on a bare relative name',
+        { executable: 'docker', args: ['exec', 'pg', 'rm', '-rf', 'dist'] }
+      ],
+      [
+        'the wrapped spelling, whose quoting takes the statement apart',
+        { executable: 'bash', args: ['-lc', 'docker exec pg psql -c "DROP DATABASE production"'] }
+      ]
+    ];
+    for (const mode of modes)
+      for (const [label, args] of carried)
+        expect(
+          approvalRequirement('shell', args, mode, undone),
+          `${label} in ${mode}`
+        ).toMatchObject({ sideEffect: 'external_consequential' });
+    const card = approvalRequirement(
+      'shell',
+      { executable: 'docker', args: ['exec', 'pg', 'psql', '-c', 'DROP DATABASE production'] },
+      'autonomous',
+      undone
+    );
+    expect(card?.action).toBe(
+      'Destroy data in another container with docker exec psql DROP DATABASE'
+    );
+    expect(card?.preview).toMatch(/other side of that boundary/);
+  });
+
+  it('judges the carried command by what it is, not by the fact it was carried', () => {
+    const ordinary: Array<[string, Record<string, unknown>]> = [
+      [
+        'a row count',
+        { executable: 'docker', args: ['exec', 'pg', 'psql', '-c', 'select count(*) from t'] }
+      ],
+      ['a listing', { executable: 'docker', args: ['exec', 'app', 'ls', '-la', '/srv'] }],
+      ['a log read', { executable: 'kubectl', args: ['exec', 'pg-0', '--', 'cat', '/var/log/p'] }],
+      ['not an exec at all', { executable: 'kubectl', args: ['get', 'pods'] }],
+      ['docker ps', { executable: 'docker', args: ['ps', '-a'] }]
+    ];
+    for (const mode of modes)
+      for (const [label, args] of ordinary)
+        expect(approvalRequirement('shell', args, mode, undone), `${label} in ${mode}`).toBeNull();
+    // And the subcommands of the same tools that are their own cards are untouched by the strip:
+    // `docker volume rm` and `docker compose down -v` are not execs and must still stop.
+    for (const args of [
+      ['volume', 'rm', 'pgdata'],
+      ['compose', 'down', '-v']
+    ])
+      expect(
+        approvalRequirement('shell', { executable: 'docker', args }, 'autonomous', undone),
+        args.join(' ')
+      ).toMatchObject({ sideEffect: 'external_consequential' });
+  });
+});
+
+/*
+ * The stores and schedulers this section named as open and did not reach, each measured free in
+ * balanced and autonomous at 59d3e67 before the rows below existed.
+ *
+ * The counterweight is the point of the second half: `rails db:migrate` and `prisma migrate deploy`
+ * are the owner's own build step, and this section has already measured once what keying on the
+ * tool rather than on the operation costs - widening the SQL arm from the statement to the
+ * executable took `K-one-shot-app` from 4 cards to 6 in balanced.
+ */
+describe('the next ring of stores out', () => {
+  const modes = ['balanced', 'autonomous'] as const;
+
+  it('cards the managed control planes and the tools whose subcommand is the act', () => {
+    const destroys: Array<[string, Record<string, unknown>]> = [
+      [
+        'aws rds delete-db-instance',
+        {
+          executable: 'aws',
+          args: [
+            'rds',
+            'delete-db-instance',
+            '--db-instance-identifier',
+            'p',
+            '--skip-final-snapshot'
+          ]
+        }
+      ],
+      [
+        'aws elasticache delete-cache-cluster',
+        {
+          executable: 'aws',
+          args: ['elasticache', 'delete-cache-cluster', '--cache-cluster-id', 's']
+        }
+      ],
+      ['aws redshift delete-cluster', { executable: 'aws', args: ['redshift', 'delete-cluster'] }],
+      [
+        'gcloud sql instances delete',
+        { executable: 'gcloud', args: ['sql', 'instances', 'delete', 'tracker-prod'] }
+      ],
+      [
+        'az postgres flexible-server delete',
+        { executable: 'az', args: ['postgres', 'flexible-server', 'delete', '-n', 't', '-g', 'r'] }
+      ],
+      ['rails db:drop', { executable: 'rails', args: ['db:drop'] }],
+      ['prisma migrate reset', { executable: 'npx', args: ['prisma', 'migrate', 'reset', '-f'] }],
+      ['typeorm schema:drop', { executable: 'typeorm', args: ['schema:drop'] }],
+      ['heroku pg:reset', { executable: 'heroku', args: ['pg:reset', 'DATABASE'] }],
+      ['cqlsh -e DROP KEYSPACE', { executable: 'cqlsh', args: ['-e', 'DROP KEYSPACE tracker'] }],
+      ['launchctl remove', { executable: 'launchctl', args: ['remove', 'com.tracker.agent'] }],
+      /*
+       * The flush inside the Lua the client hands the server. DESTRUCTION.md called reading this
+       * "a Lua reader"; it is the shape `mongosh --eval 'db.dropDatabase()'` already has, matched
+       * on the call rather than by evaluating the language.
+       */
+      [
+        'redis-cli eval calling flushall',
+        { executable: 'redis-cli', args: ['eval', "return redis.call('flushall')", '0'] }
+      ],
+      [
+        'the wrapped spelling, whose quotes the split takes off',
+        { executable: 'bash', args: ['-lc', `redis-cli eval "return redis.call('flushall')" 0`] }
+      ],
+      ['mc mirror --remove', { executable: 'mc', args: ['mirror', '--remove', 'a', 'p/b'] }]
+    ];
+    for (const mode of modes)
+      for (const [label, args] of destroys)
+        expect(approvalRequirement('shell', args, mode), `${label} in ${mode}`).toMatchObject({
+          sideEffect: 'external_consequential'
+        });
+  });
+
+  it('leaves the reads and the migrations of the same tools alone', () => {
+    const ordinary: Array<[string, Record<string, unknown>]> = [
+      ['rails db:migrate', { executable: 'rails', args: ['db:migrate'] }],
+      ['prisma migrate deploy', { executable: 'npx', args: ['prisma', 'migrate', 'deploy'] }],
+      ['prisma generate', { executable: 'npx', args: ['prisma', 'generate'] }],
+      ['heroku pg:info', { executable: 'heroku', args: ['pg:info', 'DATABASE'] }],
+      ['cqlsh a select', { executable: 'cqlsh', args: ['-e', 'select 1 from t'] }],
+      ['launchctl list', { executable: 'launchctl', args: ['list'] }],
+      [
+        'aws rds describe-db-instances',
+        { executable: 'aws', args: ['rds', 'describe-db-instances'] }
+      ],
+      [
+        'gcloud sql instances describe',
+        { executable: 'gcloud', args: ['sql', 'instances', 'describe', 'p'] }
+      ],
+      [
+        'az postgres flexible-server list',
+        { executable: 'az', args: ['postgres', 'flexible-server', 'list'] }
+      ],
+      // A script that names what it touches, which is the same answer this section gives `del` on
+      // the command line, and the bare mirror, which copies and removes nothing.
+      [
+        'redis-cli eval calling del',
+        { executable: 'redis-cli', args: ['eval', "return redis.call('del', KEYS[1])", '1', 'k'] }
+      ],
+      ['mc mirror', { executable: 'mc', args: ['mirror', 'a', 'p/b'] }],
+      // `--eval` names a FILE, whose body is on the far side of a path this function cannot open -
+      // the same bound `psql -f` has, and recorded as open rather than implied to be covered.
+      ['redis-cli --eval a script file', { executable: 'redis-cli', args: ['--eval', 'f.lua'] }]
+    ];
+    for (const mode of modes)
+      for (const [label, args] of ordinary)
+        expect(approvalRequirement('shell', args, mode), `${label} in ${mode}`).toBeNull();
+  });
+});

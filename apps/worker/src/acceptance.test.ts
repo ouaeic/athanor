@@ -1,5 +1,20 @@
-import { describe, expect, it } from 'vitest';
-import { describeAcceptanceCheck, parseAcceptanceChecks } from './acceptance.js';
+import type { DataStore, TaskRecord } from '@athanor/data';
+import { describe, expect, it, vi } from 'vitest';
+import {
+  acceptanceObservation,
+  describeAcceptanceCheck,
+  parseAcceptanceChecks,
+  type AcceptanceCheck,
+  type AcceptanceObservation,
+  type AcceptanceRecord,
+  type AcceptanceResult
+} from './acceptance.js';
+import {
+  ACCEPTANCE_SUITE_DEADLINE_SECONDS,
+  acceptanceChecks,
+  type AcceptanceRunnerDeps
+} from './acceptance-runner.js';
+import type { AgentRunnerClient } from './runner-client.js';
 import { agentTools } from './tools.js';
 
 const parse = (check: Record<string, unknown>) => parseAcceptanceChecks([check]);
@@ -261,5 +276,190 @@ describe('a check no state of the workspace can fail', () => {
     const parsed = parse({ ...command, executable: 'bash', args: ['-lc', 'rm -rf workspace'] });
     expect(parsed.ok).toBe(false);
     expect(!parsed.ok && parsed.reason).toContain('changes this computer');
+  });
+});
+
+/**
+ * The three-way reading of a result, and the coupling that keeps it true.
+ *
+ * `AcceptanceResult` has one boolean for two different facts: the check said no, and the harness
+ * never got an answer. `acceptanceObservation` separates them by reading the two openings
+ * `acceptance-runner.ts` writes, which is a string coupling across a file boundary - so half of
+ * this block is unit cases and the other half drives the REAL `acceptanceChecks` and reads the
+ * detail it actually produces. Without the second half a reworded runner would turn every
+ * `did_not_run` into `failed` with the whole suite green.
+ */
+describe('a check that could not run, told apart from one that failed', () => {
+  const result = (passed: boolean, detail: string): AcceptanceResult => ({
+    id: 'c1',
+    label: 'the suite passes',
+    passed,
+    detail
+  });
+
+  it('reads a pass as a pass whatever the detail says', () => {
+    expect(acceptanceObservation(result(true, 'exit 0'))).toBe('passed');
+    expect(
+      acceptanceObservation(
+        result(true, 'exit 0, from athanor running this same command after the last change')
+      )
+    ).toBe('passed');
+  });
+
+  it('reads an answer the harness got back as a failure, commands and artifacts alike', () => {
+    for (const detail of [
+      'exit 1 (expected 0): 3 tests failed',
+      'exit 0, but the output does not contain "OK": nothing',
+      'workspace/out.csv does not exist',
+      'workspace/out.csv is a directory, not a file',
+      '312 bytes (needs at least 4096)',
+      'renders as 4 pages, expected 3'
+    ])
+      expect(acceptanceObservation(result(false, detail)), detail).toBe('failed');
+  });
+
+  /**
+   * The half that would be silently wrong under the older rule. `turn/finish.ts` used to ask
+   * `detail.startsWith('exit ')` and an artifact check never writes an exit code, so that rule read
+   * every missing deliverable as a check the harness had not run - which is the same folding this
+   * function exists to prevent, pointed the other way.
+   */
+  it('does not read a missing exit code as a check that never ran', () => {
+    expect(acceptanceObservation(result(false, 'workspace/report.pdf does not exist'))).not.toBe(
+      'did_not_run'
+    );
+  });
+
+  it('reads the harness failing to observe as neither', () => {
+    for (const detail of [
+      'the check could not run: runner refused (503)',
+      'the check could not run: the acceptance suite ran out of time after 900s',
+      'timed out after 900s running pytest'
+    ])
+      expect(acceptanceObservation(result(false, detail)), detail).toBe('did_not_run');
+  });
+});
+
+/**
+ * The same classifier held against the file that actually writes the strings.
+ *
+ * `acceptanceChecks` is the sole writer of `AcceptanceResult.detail`. This drives it over the four
+ * shapes that matter with a stubbed runner, and asserts what `acceptanceObservation` makes of what
+ * comes back - so the day somebody rewords a detail in `acceptance-runner.ts`, this goes red rather
+ * than the completion status quietly changing what it means.
+ */
+describe('what the runner actually writes, read by the classifier', () => {
+  const key = new Uint8Array(32).fill(7);
+  const task = {
+    id: '22222222-2222-4222-8222-222222222222',
+    workspaceId: '11111111-1111-4111-8111-111111111111',
+    userId: '33333333-3333-4333-8333-333333333333'
+  } as unknown as TaskRecord;
+
+  const record = (checks: readonly AcceptanceCheck[]): AcceptanceRecord => ({
+    checks,
+    revisions: 1,
+    declaredAtStep: 1
+  });
+
+  const commandCheck = (id: string): AcceptanceCheck => ({
+    id,
+    kind: 'command',
+    label: `command ${id}`,
+    executable: 'pytest',
+    args: ['-q'],
+    cwd: 'workspace',
+    expectExit: 0,
+    timeoutSeconds: 900
+  });
+
+  /** The runner and the store, with `call` answering however the case needs it to. */
+  const deps = (call: (path: string) => unknown): AcceptanceRunnerDeps =>
+    ({
+      store: {
+        appendTaskEvent: async () => ({ id: 'event' })
+      } as unknown as DataStore,
+      runner: {
+        call: async (
+          _workspaceId: string,
+          _taskId: string,
+          _scope: string | string[],
+          path: string
+        ) => call(path)
+      } as unknown as AgentRunnerClient,
+      withLeaseRenewal: async (_task: TaskRecord, operation: () => Promise<unknown>) => operation(),
+      withCancellationWatch: async (_task: TaskRecord, operation: () => Promise<unknown>) =>
+        operation()
+    }) as unknown as AcceptanceRunnerDeps;
+
+  const observe = async (
+    checks: readonly AcceptanceCheck[],
+    call: (path: string) => unknown
+  ): Promise<AcceptanceObservation[]> =>
+    (await acceptanceChecks(deps(call), task, key, record(checks), { purpose: 'finish' })).map(
+      acceptanceObservation
+    );
+
+  it('reads a command the computer answered as passed or failed', async () => {
+    const exec = (exitCode: number) => () => ({
+      exitCode,
+      stdout: '',
+      stderr: '3 tests failed',
+      durationMs: 1,
+      timedOut: false
+    });
+    expect(await observe([commandCheck('c1')], exec(0))).toEqual(['passed']);
+    expect(await observe([commandCheck('c1')], exec(1))).toEqual(['failed']);
+  });
+
+  it('reads a runner that refused the request as a check that never ran', async () => {
+    expect(
+      await observe([commandCheck('c1')], () => {
+        throw new Error('runner request failed (503)');
+      })
+    ).toEqual(['did_not_run']);
+  });
+
+  it('reads a wedged command as a check that never ran, not as one that said no', async () => {
+    expect(
+      await observe([commandCheck('c1')], () => ({
+        exitCode: null,
+        stdout: '',
+        stderr: '',
+        durationMs: 900_000,
+        timedOut: true
+      }))
+    ).toEqual(['did_not_run']);
+  });
+
+  /**
+   * The artifact side, which is the case the `startsWith('exit ')` rule got wrong: the harness
+   * looked, the file is not there, and that is an observation about the job rather than about the
+   * computer.
+   */
+  it('reads a deliverable that is not there as a failure the harness observed', async () => {
+    const missing: AcceptanceCheck = {
+      id: 'a1',
+      kind: 'artifact',
+      label: 'the report exists',
+      path: 'workspace/report.md',
+      minBytes: 10
+    };
+    expect(await observe([missing], () => ({ entries: [] }))).toEqual(['failed']);
+  });
+
+  it('reads the suite running out of its own clock as a check that never ran', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-02T00:00:00Z'));
+    try {
+      const observations = await observe([commandCheck('c1'), commandCheck('c2')], () => {
+        // The first check spends the whole suite deadline, so the second one never starts.
+        vi.setSystemTime(Date.now() + (ACCEPTANCE_SUITE_DEADLINE_SECONDS + 1) * 1_000);
+        return { exitCode: 0, stdout: '', stderr: '', durationMs: 1, timedOut: false };
+      });
+      expect(observations).toEqual(['passed', 'did_not_run']);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

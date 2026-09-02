@@ -30,6 +30,7 @@ import type { TaskRecord } from '@athanor/data';
 import type { MemoryDeadEndCheck } from '@athanor/core';
 import {
   acceptanceFailureMessage,
+  acceptanceObservation,
   acceptancePassedEvidence,
   type AcceptanceCommandCheck,
   type AcceptanceRecord,
@@ -39,13 +40,16 @@ import type { AgentState, AgentWorkerConfig } from '../agent-state.js';
 import {
   citableEvidence,
   completionVerification,
+  harnessVerificationStatus,
   observedCommands,
   type CompletionVerification
 } from '../completion.js';
 import type { DataStore } from '@athanor/data';
 import { event } from '../tool-recording.js';
 import {
+  ACCEPTANCE_COULD_NOT_RUN_CAVEAT,
   ACCEPTANCE_EARLIER_TURN_CAVEAT,
+  ACCEPTANCE_FAILED_CAVEAT,
   CAVEAT_BESIDE_THE_TICK,
   MAX_ACCEPTANCE_FAILURES,
   MAX_FINISH_REJECTIONS
@@ -272,7 +276,14 @@ export const handleFinishCall = async (
       // Only a run that ended. "timed out after 900s" and "the check could not run" are the
       // harness failing to observe the command rather than the command failing, and a
       // caution written out of either would outlive a wedged network or a runner restart.
-      if (!result?.detail.startsWith('exit ')) return [];
+      //
+      // Asked through `acceptanceObservation` rather than through the `detail.startsWith('exit ')`
+      // this line used to spell inline: it is the same question the status below now asks, and two
+      // copies of one rule drift. The two readings agree exactly here because the guard above has
+      // already dropped every check that is not a command, which is the only kind whose detail
+      // opens with an exit code - see that function's comment for what goes wrong when the rule is
+      // let out of this narrow spot.
+      if (!result || acceptanceObservation(result) !== 'failed') return [];
       return [
         {
           label: check.label,
@@ -315,11 +326,45 @@ export const handleFinishCall = async (
         );
         return 'held';
       }
-      // Bounded like every other refusal in this loop: past the ceiling the turn ends
-      // honestly rather than spending the rest of the budget on the same failure.
+      /*
+       * Bounded like every other refusal in this loop: past the ceiling the turn ends honestly
+       * rather than spending the rest of the budget on the same failure. That half was right and
+       * is untouched - the turn stops, and the failures travel in the risks where the card already
+       * prints them.
+       *
+       * What was wrong was the word. `verified` is a claim about evidence, and here there is none:
+       * the turn declared its own checks, the harness ran them, and they failed four times. Left
+       * as the model wrote it, the field an owner or a script reads first said `verified` over
+       * that - MEASURED against a real box, byte-identical in `status` and `verification` to the
+       * run that got the answer right, with only the external verifier able to tell them apart.
+       *
+       * So the harness withdraws the claim rather than the completion. It is a value the model
+       * cannot write - it is not in the finish schema and `completionVerification` refuses it -
+       * which is what makes it evidence about the checks rather than one more thing the model says
+       * about itself, and which is why it costs the tool catalogue nothing.
+       */
+      const downgraded = harnessVerificationStatus(verification.status, results);
+      /*
+       * And the same fact in the words the owner reads, sent both ways.
+       *
+       * A line written into both the acceptance list and the risks is shown beside the tick; a line
+       * written only into the risks sits behind the disclosure with the rest of the detail. This one
+       * has to be beside the tick, on that protocol's own rule: the card is headed "Result" with a
+       * tick on it, and a reader who never opens the receipt would otherwise take it at its word.
+       *
+       * First in the list rather than appended, so the twenty-line cap cannot drop the sentence
+       * that says what the other nineteen mean.
+       */
+      const caveat =
+        downgraded === 'checks_did_not_run'
+          ? ACCEPTANCE_COULD_NOT_RUN_CAVEAT
+          : ACCEPTANCE_FAILED_CAVEAT;
+      acceptanceEvidence = [caveat, ...acceptanceEvidence];
       verification = {
         ...verification,
+        status: downgraded,
         remainingRisks: [
+          caveat,
           ...verification.remainingRisks,
           ...failed.map((result) => `${result.label} — ${result.detail}`)
         ].slice(0, 20)

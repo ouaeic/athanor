@@ -482,9 +482,13 @@ export const recallMemory = async (input: MemoryRecallInput): Promise<MemoryReca
     ];
   });
 
-  // Salience is computed from real use, so a row an agent went looking for and received counts as
-  // used. The outcome stays `unknown`: whether it helped is settled when the turn is verified, and
-  // claiming it here would grade every recall a success at the moment it was made.
+  // The use row is written for the audit trail, `use_count`, `last_used_at` and the retention
+  // fold. It is NOT a vote for this row in the ranking, and the outcome is what says so: a recall
+  // returns what the ranker chose, and whether the agent went on to do anything with it is settled
+  // when the turn is verified, by `recordMemoryPackOutcome`. `unknown` scores in neither the
+  // positive nor the negative activation - see the salience recompute in
+  // `packages/data/src/store/memory.ts`, where it used to score as a success, which is what made
+  // being returned once a reason to be returned again.
   const itemIds = entries.filter((entry) => entry.layer === 'item').map((entry) => entry.id);
   if (itemIds.length > 0)
     await input.store.recordMemoryUse({
@@ -2780,7 +2784,10 @@ export const recordMemoryPackOutcome = async (input: {
       // with the turn's success is what made `ok_count` a count of injections rather than of help.
       // The same argument runs the other way and matters more - a turn that failed must not enter
       // `fail` against the eleven entries it never read, because that is how a procedure the agent
-      // ignored gets demoted for a mistake somebody else made. Ungraded, both directions.
+      // ignored gets demoted for a mistake somebody else made. Ungraded, both directions - and
+      // that is now true of the score as well as of this call. `unknown` used to enter the
+      // positive activation in `consolidateMemory` at exactly the weight of a graded success, so
+      // every entry this branch declined to credit was credited anyway, one rank at a time.
       outcome: 'unknown'
     });
   return recorded;

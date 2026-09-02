@@ -435,15 +435,42 @@ export const ACCEPTANCE_EARLIER_TURN_CAVEAT =
   'These checks come from earlier work: they show nothing broke, not that this is right.';
 
 /**
- * The one caveat that belongs beside the tick rather than behind the disclosure.
+ * The two sentences an owner reads when the turn ended past `MAX_ACCEPTANCE_FAILURES` above.
+ *
+ * They are here rather than in `turn/finish.ts` for this file's own stated reason: the ceiling and
+ * the wording an owner is given when it is reached belong on one screen, or the number gets raised
+ * without anyone rereading the sentence.
+ *
+ * Two of them, not one, because a check that failed and a check that could not be run are different
+ * news and the owner's next move differs. "Your test says no" sends them to the failure. "athanor
+ * never got to run your test" sends them to the runner, the network or the disk, and telling them
+ * the first when the second happened is athanor claiming an observation it did not make.
+ *
+ * Both begin with what athanor did rather than with a verdict, and both say plainly what is NOT
+ * being claimed - the second in as many words, because "unchecked" is routinely read as "failed".
+ */
+export const ACCEPTANCE_FAILED_CAVEAT =
+  'athanor ran the checks this turn declared and they did not pass, so nothing here is verified - read the failures below before relying on it.';
+export const ACCEPTANCE_COULD_NOT_RUN_CAVEAT =
+  'athanor could not run the checks this turn declared, so this result is unchecked - neither proved nor disproved.';
+
+/**
+ * The caveats that belong beside the tick rather than behind the disclosure.
  *
  * Everything else about how the checks were made is detail for the owner who opens the receipt.
- * This one is different in kind: "all passed" over checks that were passing before anybody started
- * is a sentence that says the opposite of what happened, and a reader who never opens the
- * disclosure has been told something untrue. The rest qualify the evidence; this one corrects it.
+ * These are different in kind: each of them, left inside the disclosure, leaves a reader who never
+ * opens it believing something untrue. "All passed" over checks that were passing before anybody
+ * started says the opposite of what happened; a card headed "Result" with a tick on it, over checks
+ * that failed or that never ran, says the same. The rest qualify the evidence; these correct it.
+ *
+ * The mechanism is `turn/finish.ts` writing the identical line into both the acceptance list and
+ * `remainingRisks`, which is the protocol `apps/web/src/completion-card.ts` reads to decide where a
+ * line is shown. Membership here is what tells that file the line was meant to travel both ways.
  */
 export const CAVEAT_BESIDE_THE_TICK: ReadonlySet<string> = new Set([
-  ACCEPTANCE_ALREADY_PASSED_CAVEAT
+  ACCEPTANCE_ALREADY_PASSED_CAVEAT,
+  ACCEPTANCE_FAILED_CAVEAT,
+  ACCEPTANCE_COULD_NOT_RUN_CAVEAT
 ]);
 
 /**

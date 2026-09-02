@@ -2394,9 +2394,12 @@ describe('against the real store', () => {
     await store.consolidateMemory(realWorkspaceId, { now: startedAt });
     const citedSalience = (await store.getMemoryItem(realWorkspaceId, used.id))?.salience ?? 0;
     const ignoredSalience = (await store.getMemoryItem(realWorkspaceId, ignored.id))?.salience ?? 0;
-    // Both were injected the same number of times, so the usage term is identical and the citation
-    // term is the only thing separating them. Before this wave it was identical too, and these two
-    // rows scored the same forever.
+    // Both were injected the same number of times, and until `s_use` stopped crediting an ungraded
+    // use that made the usage term identical between them, leaving the citation term as the only
+    // thing separating them. It is not identical any more: this writer grades the cited entry `ok`
+    // and leaves the ignored one `unknown`, so one row now carries both positive terms and the two
+    // move together. Before this wave neither term separated them and these rows scored the same
+    // forever.
     expect(citedSalience).toBeGreaterThan(ignoredSalience);
   });
 
