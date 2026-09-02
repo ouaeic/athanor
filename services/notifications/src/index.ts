@@ -9,6 +9,7 @@ import {
   pushConfigured
 } from './config.js';
 import { createNotifier } from './loop.js';
+import { pushLifetime } from './policy.js';
 import { EndpointHealth } from './retry.js';
 import { runSweep } from './sweep.js';
 
@@ -82,8 +83,11 @@ const notifier = createNotifier({
             { endpoint: row.endpoint, keys: { p256dh: row.p256dh, auth: row.auth } },
             JSON.stringify(payload),
             {
-              TTL: 600,
-              urgency: row.kind === 'approval_required' ? 'high' : 'normal',
+              // How long the push service keeps trying, and how hard, decided by kind in
+              // `policy.ts` beside the horizon that chose the number. This was a flat ten minutes
+              // for every kind, which put the shortest life on the wire on the one notification
+              // that means the agent has stopped until a person answers.
+              ...pushLifetime(row.kind),
               timeout: 10_000
             }
           )

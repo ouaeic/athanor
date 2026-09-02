@@ -12,6 +12,7 @@ const subject = (overrides: Partial<NotificationSubject> = {}): NotificationSubj
   approvalAction: null,
   approvalSideEffect: null,
   message: null,
+  approvalExpired: false,
   spentUsd: 0.31,
   capUsd: 5,
   durationMs: 6 * 60_000,
@@ -125,6 +126,43 @@ describe('notificationPayload', () => {
     expect(notificationPayload(subject({ kind: 'takeover_needed', message: null })).body).toBe(
       'Stopped at a check only you can clear. Open the Computer and take control.'
     );
+  });
+
+  it('tells an expired approval apart from a takeover, and names what went unanswered', () => {
+    const payload = notificationPayload(
+      subject({
+        kind: 'takeover_needed',
+        approvalExpired: true,
+        approvalAction: 'shell',
+        approvalSideEffect: null,
+        message: null,
+        taskStatus: 'paused'
+      })
+    );
+    expect(payload.body).toBe(
+      'Gave up waiting: nobody answered its request to run a command on your computer. It is paused - open it to ask again.'
+    );
+    // The wrong sentence is the whole point of the flag: there is nothing left to take control of.
+    expect(payload.body).not.toContain('Open the Computer');
+    expect(payload.requireInteraction).toBe(true);
+  });
+
+  it('still says something true when the expired approval names no tool it recognises', () => {
+    expect(
+      notificationPayload(
+        subject({ kind: 'takeover_needed', approvalExpired: true, approvalAction: null })
+      ).body
+    ).toBe(
+      'Gave up waiting: nobody answered its request to do something it needs your permission for. It is paused - open it to ask again.'
+    );
+  });
+
+  it('leaves an agent-raised takeover alone even when it carries no sentence', () => {
+    expect(
+      notificationPayload(
+        subject({ kind: 'takeover_needed', approvalExpired: false, approvalAction: 'shell' })
+      ).body
+    ).toBe('Stopped at a check only you can clear. Open the Computer and take control.');
   });
 
   it('formats long and short runs without lying about precision', () => {

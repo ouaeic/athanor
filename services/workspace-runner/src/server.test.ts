@@ -1080,3 +1080,185 @@ describe('what the runner says about its own boundaries', () => {
     expect(homeStat.mode & 0o777).toBe(workspaceStat.mode & 0o777);
   });
 });
+
+/**
+ * The staleness refusal, over the routes that actually carry it.
+ *
+ * `DesktopControl.authorize` has refused a coordinate computed from a superseded observation since
+ * it was written, and until now the only caller that ever named a generation was a test passing a
+ * sixth argument by hand: `POST /desktop/action` passes five and the stream socket four, and
+ * `DesktopAction` has no field for the model to echo. That is the shape this programme keeps
+ * finding - a mechanism, its unit test, and no production caller - so this case refuses to touch
+ * `act` at all and drives the HTTP routes the worker's `desktop_observe` and `desktop_action` tools
+ * post to.
+ *
+ * The desktop itself is the one seam stood in for: there is no X server on the machine running
+ * this, and none is needed to prove which observation the runner is holding the agent to.
+ */
+describe('a desktop action posted after the screen moved under it', () => {
+  const disposers: Array<() => Promise<unknown>> = [];
+  afterEach(async () => {
+    while (disposers.length) await disposers.pop()!();
+  });
+
+  it('refuses it until the agent has observed again, over the real routes', async () => {
+    const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'athanor-desktop-stale-'));
+    disposers.push(() => rm(workspaceRoot, { recursive: true, force: true }));
+    const secret = 'runner-desktop-stale-secret-at-least-32-characters';
+    const id = '00000000-0000-4000-8000-0000000000d8';
+    await ensureWorkspace(path.join(workspaceRoot, id));
+
+    const control = new DesktopControl({ release: async () => undefined });
+    /*
+     * Everything below `ensure` is shipped code: `snapshot` records the generation it served,
+     * `act` names it, and `DesktopControl` refuses. `atspi: false` is a host with no accessibility
+     * stack, which is also the cheapest way to keep the python bridge out of a test that is about
+     * neither - the screenshot and the window list are attempted and fail, as they would here.
+     */
+    const session = {
+      root: path.join(workspaceRoot, id),
+      env: { DISPLAY: ':91' },
+      control,
+      subscribers: new Map(),
+      applicationGroups: new Set<number>(),
+      activeApplication: '',
+      lastAction: '',
+      geometry: { width: 1280, height: 800 },
+      bootGeometry: { width: 1280, height: 800 },
+      ceiling: { width: 3840, height: 2160 },
+      outputName: 'screen',
+      currentMode: null,
+      codec: 'avc1' as const,
+      congested: false,
+      atspi: false,
+      observedGeneration: null,
+      bridgeServe: false,
+      bridgeQueue: Promise.resolve(),
+      pointer: { x: 640, y: 400 }
+    };
+    class HeadlessDesktop extends DesktopManager {
+      constructor() {
+        super('/nonexistent/bridge.py', '/nonexistent/session.sh');
+      }
+
+      override async ensure(): Promise<Awaited<ReturnType<DesktopManager['ensure']>>> {
+        return session as unknown as Awaited<ReturnType<DesktopManager['ensure']>>;
+      }
+    }
+
+    const config = {
+      RUNNER_HOST: '127.0.0.1',
+      RUNNER_PORT: 0,
+      RUNNER_SHARED_SECRET: secret,
+      WORKSPACE_ROOT: workspaceRoot,
+      TAR_EXECUTABLE: '/usr/bin/tar',
+      SNAPSHOT_EXECUTABLE: path.resolve('../../scripts/athanor-snapshot'),
+      BROWSER_USE_DESKTOP_DISPLAY: false,
+      MAX_EXECUTION_SECONDS: 30,
+      RESOURCE_LIMIT_EXECUTABLE: '/usr/bin/prlimit',
+      IMAGE_CONVERT_EXECUTABLE: 'magick',
+      MAX_BACKGROUND_SECONDS: 120,
+      COMMAND_PROCESS_LIMIT: 1024,
+      COMMAND_OPEN_FILE_LIMIT: 4096,
+      MAX_FILE_BYTES: 1024 * 1024,
+      RESERVED_PREVIEW_PORTS: [],
+      CHECKPOINT_BTRFS_EXECUTABLE: '/nonexistent/btrfs',
+      CHECKPOINT_ZFS_EXECUTABLE: '/nonexistent/zfs',
+      CHECKPOINT_PACKAGE_MANIFEST: '/nonexistent/status',
+      CHECKPOINT_INCLUDE_BROWSER_PROFILE: false,
+      CHECKPOINT_RETAIN_TURNS: 20,
+      CHECKPOINT_RETAIN_DAILY_DAYS: 14,
+      CHECKPOINT_MAX_FILES: 250_000,
+      CHECKPOINT_MAX_FILE_BYTES: 2 * 1024 ** 3,
+      ISOLATE_AGENT_NETWORK: false
+    } as RunnerConfig;
+    const app = await buildServer(config, {
+      desktop: new HeadlessDesktop(),
+      hostStorage: async () => ({
+        hostStorageTotalBytes: 100 * 1024 ** 3,
+        hostStorageAvailableBytes: 50 * 1024 ** 3
+      })
+    });
+    disposers.push(() => app.close());
+
+    // A nonce is consumed by the request that uses it, so each of the six calls below mints its
+    // own; this case is about the second and third posts to the same route, not the first.
+    let issued = 0;
+    const tokenFor = (role: 'user' | 'agent', scopes: string[], route: string): string =>
+      signCapabilityToken(
+        {
+          sub: role,
+          workspaceId: id,
+          role,
+          scopes,
+          aud: capabilityAudience('POST', route),
+          nonce: `desktop-stale-${(issued += 1)}`
+        },
+        secret,
+        120
+      );
+    const snapshotRoute = `/v1/workspaces/${id}/desktop/snapshot`;
+    const actionRoute = `/v1/workspaces/${id}/desktop/action`;
+    const holderRoute = `/v1/workspaces/${id}/desktop/holder`;
+    const observe = () =>
+      app.inject({
+        method: 'POST',
+        url: snapshotRoute,
+        headers: {
+          authorization: `Bearer ${tokenFor('agent', ['desktop.read'], snapshotRoute)}`
+        },
+        payload: {}
+      });
+    // The consequential scope is granted so that the only thing left to refuse this click is the
+    // staleness check itself; a bare coordinate on a screen with no accessibility tree is a blind
+    // click and would otherwise stop for an approval first.
+    const click = () =>
+      app.inject({
+        method: 'POST',
+        url: actionRoute,
+        headers: {
+          authorization: `Bearer ${tokenFor(
+            'agent',
+            ['desktop.control', 'desktop.consequential'],
+            actionRoute
+          )}`
+        },
+        payload: { type: 'click_at', x: 250, y: 120 }
+      });
+    const setHolder = (holder: 'agent' | 'user') =>
+      app.inject({
+        method: 'POST',
+        url: holderRoute,
+        headers: {
+          authorization: `Bearer ${tokenFor('user', ['desktop.takeover'], holderRoute)}`
+        },
+        payload: { holder }
+      });
+
+    const first = await observe();
+    expect(first.statusCode).toBe(200);
+    expect(first.json()).toMatchObject({ available: true, generation: 1 });
+
+    // The owner takes the machine and gives it back: two generations, and every coordinate read
+    // off the screen before it now names whatever is there instead.
+    expect((await setHolder('user')).statusCode).toBe(200);
+    expect((await setHolder('agent')).json()).toMatchObject({ generation: 3 });
+
+    const refused = await click();
+    expect(refused.statusCode).toBeGreaterThanOrEqual(400);
+    expect(JSON.stringify(refused.json())).toMatch(/is stale; observe the desktop again/);
+
+    /*
+     * The other direction, and the reason the refusal is worth having: it is one the model can
+     * answer. Observing again re-arms the click, which then travels the whole path - authorized,
+     * classified, queued, performed - and fails only where this machine genuinely cannot go on:
+     * `spawn /usr/bin/xdotool ENOENT`, which is what it says on the host that ran this. The
+     * assertion is the absence of the staleness message rather than the presence of that one,
+     * because a host that does have xdotool fails with the X server's words instead. A check that
+     * refused everything would pass the case above and fail this one.
+     */
+    expect((await observe()).statusCode).toBe(200);
+    const attempted = await click();
+    expect(JSON.stringify(attempted.json())).not.toMatch(/is stale/);
+  });
+});

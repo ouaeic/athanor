@@ -135,9 +135,9 @@ export class DesktopControl {
    * `generation` was optional and, in production, never passed: the runner's routes had no field
    * to read it from, so the staleness half of this method was reachable only from a test while the
    * snapshot it is stamped on told the model its coordinates were being checked. It has a supplier
-   * now - `desktopActionGeneration` reads it off the action itself - and it stays optional because
-   * the owner dragging in the Computer pane is looking at the live screen and has nothing to be
-   * stale about.
+   * now - `DesktopManager.act` passes the generation the agent's last observation stamped on the
+   * session - and it stays optional because the owner dragging in the Computer pane is looking at
+   * the live screen and has nothing to be stale about.
    */
   authorize(actor: 'agent' | 'user', generation?: number): void {
     if (this.#holder !== actor && !(this.#holder === 'secure_input' && actor === 'user'))

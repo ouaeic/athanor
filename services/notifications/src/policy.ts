@@ -54,6 +54,60 @@ const HELD_WHILE_PRESENT: readonly NotificationKind[] = [
   'agent_message'
 ];
 
+/**
+ * How long a push service keeps trying to hand a receipt to a device that is not reachable.
+ *
+ * Ten minutes, unchanged, and only for `task_finished`. It is the one kind the decision above
+ * drops rather than holds when the owner is at the keyboard, for the reason written there: it
+ * reports that work is over. A receipt half a day late is not news, and the standing list in the
+ * app is where it belongs by then.
+ */
+const RECEIPT_TTL_SECONDS = 600;
+
+/** The two web-push fields this service sets per notification. Names are the wire's, not ours. */
+export interface PushLifetime {
+  TTL: number;
+  urgency: 'high' | 'normal';
+}
+
+/**
+ * What one push is worth to the transport, from the kind alone.
+ *
+ * Every send carried `TTL: 600`, an approval included. A phone that was off, in a tunnel or in a
+ * meeting for eleven minutes never learned the agent was blocked: the push service dropped the
+ * message, this service recorded the send as delivered, and the ledger row means it is never
+ * offered again. The one notification whose whole purpose is that the work is stopped until a
+ * person acts was the shortest-lived thing on the wire.
+ *
+ * Twelve hours - `MAX_HOLD_MS` - for the four kinds above, because that is the longest this
+ * service ever holds one of them: `deliveryDecision` holds an item while the owner is at the
+ * keyboard or inside quiet hours, and past `MAX_HOLD_MS` it stops holding and settles the item
+ * without a push. An approval is written with a twenty-four hour deadline
+ * (`apps/worker/src/turn/approval-park.ts`), so a push handed over at that last holdable moment
+ * and living its full TTL expires at the hour `resolveApproval` stops accepting an answer.
+ *
+ * The horizon bounds holding and NOT sending, which is the case this number does not cover.
+ * `deliveryDecision` tests staleness on its two hold arms only, so an owner who is away and
+ * outside quiet hours is sent whatever the candidate query still offers - fourteen days of it,
+ * after a stretch of downtime or a device that spent a day in backoff. An approval stays a
+ * candidate while `expires_at > NOW()`, so a send at twenty-three hours carries a TTL that runs
+ * eleven hours past its own deadline, and Approve and Deny on a push arriving then post to an
+ * approval `resolveApproval` refuses. Moving the staleness test onto the send arm is what would
+ * close that; shortening the TTL would only take twelve hours off every push that arrives on time.
+ *
+ * This does NOT make delivery reliable. A push service may discard sooner than the TTL asks, a
+ * retired endpoint is not tried at all, and nothing here re-sends what the ledger has settled.
+ * What it buys is a phone picked up within the working life of the approval.
+ */
+export const pushLifetime = (kind: NotificationKind): PushLifetime => ({
+  // Stated once, from the held set, because it is the same property: a kind still worth sending
+  // after the moment has passed is a kind still worth carrying on the wire after the moment has
+  // passed. Two lists would be two answers the day somebody edited one.
+  TTL: HELD_WHILE_PRESENT.includes(kind) ? MAX_HOLD_MS / 1000 : RECEIPT_TTL_SECONDS,
+  // The transport's own hint, for the one kind that has stopped the agent dead.
+  urgency: kind === 'approval_required' ? 'high' : 'normal'
+});
+
 const minuteOfLocalDay = (timeZone: string, instant: Date): number => {
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone,

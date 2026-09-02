@@ -483,17 +483,60 @@ describe('typing at the desktop keyboard', () => {
 
   /**
    * `classifyDesktopAction` was deliberately rewritten so the agent may type into an ordinary
-   * field - "a password box is still a handoff; a search box is typing" - and `preflight` resolves
-   * the focused node for exactly that purpose. `#perform` then throws `Private desktop text is
-   * user-only` for any actor but the owner, so the whole non-sensitive branch is unreachable and an
-   * ordinary field now hard-errors where it used to raise a handoff card. No test reached it
-   * because every existing case calls the classifier directly.
+   * field - "a password box is still a handoff; a search box is typing" - and `#classify` resolves
+   * the focused node for exactly that purpose. `#perform` then threw `Private desktop text is
+   * user-only` for any actor but the owner, so the whole non-sensitive branch was unreachable and
+   * an ordinary field hard-errored where it should have typed. No test reached it because every
+   * existing case called the classifier directly (#8, cu F2).
    *
-   * This case is written against the decision, and enabled by the step that makes it.
+   * Driven through `act`, with the same five arguments the route passes, because calling the
+   * classifier is what missed it.
    */
-  it.todo(
-    'types into an ordinary field for the agent, as the classifier already allows (#8, cu F2)'
-  );
+  it('types into an ordinary field for the agent, as the classifier already allows', async () => {
+    const harness = await buildHarness();
+    // The focused node in the default tree is the "Search" text field: named, not read-only, and
+    // nothing about it reads as a secret.
+    await act(harness, { type: 'text_input', text: 'invoices' }, 'agent');
+    expect(processes.argumentsFor('/usr/bin/xdotool')).toEqual([
+      ['type', '--delay', '12', '--', 'invoices']
+    ]);
+    // The round trip that resolves the focused node is what the judgement was made on, not a
+    // pessimistic guess about all typing.
+    expect(processes.operations()).toEqual(['ping', 'observe']);
+  });
+
+  it('still hands a focused password field to the owner rather than typing into it', async () => {
+    const harness = await buildHarness();
+    processes.nodes = [
+      node({
+        id: '0/4',
+        name: 'Password',
+        role: 'password text',
+        states: ['enabled', 'showing', 'sensitive', 'focused'],
+        sensitive: true,
+        actions: []
+      })
+    ];
+    await expect(act(harness, { type: 'text_input', text: 'hunter2' }, 'agent')).rejects.toThrow(
+      /Secure desktop input takeover is required/
+    );
+    expect(processes.argumentsFor('/usr/bin/xdotool')).toEqual([]);
+  });
+
+  /**
+   * The other half of what the deleted line was doing by accident: a screen the computer cannot
+   * read is not a screen to type a value into, and `classifyDesktopAction` judges an unknown
+   * focused field secret for that reason. Pinned because deleting the actor check is only safe
+   * while this holds.
+   */
+  it('hands typing to the owner when nothing focused can be identified at all', async () => {
+    const harness = await buildHarness();
+    harness.session.atspi = false;
+    await expect(act(harness, { type: 'text_input', text: 'invoices' }, 'agent')).rejects.toThrow(
+      /Secure desktop input takeover is required/
+    );
+    expect(processes.argumentsFor('/usr/bin/xdotool')).toEqual([]);
+  });
 });
 
 describe('what the desktop refuses', () => {
@@ -583,84 +626,122 @@ describe('what the desktop refuses', () => {
     ]);
     expect(processes.operations()).toEqual(['act']);
   });
-
-  /**
-   * `DesktopControl.authorize` refuses an action computed from an observation older than the last
-   * resize or handover. Nothing in production supplies the sixth argument - the route passes five,
-   * and `DesktopAction` has no `generation` field for the model to echo - so this proves the
-   * mechanism works and records that no caller reaches it (ledger #9).
-   */
-  it('refuses an action computed from a stale observation, when a caller says which one', async () => {
-    const harness = await buildHarness();
-    const generation = harness.session.control.generation;
-    await harness.manager.setHolder('workspace-1', '/nonexistent', 'user');
-    await harness.manager.setHolder('workspace-1', '/nonexistent', 'agent');
-    await expect(
-      harness.manager.act(
-        'workspace-1',
-        '/nonexistent',
-        DesktopAction.parse({ type: 'press', key: 'Tab' }),
-        'agent',
-        false,
-        generation
-      )
-    ).rejects.toThrow(/is stale; observe the desktop again/);
-    expect(processes.argumentsFor('/usr/bin/xdotool')).toEqual([]);
-  });
 });
 
 /**
- * The staleness mechanism, reached the way production now reaches it.
+ * The staleness mechanism, reached the way production reaches it.
  *
  * `DesktopControl.authorize` has refused work computed from a superseded observation since it was
- * written, and nothing ever named a generation: the routes passed five arguments and the action
- * contract had no field for the model to echo, so the refusal existed only in the test below it.
- * `desktopActionGeneration` reads it off the action instead of adding a seventh argument, so the
- * existing routes forward it the moment `DesktopAction` carries it - which is the change handed to
- * the lane that owns `packages/contracts`.
+ * written, and for that whole time nothing named a generation: `/desktop/action` called `act` with
+ * five arguments, the stream route with four, and `DesktopAction` has no field for the model to
+ * echo - so the refusal existed only in a test that passed a sixth argument by hand (ledger #9).
+ * The supplier is now the session: `snapshot` records what it served the agent and `act` names it.
+ *
+ * Every case below goes through the same five-argument `act` helper the route uses. That is the
+ * point: an argument only a test passes is how this shipped unwired, so no case here may pass one.
  */
-describe('an action that says which observation it was computed from', () => {
-  /**
-   * Parsed by hand rather than through `DesktopAction.parse`, because zod strips what the schema
-   * does not declare and the field lands in `packages/contracts` in this same wave. Everything
-   * below the parse is the shipped path.
-   */
-  const actWithGeneration = (
-    harness: Harness,
-    action: Record<string, unknown>,
-    generation: number
-  ): Promise<unknown> =>
-    harness.manager.act(
-      'workspace-1',
-      '/nonexistent',
-      { ...DesktopAction.parse(action), generation } as never,
-      'agent'
-    );
+describe('a coordinate action computed from an observation the screen has moved under', () => {
+  /** What the agent doing its job looks like: observe, then act on what it saw. */
+  const observe = (harness: Harness): Promise<unknown> =>
+    harness.manager.snapshot('workspace-1', '/nonexistent', 'agent');
 
-  it('performs it while that observation is still the current one', async () => {
+  /** A handover and back - what the owner closing a dialog does, twice over the generation. */
+  const ownerTakesAndReturns = async (harness: Harness): Promise<void> => {
+    await harness.manager.setHolder('workspace-1', '/nonexistent', 'user');
+    await harness.manager.setHolder('workspace-1', '/nonexistent', 'agent');
+  };
+
+  it('performs it while the observation it was read off is still the current one', async () => {
     const harness = await buildHarness();
-    await actWithGeneration(harness, { type: 'click_at', x: 250, y: 120 }, 1);
+    await observe(harness);
+    await act(harness, { type: 'click_at', x: 250, y: 120 }, 'agent');
     expect(processes.argumentsFor('/usr/bin/xdotool')).toHaveLength(1);
   });
 
-  it('refuses it once the display or the holder has moved underneath it', async () => {
+  it('refuses it once the holder has moved underneath it', async () => {
     const harness = await buildHarness();
-    const observed = harness.session.control.generation;
-    // What the owner closing a dialog does: a handover, and every coordinate read off the screen
-    // before it now names something else.
-    await harness.manager.setHolder('workspace-1', '/nonexistent', 'user');
-    await harness.manager.setHolder('workspace-1', '/nonexistent', 'agent');
-    await expect(
-      actWithGeneration(harness, { type: 'click_at', x: 250, y: 120 }, observed)
-    ).rejects.toThrow(/is stale; observe the desktop again/);
+    await observe(harness);
+    await ownerTakesAndReturns(harness);
+    processes.calls = [];
+    processes.requests = [];
+    await expect(act(harness, { type: 'click_at', x: 250, y: 120 }, 'agent')).rejects.toThrow(
+      /is stale; observe the desktop again/
+    );
     expect(processes.argumentsFor('/usr/bin/xdotool')).toEqual([]);
     // And the refusal comes before the preflight round trip, not after it.
     expect(processes.operations()).toEqual([]);
   });
 
-  it('leaves an action that names no observation alone, because the owner is watching live', async () => {
-    const harness = await buildHarness('user');
+  it('refuses a drag and a zoom on the same evidence, and lets a keystroke through', async () => {
+    const harness = await buildHarness();
+    await observe(harness);
+    await ownerTakesAndReturns(harness);
+    await expect(
+      act(
+        harness,
+        { type: 'drag', fromX: 100, fromY: 100, toX: 500, toY: 400, durationMs: 500 },
+        'agent',
+        true
+      )
+    ).rejects.toThrow(/is stale; observe the desktop again/);
+    await expect(
+      act(harness, { type: 'zoom', x: 100, y: 200, width: 300, height: 120 }, 'agent')
+    ).rejects.toThrow(/is stale; observe the desktop again/);
+    // A keystroke goes to whatever has focus, not to a place on a picture, so it is not stale.
+    await act(harness, { type: 'press', key: 'Tab' }, 'agent', true);
+    expect(processes.argumentsFor('/usr/bin/xdotool')).toEqual([['key', 'Tab']]);
+  });
+
+  it('performs the same click again once the agent has observed the new screen', async () => {
+    const harness = await buildHarness();
+    await observe(harness);
+    await ownerTakesAndReturns(harness);
+    await expect(act(harness, { type: 'click_at', x: 250, y: 120 }, 'agent')).rejects.toThrow(
+      /is stale/
+    );
+    // The refusal is one the model can answer, and this is the answer: look again.
+    await observe(harness);
+    await act(harness, { type: 'click_at', x: 250, y: 120 }, 'agent');
+    expect(processes.argumentsFor('/usr/bin/xdotool')).toHaveLength(1);
+  });
+
+  it('does not let the owner’s own observation clear the mark the agent is held to', async () => {
+    const harness = await buildHarness();
+    await observe(harness);
+    await ownerTakesAndReturns(harness);
+    // The Computer pane polls the same route. If a human's look counted, the owner watching would
+    // be what re-armed the agent's coordinates - and the owner is who moved things.
+    await harness.manager.snapshot('workspace-1', '/nonexistent', 'user');
+    await expect(act(harness, { type: 'click_at', x: 250, y: 120 }, 'agent')).rejects.toThrow(
+      /is stale; observe the desktop again/
+    );
+  });
+
+  /**
+   * The owner is never held to the agent's observation, and this is the case that says why it has
+   * to be written as a condition rather than left to the mark being empty: here the mark is set,
+   * by the agent, and then the owner takes the machine. Without the actor test they would be
+   * refused from the pane they are watching the screen in - the takeover refusing the person the
+   * takeover is for.
+   */
+  it('does not hold the owner to an observation the agent took', async () => {
+    const harness = await buildHarness();
+    await observe(harness);
+    await harness.manager.setHolder('workspace-1', '/nonexistent', 'user');
     await act(harness, { type: 'click_at', x: 250, y: 120 }, 'user');
+    expect(processes.argumentsFor('/usr/bin/xdotool')).toHaveLength(1);
+  });
+
+  /**
+   * An agent that has observed nothing has no observation to be superseded, so the refusal - whose
+   * words are "observe the desktop again" - would be describing something that did not happen. The
+   * blind-click gate is what stands there instead, and it is what this case actually measures: the
+   * click needs an approval, not a re-observation.
+   */
+  it('does not refuse an agent that has not observed this session at all', async () => {
+    const harness = await buildHarness();
+    await ownerTakesAndReturns(harness);
+    await act(harness, { type: 'click_at', x: 250, y: 120 }, 'agent');
     expect(processes.argumentsFor('/usr/bin/xdotool')).toHaveLength(1);
   });
 });
@@ -913,5 +994,40 @@ describe('what the desktop stream negotiates with the client watching it', () =>
     await harness.manager.refreshStream('workspace-1', '/nonexistent');
     expect(harness.session.congested).toBe(false);
     expect(harness.session.encoder.running).toBe(true);
+  });
+});
+
+/**
+ * The zoom bound, at the caller that produces the arguments rather than at the argument builder.
+ *
+ * `stillCaptureArguments` is where the crop and the reduction are written, and `#perform` is the
+ * only thing in production that passes it a region: it converts the agent's rectangle into display
+ * pixels and hands over the same `image` box the full screenshot is reduced into. Pinned here so
+ * that a bound proved in the builder is also proved to be reached.
+ */
+describe('a zoom that asks for more pixels than a screenshot carries', () => {
+  it('crops the region and reduces it into the box the full still is bounded to', async () => {
+    const harness = await buildHarness();
+    // The whole screen, in the agent's own coordinates. 1440x900 of image is the whole of a
+    // 2560x1600 display - 4.1 megapixels, which is what came back before this was bounded - less
+    // the one pixel `imageToDisplayPoint` keeps every coordinate inside the far edge by.
+    const result = await act(
+      harness,
+      { type: 'zoom', x: 0, y: 0, width: 1440, height: 900 },
+      'agent'
+    );
+    const args = processes.argumentsFor('/usr/bin/ffmpeg')[0] ?? [];
+    expect(args[args.indexOf('-vf') + 1]).toBe('crop=2559:1599:0:0,scale=1440:900:flags=lanczos');
+    // The region is still reported in display pixels, because that is which part of the screen the
+    // picture is of. What it does not say, and what the model is not told, is that this particular
+    // one came back no closer than the screenshot it already had.
+    expect(result).toMatchObject({ region: { x: 0, y: 0, width: 2559, height: 1599 } });
+  });
+
+  it('leaves a small region at its own density, which is what a zoom is for', async () => {
+    const harness = await buildHarness();
+    await act(harness, { type: 'zoom', x: 100, y: 200, width: 300, height: 120 }, 'agent');
+    const args = processes.argumentsFor('/usr/bin/ffmpeg')[0] ?? [];
+    expect(args[args.indexOf('-vf') + 1]).toBe('crop=533:213:178:356');
   });
 });

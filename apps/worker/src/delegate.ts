@@ -5,7 +5,7 @@ import { type ModelMessage, type ModelToolCall } from '@athanor/model-gateway';
 import { type AgentState } from './agent-state.js';
 import { delegateBudget, estimatedInferenceCostUsd, usageCredit } from './billing.js';
 import { normalisedSpan, type DelegateEvidenceCheck } from './completion.js';
-import { providerWebProvenance, untrustedOriginOfResult } from './provenance.js';
+import { originsFromResult, providerWebProvenance, untrustedOriginOfResult } from './provenance.js';
 import { delegateSpecialists, routeTo } from './routing.js';
 import { DELEGATE_MAX_STEPS } from './turn-bounds.js';
 import { startStopWatch, withRequestDeadline } from './turn-lifecycle.js';
@@ -25,6 +25,7 @@ import {
 import {
   chargeNovelty,
   classifyDestination,
+  rememberAddress,
   type DestinationContext,
   type DestinationVerdict
 } from './egress.js';
@@ -44,7 +45,41 @@ import type { ToolContext } from './tool-dispatch.js';
 async function verifyDelegateEvidence(
   context: ToolContext,
   task: TaskRecord,
-  evidence: ReadonlyArray<{ claim: string; source: string; quotedSpan: string }>
+  evidence: ReadonlyArray<{ claim: string; source: string; quotedSpan: string }>,
+  /**
+   * Where this run is allowed to go, and the turn's own byte counter, exactly as the mission's own
+   * tool calls are judged and charged a hundred lines below.
+   *
+   * This fetch had neither. It is a GET to an address taken verbatim out of the specialist's JSON -
+   * the one field in the report that IS an address - and it went out with no `classifyDestination`
+   * and no `chargeNovelty` on it, which made it the only web reach in the worker that was neither.
+   * The threat is the one this file already states for a specialist's own reads: a mission that has
+   * read a hostile page can be told to cite `https://collector.test/?q=<what it read>`, and the
+   * harness itself would fetch it - past the tool loop's refusal, past the turn's budget, and with
+   * no card, because there is no approval channel inside a tool call. A citation is the last field
+   * anybody looks at for an egress channel, which is what made it a good one.
+   */
+  destinations: DestinationContext,
+  state: AgentState,
+  /**
+   * The addresses this mission's own reads actually went to, requested and landed-on, which is what
+   * keeps the check above from becoming an outage of the mechanism it protects.
+   *
+   * An honest citation names a page the specialist read, and that page is not usually one the LEAD
+   * was sent to: a specialist searches, reads, and cites what it read, and its results never reach
+   * `#recordProvenance`, so none of it is in the lead's `knownOrigins` or `knownAddresses`. Judged
+   * against the lead's corpus alone, the ordinary honest citation would be a sink and every such
+   * report would come back "nothing in this report stood up" - a security hole traded for an
+   * outage of the only thing that makes a specialist worth having.
+   *
+   * These come from `originsFromResult`, which is the harness's own reading of the tool result and
+   * never what a page said, so they are `knownAddresses` in exactly the sense that field defines.
+   * Both the requested and the final URL are in there, which is what makes a citation to the page a
+   * redirect actually landed on free rather than novel. Nothing is credited that this harness did
+   * not itself fetch or itself hand over, so a citation to an address the mission never touched
+   * still goes through the full charge.
+   */
+  reachedAddresses: readonly string[]
 ): Promise<DelegateEvidenceCheck[]> {
   const root = `/v1/workspaces/${task.workspaceId}`;
   const checks: DelegateEvidenceCheck[] = [];
@@ -52,6 +87,35 @@ async function verifyDelegateEvidence(
     try {
       let body = '';
       if (/^https?:\/\//i.test(item.source)) {
+        /*
+         * Read at the top and written back before the request, with nothing awaited between the
+         * two, for the reason the tool loop below gives: three missions run concurrently and the
+         * turn's counter is the one thing they share.
+         */
+        const spent = state.turnNoveltyBytes ?? 0;
+        const verdict = classifyDestination(item.source, {
+          ...destinations,
+          knownAddresses: [...(destinations.knownAddresses ?? []), ...reachedAddresses],
+          spentNoveltyBytes: spent
+        });
+        if (verdict.sink) {
+          /*
+           * A sink is not a card here and cannot be one - a tool call has no approval channel - so
+           * it is recorded as a check that did not happen, in the words that say which of the two
+           * things happened. "The span is not in the source" and "the harness never opened the
+           * source" are opposite facts about a report, and the lead must not read the second as
+           * the first.
+           */
+          checks.push({
+            claim: item.claim,
+            source: item.source,
+            verified: false,
+            reread: false,
+            detail: `the harness did not fetch this source, so the span was not checked either way: ${verdict.reason}`
+          });
+          continue;
+        }
+        state.turnNoveltyBytes = chargeNovelty(spent, [verdict]);
         const read = await context.runner.call<ParallelWebReadResult>(
           task.workspaceId,
           task.id,
@@ -68,6 +132,7 @@ async function verifyDelegateEvidence(
         claim: item.claim,
         source: item.source,
         verified: found,
+        reread: true,
         detail: found
           ? 'the quoted span is present in the source'
           : 'the quoted span is not present in the source as read by the harness'
@@ -77,6 +142,9 @@ async function verifyDelegateEvidence(
         claim: item.claim,
         source: item.source,
         verified: false,
+        // A read that threw is a source the harness never got in front of it, which is the same
+        // fact as the refusal above and not the same fact as a span it looked for and missed.
+        reread: false,
         detail: `the source could not be re-read: ${error instanceof Error ? error.message : 'unknown error'}`
       });
     }
@@ -97,9 +165,24 @@ async function verifyDelegateEvidence(
  *
  * Written for the lead to read, not the owner: it is the lead that decides whether to act on a
  * finding, and "treat this as a lead to follow rather than a finding" is the instruction that
- * distinguishes the two. Nothing is emitted when some spans checked out - `evidenceChecks` already
- * says which, per claim, and a blanket sentence over a mixed report would be less true than the
- * per-item detail.
+ * distinguishes the two. Nothing is emitted when some spans checked out and some did not -
+ * `evidenceChecks` already says which, per claim, and a blanket sentence over a mixed report would
+ * be less true than the per-item detail.
+ *
+ * Two cases were added when the spot check stopped always happening and started sometimes being
+ * refused, and both are about the same thing: this function may only say what the harness actually
+ * did.
+ *
+ * - A check that was never fetched cannot support "found the quoted span in none of them", which
+ *   would be the harness reporting a fabrication it never looked for. Nothing read at all is its
+ *   own sentence, and the wording of the sentence that IS about spans now counts only the sources
+ *   it really re-read.
+ * - `checked` and `cited` are different numbers and the lead was only ever shown the first. Two
+ *   spot checks are two, whether the report cited two sources or eighty, so a report whose first
+ *   two citations happen to be real arrived silent - which the lead is entitled to read as "the
+ *   harness checked this report", because that is what silence here has always meant. The
+ *   denominator is the whole of the fix, and it is counted over the spans really compared, so a
+ *   refused citation makes that arm louder rather than turning it off.
  */
 const unverifiedNotice = (
   structured: DelegateReport | null,
@@ -107,10 +190,32 @@ const unverifiedNotice = (
 ): string | null => {
   if (!structured)
     return 'Nothing in this report was checked: it did not arrive in the shape the harness re-reads citations from, so there was no citation to re-read. Treat its claims as leads to follow rather than as findings.';
-  if (!structured.evidence.length)
+  const cited = structured.evidence.length;
+  if (!cited)
     return 'Nothing in this report was checked: the specialist cited no sources, so the harness had nothing to re-read. Treat its claims as leads to follow rather than as findings.';
-  if (checks.length && checks.every((check) => !check.verified))
-    return `Nothing in this report stood up: the harness re-read ${checks.length} of the cited sources and found the quoted span in none of them. Treat its claims as leads to follow rather than as findings.`;
+  const reread = checks.filter((check) => check.reread);
+  if (checks.length && !reread.length)
+    return `Nothing in this report was checked: the harness could not open the ${checks.length === 1 ? 'source' : `${checks.length} sources`} it spot-checked, so no quoted span was compared with anything - evidenceChecks says which, and why. Treat its claims as leads to follow rather than as findings.`;
+  if (reread.length && reread.every((check) => !check.verified))
+    return `Nothing in this report stood up: the harness re-read ${reread.length} of the ${cited} cited source${cited === 1 ? '' : 's'} and found the quoted span in none of them. Treat its claims as leads to follow rather than as findings.`;
+  /*
+   * Judged on the spans that were actually compared, not on the whole list of checks.
+   *
+   * Written first as `checks.every(verified)`, which inverted the thing this arm is for: a check
+   * that was refused is never `verified`, so one exfil-shaped citation beside an honest one turned
+   * the sentence off. Measured on this tree - three citations, the first to a host this run has
+   * never been sent to and the second to the page the mission read - the report reached the lead
+   * with `citations: {checked: 1, cited: 3}` and no `unverified` line at all, while the same three
+   * citations with an honest first one raised "only part of this report was checked". The more
+   * suspicious report was the quieter one, which is the whole failure this notice exists to stop.
+   *
+   * The refused check is still counted where it belongs: it is not in `reread`, so it lands in the
+   * "not re-read at all" number, and `evidenceChecks` says which one it was and why. A report with
+   * a mixed re-read - one span found and another looked for and missed - still says nothing here,
+   * which is the rule the header states and which this does not change.
+   */
+  if (reread.length && reread.every((check) => check.verified) && reread.length < cited)
+    return `Only part of this report was checked: the harness re-read ${reread.length} of the ${cited} cited sources and found the quoted span in ${reread.length === 1 ? 'it' : 'each of them'}, and the other ${cited - reread.length} ${cited - reread.length === 1 ? 'was' : 'were'} not re-read at all. Treat the unchecked claims as leads to follow rather than as findings.`;
   return null;
 };
 
@@ -229,6 +334,17 @@ async function runDelegatedMission(
   unverified?: string;
   evidenceChecks?: DelegateEvidenceCheck[];
   /**
+   * How many of the report's citations the harness re-read, out of how many there were.
+   *
+   * `evidenceChecks` is a list of at most two, and a list of two says nothing about whether it was
+   * two of two or two of eighty. The spot check is deliberately a spot check - the header above
+   * says why - so the size of the sample is part of what it means, and it was the one part the
+   * lead never saw. Present whenever there was a structured report to count, including when the
+   * count is zero, because "the harness checked none of them" is the reading the absence of this
+   * field was silently inviting.
+   */
+  citations?: { checked: number; cited: number };
+  /**
    * Where this specialist read from that was attacker-reachable, so the lead inherits the
    * provenance rather than the laundering.
    *
@@ -343,6 +459,16 @@ ${clockLine(new Date(), timeZone)}
   const untrusted = new Set<string>();
   const untrustedSources = (): { untrustedSources?: string[] } =>
     untrusted.size ? { untrustedSources: [...untrusted].slice(0, 8) } : {};
+  /*
+   * Every address this mission's own reads reached, so a citation to one of them is a re-read
+   * rather than a new destination. See `verifyDelegateEvidence`'s `reachedAddresses` for why the
+   * verification fetch would otherwise refuse the ordinary honest citation.
+   *
+   * Held in `rememberAddress`'s own bound - 192 addresses of at most 512 characters - rather than
+   * in a second one written here, because this list is read as `knownAddresses` and a corpus with
+   * a different bound at each end is a corpus that disagrees with itself about what it contains.
+   */
+  let reachedAddresses: string[] = [];
   /*
    * What the request carries before the first message, counted once for the whole mission.
    *
@@ -552,7 +678,14 @@ ${clockLine(new Date(), timeZone)}
       const reportText = structured ? response.text : (held?.text ?? response.text);
       const schemaErrors = structured ? validation.errors : held ? heldErrors() : validation.errors;
       const evidenceChecks = structured?.evidence.length
-        ? await verifyDelegateEvidence(context, task, structured.evidence)
+        ? await verifyDelegateEvidence(
+            context,
+            task,
+            structured.evidence,
+            destinations,
+            state,
+            reachedAddresses
+          )
         : [];
       const unverified = unverifiedNotice(structured, evidenceChecks);
       return {
@@ -567,6 +700,14 @@ ${clockLine(new Date(), timeZone)}
         ...(schemaErrors.length ? { schemaErrors: schemaErrors.slice(0, 4) } : {}),
         ...(unverified ? { unverified } : {}),
         ...(evidenceChecks.length ? { evidenceChecks } : {}),
+        ...(structured
+          ? {
+              citations: {
+                checked: evidenceChecks.filter((check) => check.reread).length,
+                cited: structured.evidence.length
+              }
+            }
+          : {}),
         ...untrustedSources()
       };
     }
@@ -641,6 +782,13 @@ ${clockLine(new Date(), timeZone)}
         // same reason here as there rather than by a second list that can drift out of step.
         const origin = untrustedOriginOfResult(call, result);
         if (origin) untrusted.add(origin);
+        // And the same reading of the same result the lead records as addresses it has been to,
+        // for the same reason: what the harness itself fetched, or itself handed over, is not
+        // material the model chose when it names it again. Read here rather than from
+        // `call.arguments` so that a redirect is credited by where the read landed as well as by
+        // where it was aimed - a citation to the final URL is a citation to the page that was read.
+        for (const url of originsFromResult(call, result))
+          reachedAddresses = rememberAddress(reachedAddresses, url);
         /*
          * Fenced and stripped on the way into the specialist's window, exactly as the lead's own
          * results are (`tool-recording.ts:540`).

@@ -112,7 +112,7 @@ describe('runSweep', () => {
 
   it('reports a batch it could only hold as idle, so the caller waits instead of spinning', async () => {
     // A hold writes nothing and is reconsidered next pass, so a sweep that held everything has
-    // nothing to show for the four-branch UNION it just ran. Only endpoint waits were counted
+    // nothing to show for the candidate UNION it just ran. Only endpoint waits were counted
     // before, so this loop re-issued that query as fast as PostgreSQL would answer it - for as
     // long as the owner kept a tab open, which on this machine can be days.
     const { store, recorded } = harness(

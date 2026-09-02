@@ -56,9 +56,10 @@ export interface DesktopSnapshot {
   mode: 'semantic_and_visual' | 'visual_fallback' | 'unavailable';
   holder: DesktopHolder;
   /**
-   * Bumped by every resize and every control handover. Stamped on frames, stills and input,
-   * so an action computed from a stale observation is refused instead of landing somewhere
-   * unintended.
+   * Bumped by every resize, every control handover and every change of stream transport. Stamped
+   * on frames and stills, and recorded on the session when this snapshot is served to the agent,
+   * so a coordinate action computed from an observation older than the last of those is refused
+   * instead of landing somewhere unintended. `act` is where that refusal is taken.
    */
   generation: number;
   /** Screenshot pixels. Agent coordinates are always in this space. */
@@ -243,6 +244,19 @@ interface DesktopSession {
    * no semantic layer to offer.
    */
   atspi: boolean;
+  /**
+   * The display generation of the last observation this session served the agent, or null when it
+   * has not observed here at all.
+   *
+   * Null is let through rather than refused. The refusal names an observation that has been
+   * superseded, and an agent that has taken none has nothing to supersede; a coordinate it
+   * produced from somewhere else is met by the approval gate instead, which treats a click landing
+   * on no control this computer can name as consequential. What this does not cover: a runner
+   * restart mints a new session at generation 1 with this back to null, so coordinates read off a
+   * screenshot from before the restart are not refused - the screen behind them is a freshly
+   * booted display, and the blind-click gate is what stands there.
+   */
+  observedGeneration: number | null;
   bridge?: BridgeChannel;
   bridgeServe: boolean;
   bridgeQueue: Promise<unknown>;
@@ -654,27 +668,32 @@ export const nodeUnderPoint = (
 };
 
 /**
- * Which observation a coordinate action was computed from, when it says.
+ * The actions whose meaning is a place on a picture, and which therefore go stale.
  *
  * `DesktopSnapshot.generation` is stamped on every snapshot, every still and every frame, and
- * `DesktopControl.authorize` has always refused work that names a generation which is no longer
- * current. Nothing supplied it: the route passed five arguments and the action contract had no
- * field for the model to echo, so the entire staleness mechanism was reachable only from a test.
- * The owner closes a dialog, the queued `click_at(820, 410)` the agent computed from the screen
- * before it lands on whatever is under those pixels now, and nothing refuses it.
+ * `DesktopControl.authorize` has refused work naming a generation that is no longer current since
+ * the day it was written. Nothing supplied one: `/desktop/action` called `act` with five
+ * arguments, the stream route with four, and `DesktopAction` carries no `generation` on any of its
+ * ten variants - so the whole mechanism was reachable only from a test, while the field it is
+ * stamped on went on saying in writing that a stale coordinate was refused. The owner closes a dialog, the
+ * `click_at(820, 410)` the agent computed from the screen before it lands on whatever is under
+ * those pixels now, and nothing refuses.
  *
- * Read off the action rather than added to the signature so the existing routes forward it for
- * free: `DesktopAction.parse` is what the runner is handed, so a `generation` on the
- * coordinate-bearing variants arrives here without any route changing. Read defensively because
- * it is optional by design - a human dragging in the Computer pane is looking at the live screen
- * and has nothing to be stale about.
+ * The supplier is the runner, not the model: `snapshot` records which generation it served the
+ * agent and `act` names that one. A field on the contract would have cost bytes on every request
+ * of every turn and handed the model arithmetic that the coordinate discipline - the runner
+ * converts, the model never does - exists to keep it out of.
+ *
+ * These three and no others. `scroll` is aimed at the pointer the runner itself is holding,
+ * `press` and `text_input` at whatever has focus, and the semantic actions carry a node id the
+ * bridge resolves against the tree as it is now; none of those is a number read off a picture,
+ * so refusing them would be ceremony rather than protection.
  */
-export const desktopActionGeneration = (action: DesktopAction): number | undefined => {
-  const declared = (action as { generation?: unknown }).generation;
-  return typeof declared === 'number' && Number.isInteger(declared) && declared > 0
-    ? declared
-    : undefined;
-};
+const COORDINATE_ACTIONS: ReadonlySet<DesktopAction['type']> = new Set([
+  'click_at',
+  'drag',
+  'zoom'
+]);
 
 export const classifyDesktopAction = (
   action: DesktopAction,
@@ -923,6 +942,10 @@ export class DesktopManager {
       codec: 'avc1',
       congested: false,
       atspi: true,
+      // Nothing has been served yet, and `#adoptDisplay` below takes a generation of its own
+      // bringing the display down to the boot size - so a fixed starting number here would refuse
+      // the agent's first action for a resize that happened before it ever looked.
+      observedGeneration: null,
       bridgeServe: true,
       bridgeQueue: Promise.resolve(),
       pointer: { x: Math.round(boot.width / 2), y: Math.round(boot.height / 2) },
@@ -1257,6 +1280,11 @@ export class DesktopManager {
     const selected = selectDesktopNodes(
       scaleNodeBounds(observation.nodes ?? [], session.geometry, image)
     );
+    // Which observation the agent's next coordinates will have been read off, recorded here
+    // because this return is the only place any are handed to it. The owner's pane polls this same
+    // route, and their observation must not clear the agent's mark: the owner is usually the one
+    // who moved the thing underneath it.
+    if (actor === 'agent') session.observedGeneration = session.control.generation;
     return {
       available: true,
       mode,
@@ -1336,7 +1364,11 @@ export class DesktopManager {
     actor: 'agent' | 'user'
   ): Promise<DesktopActionPreflight> {
     const session = await this.ensure(workspaceId, root);
-    session.control.authorize(actor, desktopActionGeneration(action));
+    // No staleness argument here, deliberately. This route performs nothing: `#classify` re-reads
+    // the tree and judges the action against the screen as it is at this instant, so its answer is
+    // about the world now rather than about the observation the caller was holding. `act` is where
+    // a superseded coordinate is refused, because `act` is what moves the pointer.
+    session.control.authorize(actor);
     return this.#classify(session, action);
   }
 
@@ -1383,15 +1415,30 @@ export class DesktopManager {
     root: string,
     action: DesktopAction,
     actor: 'agent' | 'user',
-    consequentialApproved = false,
-    expectedGeneration?: number
+    consequentialApproved = false
   ) {
     const session = await this.ensure(workspaceId, root);
-    // The action's own answer, when it carries one. `generation` reaches this method as an
-    // argument for the WebSocket path and on the action itself for the tool call, and the two
-    // mean the same thing: which observation these coordinates were read off.
-    const generation = expectedGeneration ?? desktopActionGeneration(action);
-    session.control.authorize(actor, generation);
+    /*
+     * Which observation these coordinates were read off - taken from the session, so that the two
+     * routes that reach this method get the check without passing anything and cannot forget to.
+     * A sixth argument is how this shipped unwired the first time: it existed, it was tested, and
+     * neither caller supplied it.
+     *
+     * Only the agent, and only the coordinate actions. The owner drags in the Computer pane while
+     * looking at a live stream of the screen they are dragging on, so there is no earlier picture
+     * for them to be stale against, and refusing them would be refusing the person the takeover
+     * exists to serve.
+     *
+     * Passed to `submit` as well as to `authorize` on purpose: the second check runs inside the
+     * queue slot, so a handover or a resize that lands between admitting this action and executing
+     * it refuses the click rather than letting it land on the screen that replaced the one it was
+     * computed from. That gap is the whole failure this is here for.
+     */
+    const expected =
+      actor === 'agent' && COORDINATE_ACTIONS.has(action.type)
+        ? (session.observedGeneration ?? undefined)
+        : undefined;
+    session.control.authorize(actor, expected);
     if (actor === 'agent') {
       const policy = await this.#classify(session, action);
       if (policy.sensitiveInput) throw new Error('Secure desktop input takeover is required');
@@ -1401,7 +1448,7 @@ export class DesktopManager {
     return session.control.submit(
       actor,
       async (signal) => this.#perform(session, action, actor, signal),
-      generation === undefined ? {} : { generation }
+      expected === undefined ? {} : { generation: expected }
     );
   }
 
@@ -1478,7 +1525,19 @@ export class DesktopManager {
     } else if (action.type === 'press') {
       await xdotool(pressCommand(action.key));
     } else if (action.type === 'text_input') {
-      if (actor !== 'user') throw new Error('Private desktop text is user-only');
+      /*
+       * No actor check. This line read `if (actor !== 'user') throw` and made the classifier's
+       * whole non-sensitive branch unreachable: `classifyDesktopAction` was deliberately rewritten
+       * so that a password box is a handoff and a search box is typing, `#classify` pays a bridge
+       * round trip to resolve the focused node for exactly that judgement, and the tool
+       * description offers the agent `text_input` by name. Three things saying yes and one line
+       * saying no, which the agent met as a hard error rather than as a handoff card.
+       *
+       * What still stops the agent is in `act`, where it belongs: `sensitiveInput` throws 'Secure
+       * desktop input takeover is required'. That covers more than a password box - a field the
+       * computer cannot see at all is judged secret, so a screen with no accessibility tree, or
+       * with nothing focused, is still handed to the owner rather than typed into blind.
+       */
       await xdotool(typeCommand(action.text), 10_000 + action.text.length * 20);
     } else if (action.type === 'scroll') {
       await xdotool(scrollCommand(session.pointer, action.direction, action.amount));
@@ -1633,6 +1692,14 @@ export class DesktopManager {
       // produced by the old encoder in the old format, and `#publish` drops anything stamped with
       // a generation that is no longer current. Without it the first JPEG-era frames would be run
       // through `encodeVideoAccessUnit`, or the reverse.
+      //
+      // It is now also what `act` holds the agent's coordinates to, and this is the one bumper of
+      // the three that does not move a single pixel: the display is the same size and the holder
+      // is the same, so an agent refused here has lost nothing but one observation. Paid rather
+      // than fixed with a second counter, because two answers to "is this observation current" is
+      // how the frame filter and the coordinate check would drift apart. The price is one
+      // re-observation each time the transport changes, and it changes only when a viewer without
+      // a `VideoDecoder` joins or when the last such viewer leaves somebody else still watching.
       session.control.bumpGeneration();
       this.#broadcastState(session);
       this.#announceVideoConfig(session);

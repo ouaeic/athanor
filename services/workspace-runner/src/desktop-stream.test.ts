@@ -57,8 +57,24 @@ describe('capturing one rectangle instead of the whole screen', () => {
       region: { x: 100, y: 50, width: 320, height: 200 }
     });
     expect(args.join(' ')).toContain('crop=320:200:100:50');
-    // Scaling the whole screen and cropping part of it are alternatives, never both.
+    // A region that fits the image is sent at its own size, which is the entire point of a zoom.
     expect(args.join(' ')).not.toContain('scale=');
+  });
+
+  /**
+   * The bound the `scale=` filter did not carry, because it sat in the `else` below the region
+   * branch and therefore never ran for a region at all. A zoom of the whole of a 2560x1600 display
+   * came back at 4.1 megapixels: three times the box the full screenshot of that display is reduced
+   * into, and a closer look larger than the picture it is a closer look at.
+   */
+  it('reduces a region larger than the image instead of sending it at native density', () => {
+    const args = stillCaptureArguments({
+      ...base,
+      region: { x: 0, y: 0, width: 1920, height: 1080 }
+    });
+    // Cropped first and reduced after, in one filter chain: the crop is what makes it a zoom and
+    // the scale is what stops it being bigger than a screenshot.
+    expect(args[args.indexOf('-vf') + 1]).toBe('crop=1920:1080:0:0,scale=1440:810:flags=lanczos');
   });
 
   it('clamps a region that runs off the screen instead of failing the capture', () => {
@@ -68,7 +84,9 @@ describe('capturing one rectangle instead of the whole screen', () => {
       ...base,
       region: { x: 1900, y: 1060, width: 4000, height: 4000 }
     });
-    expect(args.join(' ')).toContain('crop=1920:1080:0:0');
+    // Clamped to the display at one end and to the image at the other; before the second of those
+    // this read `crop=1920:1080:0:0` and nothing else, and passed.
+    expect(args[args.indexOf('-vf') + 1]).toBe('crop=1920:1080:0:0,scale=1440:810:flags=lanczos');
   });
 
   it('still scales the whole screen when no region is asked for', () => {

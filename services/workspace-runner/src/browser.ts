@@ -128,6 +128,13 @@ interface Session {
    */
   streamTitle: string;
   consoleMessages: Array<{ level: string; text: string; url: string; at: string }>;
+  /**
+   * The requests that came back unusable, bounded to `FAILED_REQUEST_LIMIT`.
+   *
+   * Kept per session rather than per page, exactly as `consoleMessages` is, because a failure
+   * raised by a background tab is still the reason the tab in front is not doing what was asked.
+   */
+  failedRequests: BrowserFailedRequest[];
   stream?: BrowserStream;
   downloadsDirectory: string;
   downloads: BrowserDownloadRecord[];
@@ -193,16 +200,54 @@ export interface BrowserTabSummary {
   title: string;
 }
 
+/**
+ * A request this page made that did not come back with something usable.
+ *
+ * `status` is the HTTP status; `0` means no response arrived at all, which is what a CORS
+ * rejection, a DNS failure and an aborted request all look like from here. `at` is carried for
+ * the same reason `consoleMessages` carries it: the list survives navigation, so without a
+ * timestamp a 404 from the page before this one reads as a failure of the action just taken.
+ */
+export interface BrowserFailedRequest {
+  method: string;
+  status: number;
+  url: string;
+  at: string;
+}
+
 export interface BrowserSnapshotParts {
   url: string;
   title: string;
   holder: 'agent' | 'user' | 'secure_input';
   botWall: BotWallReport | null;
   elements: BrowserSnapshotElement[];
+  /**
+   * Interactive elements this page had that `elements` does not carry, and frames it has that
+   * were not scanned at all.
+   *
+   * The scan stops at `SNAPSHOT_ELEMENT_LIMIT` and at `SNAPSHOT_FRAME_LIMIT`, and the elements it
+   * drops are the ones at the END of the document - which is exactly where consent, payment and
+   * submit frames live. Without a count the model reads a truncated list as a complete one and
+   * concludes the control it wants does not exist, which is a wrong answer rather than a slow one.
+   * `desktop_observe` has paid for this since it started selecting nodes (`nodesOmitted` in
+   * `desktop.ts`); this is the same number on the browser surface, computed the same way.
+   */
+  elementsOmitted: number;
+  framesOmitted: number;
   tabs: BrowserTabSummary[];
   downloads: BrowserDownloadRecord[];
   pendingDialog: { type: string; message: string } | null;
   consoleMessages: Array<{ level: string; text: string; url: string; at: string }>;
+  /**
+   * The requests that failed, which the console alone does not report.
+   *
+   * A submit answered 403, an XHR refused by CORS and a navigation bounced through an auth wall
+   * are all invisible in a snapshot that carries only console output, and all three look to the
+   * model exactly like "the site rejected my values" - which sends it back to re-type fields that
+   * were already correct. Empty on a page where nothing failed, so it costs nothing until it is
+   * the answer.
+   */
+  failedRequests: BrowserFailedRequest[];
   images: Array<{ url: string; alt: string; width: number; height: number }>;
   screenshotBase64: string;
   text: string;
@@ -219,10 +264,13 @@ export const composeBrowserSnapshot = (parts: BrowserSnapshotParts): BrowserSnap
   holder: parts.holder,
   botWall: parts.botWall,
   elements: parts.elements,
+  elementsOmitted: parts.elementsOmitted,
+  framesOmitted: parts.framesOmitted,
   tabs: parts.tabs,
   downloads: parts.downloads,
   pendingDialog: parts.pendingDialog,
   consoleMessages: parts.consoleMessages,
+  failedRequests: parts.failedRequests,
   images: parts.images,
   screenshotBase64: parts.screenshotBase64,
   text: parts.text.slice(0, BROWSER_SNAPSHOT_TEXT_LIMIT)
@@ -242,6 +290,85 @@ const SNAPSHOT_ELEMENT_LIMIT = 250;
 const PAGE_SCRIPT_TIMEOUT_MS = 5_000;
 /** Short, because a stale title in the pane is cosmetic and a stalled one used to be a freeze. */
 const STREAM_TITLE_TIMEOUT_MS = 250;
+/**
+ * How many failed requests a session remembers.
+ *
+ * Fifteen because the list exists to explain the action just taken, not to be a network log: a
+ * form submit that fails produces one or two entries, and a page whose whole API is down produces
+ * the same two repeated. Repeats are collapsed rather than counted (see `recordFailedRequest`),
+ * so fifteen distinct method+status+url pairs is several actions' worth of history. Each entry is
+ * about 250 bytes serialized, so the whole list is under 4 KB against a snapshot that already
+ * carries a JPEG and 12,000 characters of page text.
+ */
+const FAILED_REQUEST_LIMIT = 15;
+/** URLs on a failed request are for recognising which call failed, not for re-issuing it. */
+const FAILED_REQUEST_URL_LIMIT = 200;
+/**
+ * How long the settle protocol waits for `load`, and how long it then sits still in the page.
+ *
+ * Both numbers are Playwright MCP's `waitForCompletion`, which `docs/design/browser-automation.md`
+ * §4b tells this repository to copy verbatim, and they replace `waitForLoadState('networkidle')` -
+ * banned by name in that document - in its ban list and again in its pitfalls - because it is
+ * deprecated and never fires on a
+ * page holding a websocket or a long poll. Measured on such a page, the old fallback burned its
+ * full 15,000 ms and then threw, while a selector wait on the same page resolved in 72 ms.
+ *
+ * The sleep runs with `page.evaluate` rather than a Node timer on purpose: it doubles as a probe
+ * that the page's own JavaScript thread is still running, which a Node timer cannot tell you.
+ */
+const PAGE_SETTLE_MS = 500;
+const PAGE_LOAD_WAIT_MS = 10_000;
+
+/**
+ * Remembers one failed request, most recent last, without letting noise crowd the list out.
+ *
+ * Noise arrives in two shapes and each needs its own defence. The first is one URL repeated: a page
+ * whose API is down retries the same call on a timer, and fifteen copies of that line would bury
+ * the 403 on the submit that is the actual answer, so a repeat moves to the end with a fresh
+ * timestamp instead of taking a second slot - which is also what makes the timestamp mean "last
+ * seen" rather than "first seen".
+ *
+ * The second shape is DISTINCT urls, and collapsing does nothing about it. An analytics beacon, an
+ * ad pixel and a CDN hop each carry a cache-buster, so every one is a different URL and every one
+ * takes its own slot. Measured against a real Chromium: a page that fired twenty such cross-origin
+ * requests after one 403 on a form submit had evicted the 403 by the time the snapshot was taken,
+ * which is the one entry this whole list exists to carry. So the bound sheds the SOFT entries
+ * first - a 3xx that merely crossed an origin, and a request that got no response at all, are
+ * context - and keeps every 4xx and 5xx, which is a site refusing something the agent did. A soft
+ * entry arriving into a list already full of hard ones is therefore dropped rather than admitted;
+ * that is the same rule seen from the other end, not a second one.
+ *
+ * Exported for the tests that pin the bound, the collapsing and the shedding; the production
+ * callers are the `response` and `requestfailed` listeners `attachPage` registers.
+ */
+export const recordFailedRequest = (
+  session: Pick<Session, 'failedRequests'>,
+  method: string,
+  status: number,
+  url: string
+): void => {
+  const entry = {
+    method,
+    status,
+    // Trimmed because this exists to say WHICH call failed, not to be re-issued: a signed URL or
+    // a data URI would otherwise put kilobytes of query string into every snapshot.
+    url: url.slice(0, FAILED_REQUEST_URL_LIMIT),
+    at: new Date().toISOString()
+  };
+  const existing = session.failedRequests.findIndex(
+    (seen) => seen.method === entry.method && seen.status === entry.status && seen.url === entry.url
+  );
+  if (existing >= 0) session.failedRequests.splice(existing, 1);
+  session.failedRequests.push(entry);
+  while (session.failedRequests.length > FAILED_REQUEST_LIMIT) {
+    // The oldest SOFT entry goes first, and only when there is none does the oldest hard one go.
+    // See the note above for the measurement: plain age is what let ordinary cross-origin noise
+    // push out the failure the agent needed. `status < 400` is the whole test - a 3xx recorded
+    // for crossing an origin, or a 0 for a request that got no response.
+    const soft = session.failedRequests.findIndex((seen) => seen.status < 400);
+    session.failedRequests.splice(soft >= 0 ? soft : 0, 1);
+  }
+};
 
 /**
  * A deadline for a promise that has none of its own.
@@ -263,6 +390,42 @@ const withDeadline = async <T>(work: Promise<T>, milliseconds: number, fallback:
   ]);
   if (timer) clearTimeout(timer);
   return settled;
+};
+
+/**
+ * Waits for the page to stop changing, without asking the network to go quiet.
+ *
+ * This is the protocol `docs/design/browser-automation.md` §4b prescribes and the replacement for
+ * the `networkidle` wait that document bans: wait for `load`, which fires once the document and
+ * its subresources are in, then sit still inside the page long enough for the frame the load
+ * triggered to render.
+ *
+ * It does NOT wait for anything a script fetches after load - a single-page application still
+ * populating a list is not covered, and the answer there is a `wait_for` naming the selector or
+ * the text being waited on, which resolves as soon as the thing arrives instead of guessing.
+ *
+ * Nothing here throws. A page that never fires `load` reports that it did not, because the caller
+ * is usually a step inside a batch, and a thrown step takes every step after it with it - which is
+ * how one badly-chosen wait used to cost a form fill as well as fifteen seconds.
+ */
+const settlePage = async (page: Page, loadTimeout: number): Promise<boolean> => {
+  const loaded = await page
+    .waitForLoadState('load', { timeout: loadTimeout })
+    .then(() => true)
+    .catch(() => false);
+  // `page.evaluate` takes no timeout of its own, so the deadline is this side's; see `withDeadline`.
+  await withDeadline(
+    page.evaluate(
+      (milliseconds: number) =>
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, milliseconds);
+        }),
+      PAGE_SETTLE_MS
+    ),
+    PAGE_SETTLE_MS * 4,
+    undefined
+  );
+  return loaded;
 };
 
 /**
@@ -291,8 +454,38 @@ const reserveRefBlock = (size: number): number => {
  * folded, so the scan takes this much headroom over the caller's budget to spend on them.
  */
 const LABEL_FOLD_OVERSCAN = 64;
+/**
+ * `[onclick]` is the cheap half of "see what the page treats as clickable".
+ *
+ * A `<div onclick=...>` is a real control that declares nothing about itself, and it was invisible
+ * to a scan built from tag names and ARIA roles - while `resolveBrowserTarget` clicks one happily
+ * when handed a selector, so the agent could act on controls it could not see. The attribute form
+ * is one more CSS chunk and costs nothing.
+ *
+ * It does NOT catch a listener registered with `addEventListener`, which is the more common shape.
+ * Seeing those needs `DOMDebugger.getEventListeners` over CDP, one round trip per node, which is
+ * not affordable at 250 nodes inside `PAGE_SCRIPT_TIMEOUT_MS`; that half is deliberately not built.
+ */
 const INTERACTIVE_ELEMENT_QUERY =
-  'a[href],button,input,textarea,select,label,summary,[role="button"],[role="link"],[role="checkbox"],[role="radio"],[role="switch"],[role="tab"],[role="menuitem"],[role="combobox"],[contenteditable="true"]';
+  'a[href],button,input,textarea,select,label,summary,[onclick],[role="button"],[role="link"],[role="checkbox"],[role="radio"],[role="switch"],[role="tab"],[role="menuitem"],[role="combobox"],[contenteditable="true"]';
+/**
+ * How far the scan descends through open shadow roots.
+ *
+ * Four, because a component library nests at most a couple of levels before it is rendering leaf
+ * markup - the measured fixture (a card whose shadow root contains a component whose shadow root
+ * contains the link) needs two - and because the depth is what bounds a pathological page. The
+ * walk that uses it is priced in `scanFrameElements`.
+ */
+const SHADOW_PIERCE_DEPTH = 4;
+/**
+ * How many closed-shadow-root hosts one frame may report.
+ *
+ * A closed root cannot be read at all, so the entry says only "something is here that cannot be
+ * listed" - useful once, noise fifteen times, and every one of them spends a slot in the
+ * 250-element budget that a readable control could have had. Five is enough for the shape this
+ * exists for: a payment or consent widget the page has closed off.
+ */
+const CLOSED_SHADOW_ENTRY_LIMIT = 5;
 
 /**
  * The downloading site chooses this name, so it is hostile input: reduce it to one plain
@@ -400,6 +593,17 @@ export interface RawScannedElement {
   options: BrowserSelectOption[] | null;
   /** For a `<label>`, the ref of the control it names, when that control was scanned too. */
   labelFor: string | null;
+  /**
+   * This element is a custom element that draws itself out of a shadow root nothing can open.
+   *
+   * The scan pierces OPEN roots, so those need no marking; a closed one is genuinely unreadable
+   * and the honest report is that something is there. It is a heuristic and it can be wrong: the
+   * page-side test is a hyphenated tag with a visible box, no child elements, no text and no
+   * `shadowRoot`, which a custom element painting itself with a CSS background also satisfies.
+   * Being wrong costs one entry that says it cannot be read, which is why it is capped rather
+   * than tightened into something that would miss the real ones.
+   */
+  closedShadowRoot: boolean;
 }
 
 /**
@@ -421,11 +625,29 @@ const ELEMENT_OPTION_LIMIT = 200;
 export const redactPasswordValue = (value: string): string =>
   value.length ? `${value.length} characters entered` : '';
 
+/**
+ * What a closed-root host is told to the model. Written here rather than in the page because the
+ * page does extraction only, and because this sentence is the whole of the entry's value.
+ */
+const CLOSED_SHADOW_DESCRIPTION =
+  'This element draws itself from a closed shadow root, so its contents cannot be listed. Click the element itself, or act on it by coordinates from the screenshot.';
+
 export const describeScannedElement = (raw: RawScannedElement): ScannedElement => {
   const name =
     [raw.ariaLabel, raw.labelledByText, raw.labelText, raw.placeholder, raw.title, raw.text]
       .map(flatten)
       .find((candidate) => candidate.length > 0) ?? '';
+  if (raw.closedShadowRoot)
+    return {
+      ref: raw.ref,
+      tag: raw.tag,
+      role: raw.role,
+      name: name.slice(0, ELEMENT_NAME_LIMIT) || raw.tag,
+      type: raw.type,
+      href: null,
+      ...(raw.elementId ? { id: raw.elementId } : {}),
+      description: CLOSED_SHADOW_DESCRIPTION
+    };
   return {
     ref: raw.ref,
     tag: raw.tag,
@@ -467,41 +689,134 @@ export const describeScannedElement = (raw: RawScannedElement): ScannedElement =
  * label whose control was not scanned is kept: sites routinely style a label over an input of zero
  * size, and then the label is the only thing that can be clicked.
  */
-export const foldScannedElements = (raw: RawScannedElement[], limit: number): ScannedElement[] => {
+export const foldScannedElements = (
+  raw: RawScannedElement[],
+  limit: number
+): { kept: ScannedElement[]; folded: number } => {
   const scanned = new Set(raw.map((entry) => entry.ref));
-  return raw
-    .filter(
-      (entry) => !(entry.tag === 'label' && entry.labelFor !== null && scanned.has(entry.labelFor))
-    )
-    .slice(0, limit)
-    .map(describeScannedElement);
+  const standing = raw.filter(
+    (entry) => !(entry.tag === 'label' && entry.labelFor !== null && scanned.has(entry.labelFor))
+  );
+  return {
+    kept: standing.slice(0, limit).map(describeScannedElement),
+    // What was dropped as a duplicate rather than lost to the budget. The caller subtracts it,
+    // because a folded label is still represented - its text is on the control it names - and
+    // counting it as omitted would report a page of labelled inputs as half missing.
+    folded: raw.length - standing.length
+  };
 };
+
+/** What one frame's page-side extraction hands back: the window, and how much there was. */
+interface RawFrameScan {
+  elements: RawScannedElement[];
+  /**
+   * Visible interactive elements the frame's whole tree holds, open shadow roots included, before
+   * the budget cut anything. Counted exactly rather than estimated, which is why the walk runs to
+   * the end of the tree even once it has stopped collecting - priced in `scanFrameElements`.
+   */
+  matched: number;
+}
 
 const scanFrameElements = async (
   frame: Frame,
   ordinal: number,
   limit: number,
   rootSelector?: string
-): Promise<ScannedElement[]> => {
+): Promise<{ elements: ScannedElement[]; omitted: number }> => {
   const raw = await withDeadline(
     frame
       .evaluate<
-        RawScannedElement[],
-        { query: string; prefix: string; limit: number; root: string | null; seed: number }
+        RawFrameScan,
+        {
+          query: string;
+          prefix: string;
+          limit: number;
+          root: string | null;
+          seed: number;
+          depth: number;
+          closedLimit: number;
+        }
       >(
         // Extraction only, and deliberately written without a single named inner function: the
         // development transpiler rewrites those into calls to a helper that does not exist inside
         // a page, and the whole scan then fails silently. Text arrives unnormalised; the runner
         // tidies and judges it, where that can be tested without a browser.
-        ({ query, prefix, limit: budget, root, seed }) => {
+        ({ query, prefix, limit: budget, root, seed, depth: maxDepth, closedLimit }) => {
           const scope: ParentNode | null = root ? document.querySelector(root) : document;
-          if (!scope) return [];
-          const visible = Array.from(scope.querySelectorAll<HTMLElement>(query))
-            .filter((element) => {
+          if (!scope) return { elements: [], matched: 0 };
+          const visible: HTMLElement[] = [];
+          // The hosts whose contents nothing can read, so the runner can say so on the entry.
+          const opaque = new Set<HTMLElement>();
+          let matched = 0;
+          let opaqueSeen = 0;
+          /*
+           * A walk rather than one `querySelectorAll`, because `querySelectorAll` stops at a shadow
+           * boundary and returns nothing inside an open root - while Playwright's CSS engine
+           * pierces open roots, so the agent could already click controls this scan could not see.
+           * Web components are ordinary in payment widgets, design systems and government portals.
+           *
+           * Document order is preserved across the boundary: a host's shadow tree is walked at the
+           * point the host itself is reached, so the budget cuts the end of the page and not the
+           * components in the middle of it.
+           *
+           * The per-element test is a Set lookup, not `element.matches(query)`. One native
+           * `querySelectorAll` per root does the selector work in C++ and the walk only asks
+           * whether it produced this node, which is what keeps the whole thing cheap.
+           */
+          const stack = [
+            {
+              direct: new Set<Element>(scope.querySelectorAll(query)),
+              nodes: scope.querySelectorAll('*'),
+              at: 0,
+              depth: 0
+            }
+          ];
+          while (stack.length) {
+            const level = stack[stack.length - 1];
+            if (!level) break;
+            if (level.at >= level.nodes.length) {
+              stack.pop();
+              continue;
+            }
+            const element = level.nodes[level.at] as HTMLElement | undefined;
+            level.at += 1;
+            if (!element) continue;
+            const shadow = element.shadowRoot;
+            if (level.direct.has(element)) {
               const rect = element.getBoundingClientRect();
-              return rect.width > 0 && rect.height > 0;
-            })
-            .slice(0, budget);
+              if (rect.width > 0 && rect.height > 0) {
+                matched += 1;
+                if (visible.length < budget) visible.push(element);
+              }
+            } else if (
+              // A custom element with no open root, no children of its own and no text, that
+              // nevertheless occupies space, is drawing itself out of a closed root. The test is a
+              // heuristic - see `RawScannedElement.closedShadowRoot` for what it can be wrong
+              // about - and the cap is why being wrong stays cheap.
+              !shadow &&
+              opaqueSeen < closedLimit &&
+              element.tagName.includes('-') &&
+              !element.firstElementChild &&
+              !(element.textContent ?? '').trim()
+            ) {
+              const rect = element.getBoundingClientRect();
+              if (rect.width > 0 && rect.height > 0) {
+                opaqueSeen += 1;
+                matched += 1;
+                if (visible.length < budget) {
+                  opaque.add(element);
+                  visible.push(element);
+                }
+              }
+            }
+            if (shadow && level.depth < maxDepth)
+              stack.push({
+                direct: new Set<Element>(shadow.querySelectorAll(query)),
+                nodes: shadow.querySelectorAll('*'),
+                at: 0,
+                depth: level.depth + 1
+              });
+          }
           // Every ref is assigned before anything is read, so a label can report the ref of the
           // control it names even when that control comes later in document order. An element that
           // already carries one keeps it: that is what makes a ref survive a scoped re-read, which
@@ -520,7 +835,7 @@ const scanFrameElements = async (
             taken.add(assigned);
             element.setAttribute('data-athanor-ref', assigned);
           }
-          return visible.map((element) => {
+          const elements = visible.map((element) => {
             const field = element as HTMLInputElement;
             const select = element instanceof HTMLSelectElement ? element : null;
             const labels = field.labels ? Array.from(field.labels) : [];
@@ -589,9 +904,11 @@ const scanFrameElements = async (
                     selected: option.selected
                   }))
                 : null,
-              labelFor: control?.getAttribute('data-athanor-ref') ?? null
+              labelFor: control?.getAttribute('data-athanor-ref') ?? null,
+              closedShadowRoot: opaque.has(element)
             };
           });
+          return { elements, matched };
         },
         {
           query: INTERACTIVE_ELEMENT_QUERY,
@@ -600,7 +917,9 @@ const scanFrameElements = async (
           root: rootSelector ?? null,
           // Reserved before the page is touched, so two scans can never hand out the same number even
           // if one of them fails part-way through.
-          seed: reserveRefBlock(limit + LABEL_FOLD_OVERSCAN)
+          seed: reserveRefBlock(limit + LABEL_FOLD_OVERSCAN),
+          depth: SHADOW_PIERCE_DEPTH,
+          closedLimit: CLOSED_SHADOW_ENTRY_LIMIT
         }
       )
       // A frame can navigate or detach mid-scan; losing one frame must not lose the snapshot. Said
@@ -610,12 +929,29 @@ const scanFrameElements = async (
       // back to run this at all, which is what the deadline around it is for.
       .catch((cause: unknown) => {
         runnerLogger.warn('browser.frame_scan_failed', { code: failureCode(cause) });
-        return [] as RawScannedElement[];
+        return { elements: [], matched: 0 } satisfies RawFrameScan;
       }),
     PAGE_SCRIPT_TIMEOUT_MS,
-    []
+    { elements: [], matched: 0 }
   );
-  return foldScannedElements(raw, limit);
+  const folded = foldScannedElements(raw.elements, limit);
+  /*
+   * What the page had and this list does not carry.
+   *
+   * `matched` counts every visible interactive element in the frame; `folded` is the labels
+   * dropped onto the controls they name, which are represented rather than missing; `kept` is what
+   * survived the budget. A frame whose whole tree fits reports zero, which is the common case.
+   *
+   * When the page-side window itself was cut - `matched` above `limit + LABEL_FOLD_OVERSCAN` -
+   * labels past that window are counted as omitted controls, because nothing outside the window
+   * was read closely enough to know they were labels. That errs towards saying more is missing
+   * than is, which is the safe direction for a number whose whole job is to stop the model
+   * concluding a control does not exist.
+   */
+  return {
+    elements: folded.kept,
+    omitted: Math.max(0, raw.matched - folded.folded - folded.kept.length)
+  };
 };
 
 /*
@@ -1397,6 +1733,7 @@ export class BrowserManager {
       streamQueue: Promise.resolve(),
       streamTitle: '',
       consoleMessages: [],
+      failedRequests: [],
       // One directory per browser session keeps a re-download of the same file from silently
       // overwriting the copy an earlier session handed the user.
       downloadsDirectory: path.join(
@@ -1435,6 +1772,42 @@ export class BrowserManager {
           at: new Date().toISOString()
         });
         if (session.consoleMessages.length > 200) session.consoleMessages.splice(0, 50);
+      });
+      /*
+       * Observation only. `page.on('response')` and `page.on('requestfailed')` are events Chromium
+       * is already emitting; `page.route()` would be the other way to see this and it turns on
+       * `Network.setCacheDisabled` and `Fetch.enable('*')` for the whole session, making every
+       * navigation a cold fetch - which `docs/design/browser-automation.md` lists as a pitfall by
+       * name. Nothing here modifies, blocks or re-issues a request.
+       */
+      candidate.on('response', (response) => {
+        const status = response.status();
+        if (status >= 400) {
+          recordFailedRequest(session, response.request().method(), status, response.url());
+          return;
+        }
+        // A redirect that crosses an origin is how a submit ends up at an auth wall while every
+        // status on the way is a success. The landing page then looks like the site rejecting the
+        // values, which sends the agent back to re-type fields that were already right.
+        //
+        // The URL recorded is where it was SENT, not what was asked for: `302 GET
+        // accounts.example.com/login` says what happened, where the requested address would read
+        // as an ordinary page. The status is what marks it as a redirect rather than a failure.
+        if (status < 300 || status >= 400) return;
+        const location = response.headers()['location'];
+        if (!location) return;
+        try {
+          if (new URL(location, response.url()).origin === new URL(response.url()).origin) return;
+        } catch {
+          return;
+        }
+        recordFailedRequest(session, response.request().method(), status, location);
+      });
+      candidate.on('requestfailed', (request) => {
+        // No response arrived at all: a CORS rejection, a DNS failure, a connection reset or an
+        // abort. Reported as status 0 because that is what the model needs to tell "the server
+        // said no" from "the request never landed".
+        recordFailedRequest(session, request.method(), 0, request.url());
       });
       candidate.on('dialog', (dialog) => {
         session.pendingDialog = dialog;
@@ -1541,10 +1914,15 @@ export class BrowserManager {
         holder: session.control.holder,
         botWall: null,
         elements: [],
+        // Nothing was scanned, so nothing was cut: zero here is "no list to be missing from",
+        // not "the list is complete".
+        elementsOmitted: 0,
+        framesOmitted: 0,
         tabs: [],
         downloads: [],
         pendingDialog: null,
         consoleMessages: [],
+        failedRequests: [],
         images: [],
         screenshotBase64: '',
         text: ''
@@ -1580,10 +1958,15 @@ export class BrowserManager {
         holder: session.control.holder,
         botWall: wall,
         elements: [],
+        elementsOmitted: 0,
+        framesOmitted: 0,
         tabs: await sessionTabs(session),
         downloads: [],
         pendingDialog: null,
         consoleMessages: [],
+        // Withheld with everything else on a challenge page: what the challenge's own requests
+        // did is a description of the puzzle.
+        failedRequests: [],
         images: [],
         screenshotBase64: '',
         text: botWallMessage(wall)
@@ -1605,12 +1988,15 @@ export class BrowserManager {
       PAGE_SCRIPT_TIMEOUT_MS,
       []
     );
+    const scan = await this.#scanPage(page);
     return composeBrowserSnapshot({
       url: page.url(),
       title,
       holder: session.control.holder,
       botWall: null,
-      elements: await this.#scanPage(page),
+      elements: scan.elements,
+      elementsOmitted: scan.elementsOmitted,
+      framesOmitted: scan.framesOmitted,
       tabs: await sessionTabs(session),
       // A download that outlived the action that started it is only discoverable here.
       downloads: session.downloads.slice(-10),
@@ -1618,6 +2004,9 @@ export class BrowserManager {
         ? { type: session.pendingDialog.type(), message: session.pendingDialog.message() }
         : null,
       consoleMessages: session.consoleMessages.slice(-40),
+      // Already bounded to `FAILED_REQUEST_LIMIT` as it was recorded; copied so a later failure
+      // cannot mutate a payload that has been handed out.
+      failedRequests: [...session.failedRequests],
       images,
       screenshotBase64: screenshot.toString('base64'),
       text
@@ -1629,12 +2018,28 @@ export class BrowserManager {
    * frame the page exposes rather than the top document alone. The ref carries the frame ordinal,
    * which is how an action finds the frame the control belongs to again.
    */
-  async #scanPage(page: Page, rootSelector?: string): Promise<BrowserSnapshotElement[]> {
+  async #scanPage(
+    page: Page,
+    rootSelector?: string
+  ): Promise<{
+    elements: BrowserSnapshotElement[];
+    elementsOmitted: number;
+    framesOmitted: number;
+  }> {
     const elements: BrowserSnapshotElement[] = [];
-    for (const [ordinal, frame] of page.frames().slice(0, SNAPSHOT_FRAME_LIMIT).entries()) {
+    const frames = page.frames();
+    let elementsOmitted = 0;
+    let scannedFrames = 0;
+    for (const [ordinal, frame] of frames.slice(0, SNAPSHOT_FRAME_LIMIT).entries()) {
       const budget = SNAPSHOT_ELEMENT_LIMIT - elements.length;
+      // A frame reached with no budget left is a frame nobody looked at, so it is counted as
+      // omitted rather than skipped silently - and it is the LAST frames that go, which is where
+      // consent, payment and submit frames live.
       if (budget <= 0) break;
-      for (const scanned of await scanFrameElements(frame, ordinal, budget, rootSelector)) {
+      scannedFrames += 1;
+      const scan = await scanFrameElements(frame, ordinal, budget, rootSelector);
+      elementsOmitted += scan.omitted;
+      for (const scanned of scan.elements) {
         const { ref, ...rest } = scanned;
         elements.push({
           index: elements.length,
@@ -1643,7 +2048,9 @@ export class BrowserManager {
         });
       }
     }
-    return elements;
+    // Both ways a frame goes unread at once: past `SNAPSHOT_FRAME_LIMIT`, or reached after the
+    // element budget had already run out.
+    return { elements, elementsOmitted, framesOmitted: frames.length - scannedFrames };
   }
 
   /**
@@ -1663,11 +2070,17 @@ export class BrowserManager {
     const page = resolveTab(session, input.tabId);
     if (actor === 'agent') await this.#assertNoWall(session, page);
     this.#assertReadablePage(page, actor);
+    const scan = await this.#scanPage(page, input.selector);
     return {
       url: page.url(),
       title: await page.title().catch(() => ''),
       tabId: tabIdFor(session, page),
-      elements: await this.#scanPage(page, input.selector)
+      elements: scan.elements,
+      // The same two counts the snapshot carries, for the same reason. A scoped read of one form
+      // rarely reaches 250 controls, but an unscoped one is the same page the snapshot walks, and
+      // a truncated list that does not say so is the defect either way.
+      elementsOmitted: scan.elementsOmitted,
+      framesOmitted: scan.framesOmitted
     };
   }
 
@@ -2399,6 +2812,10 @@ export class BrowserManager {
     title: string;
     tabId: string | null;
     elements?: BrowserSnapshotElement[];
+    /** Only where `elements` is: what the budget cut, so a read of a tab says so the way a
+     * snapshot of it does. */
+    elementsOmitted?: number;
+    framesOmitted?: number;
     text?: string;
     waited?: string;
   }> {
@@ -2553,11 +2970,14 @@ export class BrowserManager {
         // without stealing focus from the one a human may be watching.
         const inspected = resolveTab(session, action.tabId);
         this.#assertReadablePage(inspected, session.control.holder === 'agent' ? 'agent' : 'user');
+        const scan = await this.#scanPage(inspected);
         return {
           url: inspected.url(),
           title: await inspected.title().catch(() => ''),
           tabId: action.tabId,
-          elements: await this.#scanPage(inspected),
+          elements: scan.elements,
+          elementsOmitted: scan.elementsOmitted,
+          framesOmitted: scan.framesOmitted,
           text: (
             await inspected
               .locator('body')
@@ -2617,6 +3037,10 @@ export class BrowserManager {
    * Condition-based waiting. A fixed sleep is either a flake or dead time, and without any wait
    * at all a snapshot taken straight after `navigate` on a single-page application returns the
    * empty shell — which is what the agent then tries to fill in.
+   *
+   * A selector, some text, or a URL fragment names the condition and resolves the instant it
+   * holds; that is the form to reach for. With none of them this waits on the page as a whole,
+   * which is a weaker thing and says so in what it returns.
    */
   async #waitFor(
     page: Page,
@@ -2641,8 +3065,23 @@ export class BrowserManager {
       await page.waitForURL((url) => url.href.includes(fragment), { timeout });
       return `url contains “${fragment}”`;
     }
-    await page.waitForLoadState('networkidle', { timeout });
-    return 'network is idle';
+    /*
+     * No selector, no text and no URL fragment: the page itself is what is being waited on.
+     *
+     * This was `waitForLoadState('networkidle')`, which `docs/design/browser-automation.md` bans
+     * by name at :336 and :560 - it is deprecated, and on a page holding a websocket or a long
+     * poll the network never goes quiet, so it burned its whole timeout and then threw. Measured
+     * on such a page: 15,000 ms and an exception, where a `wait_for` naming the selector resolved
+     * in 72 ms. Inside a `batch` that exception took every remaining step with it, so one wait
+     * cost the rest of a form fill as well as the fifteen seconds.
+     *
+     * `timeout` is the caller's own ceiling, so the load wait takes the smaller of it and the
+     * protocol's 10,000 ms and the settle runs regardless.
+     */
+    const loaded = await settlePage(page, Math.min(timeout, PAGE_LOAD_WAIT_MS));
+    return loaded
+      ? 'page finished loading and settled'
+      : 'page had not finished loading, and settled anyway - wait on a selector or on text to wait for something in particular';
   }
 
   /**
@@ -2681,8 +3120,8 @@ export class BrowserManager {
   }
 
   /**
-   * Prints the page the agent is looking at, after the network settles, which is the only route
-   * from an authored HTML document to a PDF with real page breaks, headers and margins.
+   * Prints the page the agent is looking at, once it has loaded and settled, which is the only
+   * route from an authored HTML document to a PDF with real page breaks, headers and margins.
    */
   async printPdf(
     workspaceId: string,
@@ -2706,7 +3145,12 @@ export class BrowserManager {
     if (actor === 'agent') await this.#assertNoWall(session, page);
     this.#assertReadablePage(page, actor);
     const relativePath = assertUserDataPath(root, input.path);
-    await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => undefined);
+    // Judged on its own and changed for the same reason as the wait above, not for consistency
+    // with it: this one could not throw, but on a page holding a long poll it spent its whole
+    // 15,000 ms every time and then printed exactly what `load` had already guaranteed - the
+    // document and its images, stylesheets and fonts. What it bought over `load` was content a
+    // script fetched afterwards, and `networkidle` never fires on the pages where that is true.
+    await settlePage(page, PAGE_LOAD_WAIT_MS);
     // The bytes come back here and are written through the file API rather than by handing the
     // browser a path to open on its own. The browser would resolve that name a second time, after
     // these checks, which is a window the agent's account can put a symbolic link into.

@@ -33,6 +33,16 @@ export interface NotificationSubject {
   approvalSideEffect: ApprovalSideEffect | null;
   /** What the agent asked to have said, for the two kinds it raises. Null for the rest. */
   message: string | null;
+  /**
+   * True when this `takeover_needed` is the harness speaking rather than the agent: the approval
+   * the conversation was parked on expired unanswered, and the sweep paused the task.
+   *
+   * The two arrive under one kind on purpose - see the branch that raises it in
+   * `store/notifications.ts` - and they need different sentences, because "take control of the
+   * Computer" is not what an owner does about an approval that ran out. Always false for every
+   * other kind.
+   */
+  approvalExpired: boolean;
   /** Real currency, for the two kinds where money is the whole point of the message. */
   spentUsd: number | null;
   capUsd: number | null;

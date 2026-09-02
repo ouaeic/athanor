@@ -683,11 +683,109 @@ export interface DelegateEvidenceCheck {
   readonly claim: string;
   readonly source: string;
   readonly verified: boolean;
+  /**
+   * Whether the harness actually got the source in front of it.
+   *
+   * `verified: false` was carrying two facts that are not the same fact: a span the harness looked
+   * for and could not find, which is evidence against the report, and a source the harness never
+   * opened, which is no evidence about the report at all. The second case is now reachable on the
+   * ordinary path - the citation re-read is a web reach and is refused when the destination is one
+   * this run has not been sent to - so the difference has to survive to the lead rather than
+   * arriving as the same boolean with different prose beside it. `unverifiedNotice` reads this
+   * field, and it is what keeps "nothing in this report stood up" from being said about a report
+   * nothing was read for.
+   */
+  readonly reread: boolean;
   readonly detail: string;
 }
 
+/*
+ * The characters that carry no width, and are therefore not part of what anybody quoted.
+ *
+ * A soft hyphen is a hyphenation hint the renderer may or may not use; the zero-width family and
+ * the byte-order mark are line-breaking and joining hints. None of them is visible in the page a
+ * specialist read, so none of them can be part of what it copied - a model that retypes a span it
+ * saw drops them, and the span it hands back is the same span.
+ */
+const SPAN_INVISIBLE = /[\u00ad\u200b-\u200d\u2060\ufeff]/g;
+/*
+ * The quotation and dash families, folded to the one ASCII spelling of each.
+ *
+ * These are the substitutions models actually make. Measured over six realistic variants of a
+ * genuinely copied span, five failed the old collapse-and-lowercase matcher: a curly apostrophe, a
+ * curly double quote, an `fi` ligature, a soft hyphen and an en dash. Typography is what a
+ * publisher applied to the page, not what the specialist claimed, so a report that straightened it
+ * on the way back is an honest report and was being told it had fabricated its evidence - the
+ * strongest sentence this harness says about a specialist, on the strength of one apostrophe.
+ *
+ * Guillemets are included because they are quotation marks in French and German and a model
+ * quoting such a page into English prose straightens them the same way. The primes are included
+ * because a page writes 5′ 10″ and a model retypes 5' 10".
+ */
+const SPAN_SINGLE_QUOTES = /[\u2018\u2019\u201a\u201b\u2032\u2035\u02bc]/g;
+const SPAN_DOUBLE_QUOTES = /[\u201c\u201d\u201e\u201f\u2033\u2036\u00ab\u00bb]/g;
+const SPAN_DASHES = /[\u2010-\u2015\u2212]/g;
+
+/**
+ * A quoted span and the page it came from, compared the way a reader would compare them - and not
+ * one character looser than that.
+ *
+ * Pure, and both sides go through it, so the fold is symmetric: whatever this removes it removes
+ * from the source as well, and a span can only match by being the same words in the same order.
+ *
+ * WHAT IS NORMALISED: NFKC, which resolves ligatures (`ﬁ` to `fi`), full-width forms and the
+ * no-break space, and expands `…` to three dots; the invisible characters above, removed; the
+ * quotation and dash families above, folded to ASCII; then whitespace collapsed and case dropped,
+ * which is what this function already did and which is why a span copied across a line break
+ * matched at all.
+ *
+ * WHAT IS DELIBERATELY NOT, because each of these is how a fabricated span would get in:
+ *
+ * - **Diacritics stay.** `resume` is not `résumé` and `Muller` is not `Müller`. NFKD plus mark
+ *   stripping would match every honest variant this does and would also match a span whose words
+ *   are different words in French, German or Turkish.
+ * - **Punctuation is folded, never dropped.** A comma still has to be a comma. Dropping punctuation
+ *   would let a span that reorders or splices the source's clauses match the source.
+ * - **Spaces are collapsed, never removed.** Word boundaries still have to line up, so two words
+ *   the source runs together are not the same as two the specialist ran together.
+ * - **Nothing is stemmed, reordered or truncated.** This is a substring test on the whole span.
+ *
+ * So the failure it can still produce is a specialist that paraphrased rather than copied, which is
+ * a report the lead should be told about, and the failure it can no longer produce is a specialist
+ * that copied exactly and had its typography straightened on the way.
+ */
 export const normalisedSpan = (value: string): string =>
-  value.replace(/\s+/g, ' ').trim().toLowerCase();
+  value
+    .normalize('NFKC')
+    .replace(SPAN_INVISIBLE, '')
+    .replace(SPAN_SINGLE_QUOTES, "'")
+    .replace(SPAN_DOUBLE_QUOTES, '"')
+    .replace(SPAN_DASHES, '-')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+
+/**
+ * The longest a cited `source` may be before the whole evidence item is dropped.
+ *
+ * This field was the one string in the report with no bound on it at all, and it is not a string
+ * that stays inside this file: it is classified as a destination, it is handed to the runner as a
+ * URL or a workspace path, and - the reason a bound is owed rather than merely tidy - it is copied
+ * verbatim into the `evidenceChecks` the lead reads, which are not cut by the report's own
+ * `truncateMiddle`. A specialist may write 8,192 output tokens, so two citations could put its
+ * entire output into the lead's window through a field the lead is told is an address.
+ *
+ * Two kilobytes because that is well past any real one and well short of that. `MAX_ADDRESS_CHARS`
+ * in `egress.ts` is 512, measured over 136 recorded addresses of which one exceeds 256 and none
+ * exceeds 512, and a workspace path is far shorter than a URL; this is four times that, so an
+ * unusual deep link still fits and nothing that fits is worth truncating.
+ *
+ * Dropped rather than truncated, on `egress.ts`'s own reasoning: a clipped address is a different
+ * address, and re-reading a different address to check a span proves nothing about the citation.
+ * The drop is counted and named in `errors` like every other malformed item, so the specialist is
+ * told what happened rather than watching a citation disappear.
+ */
+export const MAX_EVIDENCE_SOURCE_CHARS = 2_048;
 
 /** A specialist's report, as the two fields the lead actually reads. */
 export interface DelegateReport {
@@ -766,11 +864,13 @@ export const validateDelegateReport = (text: string): DelegateReportValidation =
     const claim = textValue(entry?.claim).trim();
     const source = textValue(entry?.source).trim();
     const quotedSpan = textValue(entry?.quotedSpan).trim();
-    return claim && source && quotedSpan ? [{ claim, source, quotedSpan }] : [];
+    return claim && source && source.length <= MAX_EVIDENCE_SOURCE_CHARS && quotedSpan
+      ? [{ claim, source, quotedSpan }]
+      : [];
   });
   if (evidence.length !== rawEvidence.length)
     errors.push(
-      `${rawEvidence.length - evidence.length} of ${rawEvidence.length} evidence items were dropped: each needs "claim", "source" and "quotedSpan" as non-empty strings`
+      `${rawEvidence.length - evidence.length} of ${rawEvidence.length} evidence items were dropped: each needs "claim", "source" and "quotedSpan" as non-empty strings, with a "source" of at most ${MAX_EVIDENCE_SOURCE_CHARS} characters`
     );
   return { report: { answer: record.answer, evidence }, errors };
 };

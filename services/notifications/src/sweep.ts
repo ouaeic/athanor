@@ -73,7 +73,7 @@ export interface SweepResult {
    * Nothing in this batch could be attempted, so the caller must wait before asking again.
    *
    * A sweep whose whole batch was held used to leave this false, because only endpoint waits were
-   * counted - so the loop re-issued the four-branch UNION as fast as PostgreSQL would answer it,
+   * counted - so the loop re-issued the candidate UNION as fast as PostgreSQL would answer it,
    * for as long as the owner kept a tab open or their quiet hours lasted. Nine hours of a hot loop
    * on a machine whose whole point is running unattended, with an inflating suppressed counter on
    * a loopback metrics port as the only sign of it.

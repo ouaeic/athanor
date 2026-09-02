@@ -69,8 +69,38 @@ export const browserActionProperties: Record<string, unknown> = {
   action: {
     type: 'string',
     enum: browserActionEnum,
+    /*
+     * The `wait_for` clause used to recommend network quiescence, and it recommended it for the
+     * one case docs/design/browser-automation.md bans it for BY NAME, twice - once in its list of
+     * what to ban from the codebase ("`waitForLoadState('networkidle')` (deprecated and wrong on
+     * SPAs with long-polling/websockets)") and once in its pitfalls ("`networkidle` is deprecated
+     * and never fires on SPAs with websockets or long-polling"). Quoted rather than cited by line,
+     * because the two line numbers this comment first carried were already stale when it shipped:
+     * the same wave that wrote them edited that document. The old sentence read "with none of those three it waits
+     * for the network to go idle, which is what a single-page application needs after navigate" -
+     * the exact inversion of the design, pointed at the exact page shape the design excludes. The
+     * bare form is still what `#waitFor` in services/workspace-runner/src/browser.ts falls through
+     * to, so this was the catalogue telling the model to prefer the arm's worst branch.
+     *
+     * The replacement steers to the three conditions and says what the bare form is worth, WITHOUT
+     * naming the mechanism, because the mechanism is being replaced underneath it in this same
+     * wave and a description that named one would be stale on arrival. "Waits on the page alone"
+     * is true of both: of the `waitForLoadState('networkidle')` this was written against, and of
+     * the `waitForLoadState('load')`-plus-settle protocol replacing it in
+     * services/workspace-runner/src/browser.ts - read from that lane's working tree rather than
+     * assumed. Neither knows a condition inside the application, which is the whole point.
+     * "Can satisfy while still empty" is the failure the runner's own `#waitFor` comment already
+     * records - "a snapshot taken straight after `navigate` on a single-page application returns
+     * the empty shell" - and the replacement arm now says the same thing back in its own result
+     * string, "wait on a selector or on text to wait for something in particular". The wire and
+     * the arm agree without either quoting the other.
+     *
+     * It does NOT say what to do when all three conditions are unknowable; there is no fourth
+     * branch in the arm to point at. Byte-neutral was the brief and it came in under: the clause
+     * went from 125 bytes to 120, measured, so the catalogue moved 55,673 -> 55,668.
+     */
     description:
-      'Which action, and the fields it takes beyond the optional tabId every one of them accepts. navigate url. click, double_click, hover selector. type selector, text and mode - fill sets the value at once, keys sends real keystrokes, which is what wakes a typeahead or a keydown validator. select_option selector, values - every chosen value for a multiple-select. upload selector, paths. text_input text, into whatever has focus. press key, for example Enter, Tab or Escape. scroll deltaY, optional deltaX and selector. wait_for optional selector with state, or text, or urlIncludes, and timeoutMs; with none of those three it waits for the network to go idle, which is what a single-page application needs after navigate. back. reload. new_tab optional url and activate. select_tab, close_tab and inspect_tab tabId - inspect_tab reads that tab in place and leaves the active one alone. click_at x, y - ambiguous, so it always needs confirmation; use a selector when the page exposes one. dialog response, optional promptText, to answer a native alert, confirm or prompt reported by browser_snapshot. batch actions.'
+      'Which action, and the fields it takes beyond the optional tabId every one of them accepts. navigate url. click, double_click, hover selector. type selector, text and mode - fill sets the value at once, keys sends real keystrokes, which is what wakes a typeahead or a keydown validator. select_option selector, values - every chosen value for a multiple-select. upload selector, paths. text_input text, into whatever has focus. press key, for example Enter, Tab or Escape. scroll deltaY, optional deltaX and selector. wait_for optional selector with state, or text, or urlIncludes, and timeoutMs; name one of those three, or it waits on the page alone, which a single-page application can satisfy while still empty. back. reload. new_tab optional url and activate. select_tab, close_tab and inspect_tab tabId - inspect_tab reads that tab in place and leaves the active one alone. click_at x, y - ambiguous, so it always needs confirmation; use a selector when the page exposes one. dialog response, optional promptText, to answer a native alert, confirm or prompt reported by browser_snapshot. batch actions.'
   },
   url: { type: 'string' },
   selector,

@@ -111,7 +111,8 @@ const RAW_ELEMENT = {
   invalid: false,
   description: '',
   options: null,
-  labelFor: null
+  labelFor: null,
+  closedShadowRoot: false
 };
 
 type Session = Awaited<ReturnType<BrowserManager['ensure']>>;
@@ -154,6 +155,12 @@ interface Harness {
     text: string;
     serverIp: string;
     landsOn: string | null;
+    /** The page-side scan's answer, which is what `elementsOmitted` is arithmetic on. */
+    scan: { elements: unknown[]; matched: number };
+    /** Whether `waitForLoadState` rejects, which is what a page that never finishes looks like. */
+    loadFails: boolean;
+    /** How many iframes the page has beyond its own main frame. */
+    extraFrames: number;
     /**
      * How many times anything asked the page for its title. `page.title()` is a CDP round trip
      * to the page's main thread, so on the stream path it is the number that matters.
@@ -233,7 +240,12 @@ const buildHarness = (): Harness => {
     text: 'Total 42.00',
     serverIp: '93.184.216.34',
     landsOn: null,
-    titleReads: 0
+    titleReads: 0,
+    // What the page-side scan answers: the window it collected, and how many visible interactive
+    // elements the frame actually had before the budget cut it.
+    scan: { elements: [RAW_ELEMENT], matched: 1 },
+    loadFails: false,
+    extraFrames: 0
   };
   const cdpSessions: FakeCdp[] = [];
   const hooks: Harness['hooks'] = { onAttachCdp: null };
@@ -297,10 +309,28 @@ const buildHarness = (): Harness => {
       },
       isClosed: () => closed,
       // The page is its own main frame, which is what `resolveBrowserTarget` and `#scanPage` walk.
-      frames: () => [page],
+      // `world.extraFrames` stands in for iframes: enough of them and the scan stops before the
+      // last ones, which is where consent and payment frames live.
+      frames: () => [
+        page,
+        ...Array.from({ length: world.extraFrames }, () => ({
+          url: () => 'https://93.184.216.34/consent',
+          evaluate: async () => ({ elements: [], matched: 0 })
+        }))
+      ],
       locator,
       getByText: (text: string) => locator(`text=${text}`),
-      evaluate: async () => [RAW_ELEMENT],
+      // Three different page functions come through here. The settle sleep is the one that takes
+      // a number, and it is traced because the wait protocol is what several cases are about; the
+      // element scan answers `world.scan`; the image scan is the remaining shape.
+      evaluate: async (_fn: unknown, argument?: unknown) => {
+        if (typeof argument === 'number') {
+          say(`settle ${argument}`);
+          return undefined;
+        }
+        if (argument && typeof argument === 'object' && 'query' in argument) return world.scan;
+        return [];
+      },
       viewportSize: () => ({ width: 1440, height: 900 }),
       goto: async (destination: string) => {
         url = destination;
@@ -323,7 +353,12 @@ const buildHarness = (): Harness => {
         tabs.delete(tabId);
       },
       waitForURL: async () => say('waitForURL'),
-      waitForLoadState: async (state: string) => say(`waitForLoadState ${state}`),
+      waitForLoadState: async (state: string) => {
+        say(`waitForLoadState ${state}`);
+        // A page still loading when the wait's ceiling arrives: Playwright rejects, and what the
+        // runner does with that rejection is the whole of item 2.
+        if (world.loadFails) throw new Error(`Timeout exceeded waiting for ${state}`);
+      },
       waitForEvent: async (event: string) => {
         say(`waitForEvent ${event}`);
         return { setFiles: async (files: string[]) => say(`chooser ${files.length}`) };
@@ -382,6 +417,7 @@ const buildHarness = (): Harness => {
     streamQueue: Promise.resolve(),
     walls: new BotWallLedger(),
     consoleMessages: [],
+    failedRequests: [],
     streamTitle: '',
     downloadsDirectory: path.join('workspace', 'downloads', '2026-01-01'),
     downloads,
@@ -537,9 +573,11 @@ const SURFACE: Array<{
     trace: ['tab-1 waitForURL']
   },
   {
+    // The doc's own protocol, and deliberately not `networkidle`: `load`, then a settle inside the
+    // page. The old fallback burned its whole 15,000 ms and threw on a long-polling page.
     name: 'wait_for (bare)',
     action: { type: 'wait_for' },
-    trace: ['tab-1 waitForLoadState networkidle']
+    trace: ['tab-1 waitForLoadState load', 'tab-1 settle 500']
   },
   { name: 'back', action: { type: 'back' }, trace: ['tab-1 goBack'] },
   { name: 'reload', action: { type: 'reload' }, trace: ['tab-1 reload'] },
@@ -599,6 +637,96 @@ describe('every browser action, performed', () => {
     expect(result).toMatchObject({ waited: 'text “Order placed” is visible', tabId: 'tab-1' });
   });
 
+  it('waits on the page without asking the network to go quiet, and does not throw when it does not settle', async () => {
+    /*
+     * The bare `wait_for` used to be `waitForLoadState('networkidle')`, which
+     * `docs/design/browser-automation.md` bans by name at :302 and :526. Measured against a real
+     * Chromium on a page holding one unanswered request: `networkidle` took 15,004 ms and threw,
+     * where `load` plus a 500 ms in-page settle took 504 ms on the same page.
+     */
+    const harness = buildHarness();
+    const settled = stepResult(await act(harness, { type: 'wait_for' }, 'agent'));
+    expect(settled.waited).toBe('page finished loading and settled');
+    expect(harness.trace).toEqual(['tab-1 waitForLoadState load', 'tab-1 settle 500']);
+
+    // And when the page never finishes: no throw, and a report that says which of the two things
+    // happened rather than claiming the page settled.
+    const stuck = buildHarness();
+    stuck.world.loadFails = true;
+    const late = stepResult(await act(stuck, { type: 'wait_for' }, 'agent'));
+    expect(late.waited).toMatch(/had not finished loading/);
+  });
+
+  it('lets the steps after a bare wait run, which a thrown wait used to take with it', async () => {
+    // A thrown step ends the batch, so one badly-advised wait cost fifteen seconds AND the rest of
+    // the form fill. This is the half of item 2 that is worth more than the fifteen seconds.
+    const harness = buildHarness();
+    harness.world.loadFails = true;
+    const result = batchResult(
+      await act(
+        harness,
+        {
+          type: 'batch',
+          actions: [
+            { type: 'wait_for' },
+            { type: 'type', selector: REF, text: 'Ada' },
+            { type: 'press', key: 'Tab' }
+          ]
+        },
+        'agent'
+      )
+    );
+    expect(result.completed).toBe(3);
+    expect(result.steps.map((step) => step.ok)).toEqual([true, true, true]);
+    expect(harness.trace).toEqual([
+      'tab-1 waitForLoadState load',
+      'tab-1 settle 500',
+      `tab-1 fill "Ada" ${REF}`,
+      'tab-1 keyboard.press Tab'
+    ]);
+  });
+
+  it('says how many controls the budget cut, rather than handing over a short list as a complete one', async () => {
+    // The elements that go are the ones at the END of the document, which is where consent,
+    // payment and submit frames live - so a truncated list read as complete is how the model
+    // concludes a control does not exist. `desktop_observe` has said this since it started
+    // selecting nodes; this is the same number on the browser surface.
+    const harness = buildHarness();
+    // A long main frame with a consent iframe after it: 306 controls, a budget of 250.
+    harness.world.scan = {
+      elements: Array.from({ length: 250 }, (_, index) => ({
+        ...RAW_ELEMENT,
+        ref: `oc-0-${index}`
+      })),
+      matched: 306
+    };
+    harness.world.extraFrames = 4;
+    const result = await harness.manager.readElements('workspace-1', WORKSPACE_ROOT, {}, 'agent');
+    expect(result.elements).toHaveLength(250);
+    expect(result.elementsOmitted).toBe(56);
+    // The budget ran out inside the main frame, so every iframe after it went unread - and it is
+    // the LAST frames that go, which is exactly where a consent or payment frame sits.
+    expect(result.framesOmitted).toBe(4);
+  });
+
+  it('counts the frames past the frame limit as well as the ones the budget never reached', () => {
+    // Two different ways a frame goes unread, and the model needs the same answer for both.
+    const cap = buildHarness();
+    cap.world.extraFrames = 14;
+    return cap.manager.readElements('workspace-1', WORKSPACE_ROOT, {}, 'agent').then((result) => {
+      // 15 frames, 12 scanned: SNAPSHOT_FRAME_LIMIT is the bound, and it is not silent.
+      expect(result.framesOmitted).toBe(3);
+      expect(result.elementsOmitted).toBe(0);
+    });
+  });
+
+  it('reports zero omitted when the whole page fitted, so the count means something when it is not zero', async () => {
+    const harness = buildHarness();
+    const result = await harness.manager.readElements('workspace-1', WORKSPACE_ROOT, {}, 'agent');
+    expect(result.elements).toHaveLength(1);
+    expect(result.elementsOmitted).toBe(0);
+  });
+
   it('reads a background tab in place, and answers with its elements rather than the active tab’s', async () => {
     const harness = buildHarness();
     const result = stepResult(await act(harness, { type: 'inspect_tab', tabId: 'tab-2' }, 'agent'));
@@ -612,6 +740,9 @@ describe('every browser action, performed', () => {
       })
     ]);
     expect(result.text).toBe('Total 42.00');
+    // A background tab's list is cut by the same budget, so it says the same thing about itself.
+    expect(result.elementsOmitted).toBe(0);
+    expect(result.framesOmitted).toBe(0);
     // Reading a tab must not activate it: nothing was brought to the front.
     expect(harness.trace).toEqual([]);
   });

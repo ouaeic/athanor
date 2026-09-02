@@ -424,8 +424,14 @@ describe('the size of the catalogue the model is sent', () => {
     // one place to put it, and the audit measured what happens there: a batch job that exited 0
     // read `state: "restarting", restarts: 2` six seconds later. Raising the background ceiling is
     // what removes the pressure; saying what a service does to a job that completes is what stops
-    // the wording from pointing at it. Measured at 55,673, up from 55,600, so the room this leaves
-    // is 27 bytes.
+    // the wording from pointing at it. Measured at 55,673 when that landed, up from 55,600.
+    //
+    // The catalogue is 55,668 as it stands: the `wait_for` clause in surface-actions.ts came down
+    // 5 bytes after the above was written. The assertion is `toBeLessThan`, so 55,699 is the last
+    // passing value and the room this leaves is 31 bytes - not the 32 the subtraction suggests,
+    // and not the 27 the sentence above computed for its own total by the same off-by-one.
+    // Re-derive rather than trust either number: `Buffer.byteLength(JSON.stringify([
+    // ...agentToolsFor(), COMPACT_CONTEXT_TOOL]))` is the whole of it.
     //
     // Both sentences were written twice, and the second version is 65 bytes shorter for the same
     // two facts. The first one passed every assertion in this file and still cost something:
@@ -1694,6 +1700,66 @@ describe('declared action shapes', () => {
       ).toBe(true);
   });
 
+  it('does not send the model at the wait the browser design bans by name', () => {
+    /*
+     * docs/design/browser-automation.md bans `waitForLoadState('networkidle')` from this codebase
+     * twice and gives the reason both times - ":302 ... deprecated and wrong on SPAs with
+     * long-polling/websockets", ":526 ... never fires on SPAs with websockets or long-polling".
+     * The clause pinned here used to say the opposite, in the tool the model reads before it acts:
+     * "with none of those three it waits for the network to go idle, WHICH IS WHAT A SINGLE-PAGE
+     * APPLICATION NEEDS AFTER NAVIGATE". A banned mechanism recommended, for the one page shape it
+     * is banned for. That is a description defect by this file's own rule, and it is worse than a
+     * stale one: it steers every model on every turn into the arm's worst branch.
+     *
+     * The two directions are scoped DIFFERENTLY, and the difference is the whole of what makes
+     * this hold. The POSITIVE checks are taken on the extracted clause, because scanning the guide
+     * is how those saturate - the guide is 1.3 kB describing twenty verbs, so a
+     * `toMatch(/selector/)` over it passes on `click`'s clause for ever after `wait_for` loses its
+     * own. `waitForClause` starting empty is checked first for the same reason: a renamed verb
+     * turns every positive assertion into a test of the empty string.
+     *
+     * The NEGATIVE check is taken on the WHOLE guide, and was moved there after it was measured
+     * failing to fire. Sentence-scoped, it is evaded by a full stop: restoring the banned advice as
+     * "...and timeoutMs. With none of those three it waits for the network to go idle, which is
+     * what a single-page application needs after navigate." leaves `find(startsWith('wait_for'))`
+     * holding only the fields half, and all 57 tests in this file passed with the ban's exact text
+     * on the wire. Widening a negative is strictly stronger and cannot saturate the way a widened
+     * positive does: absence everywhere is not satisfiable by another verb's clause. It costs
+     * nothing here because the shipped guide names the network zero times - re-derive with
+     * `verbGuide('browser_action').match(/network/gi)`, which is null - so any occurrence at all is
+     * the regression, wherever in the guide someone puts it.
+     *
+     * It does not pin the replacement WORDING, and that is deliberate rather than lazy. The runner
+     * default this describes is being changed in the same wave - `waitForLoadState('networkidle')`
+     * out, `waitForLoadState('load')` plus a settle in - and a test that froze a sentence naming a
+     * mechanism would have to be edited by whoever lands that, which is how a pin becomes a chore
+     * and then a deletion. What has to stay true whatever the default becomes is both halves
+     * below: the three conditions are named so the model can reach for one, and the fall-through
+     * is not sold as the answer. Both hold against `load` exactly as they hold against `networkidle`
+     * - an empty shell satisfies `load` too.
+     */
+    const waitForClause = verbGuide('browser_action')
+      .split(/(?<=\.)\s+/)
+      .find((sentence) => sentence.startsWith('wait_for'));
+    expect(
+      waitForClause,
+      'the browser action enum no longer describes wait_for at all'
+    ).toBeTruthy();
+    for (const condition of ['selector', 'text', 'urlIncludes'])
+      expect(
+        waitForClause,
+        `wait_for no longer names ${condition}, so the model cannot reach for a real condition`
+      ).toContain(condition);
+    // The whole of the ban, as a bound, and taken on the guide rather than the clause for the
+    // reason above: this description has no business naming the network at all. Quiescence is not
+    // a condition the model can reason about and it is not one this codebase is allowed to wait
+    // on, so the honest fall-through is described by what it is worth, not by what it watches.
+    expect(
+      verbGuide('browser_action'),
+      'the browser action guide is recommending network quiescence again - see docs/design/browser-automation.md:302 and :526'
+    ).not.toMatch(/network/i);
+  });
+
   it('names the desktop fields the description previously only alluded to', () => {
     expect(Object.keys(properties('desktop_action'))).toEqual(
       expect.arrayContaining([
@@ -1878,6 +1944,92 @@ describe('declared action shapes', () => {
         everyMinutes: 60
       })
     ).toEqual({ kind: 'daily', timeZone: 'Europe/London', localTime: '08:00' });
+  });
+});
+
+describe('the reach each publishing tool has, and the card the floor raises for it', () => {
+  /*
+   * THE TRIPWIRE FOR MERGING `publish_site` INTO `publish_preview`. Read this before you do it.
+   *
+   * The merge is worth doing and was costed this wave: publish_site is 645 wire bytes against
+   * publish_preview's 860, their required pair is identical (port, label), preview adds one
+   * optional path, they share a domain module and a runner action, and 188 bytes of the two
+   * descriptions go on telling the model which name to pick - 76 for "Use publish_site only when
+   * they asked for a deployment the public can reach." and 112 for "Deploy publicly only when the
+   * user asked for it; use publish_preview for the private link everything else wants." Roughly
+   * 450 bytes come back: 646 gross, measured by deleting the entry and re-running the byte
+   * assertion above, less about 200 for the reach enum and an honest description of what it does.
+   *
+   * WHAT STOPS IT BEING A FREE SAVING IS THIS FILE'S OWN HEADER RULE - a promise in a description
+   * the floor does not keep is a defect in the description - pointed the other way. The two tools
+   * differ in REACH, private tier against the public internet, and the approval floor cannot see
+   * reach: both branches key on the TOOL NAME, at approval-policy.ts:490 (publish_preview, taint
+   * path) and :1733 (publish_site, ordinary path). A third name-keyed row sits at :1911, inside the
+   * `asksBeforeEveryChange` arm that only `review` reaches, and it is what makes the review row in
+   * the table below workspace_write rather than NONE. It does not have to move with the other two:
+   * `strongestRequirement` takes the maximum, and external_consequential outranks workspace_write.
+   * Measured through `approvalRequirement` at
+   * 06b0493, which is what the table below asserts:
+   *
+   *   publish_site      review/balanced/autonomous  clean AND tainted -> external_consequential
+   *   publish_preview   review                      clean -> workspace_write
+   *   publish_preview   balanced/autonomous         clean -> NONE
+   *   publish_preview   any mode                    tainted -> external_reversible
+   *
+   * And measured for the merged shape, with the floor left as it is:
+   *
+   *   publish_preview {reach:'public'}   balanced (the default) and autonomous, clean -> NONE
+   *
+   * So a merge that moves the wire without moving the floor deploys to the public internet with NO
+   * approval card at all in the default security mode, silently, while apps/worker/src/context.ts
+   * still tells the model publishing publicly "always stops for the user's approval" and
+   * egress.ts:410 still says "`publish_site` raises its own card and this is not a way round it".
+   * A byte saving that blinds the floor is not a saving, so the merge is blocked on the floor
+   * moving FIRST: both branches read `args.reach` instead of `name`, external_consequential for
+   * public and external_reversible for private. The precedent is in the same file at :1742-1745,
+   * where browser_action collapsed a twenty-variant union onto a sibling field for about five
+   * kilobytes and every gate below kept reading the fields it always read.
+   *
+   * `declared` is asserted as an exact set, not a superset, so the merge cannot land quietly: the
+   * moment publish_site leaves the catalogue this test fails here and the reader arrives at this
+   * comment. Replace it then with the same table keyed on reach, and keep BOTH rows - a merge
+   * proved only for `public` downgrades nothing and a merge proved only for `private` is the
+   * defect above.
+   */
+  const declared = agentTools.map((tool) => tool.name).filter((name) => name.startsWith('publish'));
+
+  it('declares exactly the three publishing tools the floor has branches for', () => {
+    expect([...declared].sort()).toEqual(['publish_artifact', 'publish_preview', 'publish_site']);
+  });
+
+  it('stops for the owner every time something is put on the public internet', () => {
+    const args = { port: 8080, label: 'Demo' };
+    for (const mode of ['review', 'balanced', 'autonomous'] as const) {
+      expect(approvalRequirement('publish_site', args, mode, {})?.sideEffect, mode).toBe(
+        'external_consequential'
+      );
+      // Not merely "still carded": the tainted path used to REPLACE the ordinary card rather than
+      // sit above it, so a public deployment on the turn that had read a hostile page is exactly
+      // where a downgrade would hide.
+      expect(
+        approvalRequirement('publish_site', args, mode, { taintSources: ['a web page'] })
+          ?.sideEffect,
+        `${mode}, tainted`
+      ).toBe('external_consequential');
+    }
+  });
+
+  it('leaves the private tier free on a clean turn, which is what the merge must not lose', () => {
+    // The other direction, and the reason the merge cannot simply be done under the publish_site
+    // name to keep the floor honest: that would card every private preview in every mode. This
+    // file's own floor says a card that fires on everything is a card nobody reads.
+    const args = { port: 8080, label: 'Demo' };
+    expect(approvalRequirement('publish_preview', args, 'balanced', {})).toBeNull();
+    expect(approvalRequirement('publish_preview', args, 'autonomous', {})).toBeNull();
+    expect(
+      approvalRequirement('publish_preview', args, 'balanced', { taintSources: ['a web page'] })
+        ?.sideEffect
+    ).toBe('external_reversible');
   });
 });
 

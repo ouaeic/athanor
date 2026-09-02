@@ -1,6 +1,7 @@
+import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import { defaultNotificationSettings, type OwnerNotificationSettings } from './model.js';
-import { deliveryDecision, inQuietHours, MAX_HOLD_MS } from './policy.js';
+import { deliveryDecision, inQuietHours, MAX_HOLD_MS, pushLifetime } from './policy.js';
 
 const settings = (
   overrides: Partial<OwnerNotificationSettings> = {}
@@ -122,6 +123,22 @@ describe('deliveryDecision', () => {
         })
       ).toEqual({ action: 'drop', reason: 'stale' });
     }
+  });
+
+  it('still sends an item older than the horizon when nothing is holding it', () => {
+    // The horizon lives on the two hold arms and nowhere else, so age alone settles nothing. This
+    // is what `pushLifetime` says it does not cover: after downtime, or a device that spent a day
+    // in backoff, a candidate up to the fourteen-day window is sent rather than written off, and
+    // its TTL is added to an age the twelve hours never bounded.
+    expect(
+      deliveryDecision({
+        kind: 'approval_required',
+        settings: settings(),
+        ownerPresent: false,
+        eventAt: new Date(now.getTime() - 13 * 24 * 60 * 60 * 1000),
+        now
+      })
+    ).toEqual({ action: 'send' });
   });
 
   it('holds a foreground approval instead of writing it off, so it still arrives once they leave', () => {
@@ -248,5 +265,42 @@ describe('deliveryDecision', () => {
         now: night
       })
     ).toEqual({ action: 'drop', reason: 'kind_disabled' });
+  });
+});
+
+describe('pushLifetime', () => {
+  it('gives the four kinds that stop the work a life as long as the hold horizon', () => {
+    for (const kind of [
+      'approval_required',
+      'takeover_needed',
+      'spend_paused',
+      'agent_message'
+    ] as const)
+      expect(pushLifetime(kind).TTL).toBe(MAX_HOLD_MS / 1000);
+    // Twelve hours, said as a number as well as as an expression, so a change to MAX_HOLD_MS that
+    // is right for holding and wrong for the wire has to be argued for here rather than sliding
+    // through on an identity that is true whatever the constant becomes.
+    expect(pushLifetime('approval_required').TTL).toBe(43_200);
+  });
+
+  it('leaves a receipt at ten minutes, because it is the kind that stops being news', () => {
+    expect(pushLifetime('task_finished')).toEqual({ TTL: 600, urgency: 'normal' });
+  });
+
+  it('marks only an approval urgent, which is the one kind with the agent stopped behind it', () => {
+    expect(pushLifetime('approval_required').urgency).toBe('high');
+    expect(pushLifetime('takeover_needed').urgency).toBe('normal');
+  });
+
+  /**
+   * The lifetime is only worth anything if the send uses it, and `index.ts` is a process entry
+   * point - it opens a database and awaits a loop at the top level, so no test can import it. The
+   * source is read instead, which is what `log.test.ts` does for the same reason one directory
+   * over. The literal being asserted absent is the exact defect: `TTL: 600` on every send.
+   */
+  it('is what the service actually hands to web-push', async () => {
+    const source = await readFile(new URL('./index.ts', import.meta.url), 'utf8');
+    expect(source).toContain('pushLifetime(row.kind)');
+    expect(source).not.toMatch(/TTL:\s*600/);
   });
 });

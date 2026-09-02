@@ -4,12 +4,14 @@ import { acceptanceAlreadyObserved } from './acceptance.js';
 import { agentTools } from './tools.js';
 import type { AgentState } from './agent-state.js';
 import {
+  MAX_EVIDENCE_SOURCE_CHARS,
   MODEL_DECLARED_VERIFICATION_STATUSES,
   askOutcome,
   citableEvidence,
   completionVerification,
   evidenceFloor,
   harnessVerificationStatus,
+  normalisedSpan,
   observedCommands,
   parseDelegateReport,
   shellObservation,
@@ -793,7 +795,7 @@ describe('reading a specialist report against its contract', () => {
 
     expect(checked.report?.evidence).toHaveLength(1);
     expect(checked.errors).toEqual([
-      '1 of 2 evidence items were dropped: each needs "claim", "source" and "quotedSpan" as non-empty strings'
+      '1 of 2 evidence items were dropped: each needs "claim", "source" and "quotedSpan" as non-empty strings, with a "source" of at most 2048 characters'
     ]);
   });
 
@@ -984,5 +986,129 @@ describe('a status the harness writes and the model cannot', () => {
 
   it('never promotes: a claim the model did not make is not the harness’s to make', () => {
     expect(harnessVerificationStatus('not_applicable', [passing])).toBe('not_applicable');
+  });
+});
+
+/**
+ * The matcher behind the one sentence this harness says about a specialist's honesty.
+ *
+ * `normalisedSpan` decides whether a quoted span is really in the page, and a false negative on the
+ * only two citations checked fires "Nothing in this report stood up" - the strongest thing athanor
+ * says about a report. Collapse-and-lowercase failed five of six realistic variants of a span that
+ * was genuinely copied, because a page is typeset and a model retyping a span from it is not: the
+ * publisher's apostrophe is curly, the ligature is one character, the hyphen is soft, the dash is
+ * an en dash. Every one of those was athanor calling honest work fabricated.
+ *
+ * Written as a page and a span rather than as two normalised strings, because that is how the
+ * production caller uses it - `verifyDelegateEvidence` puts both sides through this and asks
+ * `.includes()`. A row that compared two normalised forms directly would pass on a matcher that
+ * never sees the same input the harness gives it.
+ */
+describe('a quoted span and the page it was copied from', () => {
+  const found = (page: string, span: string): boolean =>
+    normalisedSpan(page).includes(normalisedSpan(span));
+
+  const PAGE =
+    'Statement of accounts\n\nThe team’s ﬁrst quarter — the 2024–2025 review — closed\n' +
+    'with the “three tiers” of cover intact, and the quar­terly résumé was filed.';
+
+  /*
+   * The six the audit measured, as they were measured: the page as a publisher typeset it, and the
+   * span as a model hands it back. Five of these were reported as fabrications.
+   */
+  it.each([
+    ['a curly apostrophe straightened', 'The team’s first quarter', "the team's first quarter"],
+    [
+      'a curly double quote straightened',
+      'the “three tiers” of cover',
+      'the "three tiers" of cover'
+    ],
+    ['an fi ligature typed as two letters', 'the ﬁrst quarter', 'the first quarter'],
+    ['a soft hyphen dropped', 'the quar­terly return', 'the quarterly return'],
+    ['an en dash typed as a hyphen', 'the 2024–2025 review', 'the 2024-2025 review'],
+    ['a line break closed up', 'closed\nwith the three tiers', 'closed with the three tiers']
+  ])('finds a span the specialist really copied when %s', (_case, page, span) => {
+    expect(found(page, span)).toBe(true);
+  });
+
+  /** All six against the one page, which is the shape the production caller actually reads. */
+  it('finds every one of them in a whole page rather than in its own fragment', () => {
+    expect(found(PAGE, "the team's first quarter")).toBe(true);
+    expect(found(PAGE, 'the "three tiers" of cover')).toBe(true);
+    expect(found(PAGE, 'the 2024-2025 review')).toBe(true);
+    expect(found(PAGE, 'the quarterly resume')).toBe(false);
+  });
+
+  /*
+   * The other direction, which is the whole reason the fold is a list of families rather than a
+   * strip of everything that is not a letter. A matcher lenient enough to pass these is a matcher
+   * that cannot report a fabrication at all, and the mechanism would be worth nothing.
+   */
+  it('still refuses a span that is simply not in the source', () => {
+    expect(found(PAGE, 'the four tiers of cover')).toBe(false);
+    expect(found(PAGE, 'the board approved the merger')).toBe(false);
+  });
+
+  it('refuses a span whose digits differ, however it is punctuated', () => {
+    expect(found(PAGE, 'the 2024–2026 review')).toBe(false);
+    expect(found(PAGE, 'the 2024-2026 review')).toBe(false);
+  });
+
+  it('keeps diacritics, so a different word in another language is a different word', () => {
+    expect(found('the résumé was filed', 'the resume was filed')).toBe(false);
+    expect(found('Müller GmbH', 'Muller GmbH')).toBe(false);
+  });
+
+  it('folds punctuation rather than dropping it, so a spliced span does not match', () => {
+    expect(found('three tiers, and nothing else', 'three tiers and nothing else')).toBe(false);
+  });
+
+  it('collapses runs of space without removing the boundaries between words', () => {
+    expect(found('three   tiers', 'three tiers')).toBe(true);
+    expect(found('threetiers', 'three tiers')).toBe(false);
+  });
+
+  /** Pure, and symmetric: what it removes from the span it removes from the page as well. */
+  it('reads the same string the same way whichever side of the comparison it is on', () => {
+    const value = 'The team’s ﬁrst — quar­ter';
+    expect(normalisedSpan(value)).toBe(normalisedSpan(normalisedSpan(value)));
+    expect(found(value, value)).toBe(true);
+  });
+});
+
+/**
+ * The one string in a specialist's report that is an address, given a length.
+ *
+ * It is classified as a destination, handed to the runner, and copied into the `evidenceChecks` the
+ * lead reads - which are not cut by the report's own bound. Untrimmed, two citations could put a
+ * specialist's whole 8,192-token output into the lead's window through a field labelled "source".
+ */
+describe('how long a cited source may be', () => {
+  const reportWith = (source: string): string =>
+    JSON.stringify({
+      answer: 'Three tiers.',
+      evidence: [{ claim: 'tiers', source, quotedSpan: 'three tiers' }]
+    });
+
+  it('keeps a citation at the bound', () => {
+    const source = `https://example.test/${'a'.repeat(MAX_EVIDENCE_SOURCE_CHARS - 21)}`;
+    expect(source).toHaveLength(MAX_EVIDENCE_SOURCE_CHARS);
+    const checked = validateDelegateReport(reportWith(source));
+
+    expect(checked.report?.evidence).toHaveLength(1);
+    expect(checked.errors).toEqual([]);
+  });
+
+  it('drops one a character past it, and says why rather than losing it silently', () => {
+    const source = `https://example.test/${'a'.repeat(MAX_EVIDENCE_SOURCE_CHARS - 20)}`;
+    expect(source).toHaveLength(MAX_EVIDENCE_SOURCE_CHARS + 1);
+    const checked = validateDelegateReport(reportWith(source));
+
+    expect(checked.report?.evidence).toEqual([]);
+    expect(checked.errors[0]).toContain('1 of 1 evidence items were dropped');
+    expect(checked.errors[0]).toContain(`at most ${MAX_EVIDENCE_SOURCE_CHARS} characters`);
+    // And the report itself is still readable: an over-long source is a dropped item, not a
+    // correction pass.
+    expect(checked.report?.answer).toBe('Three tiers.');
   });
 });

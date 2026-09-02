@@ -307,6 +307,35 @@ export class NotificationStore {
           AND t.status='paused' AND t.spend_paused_at IS NOT NULL
           AND t.spend_paused_at>=ps.created_at
          UNION ALL
+         -- The approval nobody answered. cleanupExpired marks a lapsed approval 'expired', and the
+         -- API's approval sweep then releases its reserved credits and moves the task to 'paused' -
+         -- and that was where the owner's part of it ended. Every branch above requires something
+         -- this task is no longer: the approval is not pending, the task is not terminal, and
+         -- nothing set spend_paused_at. The agent stopped, asked, waited out its twenty-four hours
+         -- and gave up, and the owner found out by opening the conversation.
+         --
+         -- takeover_needed rather than a sixth kind, because that is already what "stopped, and
+         -- only a person starts it again" is called here: it has the owner's switch, its rank in
+         -- the ordering above and its place in the notifier's held-while-present set already.
+         --
+         -- Keyed on the approval id, so the ledger row that settled the approval_required push for
+         -- the same approval does not settle this one - two pieces of news about one row, and
+         -- the second is the one that says it is over. This does NOT collapse two strandings of
+         -- one conversation into a single notice: a task stranded, resumed, asked again and
+         -- stranded again carries two expired approvals and is reported twice, which is two true
+         -- things, and is not worth a per-row anti-join on a statement that runs every two seconds
+         -- per subscribed device. The candidate horizon is repeated inside the join rather than
+         -- left to the outer WHERE so the branch's own scan is bounded to a fortnight of expiries
+         -- whatever the planner decides to push down.
+         SELECT ps.id AS subscription_id, ps.user_id, ps.endpoint, ps.p256dh, ps.auth,
+           ps.created_at AS subscription_created_at, ps.updated_at AS subscription_updated_at,
+           'takeover_needed'::text AS kind, a.id AS resource_id, a.task_id,
+           t.status AS task_status, a.expires_at AS event_at, NULL::jsonb AS message_ciphertext
+         FROM push_subscriptions ps
+         JOIN approvals a ON a.user_id=ps.user_id AND a.status='expired'
+          AND a.expires_at>=ps.created_at AND a.expires_at>NOW()-$2::interval
+         JOIN tasks t ON t.id=a.task_id AND t.status='paused'
+         UNION ALL
          -- The two the agent raises: something it was asked to watch for, and a wall it cannot get
          -- past on its own. Both carry their own sentence, and both are already the agent's
          -- decision, so nothing here re-derives whether they are worth sending.

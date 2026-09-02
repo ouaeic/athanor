@@ -418,3 +418,66 @@ describe('documents this computer produces, measured', () => {
     }
   });
 });
+
+/**
+ * The one script in this pair an agent reaches by name.
+ *
+ * `athanor-document` is run by the worker at an absolute path it chose; `athanor-pdf-tables` is run
+ * by the model itself, out of the pdf-extraction skill, through `shell` - so it inherits the
+ * agent's own PATH, and the agent can write to directories on it. It resolved poppler with
+ * `shutil.which("pdftotext")` when /usr/bin/pdftotext was missing, which is precisely the
+ * search-path execution its sibling reader forbids in as many words. A workspace that dropped a
+ * file called `pdftotext` on that path had it run, on a page of the owner's own document.
+ */
+describe('the table reader an agent runs by name', () => {
+  let root: string;
+  let planted: string;
+
+  beforeAll(async () => {
+    root = await mkdtemp(path.join(tmpdir(), 'athanor-pdf-tables-'));
+    planted = path.join(root, 'was-run');
+    // What an agent would have written: something named like poppler, on a directory it controls.
+    const decoy = path.join(root, 'pdftotext');
+    // Written with a redirection rather than by calling `touch`: PATH is narrowed to this
+    // directory below, so a stub that shells out to a real command silently does nothing and the
+    // "it was never run" assertion passes whether it ran or not.
+    await writeFile(decoy, `#!/bin/sh\n: > ${JSON.stringify(planted)}\nexit 0\n`);
+    await chmod(decoy, 0o755);
+    await writeFile(path.join(root, 'doc.pdf'), '%PDF-1.7\n');
+  });
+  afterAll(async () => rm(root, { recursive: true, force: true }));
+
+  const run = (pdftotext: string) =>
+    runPython([script('athanor-pdf-tables'), '--path', 'doc.pdf', '--page', '1'], {
+      cwd: root,
+      // The override is pointed somewhere on purpose in both cases, so the result does not depend
+      // on whether the machine running this suite happens to have poppler in /usr/bin.
+      env: { ATHANOR_PDFTOTEXT: pdftotext, PATH: root }
+    });
+
+  it('says what to install rather than running whatever the search path offers', () => {
+    const result = run(path.join(root, 'absent-poppler'));
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('apt-get install -y poppler-utils');
+    // The whole point. A refusal that had quietly run the decoy first would pass every assertion
+    // above it and still be the defect.
+    expect(existsSync(planted)).toBe(false);
+  });
+
+  it('runs the binary the override names, so the refusal above is a decision and not a break', async () => {
+    // Without this the case above passes on a script that can no longer run poppler at all: a
+    // reader that refuses everything refuses the decoy too.
+    const marker = path.join(root, 'override-was-run');
+    const stub = path.join(root, 'stub-poppler');
+    await writeFile(
+      stub,
+      `#!/bin/sh\n: > ${JSON.stringify(marker)}\necho "stub poppler declined" >&2\nexit 3\n`
+    );
+    await chmod(stub, 0o755);
+    const result = run(stub);
+    expect(existsSync(marker)).toBe(true);
+    expect(result.stderr).toContain('stub poppler declined');
+    expect(result.stderr).not.toContain('apt-get install -y poppler-utils');
+    expect(existsSync(planted)).toBe(false);
+  });
+});

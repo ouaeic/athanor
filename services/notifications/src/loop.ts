@@ -67,7 +67,7 @@ export const createNotifier = (input: NotifierInput) => {
    * One pass, then the decision whether to wait.
    *
    * A sweep that could not attempt anything - every endpoint inside its backoff, or every item held
-   * because the owner is at the keyboard or asleep - has nothing to show for the four-branch UNION it
+   * because the owner is at the keyboard or asleep - has nothing to show for the candidate UNION it
    * just ran, so asking again immediately re-runs it as fast as the database will answer. Everything
    * else falls straight through to the next batch, which is what drains a backlog quickly.
    */

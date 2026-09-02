@@ -1538,6 +1538,13 @@ export const DesktopAction = z.discriminatedUnion('type', [
    * arrives a few pixels across and clicking it is a guess. This returns those pixels at their own
    * size instead of the whole screen shrunk, which is the largest single accuracy gain available on
    * this surface and costs one more screenshot.
+   *
+   * The maxima below are the coordinate box, not a promise about the answer: a rectangle asking
+   * for more pixels than a whole screenshot carries is reduced back into that box before it is
+   * sent (`stillCaptureArguments`), because a closer look larger than the picture it is a closer
+   * look at buys no detail and is resampled at the far end anyway. What nothing says is that it
+   * happened - a model that zooms the whole screen gets what it would have got from observing,
+   * and is not told the rectangle was too big to be a zoom.
    */
   z.object({
     type: z.literal('zoom'),

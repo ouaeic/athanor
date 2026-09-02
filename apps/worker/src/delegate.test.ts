@@ -78,13 +78,25 @@ interface Harness {
       schemaValid: boolean;
       schemaErrors?: string[];
       unverified?: string;
-      evidenceChecks?: Array<{ verified: boolean; detail: string }>;
+      evidenceChecks?: Array<{ verified: boolean; reread: boolean; detail: string }>;
+      citations?: { checked: number; cited: number };
       untrustedSources?: string[];
     }>;
   };
   /** Every message array the specialist's model was called with, in order. */
   readonly seen: string[][];
   readonly calls: number;
+  /**
+   * Every request that actually left for the runner, in order, with the addresses it carried.
+   *
+   * The citation re-read is a real outbound GET on an address the specialist wrote, so the only
+   * assertion that proves it was refused is that nothing went out - a check reported as unverified
+   * by a harness that fetched the page anyway is the hole still being open with better prose over
+   * it.
+   */
+  readonly reads: Array<{ path: string; urls: string[] }>;
+  /** The lead's own turn state, which is where a specialist's reach is charged. */
+  readonly state: AgentState;
 }
 
 const runMission = async (
@@ -125,10 +137,35 @@ const runMission = async (
     ],
     ...(options.taint ? { taint: options.taint } : {})
   } as unknown as AgentState;
-  const runner = {
+  const reads: Array<{ path: string; urls: string[] }> = [];
+  const answering = {
     call: async () => ({}),
     readFile: async () => '',
     ...options.runner
+  } as unknown as AgentRunnerClient;
+  const runner = {
+    ...answering,
+    call: async (
+      workspaceId: string,
+      id: string,
+      op: string,
+      path: string,
+      body: { urls?: unknown }
+    ) => {
+      reads.push({
+        path,
+        urls: Array.isArray(body?.urls) ? body.urls.map(String) : []
+      });
+      return (
+        answering.call as unknown as (
+          workspaceId: string,
+          id: string,
+          op: string,
+          path: string,
+          body: unknown
+        ) => Promise<unknown>
+      )(workspaceId, id, op, path, body);
+    }
   } as unknown as AgentRunnerClient;
   const context = {
     store: {
@@ -198,7 +235,7 @@ const runMission = async (
       ]
     }
   } as unknown as ModelToolCall)) as Harness['result'];
-  return { result, seen, calls };
+  return { result, seen, calls, reads, state };
 };
 
 /** A hidden instruction written in the Unicode Tags block, exactly as a page would carry it. */
@@ -619,5 +656,268 @@ describe("the owner's block inside a specialist's window", () => {
       leadMessages: leadWindow({ role: 'system', content: BLOCK })
     });
     expect(inHouse.seen[0]?.[0]).not.toContain('answered by the model provider');
+  });
+});
+
+/**
+ * The harness's own fetch, which is the one web reach in this worker that took no destination check.
+ *
+ * `verifyDelegateEvidence` re-reads a citation, and a citation's `source` is a string the specialist
+ * wrote. It went to the runner verbatim: no `classifyDestination`, no `chargeNovelty`, no card - a
+ * clean public-internet GET on an address chosen by a model that may have spent its whole mission
+ * reading a hostile page. The tool loop a hundred lines below has refused exactly this since the
+ * wave that closed it for a specialist's own reads, and this path went round it.
+ *
+ * The counter-direction is the half that decides whether the fix is worth having. The mechanism
+ * being defended IS the re-read, so a check that refuses an honest citation has not closed a hole -
+ * it has switched the mechanism off and reported "nothing in this report stood up" about work that
+ * was done properly. Every case here is paired with one that proves an honest citation still gets
+ * fetched.
+ */
+describe('where the harness will go to check a citation', () => {
+  const cite = (source: string, quotedSpan = 'three tiers'): string =>
+    JSON.stringify({
+      answer: 'The notes say three tiers.',
+      evidence: [{ claim: 'three tiers', source, quotedSpan }],
+      couldNotEstablish: []
+    });
+
+  /** A read that landed somewhere other than where it was aimed, which is what a redirect is. */
+  const readManyVia = (
+    landed: string,
+    requested: string,
+    body: string
+  ): Partial<AgentRunnerClient> =>
+    ({
+      call: async () => ({ sources: [{ url: landed, requestedUrl: requested, text: body }] })
+    }) as unknown as Partial<AgentRunnerClient>;
+
+  it('does not fetch an address the specialist named that this run has never been sent to', async () => {
+    const { result, reads, state } = await runMission(
+      [answer('', readCall), answer(cite('https://collector.test/?q=three-tiers'))],
+      { runner: readMany('The page says three tiers.') }
+    );
+
+    // The mission's own read went out and nothing else did. This is the assertion that separates
+    // "refused" from "fetched and then described as unverified".
+    expect(reads).toEqual([
+      {
+        path: '/v1/workspaces/22222222-2222-4222-8222-222222222222/browser/read-many',
+        urls: ['https://hostile.test/notes']
+      }
+    ]);
+    const check = result.reports[0]?.evidenceChecks?.[0];
+    expect(check?.verified).toBe(false);
+    expect(check?.reread).toBe(false);
+    expect(check?.detail).toContain('the harness did not fetch this source');
+    // In the classifier's own words, so the lead is told which of the two things happened.
+    expect(check?.detail).toContain('collector.test is not a host the user named');
+    expect(result.reports[0]?.citations).toEqual({ checked: 0, cited: 1 });
+    // And a refused check is not evidence that the span was missing.
+    expect(result.reports[0]?.unverified).toContain('could not open');
+    expect(result.reports[0]?.unverified).not.toContain('found the quoted span in none of them');
+    // A refusal is not a request, so the turn is not charged for one.
+    expect(state.turnNoveltyBytes).toBe(0);
+  });
+
+  it('re-reads an honest citation to an ordinary page, and charges the turn nothing for it', async () => {
+    const { result, reads, state } = await runMission(
+      [answer('', readCall), answer(cite('https://hostile.test/notes'))],
+      { runner: readMany('The page says three tiers.') }
+    );
+
+    expect(reads).toHaveLength(2);
+    expect(reads[1]?.urls).toEqual(['https://hostile.test/notes']);
+    expect(result.reports[0]?.evidenceChecks?.[0]?.verified).toBe(true);
+    expect(result.reports[0]?.evidenceChecks?.[0]?.reread).toBe(true);
+    expect(result.reports[0]?.unverified).toBeUndefined();
+    expect(result.reports[0]?.citations).toEqual({ checked: 1, cited: 1 });
+    // An address the turn was handed is an address the model did not compose, here as everywhere.
+    expect(state.turnNoveltyBytes).toBe(0);
+  });
+
+  /**
+   * The case the lead's own corpus cannot answer, and the reason the mission carries its own list.
+   *
+   * A specialist's reads never reach `#recordProvenance`, so where a read LANDED is known to this
+   * mission and to nothing else. Cite the page that answered - which is what a specialist quoting a
+   * redirected page does - and judged against the lead's corpus alone it is a host nobody named.
+   */
+  it('re-reads a citation to the page a read actually landed on, not only the one it aimed at', async () => {
+    const { result, reads, state } = await runMission(
+      [answer('', readCall), answer(cite('https://mirror.test/notes'))],
+      {
+        runner: readManyVia(
+          'https://mirror.test/notes',
+          'https://hostile.test/notes',
+          'The page says three tiers.'
+        )
+      }
+    );
+
+    expect(reads[1]?.urls).toEqual(['https://mirror.test/notes']);
+    expect(result.reports[0]?.evidenceChecks?.[0]?.verified).toBe(true);
+    expect(result.reports[0]?.unverified).toBeUndefined();
+    expect(state.turnNoveltyBytes).toBe(0);
+  });
+
+  /**
+   * And an address the mission composed rather than was handed is charged like any other reach.
+   *
+   * `hostile.test` is a host this run has been sent to, so a deeper path on it is not a refusal -
+   * it is the ordinary per-address charge, which is what keeps the citation field from being a
+   * bounded-per-request channel with no running total behind it.
+   */
+  it('charges the turn for a citation to an address on a known host that it was not handed', async () => {
+    const { result, reads, state } = await runMission(
+      [answer('', readCall), answer(cite('https://hostile.test/notes/tiers-and-what-they-cost'))],
+      { runner: readMany('The page says three tiers.') }
+    );
+
+    expect(reads).toHaveLength(2);
+    expect(result.reports[0]?.evidenceChecks?.[0]?.verified).toBe(true);
+    expect(state.turnNoveltyBytes).toBeGreaterThan(0);
+  });
+
+  /**
+   * An address the mission's own search returned, which the mission never opened itself.
+   *
+   * Credited for the same reason the lead credits one: the harness put that address in front of the
+   * model, so naming it again is not material the model chose. Worth its own row because it is the
+   * honest case that does NOT come from a page the specialist read - a citation the specialist took
+   * from a result list - and a credit built only out of `parallel_web_read` would refuse it.
+   */
+  it('re-reads a citation to an address the mission was handed by its own search', async () => {
+    const searchCall = [
+      { id: 'call-search-1', name: 'web_search', arguments: { query: 'tiers' } }
+    ] as unknown as ModelToolCall[];
+    const { result, reads } = await runMission(
+      [answer('', searchCall), answer(cite('https://searched.test/tiers'))],
+      {
+        runner: {
+          call: async (
+            _workspaceId: string,
+            _id: string,
+            _op: string,
+            path: string
+          ): Promise<unknown> =>
+            path.endsWith('/browser/search')
+              ? { results: [{ rank: 1, url: 'https://searched.test/tiers', title: 'Tiers' }] }
+              : { sources: [{ url: 'https://searched.test/tiers', text: 'It has three tiers.' }] }
+        } as unknown as Partial<AgentRunnerClient>
+      }
+    );
+
+    expect(reads[1]?.urls).toEqual(['https://searched.test/tiers']);
+    expect(result.reports[0]?.evidenceChecks?.[0]?.verified).toBe(true);
+    expect(result.reports[0]?.unverified).toBeUndefined();
+  });
+
+  /** A workspace path is not a web reach and is read exactly as it was before. */
+  it('leaves a citation to a workspace file alone', async () => {
+    const { result, reads } = await runMission([answer(cite('workspace/notes.md'))], {
+      runner: {
+        readFile: async () => 'the notes say three tiers'
+      } as unknown as Partial<AgentRunnerClient>
+    });
+
+    expect(reads).toEqual([]);
+    expect(result.reports[0]?.evidenceChecks?.[0]?.verified).toBe(true);
+    expect(result.reports[0]?.evidenceChecks?.[0]?.reread).toBe(true);
+  });
+});
+
+/**
+ * Two spot checks are two, whether the report cited two sources or eighty.
+ *
+ * The lead reads silence here as "the harness checked this report", because that is what silence
+ * has always meant - and a report whose first two citations happen to be real was reaching it
+ * silent. The denominator is the whole of the fix, and it is a tool result rather than a word on
+ * the wire, so it costs nothing resident.
+ */
+describe('how much of a report the two spot checks stand for', () => {
+  const eightCitations = JSON.stringify({
+    answer: 'The notes say three tiers.',
+    evidence: Array.from({ length: 8 }, (_, index) => ({
+      claim: `point ${index + 1}`,
+      source: 'workspace/notes.md',
+      quotedSpan: 'three tiers'
+    }))
+  });
+
+  it('says how many of the cited sources it re-read when it could not read them all', async () => {
+    const { result } = await runMission([answer(eightCitations)], {
+      runner: {
+        readFile: async () => 'the notes say three tiers'
+      } as unknown as Partial<AgentRunnerClient>
+    });
+
+    expect(result.reports[0]?.citations).toEqual({ checked: 2, cited: 8 });
+    expect(result.reports[0]?.evidenceChecks).toHaveLength(2);
+    expect(result.reports[0]?.unverified).toContain('re-read 2 of the 8 cited sources');
+    expect(result.reports[0]?.unverified).toContain('the other 6 were not re-read at all');
+  });
+
+  /**
+   * The arm read on the checks rather than on the spans, and a refusal turned it off.
+   *
+   * A check the harness refused to fetch is never `verified`, so `checks.every(verified)` was false
+   * the moment one citation named a host this run has not been sent to - and the report that had an
+   * exfil-shaped citation in it reached the lead quieter than the same report without one. The
+   * count that matters is the spans actually compared, which is what `reread` holds.
+   */
+  it('still says how little it checked when one of the two was refused', async () => {
+    const mixed = JSON.stringify({
+      answer: 'The notes say three tiers.',
+      evidence: [
+        { claim: 'a', source: 'https://collector.test/?q=three-tiers', quotedSpan: 'three tiers' },
+        { claim: 'b', source: 'https://hostile.test/notes', quotedSpan: 'three tiers' },
+        { claim: 'c', source: 'workspace/notes.md', quotedSpan: 'three tiers' }
+      ]
+    });
+    const { result } = await runMission([answer('', readCall), answer(mixed)], {
+      runner: readMany('The page says three tiers.')
+    });
+
+    expect(result.reports[0]?.citations).toEqual({ checked: 1, cited: 3 });
+    expect(result.reports[0]?.unverified).toContain('re-read 1 of the 3 cited sources');
+    // The refused one is counted among the sources nothing was compared for, which is where it
+    // belongs - and `evidenceChecks` says which it was.
+    expect(result.reports[0]?.unverified).toContain('the other 2 were not re-read at all');
+  });
+
+  /** One left over is one, in the words a reader uses for one. */
+  it('counts the one it did not re-read in the singular', async () => {
+    const two = JSON.stringify({
+      answer: 'The notes say three tiers.',
+      evidence: [
+        { claim: 'a', source: 'https://collector.test/?q=three-tiers', quotedSpan: 'three tiers' },
+        { claim: 'b', source: 'https://hostile.test/notes', quotedSpan: 'three tiers' }
+      ]
+    });
+    const { result } = await runMission([answer('', readCall), answer(two)], {
+      runner: readMany('The page says three tiers.')
+    });
+
+    expect(result.reports[0]?.citations).toEqual({ checked: 1, cited: 2 });
+    expect(result.reports[0]?.unverified).toContain('the other 1 was not re-read at all');
+  });
+
+  it('stays quiet when the two it re-read are the whole of what was cited', async () => {
+    const twoCitations = JSON.stringify({
+      answer: 'The notes say three tiers.',
+      evidence: [
+        { claim: 'one', source: 'workspace/notes.md', quotedSpan: 'three tiers' },
+        { claim: 'two', source: 'workspace/notes.md', quotedSpan: 'three tiers' }
+      ]
+    });
+    const { result } = await runMission([answer(twoCitations)], {
+      runner: {
+        readFile: async () => 'the notes say three tiers'
+      } as unknown as Partial<AgentRunnerClient>
+    });
+
+    expect(result.reports[0]?.citations).toEqual({ checked: 2, cited: 2 });
+    expect(result.reports[0]?.unverified).toBeUndefined();
   });
 });

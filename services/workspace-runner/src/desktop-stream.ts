@@ -630,6 +630,9 @@ export interface StillCaptureRequest {
    * pixels at full size is the cheapest accuracy there is on this surface - it is the same
    * screenshot path with two more ffmpeg arguments, and the measured gain on small targets is the
    * largest single improvement available here.
+   *
+   * "At full size" holds only while the region fits `image`; a region larger than that is reduced
+   * into it, for the reason written below.
    */
   region?: { x: number; y: number; width: number; height: number };
 }
@@ -658,7 +661,27 @@ export const stillCaptureArguments = (request: StillCaptureRequest): string[] =>
     const height = Math.max(16, Math.min(request.region.height, request.geometry.height));
     const x = Math.max(0, Math.min(request.region.x, request.geometry.width - width));
     const y = Math.max(0, Math.min(request.region.y, request.geometry.height - height));
-    args.push('-vf', `crop=${width}:${height}:${x}:${y}`);
+    /*
+     * And bounded at the far end too, which the clamp above did not do and the comment above was
+     * read as doing. `scale=` sat in the `else` below and therefore never ran for a region, so a
+     * zoom of the whole of a 2560x1600 display came back at 4.1 megapixels - three times the
+     * 1440x900 box the full screenshot of that same display is reduced into, and a "closer look"
+     * that is larger than the picture it was supposed to be a closer look at.
+     *
+     * Nothing was bought with those pixels. `CONVERTED_IMAGE_MAX_SIDE` in `images.ts` writes the
+     * same rule down for every other picture this runner sends a model: past about 1568 on the
+     * long side an image is resampled to about that size at the far end regardless, so the only
+     * question the extra pixels settle is which machine pays to carry them.
+     *
+     * A region that already fits is cropped and never scaled, which is the entire point of a zoom:
+     * this bound only ever fires on a rectangle asking for more than a whole screenshot's worth.
+     */
+    const bound = agentImageGeometry({ width, height }, request.image);
+    const crop = `crop=${width}:${height}:${x}:${y}`;
+    args.push(
+      '-vf',
+      bound.scale < 1 ? `${crop},scale=${bound.width}:${bound.height}:flags=lanczos` : crop
+    );
   } else if (
     request.image.width !== request.geometry.width ||
     request.image.height !== request.geometry.height

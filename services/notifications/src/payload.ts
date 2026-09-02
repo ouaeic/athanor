@@ -80,9 +80,16 @@ export const notificationPayload = (subject: NotificationSubject): PushPayload =
     return {
       kind: 'takeover_needed',
       title,
-      body:
-        subject.message?.trim() ||
-        'Stopped at a check only you can clear. Open the Computer and take control.',
+      // Two things arrive under this kind and they are not the same news. The agent raising it has
+      // hit a check on the Computer and written its own sentence. The harness raising it means the
+      // approval this conversation was parked on ran out unanswered and the sweep paused the
+      // task - there is nothing to take control of, the card is gone, and telling the owner to
+      // open the Computer would send them to the wrong place for the one notice they get about a
+      // conversation that has already given up.
+      body: subject.approvalExpired
+        ? `Gave up waiting: nobody answered its request to ${approvalPhrase(subject.approvalAction, subject.approvalSideEffect)}. It is paused - open it to ask again.`
+        : subject.message?.trim() ||
+          'Stopped at a check only you can clear. Open the Computer and take control.',
       url,
       tag: `takeover-${subject.resourceId}`,
       // Nothing but a person can clear this, and nothing raises it a second time: the agent carries

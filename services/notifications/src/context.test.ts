@@ -22,6 +22,7 @@ const store = (parts: Record<string, unknown>): DataStore =>
     effectiveSpendLimits: async () => ({ timeZone: 'UTC' }),
     listSessions: async () => [],
     listApprovals: async () => [],
+    getApproval: async () => null,
     getTask: async () => null,
     notificationSettings: async () => null,
     ...parts
@@ -226,5 +227,68 @@ describe('notificationSubject', () => {
     // The task was last written when the run started; the notification is what happened at 11:45,
     // and the staleness horizon has to be measured from that rather than from the task row.
     expect(eventAt.toISOString()).toBe('2026-07-31T11:45:00.000Z');
+  });
+  it('reads the approval row to tell an expired approval from an agent takeover', async () => {
+    const { subject } = await notificationSubject(
+      store({
+        getTask: async () => task({ status: 'paused' }),
+        getApproval: async () => ({
+          id: 'approval-9',
+          userId: 'owner',
+          taskId: 'task-1',
+          action: 'connector_action',
+          status: 'expired',
+          previewHash: 'hash',
+          expiresAt: '2026-07-31T11:00:00.000Z'
+        })
+      }),
+      row({
+        kind: 'takeover_needed',
+        resourceId: 'approval-9',
+        taskStatus: 'paused',
+        eventAt: '2026-07-31T11:00:00.000Z'
+      })
+    );
+    expect(subject.approvalExpired).toBe(true);
+    expect(subject.approvalAction).toBe('connector_action');
+    // A decision to go and make, not a bill. Money beside it reads as the thing being reported.
+    expect(subject.spentUsd).toBeNull();
+    expect(subject.capUsd).toBeNull();
+    expect(subject.durationMs).toBeNull();
+  });
+
+  it('leaves an agent-raised takeover alone: no approval row answers to its resource id', async () => {
+    const { subject } = await notificationSubject(
+      store({ getTask: async () => task({ status: 'running' }) }),
+      row({ kind: 'takeover_needed', resourceId: 'notification-4', taskStatus: null })
+    );
+    expect(subject.approvalExpired).toBe(false);
+    expect(subject.approvalAction).toBeNull();
+  });
+
+  it('does not claim an approval expired when the row belongs to somebody else', async () => {
+    const { subject } = await notificationSubject(
+      store({
+        getTask: async () => task({ status: 'paused' }),
+        getApproval: async () => ({ id: 'approval-9', userId: 'stranger', status: 'expired' })
+      }),
+      row({ kind: 'takeover_needed', resourceId: 'approval-9' })
+    );
+    expect(subject.approvalExpired).toBe(false);
+  });
+
+  it('fails soft when the approval cannot be read at all', async () => {
+    const { subject } = await notificationSubject(
+      store({
+        getTask: async () => task({ status: 'paused' }),
+        getApproval: async () => {
+          throw new Error('database unavailable');
+        }
+      }),
+      row({ kind: 'takeover_needed', resourceId: 'approval-9' })
+    );
+    // The general sentence, which is wrong for this row - and a notification that arrives saying
+    // roughly the right thing beats one this service threw away because a read failed.
+    expect(subject.approvalExpired).toBe(false);
   });
 });

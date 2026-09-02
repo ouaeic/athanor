@@ -25,6 +25,7 @@ import {
   downloadFileName,
   foldScannedElements,
   needsScriptedRender,
+  recordFailedRequest,
   researchResourceAllowed,
   sessionTabs,
   refFrameOrdinal,
@@ -292,8 +293,11 @@ describe('browser snapshot shape', () => {
           url: 'https://cdn.invalid/i'
         }
       ],
+      elementsOmitted: 0,
+      framesOmitted: 0,
       pendingDialog: null,
       consoleMessages: [],
+      failedRequests: [],
       images: [],
       screenshotBase64: '',
       text
@@ -318,6 +322,36 @@ describe('browser snapshot shape', () => {
 
   it('bounds the page text so it cannot swallow the budget on its own', () => {
     expect(snapshot('x'.repeat(500_000)).text).toHaveLength(BROWSER_SNAPSHOT_TEXT_LIMIT);
+  });
+
+  it('carries the truncation counts and the failed requests through to the payload', () => {
+    /*
+     * `composeBrowserSnapshot` names every key it emits, so a field added to the type and not to
+     * this function is computed and never shipped - which is the shape that has cost this
+     * programme five times. The counts and the failure list are only worth anything if the model
+     * sees them, so this is the assertion that they leave the runner at all.
+     */
+    const composed = composeBrowserSnapshot({
+      ...snapshot('short'),
+      elementsOmitted: 55,
+      framesOmitted: 14,
+      failedRequests: [
+        { method: 'POST', status: 403, url: 'https://shop.example.invalid/checkout', at: 'now' }
+      ]
+    });
+    expect(composed.elementsOmitted).toBe(55);
+    expect(composed.framesOmitted).toBe(14);
+    expect(composed.failedRequests).toEqual([
+      { method: 'POST', status: 403, url: 'https://shop.example.invalid/checkout', at: 'now' }
+    ]);
+    const delivered = truncateMiddle(
+      JSON.stringify(composeBrowserSnapshot({ ...composed, text: 'page words '.repeat(20_000) })),
+      24_000
+    );
+    // And that a wordy page cannot push them out: they sit with the actionable fields, ahead of
+    // the page text, for the same reason the elements do.
+    expect(delivered).toContain('"elementsOmitted":55');
+    expect(delivered).toContain('"status":403');
   });
 
   it('keeps saved downloads where a truncated result still shows them', () => {
@@ -551,7 +585,107 @@ const rawElement = (overrides: Partial<RawScannedElement> = {}): RawScannedEleme
   description: '',
   options: null,
   labelFor: null,
+  closedShadowRoot: false,
   ...overrides
+});
+
+describe('failed requests', () => {
+  const ring = () => ({
+    failedRequests: [] as Array<{ method: string; status: number; url: string; at: string }>
+  });
+  /** `at` is left out on purpose: what is asserted is which failures survived, and in what order. */
+  const entry = (status: number, method: string, url: string) => ({ status, method, url });
+
+  it('keeps what failed, most recent last, and forgets the oldest past the bound', () => {
+    const session = ring();
+    for (let index = 0; index < 20; index += 1)
+      recordFailedRequest(session, 'GET', 404, `https://shop.invalid/a/${index}`);
+    expect(session.failedRequests).toHaveLength(15);
+    expect(session.failedRequests[0]?.url).toBe('https://shop.invalid/a/5');
+    expect(session.failedRequests[14]?.url).toBe('https://shop.invalid/a/19');
+  });
+
+  it('collapses a repeat instead of letting it bury the one failure that is the answer', () => {
+    // A page whose API is down repeats the same failure on a timer. Fifteen copies of one line
+    // would push out the 403 on the submit, which is the entry the agent is actually looking for.
+    const session = ring();
+    recordFailedRequest(session, 'POST', 403, 'https://shop.invalid/checkout');
+    for (let index = 0; index < 30; index += 1)
+      recordFailedRequest(session, 'GET', 500, 'https://shop.invalid/api/poll');
+    expect(session.failedRequests).toEqual([
+      expect.objectContaining(entry(403, 'POST', 'https://shop.invalid/checkout')),
+      expect.objectContaining(entry(500, 'GET', 'https://shop.invalid/api/poll'))
+    ]);
+  });
+
+  it('sheds ordinary cross-origin noise rather than the failure the agent needs', () => {
+    /*
+     * Collapsing only defends the shape where the noise is one URL repeated. The ordinary shape on
+     * a real page is noise at DISTINCT urls: an analytics beacon, an ad pixel and a CDN hop each
+     * carry a cache-buster, so each one takes its own slot and none of them collapses. Measured
+     * against a real Chromium on a page that fired twenty such cross-origin requests after one 403
+     * on a form submit, the plain oldest-first bound had evicted the 403 before the snapshot was
+     * taken - the one entry the whole list exists to carry.
+     */
+    const session = ring();
+    recordFailedRequest(session, 'POST', 403, 'https://shop.invalid/checkout');
+    for (let index = 0; index < 20; index += 1) {
+      recordFailedRequest(session, 'GET', 302, `https://cdn.invalid/px?i=${index}`);
+      recordFailedRequest(session, 'GET', 0, `https://ads.invalid/b?i=${index}`);
+    }
+    expect(session.failedRequests).toHaveLength(15);
+    expect(session.failedRequests[0]).toMatchObject(
+      entry(403, 'POST', 'https://shop.invalid/checkout')
+    );
+    // And the soft entries that survived are the most recent ones, so the list still describes the
+    // page as it is now rather than as it was forty requests ago.
+    expect(session.failedRequests.at(-1)).toMatchObject(
+      entry(0, 'GET', 'https://ads.invalid/b?i=19')
+    );
+  });
+
+  it('does not admit a soft entry into a list already full of real refusals', () => {
+    // The same rule from the other end, pinned because it is the surprising half: fifteen 4xx/5xx
+    // are fifteen things the site refused, and a 302 that merely crossed an origin is not worth
+    // one of them. Nothing is silently dropped that a hard failure would not have displaced too.
+    const session = ring();
+    for (let index = 0; index < 15; index += 1)
+      recordFailedRequest(session, 'POST', 403, `https://shop.invalid/step/${index}`);
+    recordFailedRequest(session, 'GET', 302, 'https://accounts.invalid/login');
+    expect(session.failedRequests).toHaveLength(15);
+    expect(session.failedRequests.every((seen) => seen.status === 403)).toBe(true);
+    // A hard failure still displaces the oldest hard one: the bound has not stopped trimming.
+    recordFailedRequest(session, 'GET', 500, 'https://shop.invalid/final');
+    expect(session.failedRequests).toHaveLength(15);
+    expect(session.failedRequests[0]?.url).toBe('https://shop.invalid/step/1');
+    expect(session.failedRequests.at(-1)?.url).toBe('https://shop.invalid/final');
+  });
+
+  it('trims a URL to what identifies the call, not to what could re-issue it', () => {
+    const session = ring();
+    recordFailedRequest(session, 'GET', 404, `https://shop.invalid/x?token=${'a'.repeat(4_000)}`);
+    expect(session.failedRequests[0]?.url).toHaveLength(200);
+  });
+});
+
+describe('a control the page will not let anything read', () => {
+  it('reports a closed shadow root as a thing that is there and cannot be listed', () => {
+    // The scan pierces OPEN roots, so those need no marking. A closed one is genuinely unreadable,
+    // and the honest report is that something is there rather than nothing.
+    const described = describeScannedElement(
+      rawElement({
+        ref: 'oc-0-4',
+        tag: 'ds-payment',
+        valueBearing: true,
+        value: 'should not be reported',
+        closedShadowRoot: true
+      })
+    );
+    expect(described.name).toBe('ds-payment');
+    expect(described.description).toMatch(/closed shadow root/);
+    // Nothing was read out of it, so nothing about its contents is claimed - a value in particular.
+    expect(described.value).toBeUndefined();
+  });
 });
 
 describe('form field legibility', () => {
@@ -674,9 +808,13 @@ describe('form field legibility', () => {
       ],
       250
     );
-    expect(folded.map((element) => element.ref)).toEqual(['oc-0-1', 'oc-0-2']);
-    expect(folded[0]?.name).toBe('Email');
-    expect(folded[1]?.name).toBe('I agree');
+    expect(folded.kept.map((element) => element.ref)).toEqual(['oc-0-1', 'oc-0-2']);
+    expect(folded.kept[0]?.name).toBe('Email');
+    expect(folded.kept[1]?.name).toBe('I agree');
+    // One label folded onto its control, which is represented rather than missing: the caller
+    // subtracts this from the omitted count so a page of labelled inputs does not report itself
+    // as half absent.
+    expect(folded.folded).toBe(1);
   });
 
   it('honours the element budget after folding, not before it', () => {
@@ -685,7 +823,10 @@ describe('form field legibility', () => {
       rawElement({ ref: 'oc-0-1' }),
       rawElement({ ref: 'oc-0-2' })
     ];
-    expect(foldScannedElements(raw, 2).map((element) => element.ref)).toEqual(['oc-0-1', 'oc-0-2']);
+    expect(foldScannedElements(raw, 2).kept.map((element) => element.ref)).toEqual([
+      'oc-0-1',
+      'oc-0-2'
+    ]);
   });
 });
 

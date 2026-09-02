@@ -95,6 +95,7 @@ export const notificationSubject = async (
     approvalAction: null,
     approvalSideEffect: null,
     message: row.message,
+    approvalExpired: false,
     spentUsd: task?.spentUsd ?? null,
     capUsd: task?.maxSpendUsd ?? null,
     // Wall-clock from the first message to the last change. There is no separate finished-at on
@@ -133,6 +134,36 @@ export const notificationSubject = async (
       subject.spentUsd = null;
       subject.capUsd = null;
     }
+    subject.durationMs = null;
+  }
+
+  if (row.kind === 'takeover_needed') {
+    /*
+     * Which of the two takeovers this is, asked of the row rather than guessed from the shape of
+     * the other fields.
+     *
+     * The data layer raises `takeover_needed` from two places: the agent, whose row carries its
+     * own sentence, and the candidate branch for an approval that expired unanswered, whose
+     * `resourceId` is an approval id. Nothing else on the row separates them - a box with no
+     * DATA_MASTER_KEY has a null message for both - so the approval is looked up and its status
+     * read. One primary-key probe, on the rarest kind there is: a takeover means the work has
+     * stopped for a person, so there is at most a handful of these in a batch of a hundred.
+     *
+     * Verified rather than inferred, deliberately. The sentence below claims the approval ran out,
+     * and this is the row that says whether it did.
+     */
+    const approval = await store.getApproval(row.resourceId).catch(() => null);
+    subject.approvalExpired =
+      optionalText(approval?.status) === 'expired' && optionalText(approval?.userId) === row.userId;
+    // The tool name, so the sentence can say what went unanswered rather than only that something
+    // did. `getApproval` selects no side-effect column, so that half stays null and
+    // `approvalPhrase` falls back to its own general wording - which is the honest answer, not a
+    // gap: the class of side effect is on the card the owner is being sent to.
+    if (subject.approvalExpired) subject.approvalAction = optionalText(approval?.action);
+    // Same reason as the approval branch below: this is a decision the owner has to go and make,
+    // and a dollar figure beside it reads as though the money is the thing being reported.
+    subject.spentUsd = null;
+    subject.capUsd = null;
     subject.durationMs = null;
   }
 

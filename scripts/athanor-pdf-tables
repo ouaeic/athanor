@@ -17,7 +17,7 @@ import argparse
 import csv
 import io
 import json
-import shutil
+import os
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -52,15 +52,26 @@ def safe_target(raw: str) -> Path:
 
 
 def pdftotext() -> str:
-    if Path(PDFTOTEXT).is_file():
-        return PDFTOTEXT
-    found = shutil.which("pdftotext")
-    if not found:
-        raise ValueError(
-            "poppler-utils is not installed, so PDF word positions cannot be read. "
-            "Install it with: apt-get install -y poppler-utils"
-        )
-    return found
+    """Poppler, named absolutely, exactly as athanor-document names it.
+
+    This fell back to shutil.which("pdftotext"), which is the search-path execution the sibling
+    reader forbids in as many words in its own installed() helper - and this script is the one an agent
+    reaches by name through shell, with the agent's own writable PATH. A workspace that dropped a
+    file called pdftotext somewhere on that path had this script run it, on a page of the owner's
+    own document, for as long as poppler was missing from /usr/bin.
+
+    The override is the same variable name athanor-document uses for the same binary, so a
+    developer whose machine keeps poppler elsewhere sets one thing and both readers find it, and
+    the executable bit is checked rather than the file bit: a path that exists and cannot be run
+    is not an installation.
+    """
+    candidate = os.environ.get("ATHANOR_PDFTOTEXT") or PDFTOTEXT
+    if os.access(candidate, os.X_OK):
+        return candidate
+    raise ValueError(
+        "poppler-utils is not installed, so PDF word positions cannot be read. "
+        "Install it with: apt-get install -y poppler-utils"
+    )
 
 
 def page_words(target: Path, page: int) -> tuple[list[Word], float, float]:

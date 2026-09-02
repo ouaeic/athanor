@@ -140,13 +140,24 @@ export class ConnectorStore {
   /**
    * Whether one conversation is stopped on an approval.
    *
-   * The send path asks this before it moves a waiting task back into the queue, and answered it by
-   * reading every pending approval the owner has and scanning them in JavaScript - one indexed
-   * question, asked as a table read, on the hot path of every follow-up message.
+   * NOTHING IN PRODUCTION CALLS THIS. It was written to replace the read on the send path, which
+   * still asks the same question the old way: `apps/api/src/routes/tasks.ts` reads every pending
+   * approval the owner has and scans them in JavaScript before moving a waiting task back into the
+   * queue - one indexed question, asked as a table read, on the hot path of every follow-up
+   * message. This method was never forwarded on `DataStore`, so the route could not have reached
+   * it even had it tried, and its only callers are in `store.test.ts`, which holds a
+   * `ConnectorStore` directly. The comment here used to say the send path asked this, in the
+   * present tense; it never did.
    *
-   * Deliberately blind to `expires_at`, which is what the read it replaces was: an approval past
-   * its deadline that `cleanupExpired` has not swept yet is still `pending`, and it is still what
-   * the conversation is waiting for. `resolveApproval` is the one that owes the deadline an answer.
+   * Wiring it is three lines and is in the handoff: a forward beside `listApprovals` in
+   * `store.ts`, and `await store.hasPendingApproval(user.id, task.id)` in place of the
+   * `listApprovals(...).some(...)` in the unpark condition. Until that lands this is dead, and
+   * saying so is the point - a method that looks alive is worse than one that admits it is not.
+   *
+   * Deliberately blind to `expires_at`, which is what the read it would replace is: an approval
+   * past its deadline that `cleanupExpired` has not swept yet is still `pending`, and it is still
+   * what the conversation is waiting for. `resolveApproval` is the one that owes the deadline an
+   * answer.
    */
   async hasPendingApproval(userId: string, taskId: string): Promise<boolean> {
     const result = await this.database.query(
