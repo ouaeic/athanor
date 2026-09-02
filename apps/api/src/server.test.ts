@@ -8483,6 +8483,67 @@ describe('control-plane gates', () => {
     );
   });
 
+  /*
+   * The wider door beside it. `PATCH /v1/workspaces/:workspaceId/security-mode` sets the DEFAULT
+   * every future task on the workspace inherits, so one call relaxes work that does not exist yet -
+   * and it had no case in the scope table at all, falling through to `workspaces:write`, the scope
+   * a token needs to create a workspace. The per-task route was refused while this one was not,
+   * which is the shape of a fix applied to the instance and not the class.
+   */
+  test('refuses an automation token that asks to stop every future run asking', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-token-ws-mode-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+    const { cookie, workspaceId } = await seedOwnerWithTask(
+      app,
+      'token-ws-mode',
+      'File the overnight mail'
+    );
+    const token = (
+      await app.inject({
+        method: 'POST',
+        url: '/v1/api-tokens',
+        headers: { cookie },
+        payload: {
+          label: 'Filing bot',
+          scopes: ['workspaces:read', 'workspaces:write'],
+          expiresInDays: 7
+        }
+      })
+    ).json<{ token: string }>().token;
+
+    const relaxed = await app.inject({
+      method: 'PATCH',
+      url: `/v1/workspaces/${workspaceId}/security-mode`,
+      headers: { authorization: `Bearer ${token}`, 'idempotency-key': 'token-ws-mode-relax' },
+      payload: { securityMode: 'autonomous' }
+    });
+
+    expect(relaxed.statusCode, relaxed.body).toBe(403);
+    expect(relaxed.json<{ error: { code: string } }>().error.code).toBe('api_token_scope_required');
+
+    // The positive controls: the same token still reads workspaces, and the owner at their own
+    // keyboard still sets the default, which is the case the route was written for.
+    const read = await app.inject({
+      method: 'GET',
+      url: '/v1/workspaces',
+      headers: { authorization: `Bearer ${token}` }
+    });
+    expect(read.statusCode, read.body).toBe(200);
+
+    const byTheOwner = await app.inject({
+      method: 'PATCH',
+      url: `/v1/workspaces/${workspaceId}/security-mode`,
+      headers: { cookie },
+      payload: { securityMode: 'autonomous' }
+    });
+    expect(byTheOwner.json<{ error?: { code: string } }>().error?.code).not.toBe(
+      'api_token_scope_required'
+    );
+  });
+
   /**
    * The recheck route is documented as answering 200 whether or not the account replied, so its
    * failure never passes the error handler - which is the only other place a message built from an

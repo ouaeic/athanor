@@ -180,6 +180,18 @@ const requiredApiTokenScope = (method: string, route: string): ApiTokenScope | u
   if (route.startsWith('/v1/connectors')) return writing ? undefined : 'connectors:read';
   if (route.startsWith('/v1/previews')) return 'workspaces:write';
   if (route.startsWith('/v1/workspaces')) {
+    /*
+     * The sibling of the task route above, and the worse of the two: this one sets the DEFAULT that
+     * every future task on the workspace inherits, so a single call relaxes work that has not been
+     * created yet. It had no case here at all and fell through to `workspaces:write` - the scope a
+     * token needs to make a workspace in the first place - while the per-task route beside it was
+     * being refused. Closing one and not the other left the wider door open.
+     *
+     * Reading stays available for the same reason it does there: a client that may not change how
+     * much a run asks still has every reason to know what it will ask.
+     */
+    if (route === '/v1/workspaces/:workspaceId/security-mode')
+      return writing ? undefined : 'workspaces:read';
     if (route.includes('/file')) return writing ? 'files:write' : 'files:read';
     if (route.includes('/browser') || route.includes('/desktop') || route.includes('/terminal'))
       return 'workspaces:write';
