@@ -1678,10 +1678,21 @@ describe('the contract as a function of the box it is on', () => {
       'image_read',
       'Document toolchain',
       'no video generation here at all',
-      '0.0.0.0',
+      '127.0.0.1',
       'anti-bot challenge'
     ])
       expect(BASE_SYSTEM_PROMPT).toContain(fact);
+    /*
+     * The bind address, pinned in BOTH directions, because this assertion held the wrong value for
+     * as long as it existed and passed the whole time.
+     *
+     * The contract used to say an app "binds to 0.0.0.0", and this row asserted that string - so the
+     * test agreed with the prompt and both were wrong. `publish_preview` proxies to 127.0.0.1 and
+     * nothing else (services/workspace-runner/src/preview.ts), and 0.0.0.0 is every interface this
+     * box has, which on a self-hosted install includes a public one. A turn took that instruction
+     * and served a workspace directory to the internet after the owner had declined to publish it.
+     */
+    expect(BASE_SYSTEM_PROMPT).not.toContain('0.0.0.0');
     // The contract sent every document proof to a bare `libreoffice --headless --convert-to pdf`,
     // which exits 0 on a conversion that wrote nothing, while the runner probes for, the release
     // drill asserts, and every vetted procedure names the wrapper above.
