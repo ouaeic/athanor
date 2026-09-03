@@ -641,6 +641,38 @@ describe('desktop session lifecycle', () => {
         ).rejects.toThrow('cannot be started as desktop programs');
     });
   }, 20_000);
+
+  /*
+   * A PROGRAM THAT IS NOT THERE MUST NOT TAKE THE RUNNER WITH IT.
+   *
+   * Measured on the box. A turn asked the desktop for `gedit`, which is not installed, and the
+   * workspace runner died - not the call, the whole service - on Node's own
+   * `throw er; // Unhandled 'error' event` under `Error: spawn gedit ENOENT`. `Restart=always`
+   * brought it back, the turn asked again, and every other task on the machine lost its runner
+   * three times over for a missing text editor. `NRestarts=5`.
+   *
+   * `ChildProcess` is an EventEmitter and an EventEmitter with no `error` listener rethrows the
+   * event as an uncaught exception. Every other spawn in this service is followed synchronously by
+   * `awaitChildExit`, whose `once(child, 'exit')` attaches one; this path launches a detached
+   * window and never awaits it, which is exactly why it was the one without.
+   *
+   * This test would not have failed before the fix - it would have KILLED THE TEST PROCESS, which
+   * is the same thing happening to the runner and is the point.
+   */
+  it('reports a program that is not installed instead of dying with it', async () => {
+    await withSession(async (manager, root) => {
+      await expect(
+        manager.launch('workspace', root, {
+          executable: '/usr/bin/athanor-no-such-desktop-program',
+          args: [],
+          cwd: 'workspace',
+          env: {}
+        })
+      ).rejects.toThrow('is not installed on this computer');
+      // Still serving afterwards, which is the half that matters: the runner survived.
+      expect((await manager.snapshot('workspace', root, 'agent')).available).toBe(true);
+    });
+  }, 20_000);
 });
 
 /**

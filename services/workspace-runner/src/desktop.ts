@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { captureSpawnFailure, spawnFailureMessage } from './spawn-guard.js';
 import { once } from 'node:events';
 import { existsSync } from 'node:fs';
 import { readFile, rm } from 'node:fs/promises';
@@ -864,6 +865,10 @@ export class DesktopManager {
       stdio: ['ignore', 'ignore', 'pipe'],
       shell: false
     });
+    // Same reason as the launch path below, and reachable by the same call: this spawn is followed
+    // by an await, so a session script that is missing or not executable would emit its error with
+    // nobody listening and take the runner down before the loop could report anything.
+    const sessionFailure = captureSpawnFailure(process);
     let complaint = '';
     process.stderr?.setEncoding('utf8');
     process.stderr?.on('data', (chunk: string) => {
@@ -871,6 +876,13 @@ export class DesktopManager {
     });
     let serialized = '';
     for (let attempt = 0; attempt < 80; attempt += 1) {
+      const failedToSpawn = sessionFailure();
+      // Checked before `exitCode`, because a spawn that never happened has no exit code at all and
+      // would otherwise spin out the whole eight seconds before reporting the wrong sentence.
+      if (failedToSpawn)
+        throw new Error(
+          `GUI desktop session failed to start: ${spawnFailureMessage(this.sessionExecutable!, failedToSpawn)}`
+        );
       if (process.exitCode !== null)
         throw new Error(
           `GUI desktop session failed to start${complaint.trim() ? `: ${complaint.trim().split('\n').slice(-3).join(' ')}` : ''}`
@@ -1351,8 +1363,14 @@ export class DesktopManager {
       detached: true,
       shell: false
     });
+    // Attached BEFORE the first await, because the error arrives on the next tick and an error
+    // event nobody is listening for takes the whole runner down. This is the exact call that did:
+    // `gedit` is not installed here, and asking for it killed the service five times over.
+    const spawnFailure = captureSpawnFailure(child);
     if (child.pid) session.applicationGroups.add(child.pid);
     await new Promise((resolve) => setTimeout(resolve, 350));
+    const failed = spawnFailure();
+    if (failed) throw new Error(spawnFailureMessage(request.executable, failed));
     if (child.exitCode !== null && child.exitCode !== 0)
       throw new Error(`${path.basename(request.executable)} failed to launch`);
     return { pid: child.pid, executable: request.executable, args: request.args };
