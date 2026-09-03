@@ -437,7 +437,7 @@ export const OVERVIEW_RANKED_PER_FILE = 8;
  * described above, as mean references per measurable row over four splits:
  *
  *   proportional, as shipped                                          1.84
- *   aider: pagerank over the file graph, rank split across out-edges   2.14
+ *   pagerank over the file graph, rank split across out-edges          2.14
  *   distinct importers per (resolved declaring file, name)             2.25
  *   occurrences of the name in import clauses, no graph at all         3.25
  *
@@ -445,8 +445,8 @@ export const OVERVIEW_RANKED_PER_FILE = 8;
  * shipped ripgrep arguments actually produce, scores 3.18 against the proportional 1.76.
  *
  * So the graph is declined. Not because PageRank is wrong but because it measured worse than
- * counting, twice: it also loses to counting on the whole corpus, and adding aider's own
- * distinctiveness filter to it does not close the gap (2.14 -> 2.08). What the graph costs to
+ * counting, twice: it also loses to counting on the whole corpus, and adding a distinctiveness
+ * filter over the graph does not close the gap (2.14 -> 2.08). What the graph costs to
  * resolve is what it loses by: an import of `@athanor/core` or of a barrel that re-exports is an
  * edge no path arithmetic here resolves, and those are exactly the imports the most-used symbols
  * arrive through. Counting keeps them. A damping factor and forty iterations of a numeric fixed

@@ -811,7 +811,7 @@ export const agentTools: ModelTool[] = [
   {
     name: 'coding_agent',
     description:
-      'Use an official subscription coding CLI installed on this computer. status checks installation and sign-in, setup installs the official CLI from its publisher, and run hands one bounded repository task to Codex, Claude Code, or OpenCode. Credentials stay in that CLI profile and are never returned to athanor. Check status first, and hand over only when the user has signed one of them in and the job is a large self-contained code change: use file_patch, shell and code_diagnostics yourself for ordinary editing, which is faster. It cannot see this conversation, so the prompt has to stand alone. A zero-retention task refuses run outright.',
+      'Use an official subscription coding CLI installed on this computer. status checks installation and sign-in, setup installs the official CLI from its publisher, and run hands one bounded repository task to Codex, Claude Code, or OpenCode. Credentials stay in that CLI profile and are never returned to athanor. Check status first, and hand over only when the user has signed one of them in and the job is a large self-contained code change: use file_patch, shell and code_diagnostics yourself for ordinary editing. It cannot see this conversation, so the prompt has to stand alone. A zero-retention task refuses run outright.',
     parameters: {
       type: 'object',
       additionalProperties: false,
