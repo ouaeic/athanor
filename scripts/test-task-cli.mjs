@@ -578,6 +578,114 @@ check('a prompt can arrive on standard input', () => {
   assert.equal(post.body.prompt, 'a prompt long enough to be worth a file');
 });
 
+/*
+ * The other kind of stop.
+ *
+ * `awaiting_user` is two situations wearing one status - a card to decide, and a question the agent
+ * asked - and only the first had a verb or a field. A headless run that was asked anything parked
+ * for ever: `approvals` answered with an empty list, the outcome carried an empty
+ * `pendingApprovals`, and docs/HEADLESS.md said that list "holds the questions", which it does not.
+ */
+const questionEvent = (question, why, options) => ({
+  sequence: 7,
+  kind: 'question_asked',
+  summary: question,
+  payload: { question, why, ...(options ? { options } : {}) }
+});
+
+const questioned = await drive(
+  {
+    ...runRoutes(
+      [[200, taskRecord({ status: 'awaiting_user' })]],
+      [questionEvent('Which database should I point it at?', 'Two are configured', ['dev', 'prod'])]
+    ),
+    'GET /v1/approvals': [200, []]
+  },
+  started
+);
+check('a task parked on a question reports what it asked', () => {
+  assert.equal(questioned.code, 3);
+  assert.equal(questioned.outcome.pendingApprovals.length, 0);
+  assert.equal(questioned.outcome.question.question, 'Which database should I point it at?');
+  assert.equal(questioned.outcome.question.why, 'Two are configured');
+  assert.deepEqual(questioned.outcome.question.options, ['dev', 'prod']);
+});
+
+/*
+ * Precedence, and the reason it is not both at once: a card is the thing in front of the owner, and
+ * a question asked earlier in the same conversation has already been left behind by it.
+ */
+const cardOverQuestion = await drive(
+  {
+    ...runRoutes(
+      [[200, taskRecord({ status: 'awaiting_user' })]],
+      [questionEvent('An older question', 'asked earlier')]
+    ),
+    'GET /v1/approvals': [
+      200,
+      [{ id: 'ap-9', taskId: 'task-1111', action: 'shell', preview: { action: 'shell' } }]
+    ]
+  },
+  started
+);
+check('a pending card takes precedence over a question already asked', () => {
+  assert.equal(cardOverQuestion.outcome.pendingApprovals.length, 1);
+  assert.equal(cardOverQuestion.outcome.question, null);
+});
+
+check('a task that stopped for a card still reports no question', () =>
+  assert.equal(asked.outcome.question, null)
+);
+
+const answered = await drive(
+  { 'POST /v1/tasks/task-1111/messages': [200, taskRecord({ status: 'running' })] },
+  ['answer', 'task-1111', '--text', 'Use the dev one']
+);
+check('answer sends the reply as the next message on the conversation', () => {
+  assert.equal(answered.code, 0);
+  const post = answered.seen.find((r) => r.method === 'POST');
+  assert.equal(post.path, '/v1/tasks/task-1111/messages');
+  assert.equal(post.body.prompt, 'Use the dev one');
+  assert.equal(answered.outcome.contract, 'athanor.task.answer/1');
+});
+
+/*
+ * The words are the key when the caller gives none, so a curl retried after a timeout cannot become
+ * a second message in the conversation. Saying the same thing twice on purpose takes --key.
+ */
+const againSameWords = await drive(
+  { 'POST /v1/tasks/task-1111/messages': [200, taskRecord({ status: 'running' })] },
+  ['answer', 'task-1111', '--text', 'Use the dev one']
+);
+const differentWords = await drive(
+  { 'POST /v1/tasks/task-1111/messages': [200, taskRecord({ status: 'running' })] },
+  ['answer', 'task-1111', '--text', 'Use the prod one']
+);
+const keyOf = (result) => result.seen.find((r) => r.method === 'POST')?.idempotencyKey ?? null;
+check('the same answer twice carries the same idempotency key', () => {
+  assert.notEqual(keyOf(answered), null);
+  assert.equal(keyOf(againSameWords), keyOf(answered));
+  assert.notEqual(keyOf(differentWords), keyOf(answered));
+});
+
+const answeredFromFile = await drive(
+  { 'POST /v1/tasks/task-1111/messages': [200, taskRecord({ status: 'running' })] },
+  ['answer', 'task-1111', '--text-file', '-'],
+  { stdin: 'the answer, read from standard input' }
+);
+check('answer reads the words from a file or standard input', () =>
+  assert.equal(
+    answeredFromFile.seen.find((r) => r.method === 'POST').body.prompt,
+    'the answer, read from standard input'
+  )
+);
+
+const emptyAnswer = await drive({}, ['answer', 'task-1111']);
+check('answer refuses to send nothing, and sends nothing', () => {
+  assert.equal(emptyAnswer.code, 1);
+  assert.equal(emptyAnswer.seen.filter((r) => r.method === 'POST').length, 0);
+});
+
 rmSync(emptyConfig, { recursive: true, force: true });
 
 if (failures.length) {

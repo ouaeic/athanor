@@ -3719,6 +3719,8 @@ task_emit() {
       ($task[0] // {}) as $t
       | (($trail[0].events // [])) as $events
       | ($events | map(select(.kind == "completed")) | last) as $done
+      | (($pending[0] // []) | map({ id, taskId, action, preview })) as $approvals
+      | ($events | map(select(.kind == "question_asked")) | last) as $asked
       | (if ($outcome == "failed" or $outcome == "blocked")
          then (($events
                 | map(select(((.kind == "error") or (.kind == "warning"))
@@ -3748,7 +3750,12 @@ task_emit() {
           outstanding: ($done.payload.outstanding // []),
           reason: ($bad.summary // null),
           reasonCode: ($bad.payload.code // null),
-          pendingApprovals: (($pending[0] // []) | map({ id, taskId, action, preview })),
+          pendingApprovals: $approvals,
+          question: (if ($approvals | length) > 0 or $asked == null then null else {
+              question: ($asked.payload.question // $asked.summary // null),
+              why: ($asked.payload.why // null),
+              options: ($asked.payload.options // [])
+            } end),
           lastEventSequence: ($events | last | .sequence)
         }
     '
@@ -4012,9 +4019,67 @@ task_decide() {
   exit "$task_exit_ok"
 }
 
+# Answering the other kind of stop.
+#
+# `awaiting_user` is two situations wearing one status: a card the owner has to decide, and a
+# question the agent stopped to ask. Only the first had a verb, so a headless run that was asked
+# anything parked for ever - `approvals` returned an empty list, `wait` returned the same empty
+# list, and there was no command anywhere that could reply. The answer is an ordinary next message
+# on the conversation, which is exactly what the agent is told to expect, so this is `run`'s own
+# payload with only the words in it.
+task_answer() {
+  [ "$#" -ge 1 ] || fail "athanor task answer needs a task id"
+  task_answer_id="$1"
+  shift
+  task_answer_text=''
+  task_answer_file=''
+  task_key=''
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --text)
+        [ "$#" -ge 2 ] || fail "athanor task answer --text needs the words to send"
+        task_answer_text="$2"
+        shift 2
+        ;;
+      --text-file)
+        [ "$#" -ge 2 ] || fail "athanor task answer --text-file needs a path, or - for standard input"
+        task_answer_file="$2"
+        shift 2
+        ;;
+      --key)
+        [ "$#" -ge 2 ] || fail "athanor task answer --key needs an idempotency key"
+        task_key="$2"
+        shift 2
+        ;;
+      *) fail "athanor task answer: unknown option: $1" ;;
+    esac
+  done
+  if [ -n "$task_answer_file" ]; then
+    if [ "$task_answer_file" = "-" ]; then
+      task_answer_text=$(cat)
+    else
+      [ -r "$task_answer_file" ] || fail "cannot read $task_answer_file"
+      task_answer_text=$(cat "$task_answer_file")
+    fi
+  fi
+  [ -n "$task_answer_text" ] ||
+    fail "athanor task answer needs --text TEXT or --text-file PATH"
+  jq -n --arg prompt "$task_answer_text" '{ prompt: $prompt }' >"$task_payload"
+  # Without a key of the caller's own, the words are the key: sending the same answer twice is the
+  # same act, and a retried curl after a timeout must not become a second message in the
+  # conversation. A caller that means to say the same thing twice passes --key.
+  [ -n "$task_key" ] ||
+    task_key="athanor-answer-$task_answer_id-$(printf '%s' "$task_answer_text" | cksum | tr -d ' ')"
+  task_call POST "/v1/tasks/$task_answer_id/messages" "$task_key"
+  task_expect "answering the question" "tasks:write"
+  jq -n --arg taskId "$task_answer_id" \
+    '{ contract: "athanor.task.answer/1", taskId: $taskId, sent: true }'
+  exit "$task_exit_ok"
+}
+
 task_usage() {
   printf '%s\n' \
-    'Usage: athanor task {run|wait|show|cancel|approvals|approve|deny}' \
+    'Usage: athanor task {run|wait|show|cancel|approvals|approve|deny|answer}' \
     '' \
     '  run --workspace ID (--prompt TEXT | --prompt-file PATH)' \
     '      [--model ID] [--privacy-route ROUTE] [--credits N] [--spend-usd N]' \
@@ -4025,6 +4090,7 @@ task_usage() {
     '  approvals [TASK_ID]' \
     '  approve APPROVAL_ID' \
     '  deny APPROVAL_ID' \
+    '  answer TASK_ID (--text TEXT | --text-file PATH) [--key IDEMPOTENCY-KEY]' \
     '' \
     'The outcome is JSON on standard output. The exit code is 0 completed, 2 failed,' \
     '3 stopped to ask, 4 the wait ran out, 5 cancelled, 6 stopped and needing a resume,' \
@@ -4139,7 +4205,7 @@ task_command() {
   task_action="${1:-}"
   if [ "$#" -gt 0 ]; then shift; fi
   case "$task_action" in
-    run | wait | show | cancel | approvals | approve | deny) task_setup ;;
+    run | wait | show | cancel | approvals | approve | deny | answer) task_setup ;;
     help | '')
       task_usage
       exit 0
@@ -4158,6 +4224,7 @@ task_command() {
     approvals) task_approvals "$@" ;;
     approve) task_decide approve "$@" ;;
     deny) task_decide deny "$@" ;;
+    answer) task_answer "$@" ;;
   esac
 }
 

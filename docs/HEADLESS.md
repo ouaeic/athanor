@@ -74,11 +74,19 @@ sudo athanor task cancel TASK_ID
 sudo athanor task approvals [TASK_ID]
 sudo athanor task approve APPROVAL_ID
 sudo athanor task deny APPROVAL_ID
+sudo athanor task answer TASK_ID (--text TEXT | --text-file PATH)
 ```
 
 `run` also takes `--model ID`, `--privacy-route ROUTE`, `--credits N`, `--spend-usd N`,
 `--timeout SECONDS` and `--key IDEMPOTENCY-KEY`. `--prompt-file -` reads the prompt from standard
 input.
+
+`answer` is the reply to a question the agent stopped to ask, and it is a different act from
+approving a card. `awaiting_user` covers both: when a card is waiting, `pendingApprovals` holds it
+and `question` is null; when the agent asked something, `pendingApprovals` is empty and `question`
+carries what was asked, why, and any options offered. A card in front of the owner takes precedence
+over a question already asked. `answer` keys itself on the words when you pass no `--key`, so a
+retried call cannot become a second message in the conversation.
 
 `--key` is the one worth understanding. Every write on this API needs an `Idempotency-Key`, and
 `run` generates a fresh one per invocation - so re-running the same command starts a **second**
@@ -150,7 +158,7 @@ on the answer could not tell those apart.
 | 0    | `completed`         | The task finished.                                                 |
 | 1    | -                   | The command could not do its job: no token, bad option, no answer. |
 | 2    | `failed`            | The task failed. `reason` and `reasonCode` say what happened.      |
-| 3    | `awaiting_approval` | The task stopped to ask. `pendingApprovals` holds the questions.   |
+| 3    | `awaiting_approval` | The task stopped to ask: see `pendingApprovals`, or `question`.     |
 | 4    | `timed_out`         | The wait ran out. The task is still running and still spending.    |
 | 5    | `cancelled`         | The task was cancelled.                                            |
 | 6    | `blocked`           | Stopped and needing a resume: `paused` or `awaiting_resource`.     |
@@ -205,6 +213,12 @@ while [ "$(jq -r .outcome outcome.json)" = awaiting_approval ]; do
   for id in $(jq -r '.pendingApprovals[].id' outcome.json); do
     athanor task approve "$id"
   done
+  # The other kind of stop. A card is decided; a question is answered, and a loop that only
+  # decides cards spins here for ever against an empty list.
+  if [ "$(jq -r '.question.question // empty' outcome.json)" != "" ]; then
+    jq -r .question.question outcome.json >&2
+    athanor task answer "$task" --text "use your judgement and say what you assumed"
+  fi
   athanor task wait "$task" >outcome.json
 done
 exit "$(jq -r .exitCode outcome.json)"
