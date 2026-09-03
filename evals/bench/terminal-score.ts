@@ -154,7 +154,12 @@ export const runTerminalBench = async (options: TerminalBenchOptions): Promise<n
     // (arm, run-index) pairs, which is what the records directory is for.
     const scored = await scoreTerminalBenchTask(
       task,
-      { sudo: options.sudo, lifetimeSeconds: (task.maxAgentTimeoutSeconds ?? 900) + 600 },
+      {
+        sudo: options.sudo,
+        lifetimeSeconds: (task.maxAgentTimeoutSeconds ?? 900) + 600,
+        // The (arm, run-index) pair IS this process's identity on the box; see `DockerOptions.label`.
+        label: `${arm}-r${String(options.runIndex)}`
+      },
       live,
       arm
     );

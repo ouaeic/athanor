@@ -36,7 +36,25 @@ export interface DockerOptions {
   readonly sudo: boolean;
   /** Seconds the container is kept alive. The task's own agent ceiling, plus room for the verifier. */
   readonly lifetimeSeconds: number;
+  /**
+   * What tells this process's container apart from another process's container for the SAME task.
+   *
+   * Several processes run disjoint (arm, run-index) pairs over one task set on one box, and they
+   * all start at the same first task. A container named after the task alone is then one name for
+   * four containers: the second `docker run` fails on the name, and worse, the `rm -f` each process
+   * issues before it starts and after it finishes removes whichever container currently holds that
+   * name - another process's, mid-turn. Required rather than defaulted, so a caller cannot forget to
+   * say who it is.
+   */
+  readonly label: string;
 }
+
+/**
+ * The container name for one task under one process, and a pure function so it can be held to its
+ * two properties without a daemon: two labels never share a name, and the name is one Docker accepts.
+ */
+export const containerNameFor = (taskId: string, label: string): string =>
+  `tb-run-${taskId}-${label}`.replace(/[^A-Za-z0-9_.-]/g, '-').slice(0, 60);
 
 const docker = async (
   sudo: boolean,
@@ -70,7 +88,7 @@ export const scoreTerminalBenchTask = async (
   /** The arm this task runs under; `scoreTask` derives the mode and the approver from it. */
   arm: Arm = 'shipped'
 ): Promise<ScoredTask> => {
-  const container = `tb-run-${task.id}`.replace(/[^A-Za-z0-9_.-]/g, '-').slice(0, 60);
+  const container = containerNameFor(task.id, options.label);
   const image = `tb/${task.id}`;
   await removeQuietly(options.sudo, container);
   await docker(options.sudo, [
