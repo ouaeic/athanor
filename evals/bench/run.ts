@@ -27,6 +27,7 @@ import { COLUMNS, renderCsv } from './parity.js';
 import { coverageOf, IMPLEMENTED_ROUTES, type RouteObservation } from './routes.js';
 import { runScore } from './score.js';
 import { selfTest } from './selftest.js';
+import { runTerminalBench } from './terminal-score.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const routesPath = path.join(here, 'routes.json');
@@ -186,6 +187,42 @@ if (flag('routes')) {
  * mints its task `balanced`. An arm this driver cannot run under is refused here rather than
  * printed into a row, which is the same discipline `rowFrom` applies.
  */
+/*
+ * The paid command. A real model, real containers, a borrowed task set - and the only path in this
+ * directory that can spend money, which is why it is refused unless every one of its bounds is
+ * named on the command line rather than defaulted to something generous.
+ */
+if (flag('terminal-bench')) {
+  const root = argument('root');
+  const model = argument('model');
+  const maxSpendUsd = Number(argument('max-spend-usd') ?? Number.NaN);
+  const maxCallsPerTask = Number(argument('max-calls') ?? Number.NaN);
+  if (!root || !model || !Number.isFinite(maxSpendUsd) || !Number.isFinite(maxCallsPerTask)) {
+    process.stderr.write(
+      'usage: --terminal-bench --root DIR --model ID --max-spend-usd N --max-calls N [--tasks a,b,c] [--sudo] [--arm shipped]\n' +
+        '  every bound is required. A benchmark run that spends until something else stops it is\n' +
+        '  not a measurement, and a default here would be this rig choosing how much of the\n' +
+        "  owner's money to spend.\n"
+    );
+    process.exit(2);
+  }
+  process.exit(
+    await runTerminalBench({
+      root,
+      model,
+      maxSpendUsd,
+      maxCallsPerTask,
+      ids: argument('tasks')
+        ?.split(',')
+        .map((id) => id.trim())
+        .filter(Boolean),
+      sudo: flag('sudo'),
+      arm: argument('arm') ?? 'shipped',
+      out
+    })
+  );
+}
+
 if (flag('score')) {
   const arm = argument('arm') ?? 'shipped';
   if (arm !== 'shipped') {

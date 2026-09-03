@@ -27,7 +27,7 @@ import { writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { runFixture, runIdentity } from '../harness.js';
+import { runFixture, runIdentity, type LiveProvider } from '../harness.js';
 
 import { localBackend, type ExecResult, type WorkspaceBackend } from './backend.js';
 import { benchmarkBoxCatalogueBytes, BYTES_PER_TOKEN } from './catalogue.js';
@@ -55,6 +55,16 @@ export const LOCAL_DROPS: readonly string[] = [
 export interface ScoredTask {
   readonly task: WireTask;
   readonly result: TaskResult;
+  /**
+   * The box this task actually ran in, carried up so the row cannot misname it.
+   *
+   * `rowFrom` hardcoded `backend: 'local'`, which was true for as long as `scoreTask` could only
+   * open a local one. The first real Terminal-Bench run then wrote a row saying `local` while every
+   * task had run in its own container - a false claim in the one artefact whose whole value is that
+   * its claims can be checked. It is read off the backend rather than passed in beside it, because
+   * a caller that could assert it could assert it wrongly.
+   */
+  readonly ranIn: { readonly name: string; readonly isolatesNetwork: boolean };
   /** What the box said when the verifier ran, for a reader asking why a task scored 0. */
   readonly verifierExit: number | null;
   readonly verifierStderr: string;
@@ -106,6 +116,30 @@ export interface ScoreOptions {
    */
   readonly trustLocal: boolean;
   readonly onTask?: (scored: ScoredTask) => void;
+  /**
+   * How one task is put in a box and driven, or nothing for this rig's own local one.
+   *
+   * A borrowed task set brings its own box - `terminal-run.ts` starts a container per task from
+   * the image the benchmark built - and the row assembly below must not be copied to accommodate
+   * it. Two copies of `RowInput` would be two places for the refusals, the digests and the
+   * catalogue figure to drift, in the one file whose whole purpose is that a row cannot flatter
+   * the thing that produced it.
+   */
+  readonly runTask?: (task: WireTask) => Promise<ScoredTask>;
+  /**
+   * Who actually answered, for the columns that name the run.
+   *
+   * Defaulted to the scripted model, so the offline path cannot accidentally claim a provider it
+   * never reached: a row saying `scripted-no-provider` is the honest one until something overrides
+   * it, and the override is only available to a caller that really did attach one.
+   */
+  readonly identity?: {
+    readonly benchmark: string;
+    readonly model: string;
+    readonly modelRoute: string;
+    readonly provider: string;
+    readonly costOf?: (scored: ScoredTask) => number;
+  };
 }
 
 /**
@@ -122,7 +156,8 @@ const runVerifier = async (backend: WorkspaceBackend, task: WireTask): Promise<E
     cwd: task.verify.call.cwd,
     // PATH explicitly, and nothing else: the box's own environment is not this rig's. @see task.ts.
     env: { PATH: VERIFIER_PATH, LC_ALL: 'C' },
-    timeoutSeconds: 120,
+    // The task's own ceiling where it declares one. @see `Verifier.timeoutSeconds`.
+    timeoutSeconds: task.verify.timeoutSeconds ?? 120,
     network: false,
     maxOutputBytes: 64 * 1024
   });
@@ -134,12 +169,49 @@ const runVerifier = async (backend: WorkspaceBackend, task: WireTask): Promise<E
  * container per task: a solution that only works because the previous task left a file behind is a
  * solution that scored on evidence nobody declared.
  */
-export const scoreTask = async (task: WireTask, trustLocal: boolean): Promise<ScoredTask> => {
-  if (task.origin !== 'builtin' && !trustLocal)
+export const scoreTask = async (
+  task: WireTask,
+  trustLocal: boolean,
+  /*
+   * The box this task runs in, or nothing for the local one.
+   *
+   * Hardcoded to `localBackend()` until now, which is why `dockerBackend` had been written, tested
+   * by `selftest.ts` against its argv, and never once attached to a running container: there was no
+   * way to hand one in. The lifecycle stays outside on purpose - `backend.ts` says so in its own
+   * comment, because only the benchmark's task definition knows the image, the network mode and
+   * what the verifier expects - so a caller that wants a container builds it, starts it, passes an
+   * attached backend here, and stops it afterwards.
+   *
+   * A FACTORY rather than a backend, because `scoreTask` promises a fresh box per task and a
+   * caller handing the same object twice would quietly break that promise for the second one.
+   */
+  openBox: (() => Promise<WorkspaceBackend>) | undefined = undefined,
+  /*
+   * Putting the task's own tests into the box, and TAKING THEM OUT AGAIN before the turn.
+   *
+   * Two rules collide here and both are right. This rig demands the verifier run before the turn
+   * and fail, because a task that starts solved is not a task. Terminal-Bench stages its tests
+   * only AFTER the agent has finished, because an agent that can read the tests can write code
+   * that satisfies them without solving anything - and that is a score of 1 earned by reading.
+   *
+   * Staging once and leaving them satisfies the first rule and breaks the second, silently and in
+   * the flattering direction. So the tests are placed, the guard is run, and they are removed
+   * before the shim is even created; the turn happens in a box that has never held them; then they
+   * are placed again for the verdict. Both properties hold, and the cost is one extra copy.
+   *
+   * Absent for a task that carries its tests in its seed, which is every builtin one.
+   */
+  staging:
+    | { readonly place: () => Promise<void>; readonly remove: () => Promise<void> }
+    | undefined = undefined,
+  /** A real provider for this turn, or nothing for the scripted one. @see `Fixture.live`. */
+  live: LiveProvider | undefined = undefined
+): Promise<ScoredTask> => {
+  if (task.origin !== 'builtin' && !trustLocal && !openBox)
     throw new Error(
       `task "${task.id}" is an external task definition and the local backend is not a sandbox: its commands would run as this user with this user's network. Pass --trust-local to accept that, or run it on the docker backend.`
     );
-  const backend: WorkspaceBackend = await localBackend();
+  const backend: WorkspaceBackend = openBox ? await openBox() : await localBackend();
   let shim: Shim | null = null;
   let stop: (() => Promise<void>) | null = null;
   const startedWall = Date.now();
@@ -166,7 +238,10 @@ export const scoreTask = async (task: WireTask, trustLocal: boolean): Promise<Sc
      * as a free point and is indistinguishable from a score. What would change it: nothing. A task
      * that starts solved is not a task.
      */
+    await staging?.place();
     const before = await runVerifier(backend, task);
+    // Out again before anything the agent can reach exists. @see the `staging` parameter.
+    await staging?.remove();
     if (before.exitCode === 0)
       throw new Error(
         `task "${task.id}" passes its own verifier BEFORE the turn runs (${task.verify.label}), so solving it requires nothing of the agent and a score of 1 would belong to the seed. No run.`
@@ -176,7 +251,7 @@ export const scoreTask = async (task: WireTask, trustLocal: boolean): Promise<Sc
     const server = await shim.listen();
     stop = server.close;
 
-    const outcome = await runFixture(fixtureFor(task, server.url));
+    const outcome = await runFixture(fixtureFor(task, server.url, live));
 
     /*
      * The verdict, taken from the box and from nowhere else.
@@ -189,11 +264,13 @@ export const scoreTask = async (task: WireTask, trustLocal: boolean): Promise<Sc
      * The same command that was already run and already failed above, so a pass here is a
      * DIFFERENCE the turn made rather than a property the box arrived with.
      */
+    await staging?.place();
     const verified = await runVerifier(backend, task);
     const wallSeconds = (Date.now() - startedWall) / 1_000;
 
     return {
       task,
+      ranIn: { name: backend.name, isolatesNetwork: backend.isolatesNetwork },
       result: {
         taskId: task.id,
         // `null` would mean the run produced no verdict at all, which is not what happened: the
@@ -251,14 +328,29 @@ export const scoreRun = async (options: ScoreOptions): Promise<ScoreReport> => {
   for (const task of options.tasks) {
     // Sequentially, like `evals/run.ts` and `observe.ts`, and for the same reason: `runFixture`
     // installs its own `globalThis.fetch` for the duration of a run. Two at once measure each other.
-    const one = await scoreTask(task, options.trustLocal);
+    const one = options.runTask
+      ? await options.runTask(task)
+      : await scoreTask(task, options.trustLocal);
     scored.push(one);
     options.onTask?.(one);
   }
 
+  /*
+   * One box for the whole row, or no row. A run that scored half its tasks in a container and half
+   * on this host is two measurements, and averaging them would put a single `backend` and a single
+   * `isolates_network` on a row that was true of neither half.
+   */
+  const boxes = new Set(
+    scored.map((one) => `${one.ranIn.name}/${String(one.ranIn.isolatesNetwork)}`)
+  );
+  if (boxes.size > 1)
+    throw new Error(
+      `this run used ${String(boxes.size)} different boxes (${[...boxes].join(', ')}), so no single backend column is true of it. No row.`
+    );
+  const ranIn = scored[0]?.ranIn ?? { name: 'local', isolatesNetwork: false };
   const catalogueBytes = benchmarkBoxCatalogueBytes();
   const input: RowInput = {
-    benchmark: 'athanor-wire',
+    benchmark: options.identity?.benchmark ?? 'athanor-wire',
     taskSet: scored.map((one) => one.task.id).join('+'),
     // The tasks themselves, hashed, so two rows claiming the same task set can be checked rather
     // than believed. Over the prompt, the seed and the verifier argv - everything that decides what
@@ -274,9 +366,9 @@ export const scoreRun = async (options: ScoreOptions): Promise<ScoreReport> => {
     nTasks: options.tasks.length,
     // Named for what it is in every row it appears in. No provider was reached; see this file's
     // header for what that does and does not invalidate.
-    model: 'scripted-no-provider',
-    modelRoute: 'none',
-    provider: 'none',
+    model: options.identity?.model ?? 'scripted-no-provider',
+    modelRoute: options.identity?.modelRoute ?? 'none',
+    provider: options.identity?.provider ?? 'none',
     harness: 'athanor',
     harnessVersion: identity.version,
     harnessCommit: identity.commit ?? 'uncommitted',
@@ -297,9 +389,8 @@ export const scoreRun = async (options: ScoreOptions): Promise<ScoreReport> => {
     catalogueBytes,
     catalogueTokensPerCall: Math.round(catalogueBytes / BYTES_PER_TOKEN),
     surfaces: { browser: 'absent', desktop: 'absent' },
-    backend: 'local',
-    // False, and it cannot be otherwise on this backend. See `WorkspaceBackend.isolatesNetwork`.
-    isolatesNetwork: false,
+    backend: ranIn.name,
+    isolatesNetwork: ranIn.isolatesNetwork,
     verifierEnv: 'same',
     networkMode: 'host',
     declaredDrops: LOCAL_DROPS,

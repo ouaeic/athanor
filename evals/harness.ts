@@ -290,6 +290,15 @@ export interface ScriptContext {
 /** A model, as a function of what athanor just said to it. */
 export type ModelScript = (context: ScriptContext) => ModelTurn;
 
+/** Where a live run's provider is, and which model it names on the wire. @see `Fixture.live`. */
+export interface LiveProvider {
+  readonly baseUrl: string;
+  readonly apiKey: string;
+  readonly provider: 'openrouter' | 'openai-compatible';
+  readonly providerModelId: string;
+  readonly contextTokens: number;
+}
+
 const sse = (payload: unknown): string => `data: ${JSON.stringify(payload)}\n\n`;
 
 /** A value read off an untyped payload, as text. Anything that is not a string reads as absent. */
@@ -1726,6 +1735,21 @@ export interface Fixture {
   /** What this fixture protects, in prose: what breaks, or costs more, if it changes. */
   readonly why: string;
   readonly model: ModelScript;
+  /**
+   * A REAL provider, for the one caller that has to reach one.
+   *
+   * Absent everywhere in `fixtures.ts`, and the absence is what keeps this rig offline: with no
+   * `live` the worker is pinned at `PROVIDER_URL`, the wrapper below answers it from `model`, and
+   * nothing leaves the process. Present, the worker is pointed at the real route and the wrapper
+   * never matches its URL, so the request falls through to whatever `globalThis.fetch` was when
+   * `runFixture` was entered - which is where `evals/bench/provider.ts` meters it.
+   *
+   * This exists because `ModelScript` is SYNCHRONOUS - `(context) => ModelTurn` - so a script
+   * cannot await a provider. Measured: a driver that tried returned a promise the harness used as
+   * a turn, and the run billed real calls while every turn failed with "custom could not be
+   * reached". The seam a real model needs is the socket, not the script.
+   */
+  readonly live?: LiveProvider;
   readonly runner?: RunnerStub;
   /** The step ceiling in force, when the fixture is about what happens at one. */
   readonly maxSteps?: number;
@@ -2473,8 +2497,20 @@ const visionRelease: ModelRelease = {
   measuredQuality: 0.9
 };
 
-const modelFor = (contextTokens?: number): ModelRelease =>
-  contextTokens === undefined ? release : { ...release, contextTokens };
+const modelFor = (contextTokens?: number, live?: LiveProvider): ModelRelease => {
+  const shaped = contextTokens === undefined ? release : { ...release, contextTokens };
+  // `provider` is what the gateway calls itself in its own errors, and `providerModelId` is what
+  // goes on the wire. Left alone the pair says `custom` / `vendor/model-1`, which is correct for a
+  // rig that reaches no provider and is a wrong request to one that does.
+  return live === undefined
+    ? shaped
+    : {
+        ...shaped,
+        provider: live.provider === 'openrouter' ? 'openrouter' : 'custom',
+        providerModelId: live.providerModelId,
+        contextTokens: contextTokens ?? live.contextTokens
+      };
+};
 
 const taskFor = (prompt: string, maxComputeCredits: number): TaskRecord => ({
   id: taskId,
@@ -2720,7 +2756,7 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
    */
   forgetReads();
   if (fixture.schema) return schemaOutcome(fixture.schema());
-  const model = modelFor(fixture.contextTokens);
+  const model = modelFor(fixture.contextTokens, fixture.live);
   const task = taskFor(fixture.request, fixture.maxCredits ?? 50);
   const events: Array<{ kind: string; summary: string; payload: unknown }> = [];
   const approvals: string[] = [];
@@ -3171,6 +3207,26 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
     // Asked of every request to either host, because the question is what left this process, not
     // what the window happened to be assembled from.
     if (typeof init?.body === 'string' && init.body.includes(CHECKOUT_ROOT)) checkoutPathLeaks += 1;
+    /*
+     * A REAL provider, when the fixture named one, forwarded to the wire and counted as the model
+     * call it is. @see `Fixture.live`.
+     *
+     * It has to be its own branch rather than a case of the one below, because the two answers are
+     * opposite: the scripted branch SYNTHESISES a response from `fixture.model`, and this one must
+     * not touch the request at all. And it has to sit above the workspace and runner branches,
+     * because the last of those answers anything it does not recognise with a 404 - which is what
+     * a live run got before this existed: `Unstubbed runner route:
+     * https://openrouter.ai/api/v1/chat/completions`, a request the harness refused on the model's
+     * behalf while reporting it as the box's fault.
+     *
+     * Counted here for the same reason the scripted branch counts: `steps` is read off `modelCalls`
+     * and a live run that counted none would report a turn that never thought.
+     */
+    if (fixture.live !== undefined && url.startsWith(fixture.live.baseUrl)) {
+      modelCalls += 1;
+      answeredCalls += 1;
+      return await original(input, init);
+    }
     if (url.startsWith(PROVIDER_URL)) {
       const media = mediaResponse(fixture.runner ?? {}, execState, url, init);
       if (media) return media;
@@ -3368,10 +3424,10 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
         RUNNER_SHARED_SECRET: 'x'.repeat(48),
         WORKSPACE_RUNNER_URL: fixture.workspaceUrl ?? RUNNER_URL,
         PREVIEW_BASE_URL: 'http://preview.localhost:4400',
-        OPENROUTER_BASE_URL: PROVIDER_URL,
-        AI_PROVIDER: 'openai-compatible',
-        AI_BASE_URL: PROVIDER_URL,
-        AI_API_KEY: 'provider-key',
+        OPENROUTER_BASE_URL: fixture.live?.baseUrl ?? PROVIDER_URL,
+        AI_PROVIDER: fixture.live?.provider ?? 'openai-compatible',
+        AI_BASE_URL: fixture.live?.baseUrl ?? PROVIDER_URL,
+        AI_API_KEY: fixture.live?.apiKey ?? 'provider-key',
         AI_REQUIRE_ZDR: false,
         // Pinned so a search is answered by the workspace's own browser on every fixture. Which
         // host answers a search is a policy decision with its own tests; what these fixtures are

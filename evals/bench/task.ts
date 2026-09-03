@@ -23,7 +23,7 @@
  * reads what athanor just said can, and the step count it produces is then the measured price of
  * the holds rather than an arrangement of this file.
  */
-import type { Fixture, ModelScript, ScriptContext } from '../harness.js';
+import type { Fixture, LiveProvider, ModelScript, ScriptContext } from '../harness.js';
 
 import type { ExecCall } from './backend.js';
 
@@ -32,6 +32,17 @@ export interface Verifier {
   /** What the check is, in the words a reader of the row needs. */
   readonly label: string;
   readonly call: Pick<ExecCall, 'executable' | 'args' | 'cwd'>;
+  /**
+   * How long the check may take, or nothing for this rig's own default.
+   *
+   * A borrowed task set brings its own ceiling and it is routinely far larger than ours: of the 241
+   * Terminal-Bench tasks, 232 declare a `max_test_timeout_sec` above the 120 seconds `score.ts`
+   * used to hardcode, running to 28,800. A verifier killed at 120 reports a non-zero exit that is
+   * indistinguishable from a failed solution, so the score comes out LOW and looks like the agent's
+   * fault. That is the worst failure available to a benchmark: not a refused row, but a wrong
+   * number in the flattering-to-nobody direction, produced silently.
+   */
+  readonly timeoutSeconds?: number;
 }
 
 export interface WireTask {
@@ -232,7 +243,8 @@ export const TASKS: readonly WireTask[] = [SUM_TASK];
  * the checking in this rig is the verifier in the box, not an expectation table - so it is empty
  * and says so rather than carrying assertions nothing evaluates.
  */
-export const fixtureFor = (task: WireTask, workspaceUrl: string): Fixture => ({
+export const fixtureFor = (task: WireTask, workspaceUrl: string, live?: LiveProvider): Fixture => ({
+  ...(live === undefined ? {} : { live }),
   id: `bench-${task.id}`,
   shape: 'files',
   request: task.request,
