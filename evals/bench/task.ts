@@ -243,8 +243,22 @@ export const TASKS: readonly WireTask[] = [SUM_TASK];
  * the checking in this rig is the verifier in the box, not an expectation table - so it is empty
  * and says so rather than carrying assertions nothing evaluates.
  */
-export const fixtureFor = (task: WireTask, workspaceUrl: string, live?: LiveProvider): Fixture => ({
+export const fixtureFor = (
+  task: WireTask,
+  workspaceUrl: string,
+  live?: LiveProvider,
+  /**
+   * The arm, as the harness takes it: the mode the task is minted under and whether an approver
+   * answers its cards. Absent, the fixture is minted the way every offline fixture is - `balanced`,
+   * nobody answering - which is the `shipped` arm.
+   */
+  arm?: {
+    readonly securityMode: 'review' | 'balanced' | 'autonomous';
+    readonly autoApprove: boolean;
+  }
+): Fixture => ({
   ...(live === undefined ? {} : { live }),
+  ...(arm === undefined ? {} : { securityMode: arm.securityMode, autoApprove: arm.autoApprove }),
   id: `bench-${task.id}`,
   shape: 'files',
   request: task.request,

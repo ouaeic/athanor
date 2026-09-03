@@ -46,24 +46,37 @@ export interface CatalogueWeight {
 }
 
 /**
- * Bytes per catalogue token, taken from this repository's own wire rather than from the usual
- * four-bytes-a-token rule of thumb.
+ * Bytes per catalogue token: the rule the eval suite itself bills by, and nothing more precise.
  *
- * `evals/baseline.json` measured 12,508 catalogue tokens at the maximum, and the fully provisioned
- * catalogue this file weighs at that configuration is 55,673 bytes. Say what does and does not
- * commit to that figure, because the two nearby assertions are about different boxes:
- * `apps/worker/src/tool-catalogue.test.ts:402` holds the DEFAULT catalogue under an upper bound of
- * 55,700, which 55,673 sits 27 bytes inside, and the 44,000 assertion further down that file is
- * over a BARE box and is the anchor used lower in this rig. No test commits to 55,673 exactly; it
- * is measured here through the production `agentToolsFor`. 55,673 / 12,508 = 4.451. Using 4 would
- * overstate every token figure below by about 11%, which is the direction that flatters the
- * counter-argument rather than athanor, and it would still be wrong.
+ * This used to be `55_673 / 12_508 = 4.451`, described as "taken from this repository's own wire".
+ * Re-derived on 2026-09-03 it was a ratio between two numbers that measure different things on
+ * different boxes, and the token half was not even the right figure:
  *
- * It is an approximation. The exact number depends on the tokeniser the route uses, which is a
- * property of the provider and not of this repository. What would change it: a different model
- * family, or a catalogue whose character mix moves.
+ *   - `evals/baseline.json` bills catalogue tokens as `Math.ceil(bytes / 4)` over
+ *     `JSON.stringify(body.tools)` of each request (`evals/harness.ts`, `wireCatalogueTokens`). It
+ *     is bytes over four by construction. Its maximum per call is 12,462 - `catalogueTokens /
+ *     modelCalls` over every row; 62 of the 73 rows sit exactly at it, every fixture whose calls
+ *     all carry the catalogue - not 12,508, which no row carries.
+ *   - That wire is the suite's OWN box, `/surfaces` both available and `listConnectors` empty, on
+ *     which the harness reports the catalogue resident at 49,830 bytes when the baseline was
+ *     accepted (49,903 on this checkout): the second row of the table below, not the first. The
+ *     55,673 (55,363 on this checkout, measured through `pnpm eval:bench`) is the fully
+ *     provisioned box, which the suite never sends.
+ *
+ * So the quotient was a provisioned byte count over a different box's bytes-over-four, and every
+ * token figure printed from it was 11% under the rule the baseline actually uses. Four is that
+ * rule, so the tokens this file prints and the tokens `baseline.json` bills now agree on the box
+ * they share: 49,830 / 4 = 12,458 for the suite's wire as the baseline was accepted, against its
+ * committed 12,462 (the ceil is taken per call, and the resident size differs by a few bytes
+ * between fixtures); a tool description that moves the catalogue moves both together.
+ *
+ * It is still an approximation. The exact number depends on the tokeniser the route uses, which is
+ * a property of the provider and not of this repository. What would change it: a live row now
+ * carries the provider's own input count per call (`RunOutcome.providerInputTokens`), so a paid run
+ * can put a measured ratio here - for the WHOLE prompt, though, not the catalogue alone, which no
+ * provider counts separately.
  */
-export const BYTES_PER_TOKEN = 55_673 / 12_508;
+export const BYTES_PER_TOKEN = 4;
 
 /** The four boxes, in the order that makes the argument. */
 export const catalogueWeights = (): CatalogueWeight[] => {
@@ -74,11 +87,11 @@ export const catalogueWeights = (): CatalogueWeight[] => {
     // twenty-four actions. A box with nothing connected is the last row, where `claim.ts:212`
     // takes the whole tool away.
     [
-      'fully provisioned, all five connector kinds (what the eval suite measures)',
+      'fully provisioned, all five connector kinds',
       'available',
       ['github', 'webdav', 'mcp_http', 'imap', 'caldav'] as ConnectorKind[]
     ],
-    ['a browser and a screen, nothing connected', 'available', []],
+    ['a browser and a screen, nothing connected (what the eval suite measures)', 'available', []],
     ['no browser, no screen, one connection', 'absent', ['github'] as ConnectorKind[]],
     ['no browser, no screen, nothing connected (THE BENCHMARK BOX)', 'absent', []]
   ];

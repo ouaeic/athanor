@@ -774,19 +774,20 @@ export const selfTest = async (observation: RouteObservation | null): Promise<st
     problems.push(
       `a box with no browser, no screen and no connections carries ${bare} bytes against a provisioned box's ${provisioned}, so nothing is being withdrawn`
     );
-  // BYTES_PER_TOKEN is anchored on the fully provisioned catalogue weighing 55,673 bytes at
-  // 12,508 tokens. `evals/baseline.json` commits to the token figure; nothing commits to 55,673
-  // exactly - `tool-catalogue.test.ts:402` holds the default catalogue under 55,700, which it sits
-  // 27 bytes inside, and the 44,000 assertion later in that file is over a bare box, not this one. If the catalogue moves, the anchor is stale and
-  // every token figure this rig prints is quietly wrong - so the anchor is checked, not trusted.
-  // The band is 2%, which is roughly one added tool description and well inside the 55,700
-  // ceiling the catalogue test holds.
+  // The README's table (section 3) prints whatever this file's own `catalogueWeights` measured on
+  // the day it was last re-derived; 55,290 bytes is the anchor that table was first written
+  // against, on 2026-09-03, and the README names it as the anchor. Nothing else commits to it -
+  // `tool-catalogue.test.ts:402` holds the default catalogue under 55,700, and the 44,000 assertion
+  // later in that file is over a bare box, not this one. If the catalogue moves, the table is
+  // stale - so the figure is checked here, not trusted. The band is 2%, roughly one added tool
+  // description and well inside the 55,700 ceiling the catalogue test holds. (BYTES_PER_TOKEN no
+  // longer hangs off this number; see catalogue.ts for why it is four.)
   // One constant, read into both the comparison and the message, so a message cannot say a
   // different number than the one that was checked.
-  const anchorBytes = 55_673;
+  const anchorBytes = 55_290;
   if (Math.abs(provisioned - anchorBytes) / anchorBytes > 0.02)
     problems.push(
-      `the fully provisioned catalogue now weighs ${provisioned} bytes against the ${anchorBytes} BYTES_PER_TOKEN is anchored on, so every token figure this rig prints is stale (ratio ${BYTES_PER_TOKEN.toFixed(3)})`
+      `the fully provisioned catalogue now weighs ${provisioned} bytes against the ${anchorBytes} the README table is anchored on, so the table and every token figure this rig prints (at ${BYTES_PER_TOKEN.toFixed(1)} bytes a token) are stale`
     );
   if (bare >= 44_000)
     problems.push(

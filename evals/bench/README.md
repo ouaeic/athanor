@@ -1,23 +1,27 @@
 # The external-benchmark instrument
 
 ```
-pnpm eval:bench                  self-test, THE END-TO-END JOIN, catalogue weights, coverage  (~2.5 s, offline)
-pnpm eval:bench --score          drive a real AgentWorker against the shim and score it       (~2 s, offline)
-pnpm eval:bench --observe        re-sweep all 73 fixtures, rewrite routes.json                (~10 s, offline)
-pnpm eval:bench --routes         print the committed observation and coverage
+pnpm eval:bench                        self-test, THE END-TO-END JOIN, catalogue weights, coverage  (~2.5 s, offline)
+pnpm eval:bench --score [--arm A]      drive a real AgentWorker against the shim and score it       (~2 s, offline)
+pnpm eval:bench --observe              re-sweep all 73 fixtures, rewrite routes.json                (~10 s, offline)
+pnpm eval:bench --routes               print the committed observation and coverage
+pnpm eval:bench --terminal-bench ...   THE PAID RUN: real model, real containers, one record per task (section 5)
+pnpm eval:bench --assemble ...         build a parity row from the records and upsert it into parity.csv (offline)
 ```
 
-Offline, no key, no network, no provider, no Docker. Nothing in this directory can spend money.
-Not part of `pnpm check`, like every other rig in `evals/`.
+Everything but `--terminal-bench` is offline: no key, no network, no provider, no Docker. The paid
+path refuses to start without a key and without every bound named on the command line. Not part of
+`pnpm check`, like every other rig in `evals/`.
 
-**This is an instrument, not a result.** There is no athanor benchmark score in this repository and
-there is not one in this directory. What is here is the thing that has to exist and be trusted
-before a score means anything, plus the exact command that would produce the first one and what it
-costs. `parity.csv` is committed with its 44 columns and **zero rows**, on purpose.
+**This is an instrument, and it has taken one reading.** The first athanor benchmark score exists:
+Terminal-Bench, 20 tasks, one model, the `shipped` arm, 0.250 (section 5). It is one run against a
+floor of three, so `parity.csv` is committed with its 44 columns and **no publishable row yet**;
+the arm ladder the instrument was built for is the next reading, and the placeholder for it is in
+section 5.
 
-`parity-wire.csv` is the one file here with a row in it, and it is **not a score**: see section 2.5.
-It is one task, solved by a scripted model, verified by a command in a real directory. Its `model`
-column says `scripted-no-provider` in every row it will ever have.
+`parity-wire.csv` is the other file here with a row in it, and it is **not a score**: see section
+2.5. It is one task, solved by a scripted model, verified by a command in a real directory. Its
+`model` column says `scripted-no-provider` in every row it will ever have.
 
 ---
 
@@ -245,16 +249,22 @@ diffing the output. Identical. `pnpm eval:gate --filter files-helper-script-then
    The scored turn is that run, and `selftest.ts` asserts the catalogue it was offered - names
    derived through `agentToolsFor`, never listed. Point the runner back at the fixture stub, whose
    `/surfaces` says both available, and all seven reappear.
-3. **The holds cost three steps on a wrong answer and one on a right one.** Right answer: 5 model
-   calls, **65,569 prompt tokens**, one `acceptance_hold`. Wrong answer: 8 calls, **107,419 prompt
-   tokens**, one `acceptance_hold` and three `acceptance_failed`. Both measured, both in
-   `parity-wire.csv`'s own `input_tokens_mean` column. So discovering the work was wrong cost
-   **41,850 tokens, 64% again on top of the whole task** - which on a paid run is real money, and
-   which no other harness in this field pays or reports. It is also, on a benchmark, entirely
-   wasted: the task scores 0 either way. That is the `shipped`-arm tax made concrete.
-4. **The catalogue is 64% of what a short task's prompt weighs.** 65,569 prompt tokens over 5 calls,
-   of which 8,389 per call is catalogue: 41,945 of 65,569. On the _benchmark_ box, after the
-   withdrawals - the provisioned box would be worse.
+3. **The holds cost three steps on a wrong answer and one on a right one.** Re-measured on this
+   checkout, 2026-09-03. Right answer: 5 model calls, **65,197 prompt tokens**, one
+   `acceptance_hold` - the row `parity-wire.csv` holds, its own `input_tokens_mean`. Wrong answer
+   (the solution broken to write the line count, 7): 8 calls, **106,823 prompt tokens**, one
+   `acceptance_hold` and three `acceptance_failed`, driven through the same `scoreTask`. So
+   discovering the work was wrong cost **41,626 tokens, 64% again on top of the whole task** -
+   which on a paid run is real money, and which no other harness in this field pays or reports. It
+   is also, on a benchmark, entirely wasted: the task scores 0 either way. That is the
+   `shipped`-arm tax made concrete. (The same broken turn now reports `verification=checks_failed`
+   where the 2026-09-02 measurement in item 1 saw `verified`; `status` still reads `completed` for
+   both. The verdict is still the verifier's, for the reason item 1 gives.)
+4. **The catalogue is 73% of what a short task's prompt weighs.** 65,197 prompt tokens over 5 calls,
+   of which 9,474 per call is catalogue: the benchmark box's catalogue plus the `type: function`
+   envelope each tool is sent in, **37,896 bytes on the wire**, over four (the rule section 3
+   explains) - 47,370 of 65,197. On the _benchmark_ box, after the withdrawals; the provisioned box
+   would be worse.
 5. **The stationary watch caught this rig's own bug.** The first script read the whole window for a
    hold marker rather than the last message, so it answered the acceptance hold four times with
    byte-identical arguments. `NOTHING HAS CHANGED FOR 3 STEPS. Every one of them made the same call
@@ -264,16 +274,19 @@ diffing the output. Identical. `pnpm eval:gate --filter files-helper-script-then
    as "could not run" - and `rowFrom` refuses the row. `parity-wire.csv` is left with its header and
    nothing else, so a voided run cannot leave a stale row behind. Exit 1.
 
-### What `--score` still cannot do
+### What `--score` can do now, and still cannot
 
-- **Only the `shipped` arm.** `evals/harness.ts`'s `taskFor` mints the task `balanced`. `autonomous`
-  needs that field settable and `unattended` needs an auto-approver as well. `--arm` refuses
-  anything else rather than printing a row that names a configuration it was not measured under.
+- **All three arms.** `Fixture.securityMode` mints the task under the arm's own mode and
+  `Fixture.autoApprove` attaches the auto-approver for `unattended` (section 5 says exactly what it
+  does and does not answer). `--arm` refuses anything outside the ladder rather than printing a row
+  that names a configuration it was not measured under. The built-in task raises no card, so the
+  three arms produce the same wire row; the arms differ on a task set that reaches the floor, which
+  is what the paid ladder is for.
 - **One task, and its solution is written here.** It measures the wire, not the agent.
-- **`local` backend only.** The docker backend is still unexercised on this machine, and `score.ts`
-  refuses a task whose `origin` is not `builtin` on the local backend without `--trust-local` -
-  which is a guard `backend.ts` had promised in prose since it was written and which existed nowhere
-  in the repository until now.
+- **`local` backend only.** The docker backend is exercised by the paid path (section 5) and not
+  here, and `score.ts` refuses a task whose `origin` is not `builtin` on the local backend without
+  `--trust-local` - a guard `backend.ts` had promised in prose since it was written and which
+  existed nowhere in the repository until the join was built.
 
 ---
 
@@ -282,7 +295,7 @@ diffing the output. Identical. `pnpm eval:gate --filter files-helper-script-then
 **The case against benchmarking athanor at all.** Every design commitment it has is a cost on a
 leaderboard, and the costs are athanor's own and measurable:
 
-- **The catalogue.** 37,340 bytes on every request of every turn on a benchmark box, measured
+- **The catalogue.** 36,926 bytes on every request of every turn on a benchmark box, measured
   below. A scaffold built only to solve coding tasks sends a fraction of that.
 - **The approval floor.** athanor stops for what the computer cannot take back even in
   `autonomous` (`apps/worker/src/approval-policy.ts:692`), and a card that fires with nobody at
@@ -320,23 +333,43 @@ The design research put the tax at 12,508 tokens per call and 39.9% of every pro
 suite bills. That is a real measurement of the **wrong box**: the eval harness answers `/surfaces`
 with both surfaces available, and `claim.ts:212` withdraws `connector_action` outright on a box with
 no connections. `catalogue.ts` measures the real thing through the production function, printed on
-every run of this rig:
+every run of this rig. Re-measured on this checkout, 2026-09-03:
 
-|      bytes |    tokens | box                                                                                   |
-| ---------: | --------: | ------------------------------------------------------------------------------------- |
-|     55,673 |    12,508 | fully provisioned, all five connector kinds - **what `evals/baseline.json` measures** |
-|     49,032 |    11,016 | a browser and a screen, nothing connected                                             |
-|     39,586 |     8,894 | no browser, no screen, one connection                                                 |
-| **37,340** | **8,389** | no browser, no screen, nothing connected - **the benchmark box**                      |
+|      bytes |    tokens | box                                                                                 |
+| ---------: | --------: | ----------------------------------------------------------------------------------- |
+|     55,363 |    13,841 | fully provisioned, all five connector kinds                                         |
+|     48,722 |    12,181 | a browser and a screen, nothing connected - **what `evals/baseline.json` measures** |
+|     39,172 |     9,793 | no browser, no screen, one connection                                               |
+| **36,926** | **9,232** | no browser, no screen, nothing connected - **the benchmark box**                    |
 
-The top row reproduces, to the byte and to the token, the two figures this repository already
-commits to elsewhere: 55,673 bytes at `apps/worker/src/tool-catalogue.test.ts:749` and 12,508
-catalogue tokens per call in `evals/baseline.json`. That agreement is what makes the bottom row
-worth reading, and `selftest.ts` fails if the anchor drifts by more than 2%.
+Two corrections to what this table used to say, both found by re-deriving rather than re-reading:
+
+- **The eval suite measures the second row, not the first.** `evals/harness.ts` answers
+  `listConnectors` with nothing, so `connector_action` is withdrawn on its box exactly as it is on
+  the benchmark box. The suite's own wire carries the catalogue resident at **49,903 bytes** (the
+  figure `pnpm eval` prints on this checkout), which is this table's second row plus the `type: function` envelope
+  each tool is sent in.
+- **The token column is bytes over four, because that is what the baseline bills.** The suite
+  counts catalogue tokens as `ceil(bytes / 4)` per request, and its maximum is **12,462** per call
+  (`catalogueTokens / modelCalls`; 62 of the 73 rows sit exactly at it, every fixture whose calls
+  all carry the catalogue) - not 12,508, which no row carries. The
+  previous ratio, 55,673 over 12,508, divided the provisioned box's bytes by a different box's
+  bytes-over-four and printed every token figure here 11% under the rule the suite uses. Four is
+  the rule, so this table and the baseline agree on the box they share to within the catalogue's own
+  drift: 49,903 / 4 = 12,476 on this checkout against the committed 12,462, which was accepted at
+  `c0545ed` when the same wire carried 49,830 bytes (every tool description moves both numbers
+  together, and `pnpm eval:bench` prints the current ones). It is still not a tokeniser: a paid row now carries the provider's
+  own input count per call, and a whole-prompt ratio can be measured from it, but no provider
+  counts the catalogue apart.
+
+`selftest.ts` holds the top row within 2% of 55,290 (its anchor; 55,363 is inside the band), so a
+catalogue that moves more than a description's worth fails this rig rather than leaving the table
+stale. The four figures above are what `pnpm eval:bench` printed on 2026-09-03; the row a paid run
+declares is measured again by that run, never copied from here.
 
 So athanor already withdraws about **18 kB, roughly a third of the catalogue**, before a benchmark
 run starts - and it does it without being asked, because connectors and surfaces are gated per box.
-The honest residual charge is **37,340 bytes, about 8,400 tokens per call, of non-withdrawable core
+The honest residual charge is **36,926 bytes, about 9,200 tokens per call, of non-withdrawable core
 tooling**, which a purpose-built coding scaffold does not carry. Still a real charge. It does not
 need the overstatement, and the arm ladder does not need a fourth `lean` rung - see the comment on
 `Arm` in `parity.ts` for why that rung would have measured nothing.
@@ -351,7 +384,11 @@ never has to go and find a default in a Python file.
 
 ## 4. The parity CSV
 
-44 columns, zero rows. Four disciplines are **enforced in code**, not documented:
+44 columns. Rows are **upserted**, never overwritten: a row with the same benchmark, task-set
+digest, arm, model, build and run count replaces the old one, every other row is kept, and the
+file is ordered by arm - shipped, autonomous, unattended - so the ladder reads top to bottom
+(`results.ts`, `upsertRow`). The self-test re-renders the file every run to exercise the header and
+keeps whatever rows it holds. Four disciplines are **enforced in code**, not documented:
 
 1. **The aggregator is `mean` and it is a column.** `Max` over n attempts silently turns pass^1 into
    pass@k. `aggregate()` has no other mode.
@@ -374,57 +411,191 @@ credible row.
 
 ## 5. The paid command
 
-Nothing above costs anything. Here is what does.
+Nothing above costs anything. Here is what does, as it is actually run.
 
-**Prerequisite, and it is not the blocker the research named.** The VPS is container-ready _today_.
-Measured read-only on 2026-09-02: `sudo -n docker info` returns `29.1.3`, 16 CPU, 31.3 GiB,
-`overlayfs`, and `/` has 746 G free. `administrator` holds `(ALL) NOPASSWD: ALL`. The empty `docker`
-group is an ergonomic question (`usermod -aG docker administrator`, which the operator can do
-themselves), not an owner action. There is no `uv` on the box; Terminal-Bench's own harness wants
-one.
-
-**Step A - the container proof, $0 in tokens, about an hour of wall clock.** Pull one Terminal-Bench
-2.0 task image on the VPS, start it, and run this shim's docker backend against it with the task's
-shipped oracle solution. This proves the container, the verifier and the exec/file plumbing. **It
-does not prove route fidelity** - an oracle runs a solution script and never exercises `/surfaces`,
-`/machine`, `/toolchain` or `/checkpoints`, which is precisely why the route instrument above is a
-separate, already-completed step.
-
-**Step B - the first athanor number.**
+### The command, as run
 
 ```
-# on administrator@85.190.100.211, inside a scratch dir, with a provider key in the environment
-OPENROUTER_API_KEY=…  pnpm eval:bench --score \
-    --benchmark terminal-bench-2.0 --tasks <20-task subset> \
-    --model <mini-class model id> --arm unattended --runs 1 \
-    --backend docker --container-per-task --surfaces absent
+# on administrator@85.190.100.211
+cd /home/administrator/tb/athanor && \
+NODE_OPTIONS=--conditions=development OPENROUTER_API_KEY=... ./node_modules/.bin/tsx evals/bench/run.ts \
+    --terminal-bench --root /home/administrator/tb/terminal-bench/original-tasks \
+    --model openrouter/z-ai/glm-5.3-flash \
+    --max-spend-usd 20 --max-calls 50 \
+    --results /home/administrator/tb/results --arm shipped --run-index 0 \
+    --tasks <the 20 ids> --sudo
 ```
 
-- **needs**: a provider key, which this repository holds nowhere by design; the 20 task images
-  pulled; `--trust-local` is not enough - a benchmark's own task commands belong in a container, so
-  this is `--backend docker`. **`--score` now exists** and drives a real `AgentWorker` end to end
-  (section 2.5). What it does not yet have is the four flags above it: `--benchmark` and `--tasks`
-  need a Terminal-Bench task loader (prompt, seed files, verifier argv - the `WireTask` shape in
-  `task.ts` is already that shape, so it is a loader and not a redesign); `--model`, `--runs` and
-  `--backend docker` need the provider seam and the container backend that `dockerExecArgv` is
-  already written for; `--arm unattended` needs a settable `securityMode` and an auto-approver,
-  which is the one part `rowFrom` will refuse a row for until it exists.
-- **costs**: about **$17** in tokens at a mini-class model, call it **$40** with retries. Derived
-  from `evals/baseline.json`'s own measured numbers, adjusted for the 37,340-byte benchmark
-  catalogue rather than the 50,404-byte provisioned one.
-- **takes**: about half a day of wall clock. Terminal-Bench 2.0's own per-task agent timeouts
-  average **at least 1,449 s** over the 78 of 89 tasks whose timeout is recorded (11 unrecorded, so
-  that is a floor): at `WORKER_CONCURRENCY` 8 on 16 vCPU, a full 89-task run is **>= 4.5 h**.
-- **it will be a bad number.** Publish it anyway.
+Prerequisites, all in place on that box: Docker (`sudo -n docker`, which is why `--sudo`), one
+image per task built as `tb/<id>` from the benchmark's own Dockerfile (a missing image is a
+refusal, never a zero), a provider key in the environment, and this checkout on Node 24.
 
-**Step C - the arm ladder**, the artefact nobody else has: the same 20 tasks at `shipped`,
-`autonomous` and `unattended`. Four times step B's cost per model.
+**What each bound is.** `--max-spend-usd` is checked between tasks against the key's own running
+total as the provider reports it, so a task under way is never cut and a half-run task is never
+counted as a failure; with several processes on one key it is a **global** ceiling, every process
+stops when the key as a whole reaches it. `--max-calls` is the step ceiling every task runs under,
+and it is what the row's `task_max_steps` column then says - it used to be accepted and read by
+nothing, so the first run said `--max-calls 120` and ran under the loader's own 50. Pass **50** for
+the ladder so the rows are comparable with the first one. A step is one model call however many
+tools it uses, and under `unattended` that includes the call a card was raised on: each re-entry
+after an answered card is built one step shorter, so the ceiling bounds the model calls of the
+whole task on every arm alike (see the auto-approver, item 4 below). The one call outside it on
+every arm is the closing handoff a turn at its ceiling makes.
 
-**Step D - the parity row.** The same task set and the same model, run twice: once through athanor
-and once through the reference harness the leaderboard names, 3 runs each. About **$360** at a mini-class model, **$3,600** at Sonnet-class (honest range $2,500-5,000).
-Two days on the VPS. Do not start at SWE-bench Verified: 500 instances at 3 runs is about $12,500.
+### The first reading, and what it cost
 
----
+Terminal-Bench, 20 stratified tasks, GLM 5.3 Flash, arm `shipped`, athanor `fbd5888`:
+
+|                          |                                                                                              |
+| ------------------------ | -------------------------------------------------------------------------------------------- |
+| score                    | **0.250**, 5 of 20 resolved                                                                  |
+| cost, provider's account | **$0.4885** for the run                                                                      |
+| steps                    | mean **19**, p95 **49** (the ceiling was 50; see `--max-calls` above)                        |
+| wall clock               | **417 s** per task, sequential                                                               |
+| how the 15 were lost     | **11 parked on a single approval card** with nobody at the keyboard, 1 upstream 504, 3 wrong |
+
+The eleven cards are the floor doing its job, exactly as the comment on `Arm` in `parity.ts` said
+it would, and they are the reason the ladder is the artefact and not the rank. Two defects in that
+row were fixed on the way to this one: `backend` said `local` while every task ran in a container
+(read off the backend now, `ScoredTask.ranIn`), and `input_tokens_mean` said 0 because the
+harness's live branch never priced the request (the provider's own input count is now read off every
+response's usage frame - the lead steps, the summariser, a specialist's steps, all of them, the same
+calls `steps` counts and the per-call cost prices - and the cached share beside it).
+
+**Cost per step, derived from that run.** GLM 5.3 Flash on this route is $0.075 per million input
+tokens, $0.25 per million output and $0.015 per million cache reads, and the run saw **66-73% of
+input tokens served from cache**. Over the 380 steps of the run (20 × 19) the $0.4885 is **$0.0013
+a step on average**; the longer tasks, where the window has grown, cost **$0.0015-0.0020 a step**.
+That is the figure to plan from, and it is why the README's earlier "$17, call it $40" was wrong by
+35×: it assumed every task would run to a 120-step ceiling, and the measured mean was 19.
+
+### The arm ladder: 3 runs × 3 arms × 20 tasks, from those figures
+
+|              | per (arm, run)                                                                                                        | × 3 runs   |
+| ------------ | --------------------------------------------------------------------------------------------------------------------- | ---------- |
+| `shipped`    | $0.49 measured; 11 tasks park early and are cheap                                                                     | ~$1.50     |
+| `autonomous` | the floor still fires on some of the 11; guess $0.50-1.00                                                             | ~$1.50-3   |
+| `unattended` | every card answered, so the 11 run to a finish or the 50-step ceiling: up to 50 × $0.002 × 11 ≈ $1.10 on top of $0.49 | ~$3-5      |
+| **total**    |                                                                                                                       | **~$6-10** |
+
+Call it **$10, ceiling $20 per process**, which is what `--max-spend-usd 20` already says. Wall
+clock is the real cost: 417 s × 20 tasks is **2.3 h per (arm, run)**, and `unattended` will be
+longer because nothing parks early. Nine (arm, run) pairs sequential in one process is **~21 h**.
+
+**Sequential within a process, parallel across processes.** `runFixture` installs its own
+`globalThis.fetch` for the duration of a run, so one process runs one task at a time and two would
+measure each other. Parallelism is several processes on **disjoint (arm, run-index) pairs**:
+
+```
+--arm shipped    --run-index 0 | 1 | 2
+--arm autonomous --run-index 0 | 1 | 2
+--arm unattended --run-index 0 | 1 | 2
+```
+
+nine processes on the 16-vCPU box, each with its own containers (the container name carries the
+task id, so two processes must not share a task - which disjoint pairs guarantee), finishing in
+**3-5 h** instead of a day. The key is shared, which is why cost had to stop being an account delta.
+
+### Records and assembly: why the row is not written by the run
+
+The run writes **one JSON per task as it finishes**, to `--results DIR/<arm>/run-<i>/<id>.json`,
+with the loop's own events beside it in `<id>.events.jsonl` (the edit-format lane wanted the
+`file_edit` refusals a real turn produces, and they are in the events and nowhere else). It writes
+**no row**. A task whose record already exists is **skipped and printed as such**, so the same
+command re-run after a crash resumes from where it stopped and a dead process loses one task, not
+twenty. The row is built afterwards:
+
+```
+pnpm eval:bench --assemble --results DIR --arm A --runs 3 --tasks <the 20 ids> --root <task dir>
+```
+
+`results.ts` reads every record under `DIR/A/run-0..2`, puts a task with no record into its run at
+`resolved: null` so `scoreOf` scores it 0 against the declared denominator **and prints which**,
+refuses records from two boxes, two builds or two models (one box, one build, one model per row -
+a single `backend`, `athanor_commit` and `model` column cannot be true of a mixture), recomputes the
+task-set digest from `--root` and refuses if the tasks on disk are not the tasks that were run, and
+then hands the same `RowInput` the offline path builds to the same `rowFrom` with the same refusals.
+The row is **upserted** into `parity.csv` by its key; the ladder's three rows sit in one file.
+
+**Cost, twice.** The per-task figure printed and stored is the **provider's own per-call cost**,
+read by the harness off a copy of every answered response's usage frame - the `cost` the route
+puts beside `prompt_tokens` and `completion_tokens` - and summed (`RunOutcome.providerCostUsd`).
+The input, cached and output token columns are read off the **same frames**, so the four columns
+describe one set of calls: every request the loop sent, the compaction summariser, a vision
+handoff and a delegated specialist's steps included, and not only the lead steps the loop writes a
+`cost` event for (a live turn that compacted twice used to count 52 calls and sum the tokens of
+50). A response with no frame - a stream cut before its last data frame - or a frame with no price
+falls back to the ledger row the loop wrote for that call, and the task record says how many did
+(`providerUsageFallbacks`; the per-task line prints it when it is not zero). That number belongs to
+the task whatever else is running on the key. The account's running total is read when the process
+opens and closes and printed as the whole-process check **with the discrepancy** - other processes
+on the key, the provider's rounding, or a call the route did not price - and between tasks it is
+the ceiling.
+
+### The unattended arm: exactly what the auto-approver does
+
+`unattended` is `autonomous` plus **an approver that answers every card approved with nobody
+reading it, which is what every published leaderboard adapter is**. `Fixture.autoApprove` in
+`evals/harness.ts` plays the owner's half of the production approval flow, step for step:
+
+1. The turn parks as it does in production: `parkForApproval` creates the card with the argument
+   hash, saves the trajectory, writes the task `awaiting_user` with its lease cleared, and
+   `AgentWorker.run` returns. The harness's store stub now records the card as a row and answers
+   `getApproval` with it - a pending row, which is what production returns for a card nobody has
+   answered, so an offline fixture that parks is unchanged.
+2. The harness marks the newest pending card **approved**, and claims the task back as `running`
+   under its own worker id with a lease in the future. In production the API sets `queued` and a
+   worker's poll makes it `running`; the harness has no poll loop, so it performs the claim itself.
+3. `AgentWorker.run` is entered again, through the same construction. `claimTurn` decrypts the saved
+   state, `resumeParkedTurn` finds the approval, checks the argument hash against the call, and
+   executes the approved call before the loop goes on. `approvals_auto_answered` counts each
+   re-entry; `approval_cards_fired_mean` keeps counting every card.
+4. **The bound is model calls, counted by the harness, against `--max-calls`.** The loop's step
+   counter advances only when a step completes, and a step that cards never does - so a resumed
+   turn re-runs the same step number, the worker's own `TASK_MAX_STEPS` bounds nothing across
+   entries, and a turn that carded on every call could have made the ceiling's worth of calls
+   _and_ the ceiling's worth of re-entries (measured: ceiling 4, five model calls, all at step 0).
+   A request the provider refused and the loop retried is a call no step number records either.
+   So the harness re-enters only while its own count of every request that left the process is
+   below the ceiling, and each re-entry is built with a ceiling one lower per card answered, so
+   that a single entry cannot spend steps earlier entries already parked on. `task_max_steps` is
+   then a true ceiling on provider calls under this arm exactly as under the others (plus the
+   closing handoff a turn at its ceiling makes, which every arm pays). Reaching it is recorded on
+   the task (`autoApproveCapReached`) rather than swallowed - a task that ends on its cap ends
+   parked on the card it could not afford to answer. Measured in `approver.test.ts`: ceiling 4,
+   four calls, three answered; ceiling 3 with the opening request refused, three calls, one
+   answered.
+
+**What it does not answer: a question.** `ask` parks the task `awaiting_user` too, but creates no
+approval row - the answer is the owner's next message, not a yes. The harness answers only a
+pending card, so a question park stays parked and that task scores what it scores. An auto-approver
+is not an auto-owner, and a rig that typed an answer would be measuring its own prose.
+
+`evals/bench/approver.test.ts` drives all of this through the real loop: a push that cards under
+`autonomous` is answered once, the approved shell runs on the re-entry, and the turn finishes; with
+nobody answering the same turn parks; a question is left parked.
+
+### The arm ladder results
+
+<!-- PLACEHOLDER: paste the three assembled rows here after the runs. Keep the columns that carry
+     the argument: arm, n_runs, score_mean, score_std, cost_usd_mean, steps_mean, steps_p95,
+     approval_cards_fired_mean, approvals_auto_answered, security_mode, task_max_steps,
+     infra_failures_advisory, athanor_commit. -->
+
+| arm          | n_runs | score_mean | score_std | cost_usd_mean | steps_mean | steps_p95 | cards_fired_mean | auto_answered | task_max_steps | athanor_commit |
+| ------------ | ------ | ---------- | --------- | ------------- | ---------- | --------- | ---------------- | ------------- | -------------- | -------------- |
+| `shipped`    | _tbd_  | _tbd_      | _tbd_     | _tbd_         | _tbd_      | _tbd_     | _tbd_            | 0             | 50             | _tbd_          |
+| `autonomous` | _tbd_  | _tbd_      | _tbd_     | _tbd_         | _tbd_      | _tbd_     | _tbd_            | 0             | 50             | _tbd_          |
+| `unattended` | _tbd_  | _tbd_      | _tbd_     | _tbd_         | _tbd_      | _tbd_     | _tbd_            | _tbd_         | 50             | _tbd_          |
+
+The gap between the first and the last row is the price of the approval floor in benchmark points.
+
+### After the ladder
+
+**The parity row.** The same task set and the same model, run through the reference harness the
+leaderboard names, 3 runs. At this model and these step counts that is a few dollars, not the
+hundreds the earlier estimate said; the cost is the wall clock and the second harness's own setup.
+Do not start at SWE-bench Verified: 500 instances at 3 runs is a different order of wall clock.
 
 ## Why this is not a gate
 

@@ -18,6 +18,7 @@ import path from 'node:path';
 import { dockerBackend, type WorkspaceBackend } from './backend.js';
 import { scoreTask, type ScoredTask } from './score.js';
 import type { LiveProvider } from '../harness.js';
+import type { Arm } from './parity.js';
 import {
   TERMINAL_BENCH_TEST_DIR,
   TERMINAL_BENCH_RUN_TESTS,
@@ -65,7 +66,9 @@ const removeQuietly = async (sudo: boolean, container: string): Promise<void> =>
 export const scoreTerminalBenchTask = async (
   task: TerminalBenchTask,
   options: DockerOptions,
-  live?: LiveProvider
+  live?: LiveProvider,
+  /** The arm this task runs under; `scoreTask` derives the mode and the approver from it. */
+  arm: Arm = 'shipped'
 ): Promise<ScoredTask> => {
   const container = `tb-run-${task.id}`.replace(/[^A-Za-z0-9_.-]/g, '-').slice(0, 60);
   const image = `tb/${task.id}`;
@@ -103,7 +106,7 @@ export const scoreTerminalBenchTask = async (
         // otherwise would put "egress gated" in the artefact on the strength of nothing.
         isolatesNetwork: false
       });
-    return await scoreTask(task, false, openBox, { place, remove }, live);
+    return await scoreTask(task, false, openBox, { place, remove }, live, arm);
   } finally {
     await removeQuietly(options.sudo, container);
   }

@@ -91,6 +91,19 @@ export interface TaskResult {
    * can discount the row themselves.
    */
   readonly infraFailure: boolean;
+  /**
+   * Input tokens the provider served from its prompt cache, when the provider said. Optional and
+   * advisory: no column reads it yet, and a scripted run has no cache to report. Kept on the result
+   * because a paid row's cost cannot be argued from `inputTokens` alone once two thirds of them
+   * were billed at the cache-read rate.
+   */
+  readonly cachedTokens?: number | null;
+  /**
+   * Cards this task's turn had answered for it by an auto-approver. The row's own
+   * `approvalsAutoAnswered` is the sum of these, and `rowFrom` refuses that sum under any arm but
+   * `unattended`; it travels per task so an assembled row can be checked against its records.
+   */
+  readonly approvalsAutoAnswered?: number;
 }
 
 export interface RunRecord {

@@ -32,7 +32,15 @@ import { runFixture, runIdentity, type LiveProvider } from '../harness.js';
 import { localBackend, type ExecResult, type WorkspaceBackend } from './backend.js';
 import { benchmarkBoxCatalogueBytes, BYTES_PER_TOKEN } from './catalogue.js';
 import { writeFile } from './files.js';
-import { renderCsv, rowFrom, type Arm, type RowInput, type TaskResult } from './parity.js';
+import {
+  ARM_SECURITY_MODE,
+  renderCsv,
+  rowFrom,
+  type Arm,
+  type RowInput,
+  type RunRecord,
+  type TaskResult
+} from './parity.js';
 import { createShim, type Shim } from './shim.js';
 import { fixtureFor, TASKS, VERIFIER_PATH, type WireTask } from './task.js';
 
@@ -104,7 +112,43 @@ export interface ScoredTask {
   readonly misses: readonly string[];
   readonly absentRequests: number;
   readonly observedRoutes: readonly string[];
+  /**
+   * The loop's own events for this turn, whole, so a paid run can keep the transcript per task.
+   * Payloads are the decrypted objects the harness already holds; nothing here re-reads them.
+   */
+  readonly events: ReadonlyArray<{
+    readonly kind: string;
+    readonly summary: string;
+    readonly payload: unknown;
+  }>;
+  /** The mode the task was minted under, which the row has to agree with. */
+  readonly securityMode: 'review' | 'balanced' | 'autonomous';
+  /** Cards the auto-approver answered. Zero unless the arm was `unattended`. */
+  readonly autoAnswered: number;
+  /** Whether the auto-approver hit its re-entry ceiling and left the task parked. */
+  readonly autoApproveCapReached: boolean;
+  /**
+   * Live calls priced and counted from the loop's ledger rather than the provider's frame, because
+   * the response carried none. Zero scripted. @see `RunOutcome.providerUsageFallbacks`.
+   */
+  readonly providerUsageFallbacks: number;
 }
+
+/**
+ * The arm as the harness sees it: the mode the task is minted under, and whether anybody answers.
+ *
+ * `unattended` is autonomous plus an approver that answers every card approved with nobody reading
+ * it, which is what every published leaderboard adapter is. The other two leave the card standing.
+ */
+export const armFixtureFields = (
+  arm: Arm
+): {
+  readonly securityMode: 'review' | 'balanced' | 'autonomous';
+  readonly autoApprove: boolean;
+} => ({
+  securityMode: ARM_SECURITY_MODE[arm],
+  autoApprove: arm === 'unattended'
+});
 
 export interface ScoreOptions {
   readonly tasks: readonly WireTask[];
@@ -116,31 +160,94 @@ export interface ScoreOptions {
    */
   readonly trustLocal: boolean;
   readonly onTask?: (scored: ScoredTask) => void;
-  /**
-   * How one task is put in a box and driven, or nothing for this rig's own local one.
-   *
-   * A borrowed task set brings its own box - `terminal-run.ts` starts a container per task from
-   * the image the benchmark built - and the row assembly below must not be copied to accommodate
-   * it. Two copies of `RowInput` would be two places for the refusals, the digests and the
-   * catalogue figure to drift, in the one file whose whole purpose is that a row cannot flatter
-   * the thing that produced it.
-   */
-  readonly runTask?: (task: WireTask) => Promise<ScoredTask>;
-  /**
-   * Who actually answered, for the columns that name the run.
-   *
-   * Defaulted to the scripted model, so the offline path cannot accidentally claim a provider it
-   * never reached: a row saying `scripted-no-provider` is the honest one until something overrides
-   * it, and the override is only available to a caller that really did attach one.
-   */
-  readonly identity?: {
-    readonly benchmark: string;
-    readonly model: string;
-    readonly modelRoute: string;
-    readonly provider: string;
-    readonly costOf?: (scored: ScoredTask) => number;
-  };
 }
+
+/**
+ * What decides what solving a task means: the prompt, the seed and the verifier argv. The task-set
+ * digest is taken over these and nothing else, so two rows claiming the same set can be checked
+ * rather than believed - and a record written by a paid run carries its own copy, so a row can be
+ * assembled from records after the process that ran them is gone.
+ */
+export interface TaskSetMember {
+  readonly id: string;
+  readonly request: string;
+  readonly seed: Readonly<Record<string, string>>;
+  readonly verifyCall: WireTask['verify']['call'];
+}
+
+export const taskSetMemberOf = (task: WireTask): TaskSetMember => ({
+  id: task.id,
+  request: task.request,
+  seed: task.seed,
+  verifyCall: task.verify.call
+});
+
+export const taskSetShaOf = (members: readonly TaskSetMember[]): string =>
+  createHash('sha256')
+    .update(JSON.stringify(members.map((one) => [one.id, one.request, one.seed, one.verifyCall])))
+    .digest('hex')
+    .slice(0, 16);
+
+/**
+ * Everything a row is built from, in one shape, so the in-process path and the record assembler
+ * (`results.ts`) build the SAME `RowInput`. Two builders would be two places for a column's meaning
+ * to drift, in the one file whose whole purpose is that a row cannot flatter what produced it.
+ */
+export interface RowFacts {
+  readonly benchmark: string;
+  readonly taskIds: readonly string[];
+  readonly taskSetSha: string;
+  readonly nTasks: number;
+  readonly model: string;
+  readonly modelRoute: string;
+  readonly provider: string;
+  readonly harnessVersion: string;
+  readonly harnessCommit: string;
+  readonly arm: Arm;
+  readonly securityMode: 'review' | 'balanced' | 'autonomous';
+  readonly approvalsAutoAnswered: number;
+  readonly taskMaxSteps: number;
+  readonly maxComputeCredits: number;
+  readonly maxSpendUsd: number | null;
+  readonly catalogueBytes: number;
+  readonly ranIn: { readonly name: string; readonly isolatesNetwork: boolean };
+  readonly shimMisses: readonly string[];
+  readonly absentRequests: number;
+  readonly runs: readonly RunRecord[];
+}
+
+export const rowInputFrom = (facts: RowFacts): RowInput => ({
+  benchmark: facts.benchmark,
+  taskSet: facts.taskIds.join('+'),
+  taskSetSha: facts.taskSetSha,
+  nTasks: facts.nTasks,
+  model: facts.model,
+  modelRoute: facts.modelRoute,
+  provider: facts.provider,
+  harness: 'athanor',
+  harnessVersion: facts.harnessVersion,
+  harnessCommit: facts.harnessCommit,
+  arm: facts.arm,
+  securityMode: facts.securityMode,
+  approvalsAutoAnswered: facts.approvalsAutoAnswered,
+  taskMaxSteps: facts.taskMaxSteps,
+  // `evals/harness.ts` pins `TASK_MAX_SELF_CONTINUATIONS: 0`, so every step count here is the
+  // cost of one budget rather than of two.
+  selfContinuations: 0,
+  maxComputeCredits: facts.maxComputeCredits,
+  maxSpendUsd: facts.maxSpendUsd,
+  catalogueBytes: facts.catalogueBytes,
+  catalogueTokensPerCall: Math.round(facts.catalogueBytes / BYTES_PER_TOKEN),
+  surfaces: { browser: 'absent', desktop: 'absent' },
+  backend: facts.ranIn.name,
+  isolatesNetwork: facts.ranIn.isolatesNetwork,
+  verifierEnv: 'same',
+  networkMode: 'host',
+  declaredDrops: LOCAL_DROPS,
+  shimMisses: facts.shimMisses,
+  absentRequests: facts.absentRequests,
+  runs: facts.runs
+});
 
 /**
  * The task's own verifier, run in the box.
@@ -205,7 +312,12 @@ export const scoreTask = async (
     | { readonly place: () => Promise<void>; readonly remove: () => Promise<void> }
     | undefined = undefined,
   /** A real provider for this turn, or nothing for the scripted one. @see `Fixture.live`. */
-  live: LiveProvider | undefined = undefined
+  live: LiveProvider | undefined = undefined,
+  /**
+   * The arm, which decides the mode the task is minted under and whether cards are answered. The
+   * offline default is the arm the owner installs.
+   */
+  arm: Arm = 'shipped'
 ): Promise<ScoredTask> => {
   if (task.origin !== 'builtin' && !trustLocal && !openBox)
     throw new Error(
@@ -251,7 +363,8 @@ export const scoreTask = async (
     const server = await shim.listen();
     stop = server.close;
 
-    const outcome = await runFixture(fixtureFor(task, server.url, live));
+    const fields = armFixtureFields(arm);
+    const outcome = await runFixture(fixtureFor(task, server.url, live, fields));
 
     /*
      * The verdict, taken from the box and from nowhere else.
@@ -277,18 +390,24 @@ export const scoreTask = async (
         // verifier ran and answered. A failed verifier is `false`, and `scoreOf` divides by the
         // declared task count either way, so neither reading changes the denominator.
         resolved: verified.exitCode === 0,
-        // No provider was called, so nothing was billed. Zero here is a fact about this run and
-        // not a cost measurement; the `model` column names the run as scripted so the cell cannot
-        // be read as "athanor solved this for nothing".
-        costUsd: 0,
-        // Real, and measured on the wire by `evals/harness.ts` rather than estimated: the whole
-        // request body, catalogue included.
-        inputTokens: outcome.promptTokens,
-        outputTokens: outcome.outputTokens,
+        // Live: the provider's own per-call cost, summed by the harness off every answered
+        // response's usage frame - attributable to THIS task, which the account's running total
+        // is not once two processes share a key. Scripted: no provider was called, so nothing was billed, and
+        // zero is a fact about this run and not a cost measurement; the `model` column names the
+        // run as scripted so the cell cannot be read as "athanor solved this for nothing".
+        costUsd: live === undefined ? 0 : outcome.providerCostUsd,
+        // Live: the provider's own input count, off the same response frames as the cost.
+        // Scripted: measured on the wire by `evals/harness.ts` rather than estimated, the whole
+        // request body, catalogue included. `promptTokens` reads the same either way; see the
+        // harness's live branch.
+        inputTokens: live === undefined ? outcome.promptTokens : outcome.providerInputTokens,
+        outputTokens: live === undefined ? outcome.outputTokens : outcome.providerOutputTokens,
         steps: outcome.modelCalls,
         wallSeconds,
         compactions: outcome.compactions,
         approvalCardsFired: outcome.approvalsRaised,
+        cachedTokens: live === undefined ? null : outcome.providerCachedTokens,
+        approvalsAutoAnswered: outcome.approvalsAutoAnswered,
         // An infrastructure failure is something that stopped the run from being about the agent.
         // A throw out of the loop is one; a wrong answer is not.
         infraFailure: outcome.error !== null
@@ -304,7 +423,12 @@ export const scoreTask = async (
       error: outcome.error,
       misses: shim.misses,
       absentRequests: shim.absentRequests,
-      observedRoutes: outcome.observedRoutes
+      observedRoutes: outcome.observedRoutes,
+      events: outcome.events,
+      securityMode: fields.securityMode,
+      autoAnswered: outcome.approvalsAutoAnswered,
+      autoApproveCapReached: outcome.autoApproveCapReached,
+      providerUsageFallbacks: outcome.providerUsageFallbacks
     };
   } finally {
     if (stop) await stop();
@@ -328,9 +452,14 @@ export const scoreRun = async (options: ScoreOptions): Promise<ScoreReport> => {
   for (const task of options.tasks) {
     // Sequentially, like `evals/run.ts` and `observe.ts`, and for the same reason: `runFixture`
     // installs its own `globalThis.fetch` for the duration of a run. Two at once measure each other.
-    const one = options.runTask
-      ? await options.runTask(task)
-      : await scoreTask(task, options.trustLocal);
+    const one = await scoreTask(
+      task,
+      options.trustLocal,
+      undefined,
+      undefined,
+      undefined,
+      options.arm
+    );
     scored.push(one);
     options.onTask?.(one);
   }
@@ -348,58 +477,38 @@ export const scoreRun = async (options: ScoreOptions): Promise<ScoreReport> => {
       `this run used ${String(boxes.size)} different boxes (${[...boxes].join(', ')}), so no single backend column is true of it. No row.`
     );
   const ranIn = scored[0]?.ranIn ?? { name: 'local', isolatesNetwork: false };
-  const catalogueBytes = benchmarkBoxCatalogueBytes();
-  const input: RowInput = {
-    benchmark: options.identity?.benchmark ?? 'athanor-wire',
-    taskSet: scored.map((one) => one.task.id).join('+'),
+  const input = rowInputFrom({
+    benchmark: 'athanor-wire',
+    taskIds: scored.map((one) => one.task.id),
     // The tasks themselves, hashed, so two rows claiming the same task set can be checked rather
     // than believed. Over the prompt, the seed and the verifier argv - everything that decides what
     // solving it means.
-    taskSetSha: createHash('sha256')
-      .update(
-        JSON.stringify(
-          scored.map((one) => [one.task.id, one.task.request, one.task.seed, one.task.verify.call])
-        )
-      )
-      .digest('hex')
-      .slice(0, 16),
+    taskSetSha: taskSetShaOf(scored.map((one) => taskSetMemberOf(one.task))),
     nTasks: options.tasks.length,
     // Named for what it is in every row it appears in. No provider was reached; see this file's
     // header for what that does and does not invalidate.
-    model: options.identity?.model ?? 'scripted-no-provider',
-    modelRoute: options.identity?.modelRoute ?? 'none',
-    provider: options.identity?.provider ?? 'none',
-    harness: 'athanor',
+    model: 'scripted-no-provider',
+    modelRoute: 'none',
+    provider: 'none',
     harnessVersion: identity.version,
     harnessCommit: identity.commit ?? 'uncommitted',
     arm: options.arm,
-    // `evals/harness.ts`'s `taskFor` mints the task `balanced`, which is the mode the owner
-    // installs, so `shipped` is the only arm this driver can currently produce. The other two need
-    // that field to be settable and the `unattended` one needs an auto-approver as well; both are
-    // in README.md's paid ladder, and a row that named an arm it did not run under is exactly what
-    // `rowFrom` refuses.
-    securityMode: 'balanced',
-    approvalsAutoAnswered: 0,
+    // The mode the arm IS, and the mode every task was minted under: `scoreTask` derives both from
+    // the arm through `armFixtureFields`, so the row and the run cannot disagree. `rowFrom` still
+    // checks, because a row that named an arm it did not run under is exactly what it refuses.
+    securityMode: ARM_SECURITY_MODE[options.arm],
+    approvalsAutoAnswered: scored.reduce((total, one) => total + one.autoAnswered, 0),
     taskMaxSteps: Math.max(...options.tasks.map((task) => task.maxSteps)),
-    // `evals/harness.ts` pins `TASK_MAX_SELF_CONTINUATIONS: 0`, so every step count here is the
-    // cost of one budget rather than of two.
-    selfContinuations: 0,
     maxComputeCredits: Math.max(...options.tasks.map((task) => task.maxCredits)),
     maxSpendUsd: null,
-    catalogueBytes,
-    catalogueTokensPerCall: Math.round(catalogueBytes / BYTES_PER_TOKEN),
-    surfaces: { browser: 'absent', desktop: 'absent' },
-    backend: ranIn.name,
-    isolatesNetwork: ranIn.isolatesNetwork,
-    verifierEnv: 'same',
-    networkMode: 'host',
-    declaredDrops: LOCAL_DROPS,
+    catalogueBytes: benchmarkBoxCatalogueBytes(),
+    ranIn,
     // The gate. Any route the run asked for that this shim does not implement voids the row, and
     // the misses are unioned across every task because one bad task is one bad environment.
     shimMisses: [...new Set(scored.flatMap((one) => one.misses))],
     absentRequests: scored.reduce((total, one) => total + one.absentRequests, 0),
     runs: [{ startedAt, tasks: scored.map((one) => one.result) }]
-  };
+  });
 
   let row: string[] | null = null;
   let refusal: string | null = null;

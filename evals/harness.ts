@@ -379,6 +379,73 @@ const promptTokensFor = (body: Record<string, unknown>): number =>
 const catalogueBytesOf = (body: Record<string, unknown>): number =>
   JSON.stringify(body.tools ?? []).length;
 
+/** What a provider said one call weighed, read off the completion it sent back. */
+export interface ProviderUsageFrame {
+  readonly inputTokens: number;
+  /** Of the input, what the route served from its prompt cache, where it said. */
+  readonly cachedTokens: number;
+  readonly outputTokens: number;
+  /** The route's own price for the call, where it put one on the body. */
+  readonly costUsd: number | null;
+}
+
+/**
+ * The usage frame of one provider response, whatever shape the response took.
+ *
+ * A streamed completion carries it in the last data frame before `[DONE]` (the adapter asks for it
+ * with `stream_options.include_usage`); a plain completion carries it on the body. Field names are
+ * the wire's: `prompt_tokens`, `completion_tokens`, `prompt_tokens_details.cached_tokens` (or the
+ * other spelling the gateway's `readCacheUsage` accepts), and `cost` where the route prices calls.
+ * A body with no frame - a cut stream, an error - reads as `null` rather than as zeros, so a call
+ * that reported nothing is not summed as a call that reported nothing was used.
+ */
+export const usageFrameOf = (text: string): ProviderUsageFrame | null => {
+  const count = (value: unknown): number =>
+    typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
+  let found: ProviderUsageFrame | null = null;
+  const read = (payload: unknown): void => {
+    const usage = (payload as { usage?: unknown } | null)?.usage as
+      | {
+          prompt_tokens?: unknown;
+          completion_tokens?: unknown;
+          cost?: unknown;
+          prompt_tokens_details?: { cached_tokens?: unknown };
+          cache_read_input_tokens?: unknown;
+        }
+      | null
+      | undefined;
+    if (!usage || typeof usage !== 'object') return;
+    found = {
+      inputTokens: count(usage.prompt_tokens),
+      cachedTokens: count(
+        usage.prompt_tokens_details?.cached_tokens ?? usage.cache_read_input_tokens
+      ),
+      outputTokens: count(usage.completion_tokens),
+      costUsd: typeof usage.cost === 'number' && Number.isFinite(usage.cost) ? usage.cost : null
+    };
+  };
+  const trimmed = text.trimStart();
+  if (trimmed.startsWith('data:') || trimmed.startsWith(':')) {
+    for (const line of text.split('\n')) {
+      if (!line.startsWith('data:')) continue;
+      const raw = line.slice('data:'.length).trim();
+      if (!raw || raw === '[DONE]') continue;
+      try {
+        read(JSON.parse(raw));
+      } catch {
+        // A partial or non-JSON frame is not a usage frame.
+      }
+    }
+    return found;
+  }
+  try {
+    read(JSON.parse(text));
+  } catch {
+    return null;
+  }
+  return found;
+};
+
 const framesFor = (turn: ModelTurn, promptTokens: number): string[] => {
   const parts: string[] = [];
   const pieces = turn.chunks ?? (turn.text ? [turn.text] : []);
@@ -1750,6 +1817,25 @@ export interface Fixture {
    * reached". The seam a real model needs is the socket, not the script.
    */
   readonly live?: LiveProvider;
+  /**
+   * The mode the task is minted under. Absent everywhere in `fixtures.ts`, and the absence is
+   * `balanced` - the mode the owner installs, and the one every committed row was measured under.
+   * `evals/bench` sets it per arm: `autonomous` is the floor every mode shares, and a fixture that
+   * names it is asking what the floor alone still stops.
+   */
+  readonly securityMode?: 'review' | 'balanced' | 'autonomous';
+  /**
+   * An approver that answers every card approved with nobody reading it, which is what every
+   * published leaderboard adapter is.
+   *
+   * Off everywhere in `fixtures.ts`: a card that fires parks the run in `awaiting_user` and the
+   * fixture measures the park, which is the product. On, the harness plays the owner's part of the
+   * production approval flow step for step - the card is marked approved, the task is claimed back
+   * as `running` under this worker, and `AgentWorker.run` is entered again so `turn/resume.ts`
+   * finds the approval, checks the argument hash and executes the approved call. See the loop
+   * after the first `run(task)` in `runFixture` for what it does NOT answer: a parked question.
+   */
+  readonly autoApprove?: boolean;
   readonly runner?: RunnerStub;
   /** The step ceiling in force, when the fixture is about what happens at one. */
   readonly maxSteps?: number;
@@ -2386,6 +2472,66 @@ export interface RunOutcome {
    * it, so no committed baseline row can move because this is published.
    */
   readonly approvalsRaised: number;
+  /**
+   * Cards the harness answered approved on the fixture's behalf. Zero unless `Fixture.autoApprove`
+   * is on; `approvalsRaised` keeps counting every card across the re-entries, so the difference
+   * between the two is the cards left standing when the run ended.
+   */
+  readonly approvalsAutoAnswered: number;
+  /**
+   * Whether the auto-approver stopped re-entering because it reached its own ceiling, leaving the
+   * run parked on a card it would otherwise have answered. A bounded loop that hit its bound is a
+   * different fact from a turn that parked, and a row should be able to tell them apart.
+   */
+  readonly autoApproveCapReached: boolean;
+  /**
+   * What this run cost in USD, by the provider's own figure where it gave one.
+   *
+   * Live: the `cost` field on every answered response's usage frame, summed - the same responses
+   * the three token sums below are read off, so cost and tokens describe one set of calls. It is
+   * attributable to this run alone, which the account's running total is not once two processes
+   * share a key. A response that carried no frame, or a frame with no price, falls back to the
+   * usage row the loop recorded for that call (its own estimate at the release's price), and
+   * `providerUsageFallbacks` says how many did. Offline it is the sum of the loop's usage rows -
+   * its own estimate - and nothing in `evals/report.ts` reads it, so no committed row can move
+   * because it exists.
+   */
+  readonly providerCostUsd: number;
+  /**
+   * How many live responses the provider answered - every request under `Fixture.live.baseUrl`
+   * that came back with a 2xx, whatever kind of call it was. The three token sums and the cost
+   * above are over exactly these, and `modelCalls` counts them plus the requests the provider
+   * refused. Zero offline: nothing is forwarded.
+   */
+  readonly providerCalls: number;
+  /**
+   * Of `providerCalls`, how many were priced and counted from the loop's own ledger row rather
+   * than from the provider's frame, because the response carried no frame (a cut stream) or a
+   * frame with no price (a route that does not price its calls). A row with this above zero is
+   * a row where the columns are partly the loop's arithmetic, and a reader should know that
+   * rather than infer it. Zero offline.
+   */
+  readonly providerUsageFallbacks: number;
+  /**
+   * Input tokens the provider reported, summed off every live response's own usage frame - the
+   * lead steps, the compaction summariser, a vision handoff, a delegated specialist's steps, all
+   * of them - rather than off the loop's cost events, which only a lead step and the closing
+   * handoff write. Zero offline: nothing reports.
+   */
+  readonly providerInputTokens: number;
+  /** Of those, the tokens the provider served from its prompt cache, where it said. */
+  readonly providerCachedTokens: number;
+  /** Output tokens the provider reported, summed off the same responses. */
+  readonly providerOutputTokens: number;
+  /**
+   * The loop's own events, whole and in order, payloads already decrypted. Here so a bench run can
+   * persist the transcript per task; nothing in `evals/report.ts` reads it.
+   */
+  readonly events: ReadonlyArray<{
+    readonly kind: string;
+    readonly summary: string;
+    readonly payload: unknown;
+  }>;
   readonly fallbackPlan: boolean;
   readonly untrusted: boolean;
   readonly replies: number;
@@ -2512,7 +2658,11 @@ const modelFor = (contextTokens?: number, live?: LiveProvider): ModelRelease => 
       };
 };
 
-const taskFor = (prompt: string, maxComputeCredits: number): TaskRecord => ({
+const taskFor = (
+  prompt: string,
+  maxComputeCredits: number,
+  securityMode: 'review' | 'balanced' | 'autonomous' = 'balanced'
+): TaskRecord => ({
   id: taskId,
   userId,
   workspaceId,
@@ -2530,7 +2680,7 @@ const taskFor = (prompt: string, maxComputeCredits: number): TaskRecord => ({
   status: 'running',
   modelId: release.id,
   privacyRoute: 'provider_zdr',
-  securityMode: 'balanced',
+  securityMode,
   maxComputeCredits,
   actualComputeCredits: 0,
   maxSpendUsd: null,
@@ -2719,6 +2869,15 @@ const schemaOutcome = (findings: readonly string[]): RunOutcome => ({
   verification: 'none',
   askedOwner: false,
   approvalsRaised: 0,
+  approvalsAutoAnswered: 0,
+  autoApproveCapReached: false,
+  providerCostUsd: 0,
+  providerCalls: 0,
+  providerUsageFallbacks: 0,
+  providerInputTokens: 0,
+  providerCachedTokens: 0,
+  providerOutputTokens: 0,
+  events: [],
   fallbackPlan: false,
   untrusted: false,
   replies: 0,
@@ -2757,9 +2916,40 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
   forgetReads();
   if (fixture.schema) return schemaOutcome(fixture.schema());
   const model = modelFor(fixture.contextTokens, fixture.live);
-  const task = taskFor(fixture.request, fixture.maxCredits ?? 50);
+  /*
+   * The task record the worker is handed, and - under `autoApprove` - the record it is handed AGAIN.
+   * A `let` for that reason alone: the stub's `updateTask` reassigns it so that the state the loop
+   * saved when it parked is the state `claimTurn` decrypts on the way back in, exactly as the
+   * production store hands the next claim the row the last write left. Every offline fixture
+   * leaves `autoApprove` off, and for those `updateTask` never touches this binding.
+   */
+  let task = taskFor(fixture.request, fixture.maxCredits ?? 50, fixture.securityMode ?? 'balanced');
   const events: Array<{ kind: string; summary: string; payload: unknown }> = [];
   const approvals: string[] = [];
+  /**
+   * The approvals table, as far as the resume needs it: the row `createApproval` wrote, by id, with
+   * the status the auto-approver flips. `getApproval` answers from here unconditionally - a pending
+   * row is what production returns for a card nobody has answered, so answering it moves nothing
+   * for a fixture that parks.
+   */
+  const approvalRows = new Map<
+    string,
+    {
+      id: string;
+      previewHash: unknown;
+      status: 'pending' | 'approved';
+      expiresAt: unknown;
+      action: string;
+    }
+  >();
+  /** Every usage row the loop recorded, for the cost the provider itself put on each call. */
+  const usageRows: Array<{ kind: string; costUsd: number; quantity: number }> = [];
+  /**
+   * Every live response in order - whether the provider answered it, and the usage frame read off
+   * a copy of its body once that copy has been read to its end. See the live branch below.
+   */
+  const liveResponses: Array<{ ok: boolean; frame: ProviderUsageFrame | null }> = [];
+  const liveUsageReads: Promise<void>[] = [];
   let finalStatus = 'running';
   /** Whether the turn has already taken the owner's queued correction; see `Fixture.correction`. */
   let correctionTaken = false;
@@ -2902,6 +3092,27 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
       // ordinary pause leaves it null on purpose, so `!= null` is the whole distinction and a
       // truthiness test on a Date would read the same either way.
       if (input.spendPausedAt !== undefined && input.spendPausedAt !== null) spendPaused = true;
+      /*
+       * Under the auto-approver only, the write lands on the record the next `run(task)` reads:
+       * status, the saved trajectory and the lease, which is what `parkForApproval` writes and what
+       * `claimTurn` and `taskClaim` read back. Gated on the fixture rather than done for every row
+       * because the offline suite measures a task whose `taskClaim` never changes under it - a
+       * spend pause writes `paused`, and a claim that reported it would stand the loop down where
+       * the committed rows measure it carrying on - so the write stays a no-op there, as it always
+       * was.
+       */
+      if (fixture.autoApprove === true)
+        task = {
+          ...task,
+          ...(typeof input.status === 'string' ? { status: input.status } : {}),
+          ...(input.agentStateCiphertext !== undefined
+            ? {
+                agentStateCiphertext:
+                  input.agentStateCiphertext as TaskRecord['agentStateCiphertext']
+              }
+            : {}),
+          ...(input.clearLease === true ? { leaseOwner: null, leaseExpiresAt: null } : {})
+        };
       return task;
     },
     renewTaskLease: async () => true,
@@ -2920,11 +3131,33 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
       id: 'notification',
       ...input
     }),
-    createApproval: async (input: { action?: unknown }) => {
+    createApproval: async (input: {
+      action?: unknown;
+      previewHash?: unknown;
+      expiresAt?: unknown;
+    }) => {
       approvals.push(asText(input.action));
-      return `approval-${approvals.length}`;
+      const id = `approval-${approvals.length}`;
+      // The hash travels with the row because `turn/resume.ts` recomputes it over the call it is
+      // about to run and refuses the call when the two differ. A stub that dropped it would make
+      // every approved resume a refusal.
+      approvalRows.set(id, {
+        id,
+        previewHash: input.previewHash,
+        status: 'pending',
+        expiresAt: input.expiresAt,
+        action: asText(input.action)
+      });
+      return id;
     },
-    recordUsage: async () => undefined,
+    getApproval: async (id: string) => approvalRows.get(id) ?? null,
+    recordUsage: async (input: { kind?: unknown; costUsd?: unknown; quantity?: unknown }) => {
+      usageRows.push({
+        kind: asText(input.kind),
+        costUsd: typeof input.costUsd === 'number' ? input.costUsd : 0,
+        quantity: typeof input.quantity === 'number' ? input.quantity : 0
+      });
+    },
     // A delivered file, so a job that makes something can be measured all the way to the owner
     // rather than stopping at the workspace.
     createArtifact: async (input: Record<string, unknown>) => ({
@@ -3225,7 +3458,41 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
     if (fixture.live !== undefined && url.startsWith(fixture.live.baseUrl)) {
       modelCalls += 1;
       answeredCalls += 1;
-      return await original(input, init);
+      // The catalogue is priced off the request, which this side has whole. The prompt is NOT:
+      // it is left to the provider's own count, read off the RESPONSE below, because the wire
+      // estimate `promptTokensFor` makes is this rig's arithmetic and a live row's input column
+      // should be the number the bill was computed from.
+      wireCatalogueTokens.push(Math.ceil(catalogueBytesOf(bodyOf(init)) / 4));
+      const response = await original(input, init);
+      /*
+       * The provider's usage frame, read off a copy of every response that came back under this
+       * prefix - the same set of calls `modelCalls` just counted.
+       *
+       * It used to be read off the loop's `cost` events, and those are written for a lead step
+       * and for the closing handoff only: a compaction's summariser, a vision handoff, a delegated
+       * specialist's steps and a provider search each record a usage row and write no cost event.
+       * So a live turn that compacted twice counted 52 calls, priced 52 usage rows, and summed the
+       * input tokens of 50 - three columns of one row describing three different sets of calls.
+       * The response is the one place every call passes through, and the frame on it is the
+       * number the bill was computed from. `clone()` tees the body, so the gateway reads its
+       * stream untouched while this side reads the copy to its end; a stream that was cut never
+       * carries a frame and reads as nothing, which is also what the gateway sees.
+       */
+      const slot: { ok: boolean; frame: ProviderUsageFrame | null } = {
+        ok: response.ok,
+        frame: null
+      };
+      liveResponses.push(slot);
+      liveUsageReads.push(
+        response
+          .clone()
+          .text()
+          .then((text) => {
+            slot.frame = usageFrameOf(text);
+          })
+          .catch(() => undefined)
+      );
+      return response;
     }
     if (url.startsWith(PROVIDER_URL)) {
       const media = mediaResponse(fixture.runner ?? {}, execState, url, init);
@@ -3412,8 +3679,20 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
   }) as typeof fetch;
 
   let error: string | null = null;
-  try {
-    await new AgentWorker(
+  /** Cards this harness answered approved on the fixture's behalf; see `Fixture.autoApprove`. */
+  let approvalsAutoAnswered = 0;
+  let autoApproveCapReached = false;
+  /**
+   * The worker, built once per entry and the same way on every entry: production claims a resumed
+   * task with whatever worker polls it next, and that worker is constructed exactly as the first
+   * one was. A local function rather than a hoisted instance so a re-entry cannot inherit state a
+   * previous `run` left on the object.
+   *
+   * The one thing that differs between entries is the step ceiling, and only under the
+   * auto-approver: see the re-entry loop below for why a re-entry is built with one step fewer.
+   */
+  const worker = (stepCeiling: number): AgentWorker =>
+    new AgentWorker(
       store,
       {
         WORKER_ID,
@@ -3439,14 +3718,78 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
         CONNECTOR_ALLOWED_HOST_SUFFIXES: '',
         WORKER_CONCURRENCY: 2,
         WORKER_POLL_MS: 1_000,
-        TASK_MAX_STEPS: fixture.maxSteps ?? 12,
+        TASK_MAX_STEPS: stepCeiling,
         // A turn that renews its own budget is a separate mechanism with its own bounds. Left off
         // so every step count below is the cost of one budget rather than of two.
         TASK_MAX_SELF_CONTINUATIONS: 0
       },
       masterKey,
       runnerSecret
-    ).run(task);
+    );
+  const stepCeiling = fixture.maxSteps ?? 12;
+  try {
+    await worker(stepCeiling).run(task);
+    /*
+     * The owner's half of the production approval flow, played by the harness.
+     *
+     * In production: `parkForApproval` creates the card, saves the trajectory and writes the task
+     * `awaiting_user` with its lease cleared, and `AgentWorker.run` returns. The owner approves;
+     * the API marks the row approved and sets the task `queued`; a worker's poll claims it as
+     * `running` under its own id; `run` decrypts the saved state and `resumeParkedTurn` finds the
+     * approval, checks the argument hash, and executes the approved call before the loop goes on.
+     *
+     * Here every one of those happens, in that order, except the poll: the harness has no worker
+     * loop to claim a `queued` task, so it performs the claim itself - `running`, this worker's id,
+     * a lease in the future - which is the row a claim leaves behind. What `run` is then handed is
+     * indistinguishable from a claimed resume.
+     *
+     * WHAT IS NOT ANSWERED: a parked question. `ask` writes the task `awaiting_user` too, but
+     * creates no approval row - the answer is the owner's next message, not a yes. An auto-approver
+     * is not an auto-owner, and a rig that typed an answer would be measuring its own prose. The
+     * newest approval still being `pending` is the whole test: a question park leaves it answered
+     * (or absent) and the loop below leaves the run parked, which is the correct outcome for it.
+     */
+    /*
+     * WHAT BOUNDS IT: the model calls this harness has counted, against `maxSteps`, and not a
+     * count of re-entries.
+     *
+     * The loop's step counter advances only when a step COMPLETES (`agent.ts`, the `for` over
+     * `state.step`); a step that parks on a card never gets there, so a resumed turn re-runs the
+     * same step number, and the worker's own `TASK_MAX_STEPS` bounds nothing across entries.
+     * Measured: `maxSteps` 4 and a model that proposes a push on every call made 5 calls, 4 of
+     * them answered, every one of them at step 0 - so a row's `task_max_steps` named a bound the
+     * run was not under. The product's own definition of a step is "one model call however many
+     * tools it uses" (`turn-bounds.ts`), and the call that carded WAS a model call; so was the
+     * request a provider refused and the loop retried, which no step number ever records.
+     * `modelCalls` is the one counter on this side that sees every request, whichever entry made
+     * it, so it is the bound: no re-entry once the run has spent the ceiling's worth of calls,
+     * and reaching it is recorded rather than swallowed. Under this arm `task_max_steps` is then
+     * a true ceiling on provider calls exactly as under the others (plus the closing handoff a
+     * turn at its ceiling makes, which every arm pays).
+     *
+     * The re-entered worker is still built one step shorter per card answered: the guard above
+     * stops the NEXT re-entry, and the worker's own ceiling is what stops a re-entered turn from
+     * spending, within one entry, steps that earlier entries already parked on.
+     */
+    while (fixture.autoApprove === true && finalStatus === 'awaiting_user') {
+      const newest = [...approvalRows.values()].at(-1);
+      if (!newest || newest.status !== 'pending') break;
+      if (modelCalls >= stepCeiling) {
+        autoApproveCapReached = true;
+        break;
+      }
+      newest.status = 'approved';
+      task = {
+        ...task,
+        status: 'running',
+        leaseOwner: WORKER_ID,
+        leaseExpiresAt: new Date(Date.now() + 120_000).toISOString()
+      };
+      finalStatus = 'running';
+      approvalsAutoAnswered += 1;
+      // One step fewer per card answered; see the comment above the loop.
+      await worker(stepCeiling - approvalsAutoAnswered).run(task);
+    }
   } catch (cause) {
     error = cause instanceof Error ? cause.message : String(cause);
   } finally {
@@ -3454,6 +3797,51 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
     Date.now = realNow;
     advanceClockBy = () => undefined;
   }
+  // Every live response has been handed to the gateway by now; wait for the copies this rig kept
+  // to be read to their end before anything below sums them.
+  await Promise.all(liveUsageReads);
+  /*
+   * One usage figure per answered live response, the provider's where it gave one.
+   *
+   * A response the provider refused (a 5xx the loop retried) is a request `modelCalls` counts and
+   * nothing prices: it carried no completion and no route bills one. An answered response with no
+   * frame - a stream cut before its last data frame - or a frame with no `cost` is the case the
+   * lead asked to be named rather than zeroed: it falls back to the ledger row the loop wrote for
+   * that call. The loop writes one `model_inference` row per answered call, in the order the calls
+   * were answered, so the n-th answered response and the n-th row are the same call. What that row
+   * carries is the loop's `quantity` (its billed input plus the output it counted) and its own
+   * price; the split is recovered from the `cost` event the same call wrote where it wrote one - a
+   * lead step's event carries `usage.estimated` and the counted output - and where it wrote none
+   * (a specialist, a summariser) the whole quantity is read as input, which is what nearly all of
+   * a frameless call is. Counted, so a row built on this is read for what it is.
+   */
+  const ledgerRows = usageRows.filter((row) => row.kind === 'model_inference');
+  const estimatedEvents = events
+    .filter((entry) => entry.kind === 'cost')
+    .map(
+      (entry) =>
+        ((entry.payload ?? {}) as { usage?: { estimated?: unknown; outputTokens?: unknown } }).usage
+    )
+    .filter((usage) => usage?.estimated === true);
+  let providerUsageFallbacks = 0;
+  const liveUsage: ProviderUsageFrame[] = liveResponses
+    .filter((response) => response.ok)
+    .map((response, ordinal) => {
+      const frame = response.frame;
+      if (frame && frame.costUsd !== null) return frame;
+      providerUsageFallbacks += 1;
+      const row = ledgerRows[ordinal];
+      if (frame) return { ...frame, costUsd: row?.costUsd ?? 0 };
+      const counted = estimatedEvents.shift();
+      const outputTokens = Number(counted?.outputTokens) || 0;
+      const quantity = row?.quantity ?? 0;
+      return {
+        inputTokens: Math.max(quantity - outputTokens, 0),
+        cachedTokens: 0,
+        outputTokens,
+        costUsd: row?.costUsd ?? 0
+      };
+    });
 
   /**
    * What the context layer decided on each billed step, read off the event it already writes.
@@ -3586,7 +3974,17 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
   return {
     modelCalls,
     delegatedCalls,
-    promptTokens: wirePromptTokens.reduce((total, value) => total + value, 0),
+    // Offline: every request body priced on the wire by `promptTokensFor`. Live: the provider's
+    // own input count off every response's usage frame, because the live branch forwards the
+    // request untouched and never pushed a wire estimate - so the first paid row read
+    // `input_tokens_mean 0` for a run that had billed thirteen million of them. The provider's
+    // number rather than the wire estimate on purpose: it is what the bill was computed from, and
+    // the two differ by the tokeniser, which this rig does not have. Off the responses rather than
+    // the cost events so that it covers the same calls `modelCalls` counts; see the live branch.
+    promptTokens:
+      fixture.live === undefined
+        ? wirePromptTokens.reduce((total, value) => total + value, 0)
+        : liveUsage.reduce((total, usage) => total + usage.inputTokens, 0),
     catalogueTokens: wireCatalogueTokens.reduce((total, value) => total + value, 0),
     // The catalogue as one request carries it, which is the number a residency change moves and the
     // only one that can be compared against `tool-catalogue.test.ts`'s ceiling. The sum above is
@@ -3680,6 +4078,21 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
       ) || 'none',
     askedOwner: approvals.length > 0,
     approvalsRaised: approvals.length,
+    approvalsAutoAnswered,
+    autoApproveCapReached,
+    // Live: the provider's own price off every answered response, the fallbacks above included.
+    // Offline: the loop's inference rows - a document tool records usage too, and it is not a
+    // call to the model.
+    providerCostUsd:
+      fixture.live === undefined
+        ? ledgerRows.reduce((total, row) => total + row.costUsd, 0)
+        : liveUsage.reduce((total, usage) => total + (usage.costUsd ?? 0), 0),
+    providerCalls: liveUsage.length,
+    providerUsageFallbacks,
+    providerInputTokens: liveUsage.reduce((total, usage) => total + usage.inputTokens, 0),
+    providerCachedTokens: liveUsage.reduce((total, usage) => total + usage.cachedTokens, 0),
+    providerOutputTokens: liveUsage.reduce((total, usage) => total + usage.outputTokens, 0),
+    events,
     fallbackPlan,
     untrusted: events.some(
       (entry) => entry.kind === 'warning' && entry.summary.startsWith('Untrusted content entered')

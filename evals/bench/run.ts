@@ -6,10 +6,12 @@
  *   pnpm eval:bench --observe          re-sweep the fixtures and rewrite routes.json
  *   pnpm eval:bench --observe --filter research   sweep a selection (a FLOOR of a floor; say so)
  *   pnpm eval:bench --routes           print the committed observation and the shim's coverage
- *   pnpm eval:bench --score            drive a real AgentWorker against the shim and score it
+ *   pnpm eval:bench --score [--arm A]  drive a real AgentWorker against the shim and score it
+ *   pnpm eval:bench --terminal-bench   the paid run: real model, real containers, records per task
+ *   pnpm eval:bench --assemble         build a parity row from the records and upsert it
  *
- * Everything here runs offline, with no key, no network and no provider. Nothing in this rig can
- * spend money; the paid step is a command in README.md that the owner runs, not a flag on this.
+ * Everything but `--terminal-bench` runs offline, with no key, no network and no provider. The
+ * paid path refuses to start without a key and without every bound named on the command line.
  *
  * Not part of `pnpm check`, like every other rig in `evals/`. It exits non-zero on a self-test
  * failure or on a route athanor asks for that the shim does not implement, so it is usable in CI
@@ -25,9 +27,10 @@ import { benchmarkBoxCatalogueBytes, catalogueWeights } from './catalogue.js';
 import { allFixtures, observe } from './observe.js';
 import { COLUMNS, renderCsv } from './parity.js';
 import { coverageOf, IMPLEMENTED_ROUTES, type RouteObservation } from './routes.js';
+import { readCsvRows } from './results.js';
 import { runScore } from './score.js';
 import { selfTest } from './selftest.js';
-import { runTerminalBench } from './terminal-score.js';
+import { isArm, runAssemble, runTerminalBench } from './terminal-score.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const routesPath = path.join(here, 'routes.json');
@@ -178,31 +181,59 @@ if (flag('routes')) {
   process.exit(coverage.missing.length === 0 ? 0 : 1);
 }
 
-/*
- * The join, driven to a score. Still offline, still free: the model is a script and no provider is
- * reached. See `score.ts` for what that does and does not prove, and README.md section 5 for the
- * command that produces a number about athanor rather than about the wire.
- *
- * `--arm` is accepted and only `shipped` can currently be honoured, because `evals/harness.ts`
- * mints its task `balanced`. An arm this driver cannot run under is refused here rather than
- * printed into a row, which is the same discipline `rowFrom` applies.
+const taskIdsArgument = (): readonly string[] =>
+  (argument('tasks') ?? '')
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean);
+
+/**
+ * The arm, or a refusal. All three run now: the harness mints the task under the arm's own mode
+ * and attaches the auto-approver for `unattended`, so a flag naming an arm is a flag the row can
+ * honour. An arm outside the ladder is refused here rather than printed into a row, which is the
+ * same discipline `rowFrom` applies.
  */
+const armArgument = (): 'shipped' | 'autonomous' | 'unattended' => {
+  const arm = argument('arm') ?? 'shipped';
+  if (!isArm(arm)) {
+    process.stderr.write(`--arm ${arm} is not on the ladder: shipped, autonomous or unattended.\n`);
+    process.exit(2);
+  }
+  return arm;
+};
+
 /*
  * The paid command. A real model, real containers, a borrowed task set - and the only path in this
  * directory that can spend money, which is why it is refused unless every one of its bounds is
- * named on the command line rather than defaulted to something generous.
+ * named on the command line rather than defaulted to something generous. It writes one record per
+ * task under --results and no row; --assemble builds the row afterwards. See terminal-score.ts.
  */
 if (flag('terminal-bench')) {
   const root = argument('root');
   const model = argument('model');
+  const results = argument('results');
   const maxSpendUsd = Number(argument('max-spend-usd') ?? Number.NaN);
   const maxCallsPerTask = Number(argument('max-calls') ?? Number.NaN);
-  if (!root || !model || !Number.isFinite(maxSpendUsd) || !Number.isFinite(maxCallsPerTask)) {
+  const runIndex = Number(argument('run-index') ?? '0');
+  if (
+    !root ||
+    !model ||
+    !results ||
+    !Number.isFinite(maxSpendUsd) ||
+    !Number.isFinite(maxCallsPerTask) ||
+    !Number.isFinite(runIndex)
+  ) {
     process.stderr.write(
-      'usage: --terminal-bench --root DIR --model ID --max-spend-usd N --max-calls N [--tasks a,b,c] [--sudo] [--arm shipped]\n' +
+      'usage: --terminal-bench --root DIR --model ID --max-spend-usd N --max-calls N --results DIR\n' +
+        '                        [--run-index N] [--tasks a,b,c] [--sudo] [--arm shipped|autonomous|unattended]\n' +
         '  every bound is required. A benchmark run that spends until something else stops it is\n' +
         '  not a measurement, and a default here would be this rig choosing how much of the\n' +
-        "  owner's money to spend.\n"
+        "  owner's money to spend.\n" +
+        "  --max-spend-usd is checked between tasks against the KEY's own running total, so with\n" +
+        '  several processes on one key it is a global ceiling: every process stops when the key\n' +
+        '  as a whole has spent it. --max-calls is the step ceiling each task runs under.\n' +
+        '  --results DIR/<arm>/run-<N>/<task>.json is written per task as it finishes; a task whose\n' +
+        '  record exists is skipped, so the same command resumes after a crash.\n'
     );
     process.exit(2);
   }
@@ -212,27 +243,51 @@ if (flag('terminal-bench')) {
       model,
       maxSpendUsd,
       maxCallsPerTask,
-      ids: argument('tasks')
-        ?.split(',')
-        .map((id) => id.trim())
-        .filter(Boolean),
+      ids: taskIdsArgument(),
       sudo: flag('sudo'),
-      arm: argument('arm') ?? 'shipped',
+      arm: armArgument(),
+      results,
+      runIndex,
       out
     })
   );
 }
 
-if (flag('score')) {
-  const arm = argument('arm') ?? 'shipped';
-  if (arm !== 'shipped') {
+/*
+ * The row, from the records. Offline: it reads files and writes parity.csv, and reaches no
+ * provider and no container. --root is optional and worth passing: it recomputes the task-set
+ * digest from the tasks on disk and refuses if the records were run on different ones.
+ */
+if (flag('assemble')) {
+  const results = argument('results');
+  const runs = Number(argument('runs') ?? Number.NaN);
+  const taskIds = taskIdsArgument();
+  if (!results || !Number.isInteger(runs) || runs <= 0 || taskIds.length === 0) {
     process.stderr.write(
-      `--arm ${arm} needs a task minted under a different security mode than evals/harness.ts mints, and an auto-approver for "unattended". This driver runs "shipped" only; see README.md section 5.\n`
+      'usage: --assemble --results DIR --arm A --runs N --tasks a,b,c [--root DIR]\n' +
+        '  --runs is the number of run-indexes the row claims (0..N-1), every one scored against\n' +
+        '  --tasks whether or not it has a record; a missing record scores 0 and is printed.\n'
     );
     process.exit(2);
   }
   process.exit(
-    await runScore({ arm, trustLocal: flag('trust-local'), filter: argument('task'), out })
+    runAssemble({ results, arm: armArgument(), runs, taskIds, root: argument('root'), out })
+  );
+}
+
+/*
+ * The join, driven to a score. Still offline, still free: the model is a script and no provider is
+ * reached. See `score.ts` for what that does and does not prove, and README.md section 5 for the
+ * command that produces a number about athanor rather than about the wire.
+ */
+if (flag('score')) {
+  process.exit(
+    await runScore({
+      arm: armArgument(),
+      trustLocal: flag('trust-local'),
+      filter: argument('task'),
+      out
+    })
   );
 }
 
@@ -241,13 +296,14 @@ const problems = await selfTest(observation);
 out(`evals/bench self-test: ${problems.length === 0 ? 'clean' : `${problems.length} problem(s)`}`);
 for (const problem of problems) out(`  - ${problem}`);
 
-// The empty artefact, written every run so the columns and the header are exercised rather than
-// asserted. A row needs a scored run, and a scored run costs money this lane may not spend; what
-// is committed is the shape, the aggregator and the refusals, all of which are testable at zero
-// cost. See README.md for the command that fills it in.
+// The artefact, re-rendered every run so the columns and the header are exercised rather than
+// asserted - WITH ITS ROWS KEPT. It used to be written empty here, which was right while it had
+// no rows and would have wiped the ladder the first time it had one; `readCsvRows` refuses a
+// header this rig does not write rather than guessing which column is which.
 // Not through Prettier: it has no CSV parser, so the file is its own format and the gate ignores
 // it. The header row is the whole of its shape and `COLUMNS` is the one place that shape lives.
-writeFileSync(csvPath, renderCsv([]));
+const keptRows = readCsvRows(csvPath);
+writeFileSync(csvPath, renderCsv(keptRows));
 out('');
 // The counter-argument, answered with a measurement rather than an assertion. See catalogue.ts.
 out('What the catalogue weighs, measured through agentToolsFor on this checkout:');
@@ -260,7 +316,9 @@ out(
 );
 
 out('');
-out(`Parity CSV shape: ${COLUMNS.length} columns, 0 rows, written to ${csvPath}`);
+out(
+  `Parity CSV shape: ${COLUMNS.length} columns, ${String(keptRows.length)} row(s) kept, written to ${csvPath}`
+);
 out(
   `  aggregator is "${'mean'}" and is a column; a missing result scores 0; a run that reached an unimplemented route emits no row.`
 );
