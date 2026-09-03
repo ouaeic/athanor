@@ -141,6 +141,31 @@ const RANGE = /^(\d+)(?:(?:\s*(?:\.=|\.\.|\.|-|–|—|,|to|:)\s*|\s+)(\d+))?\s*
 const CANONICAL =
   'expected PUT N:, PUT N.=M:, PUT N*:, PUT <N:, PUT >N:, CUT N.=M, CUT N.=M @name or PUT >N @name';
 
+/**
+ * One patch, written out, appended to every parse failure.
+ *
+ * `CANONICAL` above is a grammar, and a grammar is what a reader who already knows the format needs.
+ * Measured on the box: nine `file_patch` calls in one turn, five of them refused, and three of those
+ * five were a body row that never reached its operation - `PUT 3:+from x import y` with the body on
+ * the operation's own line, and a bare `def test_split(): ` read as an operation because the PUT
+ * above it had not opened a body. Each refusal restated the same list of forms, and the list does
+ * not show the one thing all three got wrong, which is that the operation and its body are on
+ * SEPARATE LINES and every body row carries a marker.
+ *
+ * So the shape goes out with the rule. It is on the failure path only and costs nothing resident,
+ * which is the whole reason it can afford to be this long.
+ */
+const WORKED_EXAMPLE = [
+  'A whole patch looks like this - the operation on its own line, the body indented under it, one',
+  'marker per body row (+ adds, - is the line you claim is there now, a space is context):',
+  '  PUT 12.=14:',
+  '  -    return None',
+  '  +    return merge(rest)',
+  '  PUT >40:',
+  '  +def split(intervals, at):',
+  '  +    return intervals'
+].join('\n');
+
 export const parseEdit = (source: string): ParseResult => {
   const rows = toLines(source);
   const ops: EditOp[] = [];
@@ -150,7 +175,9 @@ export const parseEdit = (source: string): ParseResult => {
   };
   const fail = (row: number, message: string): ParseResult => ({
     ok: false,
-    failure: { kind: 'parse', row: row + 1, message }
+    // The example rides on every parse failure rather than on the three that earned it: a reader
+    // that could not write a valid operation needs to see one whichever rule it tripped.
+    failure: { kind: 'parse', row: row + 1, message: `${message}\n${WORKED_EXAMPLE}` }
   });
 
   let index = 0;

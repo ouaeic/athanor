@@ -530,6 +530,26 @@ describe('the bounds that stop a patch corrupting a file', () => {
     expect(refused('PUT <3 @body')).toContain('PUT <3:');
   });
 
+  /*
+   * A grammar is what a reader who already knows the format needs. Measured on the box: nine
+   * file_patch calls in one turn, five refused, and three of those were a body row that never
+   * reached its operation - the body written on the operation's own line, and a bare `def f():`
+   * read as an operation. Each refusal restated the same list of forms, and the list does not show
+   * the one thing all three got wrong: the operation and its body are on separate lines.
+   */
+  it('shows a whole valid patch on every parse failure, whichever rule was tripped', () => {
+    read();
+    for (const bad of [
+      'PUT 3:+from ivl.intervals import merge',
+      'def test_split_empty():',
+      'CUT'
+    ]) {
+      const message = refused(bad);
+      expect(message, bad).toContain('PUT 12.=14:');
+      expect(message, bad).toContain('marker per body row');
+    }
+  });
+
   it('refuses a block that does not close within the lines that were shown', () => {
     // A window that stops inside a function: claiming the rest of the file would be destructive, so
     // the scanner claims nothing and the applier says so by name.

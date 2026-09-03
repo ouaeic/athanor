@@ -1017,7 +1017,7 @@ async function runWorkspaceTool(context: ToolContext, call: ModelToolCall): Prom
         if (seenPaths.has(path))
           throw new AthanorError(
             'patch_invalid',
-            `${path} appears in two patches of the same call. Every operation on one file addresses the numbers of the same read, so they belong in that file's single patch.`
+            `${path} appears in two patches of the same call. Every operation on one file addresses the numbers of the same read, so they belong in that file's single patch. Put all the operations for ${path} in one edit, each on its own line and in any order: they are applied from the end of the file backwards, so an edit low down does not move the numbers an edit higher up is addressing.`
           );
         seenPaths.add(path);
         let before: string;
