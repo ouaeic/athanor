@@ -3727,6 +3727,11 @@ task_emit() {
                              and ((.payload.owner // false) == true))
                   )
                 | last)
+               # A spend ceiling parks the task with a `status` carrying `blockedBy`, not an error -
+               # so `blocked` came back with `reason: null` while the timeline held the sentence
+               # "Paused at $0.0015 of the $0.01 limit for this task. Raise the limit to carry on."
+               # The one channel a headless caller has said only "blocked".
+               // ($events | map(select(.kind == "status" and (.payload.blockedBy != null))) | last)
                // ($events | map(select(.kind == "error")) | last))
          else null end) as $bad
       | {
@@ -3750,6 +3755,9 @@ task_emit() {
           outstanding: ($done.payload.outstanding // []),
           reason: ($bad.summary // null),
           reasonCode: ($bad.payload.code // null),
+          # Which ceiling stopped it - "task", "daily" or "monthly" - rather than a code invented
+          # here for the occasion. Null for every stop that is not a spend ceiling.
+          blockedBy: ($bad.payload.blockedBy // null),
           pendingApprovals: $approvals,
           question: (if ($approvals | length) > 0 or $asked == null then null else {
               question: ($asked.payload.question // $asked.summary // null),

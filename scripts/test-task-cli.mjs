@@ -686,6 +686,57 @@ check('answer refuses to send nothing, and sends nothing', () => {
   assert.equal(emptyAnswer.seen.filter((r) => r.method === 'POST').length, 0);
 });
 
+/*
+ * A task parked by a spend ceiling has to say so.
+ *
+ * Measured on the box: a run with `--spend-usd 0.01` came back `blocked`, exit 6, and
+ * `reason: null`. The timeline held the whole sentence - "Paused at $0.0015 of the $0.01 limit for
+ * this task. Raise the limit to carry on, or leave it here." - on a `status` event carrying
+ * `blockedBy`, and the outcome only looked at `error` and `warning`. The one channel a headless
+ * caller has said "blocked" and nothing else, which is the quiet wrong the exit codes exist to
+ * prevent.
+ */
+const pausedByCeiling = await drive(
+  {
+    ...runRoutes(
+      [[200, taskRecord({ status: 'paused' })]],
+      [
+        {
+          sequence: 11,
+          kind: 'status',
+          summary:
+            'Paused at $0.0015 of the $0.01 limit for this task. Raise the limit to carry on.',
+          payload: {
+            blockedBy: 'task',
+            windows: [{ name: 'task', capUsd: 0.01, state: 'exceeded' }]
+          }
+        }
+      ]
+    )
+  },
+  started
+);
+check('a task parked by a spend ceiling reports which ceiling and what it said', () => {
+  assert.equal(pausedByCeiling.code, 6);
+  assert.equal(pausedByCeiling.outcome.outcome, 'blocked');
+  assert.match(pausedByCeiling.outcome.reason, /Raise the limit to carry on/);
+  assert.equal(pausedByCeiling.outcome.blockedBy, 'task');
+});
+
+/*
+ * The counter-direction: an ordinary completed run invents neither field, and a stop that is not a
+ * ceiling reports no ceiling.
+ */
+check('a completed run reports no reason and no ceiling', () => {
+  assert.equal(finished.outcome.reason, null);
+  assert.equal(finished.outcome.blockedBy, null);
+});
+
+check('a failed run still prefers its own error over a ceiling that never fired', () => {
+  assert.equal(failed.outcome.blockedBy, null);
+  assert.notEqual(failed.outcome.reason, null);
+});
+
 rmSync(emptyConfig, { recursive: true, force: true });
 
 if (failures.length) {

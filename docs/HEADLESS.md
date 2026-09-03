@@ -81,6 +81,13 @@ sudo athanor task answer TASK_ID (--text TEXT | --text-file PATH)
 `--timeout SECONDS` and `--key IDEMPOTENCY-KEY`. `--prompt-file -` reads the prompt from standard
 input.
 
+`--spend-usd` is the ceiling that actually stops work, and `--credits` is not its twin.
+Compute credits are a runaway backstop rather than a budget: the server raises the number you pass
+to at least what the chosen model's step limit would cost, so a value below that floor changes
+nothing and the outcome reports the floor it was raised to. Set the money limit; a task parked by
+one comes back `blocked`, exit 6, with `reason` carrying the sentence and `blockedBy` naming which
+ceiling it was - `task`, `daily` or `monthly`.
+
 `answer` is the reply to a question the agent stopped to ask, and it is a different act from
 approving a card. `awaiting_user` covers both: when a card is waiting, `pendingApprovals` holds it
 and `question` is null; when the agent asked something, `pendingApprovals` is empty and `question`
