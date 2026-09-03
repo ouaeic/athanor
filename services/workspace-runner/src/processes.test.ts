@@ -1208,6 +1208,45 @@ describe('saying that a service is reachable from outside this computer', () => 
   );
 
   /*
+   * THE PATH THAT ACTUALLY RUNS ON THE BOX.
+   *
+   * A service comes under supervision two ways: an agent declares one, and the runner comes back
+   * up and finds records on disk. The sweep was started from the first only - so on a real install,
+   * where every deploy restarts the runner and every service therefore arrives by the second, the
+   * observation was live, correct and never once executed. Measured that way: a service was up on
+   * 127.0.0.1:8096 and every row reported nothing.
+   */
+  it(
+    'observes a service that came back with the runner, not only one just declared',
+    async () => {
+      const root = await mkdtemp(path.join(tmpdir(), 'athanor-resume-'));
+      roots.push(root);
+      await mkdir(path.join(root, 'workspace'));
+      const first = new ProcessManager(undefined, undefined, 20, async () => []);
+      await first.start(
+        root,
+        'workspace-1',
+        'task-1',
+        { executable: '/bin/sh', args: ['-c', 'sleep 30'], service: 'files' },
+        30,
+        false
+      );
+      first.close();
+
+      const rebooted = new ProcessManager(undefined, undefined, 20, async () => [
+        { address: '0.0.0.0', port: 8096 }
+      ]);
+      expect(await rebooted.resumeWorkspace(root, 'workspace-1', false)).toBe(1);
+      await new Promise((resolve) => setTimeout(resolve, 80));
+
+      const [row] = rebooted.listWorkspace('workspace-1');
+      expect(row?.service).toMatchObject({ name: 'files', listening: ['0.0.0.0:8096'] });
+      rebooted.close();
+    },
+    TEST_TIMEOUT_MS
+  );
+
+  /*
    * A host with no `/proc` answers exactly as a service binding nothing does, so the field is
    * OMITTED rather than empty. `listening: []` would be a claim that the service is reachable from
    * nowhere, which is the one sentence this must never produce on a machine it could not read.

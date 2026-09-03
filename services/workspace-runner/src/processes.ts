@@ -521,7 +521,7 @@ export class ProcessManager {
     // The pid and the moment it was handed out, written together: `reclaimOrphan` reads them as one
     // fact, because a pid on its own stops meaning anything the instant the host reboots.
     record.startedAt = session.startedAt;
-    this.#supervised.set(record.id, {
+    this.#supervise(record.id, {
       record,
       registry,
       root,
@@ -529,7 +529,6 @@ export class ProcessManager {
       guards: options.guards,
       retiring: false
     });
-    this.#startListenerSweep();
     await registry.put(record);
     return this.#view(session, false);
   }
@@ -546,6 +545,20 @@ export class ProcessManager {
    * without `/proc` sweeps to no answer at all rather than to an empty one, and the view below
    * omits the field instead of claiming the service is private.
    */
+  /**
+   * The one door into supervision, so that everything owed to a supervised service is owed once.
+   *
+   * There are two ways a service comes under supervision - `startService` when an agent declares
+   * one, and `resumeWorkspace` when the runner comes back up and finds records on disk - and the
+   * listener sweep was started from only the first. Every deploy restarts the runner, so on the
+   * box every service arrived by the second path and the sweep never ran at all: the observation
+   * was live, correct, and unreachable. Two entry points, one of them wired.
+   */
+  #supervise(id: string, entry: Supervised): void {
+    this.#supervised.set(id, entry);
+    this.#startListenerSweep();
+  }
+
   #startListenerSweep(): void {
     if (this.#listenerSweep) return;
     const sweep = () => {
@@ -778,14 +791,7 @@ export class ProcessManager {
       record.consecutiveFailures = 0;
       record.state = 'restarting';
       record.pid = undefined;
-      this.#supervised.set(record.id, {
-        record,
-        registry,
-        root,
-        isolateNetwork,
-        guards,
-        retiring: false
-      });
+      this.#supervise(record.id, { record, registry, root, isolateNetwork, guards, retiring: false });
       await this.#relaunchService(record.id);
       started += 1;
     }
