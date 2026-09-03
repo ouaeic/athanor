@@ -94,8 +94,21 @@ RestrictRealtime=true
 # so without the second line the agent has no workspace at all. /run/user goes with /home, which the
 # desktop session already expects - infra/native/start-desktop-session.sh falls back to a runtime
 # directory inside the workspace when /run/user/<uid> is not writable.
-ProtectHome=true
-ReadWritePaths=/home/athanor
+#
+# `tmpfs` AND `BindPaths=`, NOT `true` and `ReadWritePaths=`, and the difference is the whole unit.
+# `ProtectHome=true` mounts over /home, and `ReadWritePaths=` cannot reopen a path something has
+# been mounted over - it changes the access mode of a path the namespace can still see. Measured on
+# a real box the day this first deployed: inside the unit's namespace /home was `d---------` and
+# empty, `/home/athanor` did not exist, and every filesystem tool call in every task failed with
+# `EACCES ... mkdir '/home/athanor/<workspace>'` on a directory that was there all along. The
+# hardening took the whole product away and the unit read as if it had not.
+#
+# `ProtectHome=tmpfs` mounts an empty tmpfs over /home, and `BindPaths=` mounts the real directory
+# back inside it, which is the documented way to keep one home while hiding the rest. Verified on
+# the same box: `/home/athanor` visible with all 41 workspaces, `/home/administrator` still
+# `No such file or directory`. The security goal is unchanged; only the mechanism works now.
+ProtectHome=tmpfs
+BindPaths=/home/athanor
 
 # Everything the agent runs stays in this unit's control group, so these bound the whole agent
 # computer at once. PostgreSQL, the API and the interface share this machine, and without a

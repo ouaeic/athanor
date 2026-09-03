@@ -306,9 +306,47 @@ jobs:
             carries "$required" || { printf '%s lost %s\n' "$unit" "$required" >&2; exit 1; }
           done
           # WORKSPACE_ROOT is /home/athanor (scripts/install-native.sh), so ProtectHome without
-          # this exemption takes every workspace away from the agent.
-          grep -q '^ReadWritePaths=/home/athanor$' "$unit" ||
-            { printf '%s hides /home without reopening the workspace root\n' "$unit" >&2; exit 1; }
+          # an exemption takes every workspace away from the agent.
+          #
+          # This used to assert `ReadWritePaths=/home/athanor` was present, and it was present, and
+          # it did not work: `ReadWritePaths=` changes the access mode of a path the namespace can
+          # still see, and `ProtectHome=true` mounts over /home so there is nothing left to reopen.
+          # The line was there, the comment said what it was for, and on a real box the runner saw
+          # `/home` as an empty `d---------` with no `athanor` in it and every task failed. A check
+          # that reads the text of a mitigation cannot tell a working one from a decorative one, so
+          # this one runs it instead - see the namespace drill below, which is the assertion that
+          # actually holds this now.
+          grep -q '^ProtectHome=tmpfs$' "$unit" ||
+            { printf '%s must hide /home with tmpfs, not true\n' "$unit" >&2; exit 1; }
+          grep -q '^BindPaths=/home/athanor$' "$unit" ||
+            { printf '%s hides /home without binding the workspace root back\n' "$unit" >&2; exit 1; }
+          grep -Eq '^ReadWritePaths=/home' "$unit" &&
+            { printf '%s reopens /home with ReadWritePaths, which cannot reopen a mounted-over path\n' "$unit" >&2; exit 1; }
+
+      # The directives above, RUN rather than read. A unit that carries every hardening line and
+      # cannot open its own workspace is the shape this drill exists to catch, and it is the shape
+      # that shipped: the text assertion passed on a unit that took the whole product away.
+      - name: Prove the home confinement still leaves the workspace root reachable
+        run: |
+          set -eu
+          sudo mkdir -p /home/athanor/probe-workspace
+          sudo touch /home/athanor/probe-workspace/marker
+          # What the unit does: the workspace root is there and writable, and no other home is.
+          sudo systemd-run --wait --pipe --collect --service-type=oneshot \
+            --property=ProtectHome=tmpfs --property=BindPaths=/home/athanor \
+            /bin/sh -c 'test -f /home/athanor/probe-workspace/marker &&
+              touch /home/athanor/probe-workspace/written &&
+              ! ls /home/runner >/dev/null 2>&1'
+          sudo test -f /home/athanor/probe-workspace/written
+          # And the counter-direction, which is the pairing that shipped: it must NOT work, so a
+          # future edit back to it fails here rather than on somebody's server.
+          if sudo systemd-run --wait --pipe --collect --service-type=oneshot \
+            --property=ProtectHome=true --property=ReadWritePaths=/home/athanor \
+            /bin/sh -c 'test -f /home/athanor/probe-workspace/marker'; then
+            printf 'ProtectHome=true with ReadWritePaths now reaches the workspace; this drill is stale\n' >&2
+            exit 1
+          fi
+          sudo rm -rf /home/athanor/probe-workspace
 
       # One directive at a time, which is how this unit has to be tightened and now how it is
       # checked. Each confinement directive is put in front of the sudo call on its own, against a
