@@ -471,6 +471,20 @@ export const CASES: readonly ConformanceCase[] = [
     want: { kind: 'refuse', fixableFrom: 'shape' }
   },
   {
+    /*
+     * Watched on the box, twice in one turn. The model put the body on the operation's own line -
+     * `PUT 3:+from ivl.intervals import merge` - so the operation row did not parse and the next
+     * real body row was then read as an operation. Two refusals from one habit, and neither of the
+     * two `body-unmarked-*` rows above has it: those put the body on its own line and drop only the
+     * marker.
+     */
+    id: 'body-on-the-operation-row',
+    group: 'body',
+    what: 'the body written after the colon on the operation row itself',
+    edit: 'PUT 11:+    return undefined;',
+    want: { kind: 'refuse', fixableFrom: 'shape' }
+  },
+  {
     id: 'body-unmarked-content-that-reads-as-a-verb',
     group: 'body',
     what: 'an unmarked body row that happens to begin `delete `',
@@ -775,6 +789,19 @@ export const CASES: readonly ConformanceCase[] = [
     group: 'dialect',
     what: 'PUT 10..12:',
     edit: 'PUT 10..12:\n+    return undefined;',
+    want: { kind: 'apply', after: (live) => splice(live, 10, 12, ['    return undefined;']) }
+  },
+  {
+    /*
+     * Watched on the box. A turn wrote `PUT 40.:=42:` and was refused with "unexpected `.:=` after
+     * the range" - it had blended the two spellings this parser already accepted separately. The
+     * three dialect rows above are each ONE separator; none of them is a mixture, which is what the
+     * gap in the list was.
+     */
+    id: 'dialect-blended-range-separator',
+    group: 'dialect',
+    what: 'PUT 10.:=12: - two accepted separators run together',
+    edit: 'PUT 10.:=12:\n+    return undefined;',
     want: { kind: 'apply', after: (live) => splice(live, 10, 12, ['    return undefined;']) }
   },
   {

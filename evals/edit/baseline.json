@@ -112,6 +112,10 @@
       "cost": 1,
       "verdict": "refused"
     },
+    "body-on-the-operation-row": {
+      "cost": 1,
+      "verdict": "refused"
+    },
     "body-unmarked-content-that-reads-as-a-verb": {
       "cost": 1,
       "verdict": "refused"
@@ -237,6 +241,10 @@
       "verdict": "landed"
     },
     "dialect-double-dot-range": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "dialect-blended-range-separator": {
       "cost": 0,
       "verdict": "landed"
     },
@@ -372,9 +380,9 @@
     }
   },
   "totals": {
-    "cases": 67,
-    "free": 35,
-    "oneTrip": 29,
+    "cases": 69,
+    "free": 36,
+    "oneTrip": 30,
     "twoTrips": 2,
     "overRefused": 1,
     "defects": 1
