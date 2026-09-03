@@ -58,8 +58,25 @@ case "$requested" in
   # means idle, which is what an unattended box normally is.
   */metrics)
     if [ -f "$ATHANOR_TEST_WORKER_BUSY" ]; then printf "athanor_worker_active 1\n"; fi
+    # A worker that goes busy in the fraction of a second between the unattended run finding it idle
+    # and the update re-checking on the way in. That gap is the only path through update_athanor
+    # that returns without recording an outcome, and a drill cannot produce it with a static marker:
+    # this one answers idle the first time it is asked and busy every time after.
+    if [ -f "$ATHANOR_TEST_WORKER_BUSY_LATE" ]; then
+      metrics_asks=$(cat "$ATHANOR_TEST_WORKER_BUSY_LATE" 2>/dev/null || printf 0)
+      case "$metrics_asks" in ""|*[!0-9]*) metrics_asks=0 ;; esac
+      metrics_asks=$((metrics_asks + 1))
+      printf "%s\n" "$metrics_asks" >"$ATHANOR_TEST_WORKER_BUSY_LATE"
+      [ "$metrics_asks" -le 1 ] || printf "athanor_worker_active 1\n"
+    fi
     ;;
   */v1/legal) printf "{\"applicationLicense\":\"AGPL-3.0-only\",\"accepted\":false}\n" ;;
+  # The runner health document, which is where `doctor` reads the rung the sandbox is actually on
+  # rather than the one runner.env asked for. Silent unless a fixture is in place, because every
+  # case above this one only needs the endpoint to answer at all.
+  *4300/healthz)
+    if [ -f "$ATHANOR_TEST_RUNNER_HEALTH" ]; then cat "$ATHANOR_TEST_RUNNER_HEALTH"; fi
+    ;;
 esac
 exit 0'
 make_fake nginx 'exit 0'
@@ -118,6 +135,11 @@ case "$*" in
   *"dropdb"*|*"createdb"*) : >"$ATHANOR_TEST_DATABASE" ;;
   *"schema_migrations"*)
     if [ -f "$ATHANOR_TEST_CHECKOUT/FAIL_MIGRATION" ]; then printf "6\n"; else printf "7\n"; fi
+    ;;
+  # The sandbox helper, which both boundary arms of `doctor` reach through runuser and sudo. Silent
+  # unless a report is in place, which is the box where the helper answers nothing.
+  *athanor-sandbox*)
+    if [ -f "$ATHANOR_TEST_SANDBOX_REPORT" ]; then cat "$ATHANOR_TEST_SANDBOX_REPORT"; fi
     ;;
 esac
 exit 0'
@@ -310,6 +332,9 @@ run_athanor() {
     ATHANOR_BACKUP_KEEP="${ATHANOR_TEST_BACKUP_KEEP:-5}" \
     ATHANOR_BACKUP_IDLE_WAIT_SECONDS="${ATHANOR_TEST_BACKUP_IDLE_WAIT:-0}" \
     ATHANOR_TEST_WORKER_BUSY="$worker_busy" \
+    ATHANOR_TEST_WORKER_BUSY_LATE="${ATHANOR_TEST_WORKER_BUSY_LATE:-$test_root/worker-busy-late}" \
+    ATHANOR_TEST_RUNNER_HEALTH="$test_root/runner-health" \
+    ATHANOR_TEST_SANDBOX_REPORT="$test_root/sandbox-report" \
     ATHANOR_TEST_DATABASE="$database_file" \
     ATHANOR_TEST_OFF_HOST="$off_host" \
     ATHANOR_READY_TIMEOUT_SECONDS=3 \
@@ -1030,6 +1055,483 @@ grep -q 'Rollback complete' <<EOF
 $rollback_output
 EOF
 printf 'ok  rollback with no argument consumes the newest backup and puts both halves back\n'
+
+# What a release carries besides its code, and whether an update delivers any of it.
+#
+# Measured on the owner's server, updated from f02ca24 to 9bf2bdc with `sudo athanor update`, which
+# printed "Update complete after 1 minutes offline" and exited 0. Four things did not arrive:
+# CONFINE_AGENT_FILESYSTEM was absent from /etc/athanor/runner.env, so the Landlock boundary was
+# present and switched off while `athanor-sandbox check` answered `filesystem=landlock`;
+# python3-scipy and statsmodels were in the capability table and not on the disk; no workspace had
+# the `.home` the agent's HOME had moved to; and nothing recorded the run, so `doctor` said "no
+# update run recorded yet" minutes afterwards. The update ran three steps - fetch, install
+# dependencies, build - plus the runtime files and the migrations, and nothing else an install does.
+#
+# The case below is generic on purpose: what it publishes is a revision whose OWN installer answers
+# `--release-steps`, and what it checks is that the update called it and that what it did landed.
+# That is the property that has to hold for a step nobody has written yet.
+: >"$command_log"
+cat >"$seed/scripts/install-native.sh" <<'RELEASE_INSTALLER'
+#!/bin/sh
+set -eu
+case "${1:-}" in
+  --release-steps)
+    printf 'the release steps ran\n' >>"$ATHANOR_TEST_COMMAND_LOG"
+    printf 'installed newly-declared-package\n' >>"$ATHANOR_TEST_COMMAND_LOG"
+    printf 'NEWLY_DECLARED_KEY=written-by-the-release\n' >>"$ATHANOR_CONFIG/runner.env"
+    exit 0
+    ;;
+esac
+printf 'the installer ran\n' >>"$ATHANOR_TEST_COMMAND_LOG"
+RELEASE_INSTALLER
+chmod 0755 "$seed/scripts/install-native.sh"
+printf '\n# fixture-version=v11\n' >>"$seed/scripts/athanor-service"
+publish_fixture v11-carries-release-steps
+run_update >/dev/null 2>&1
+if ! grep -q 'the release steps ran' "$command_log"; then
+  printf 'the update never asked the new release for the steps it carries\n' >&2
+  exit 1
+fi
+grep -q 'installed newly-declared-package' "$command_log"
+# Once in one update, and this is the ordinary path where it could be twice. The checkout's own
+# `update install-runtime-files` phase applies the steps and leaves a marker; the shell that started
+# the update reads that marker and does not do it again. Without it the owner pays for a second
+# package resolution in the middle of their outage.
+if [ "$(grep -c 'the release steps ran' "$command_log")" -ne 1 ]; then
+  printf 'the release steps ran %s times in one update\n' \
+    "$(grep -c 'the release steps ran' "$command_log")" >&2
+  exit 1
+fi
+# And the marker the two shells talk through is cleared, so the next run cannot read a stale one.
+test ! -e "$state/release-steps-applied"
+if ! grep -q '^NEWLY_DECLARED_KEY=written-by-the-release$' "$config/runner.env"; then
+  printf 'a setting the new release declares was not written to runner.env by the update\n' >&2
+  exit 1
+fi
+# And what ran was the release entry point, not an install. Creating accounts, writing sudoers,
+# regenerating the shared secret and re-issuing a certificate on a box that is already serving is
+# the mistake this whole shape is arranged to avoid, and the fixture says which of the two it was.
+if grep -q 'the installer ran' "$command_log"; then
+  printf 'the update ran a full install on a box that was already installed\n' >&2
+  exit 1
+fi
+printf 'ok  an update delivers the packages and settings the new release carries\n'
+
+# And it delivers them to the box that cannot ask for them.
+#
+# `athanor update` is /usr/local/bin/athanor, the PREVIOUS release's copy of this script, so the
+# release that first calls the release steps from `update_athanor` cannot make itself arrive: the
+# shell running that update has never heard of the call. That is exactly the server this lane came
+# from - it runs the copy of `athanor` the last update placed, which knows how to hand the runtime
+# files to the checkout and nothing about the steps beside them. Without a route through the phase,
+# the boundary that shipped switched off stays off for one more release.
+#
+# The fixture is that server: this release's script with the one line in `update_athanor` removed,
+# keeping the phase. What it must do is apply the steps anyway, once, from the checkout's own arm.
+predating_updater="$test_root/predating-athanor"
+# The call is replaced by a no-op rather than deleted, because deleting it would leave the `else` it
+# sits in empty and the fixture would fail to parse instead of standing in for a real server. What a
+# release that predates the call has at that point in `update_athanor` is nothing happening.
+sed 's/^    install_release_carried_steps$/    : "this release had no such call"/' \
+  "$checkout/scripts/athanor" >"$predating_updater"
+if cmp -s "$predating_updater" "$checkout/scripts/athanor"; then
+  printf 'the fixture changed nothing, so it stands in for no server at all\n' >&2
+  exit 1
+fi
+if grep -q '^    install_release_carried_steps$' "$predating_updater"; then
+  printf 'the fixture still calls the release steps from update_athanor\n' >&2
+  exit 1
+fi
+# And it keeps the one route this case is about: the phase it hands the runtime files to.
+grep -q '^      install-runtime-files)' "$predating_updater"
+chmod 0755 "$predating_updater"
+: >"$command_log"
+: >"$config/runner.env"
+printf '\n# fixture-version=v11a\n' >>"$seed/scripts/athanor-service"
+publish_fixture v11a-updated-by-a-script-that-predates-the-call
+PATH="$fake_bin:$PATH" \
+  ATHANOR_TEST_COMMAND_LOG="$command_log" \
+  ATHANOR_TEST_REAL_GIT="$real_git" \
+  ATHANOR_TEST_CHECKOUT="$checkout" \
+  ATHANOR_ROOT="$checkout" \
+  ATHANOR_CONFIG="$config" \
+  ATHANOR_STATE="$state" \
+  ATHANOR_HOME="$home" \
+  ATHANOR_BACKUP_ROOT="$backups" \
+  ATHANOR_BACKUP_KEEP=5 \
+  ATHANOR_BACKUP_IDLE_WAIT_SECONDS=0 \
+  ATHANOR_TEST_WORKER_BUSY="$worker_busy" \
+  ATHANOR_TEST_WORKER_BUSY_LATE="$test_root/worker-busy-late" \
+  ATHANOR_TEST_DATABASE="$database_file" \
+  ATHANOR_TEST_OFF_HOST="$off_host" \
+  ATHANOR_READY_TIMEOUT_SECONDS=3 \
+  ATHANOR_RUNTIME_PREFIX="$runtime" \
+  /bin/sh "$predating_updater" update >/dev/null 2>&1
+if ! grep -q '^NEWLY_DECLARED_KEY=written-by-the-release$' "$config/runner.env"; then
+  printf 'a box whose athanor predates the call never received what the release carries\n' >&2
+  exit 1
+fi
+# Once, not twice: a second package resolution is minutes of the owner's outage for nothing.
+if [ "$(grep -c 'the release steps ran' "$command_log")" -ne 1 ]; then
+  printf 'the release steps ran %s times in one update\n' \
+    "$(grep -c 'the release steps ran' "$command_log")" >&2
+  exit 1
+fi
+# And the marker the two shells talk through is not left behind for the next run to read.
+test ! -e "$state/release-steps-applied"
+printf 'ok  a box whose athanor predates the call still gets what the release carries, once\n'
+
+# Every route to a completed update records itself, so `doctor` can answer "when did this box last
+# actually move". `record_update_status` has been drilled as a function in
+# scripts/test-native-provisioning.sh since it was written; what had never been watched is the call
+# site, which is the half that was missing on the server - it ran the previous release's script,
+# and that script had no such line.
+update_status_file="$state/update.status"
+update_field() {
+  sed -n "s/^$1=//p" "$update_status_file" | sed -n '1p'
+}
+test -f "$update_status_file"
+test "$(update_field outcome)" = ok
+test -n "$(update_field at)"
+test "$(update_field revision)" = "$("$real_git" -C "$checkout" rev-parse --short HEAD)"
+printf 'ok  a completed update records itself, with the revision it landed on\n'
+
+# The counter-direction, and the one that would break somebody's server. A checkout from before the
+# entry point existed treats `--release-steps` as an argument it has never heard of and runs a whole
+# install: three accounts, a sudoers file, a regenerated runner secret and a certificate re-issue,
+# on a stopped production box. So the phase is asked only of a revision that answers to it, and an
+# update against one that does not still completes.
+: >"$command_log"
+cat >"$seed/scripts/install-native.sh" <<'OLD_INSTALLER'
+#!/bin/sh
+set -eu
+printf 'the installer ran\n' >>"$ATHANOR_TEST_COMMAND_LOG"
+OLD_INSTALLER
+chmod 0755 "$seed/scripts/install-native.sh"
+printf '\n# fixture-version=v12\n' >>"$seed/scripts/athanor-service"
+publish_fixture v12-installer-predates-the-entry-point
+older_installer_output=$(run_update 2>&1)
+if grep -q 'the installer ran' "$command_log"; then
+  printf 'a full install was run against a checkout that has no release-steps entry point\n' >&2
+  exit 1
+fi
+grep -q 'fixture-version=v12' "$runtime/usr/local/lib/athanor/athanor-service"
+grep -q 'Update complete' <<EOF
+$older_installer_output
+EOF
+printf 'ok  the release steps are asked only of an installer that answers to them\n'
+
+# The unattended run that returns without saying anything.
+#
+# `auto_update_run` writes `running` before it starts, because a run killed by its own start timeout
+# reaches no further line. `update_athanor` then re-checks the worker in the fraction of a second
+# the earlier wait cannot cover, and returned through that gate without correcting the record - so a
+# box whose worker happened to pick up a task at that instant was reported by `doctor` as an update
+# that started and never came back, every week, for as long as the pattern lasted. The loudest thing
+# the record can say, for the most ordinary thing that can happen.
+printf '\n# fixture-version=v13\n' >>"$seed/scripts/athanor-service"
+publish_fixture v13-a-task-starts-late
+revision_before_stand_down=$("$real_git" -C "$checkout" rev-parse HEAD)
+busy_late="$test_root/worker-busy-late-marker"
+: >"$busy_late"
+stand_down_output=$(
+  ATHANOR_TEST_WORKER_BUSY_LATE="$busy_late" run_athanor auto-update run 2>&1
+)
+grep -q 'a task started while the update was preparing' <<EOF
+$stand_down_output
+EOF
+test "$("$real_git" -C "$checkout" rev-parse HEAD)" = "$revision_before_stand_down"
+if [ "$(update_field outcome)" = running ]; then
+  printf 'a run that stood down at the last moment is still recorded as one that never came back\n' >&2
+  exit 1
+fi
+test "$(update_field outcome)" = skipped
+test "$(update_field reason)" = "a task started while the update was preparing"
+printf 'ok  an update that stands down at the last moment corrects its own record\n'
+
+# The installer's release steps themselves, run rather than read.
+#
+# Everything above pins the WIRING - that the update asks the incoming release for its steps and
+# that what they do lands. This runs the real scripts/install-native.sh, with one line replaced,
+# and asks what `--release-steps` actually does on a box that is already installed.
+#
+# THE ONE LINE. `athanor_detect_host` reads /etc/os-release, which does not exist on the machine
+# this drill runs on, and the host it reports decides which column of the package table is used. It
+# is replaced with a debian answer; every other line of the installer is the one that ships.
+#
+# WHAT CATCHES AN ENTRY POINT THAT STOPS EXITING before the install body: the run itself. Execution
+# continues into `[ -f "$athanor_root/package.json" ]`, which this rig's root does not have, so the
+# run ends non-zero and every case below it goes red - measured by deleting that `exit 0`. On a real
+# box the same fall-through would find a checkout and go on to create accounts, so the exit status
+# is the whole of what this rig can prove there, and it is enough to fail the drill.
+#
+# WHAT THE ONE-TIME STAND-INS BELOW CATCH IS A DIFFERENT THING, and they are not decorative: they
+# fire if a once-only command is ever added INSIDE a release step - a `usermod -a -G` that looks
+# harmless, an `openssl rand` that quietly rotates a secret two services are holding. That is the
+# mistake this shape makes easy to make, because the steps sit in the installer beside the code that
+# legitimately does those things.
+release_root="$test_root/release-root"
+release_config="$test_root/release-etc"
+release_home="$test_root/release-home"
+release_bin="$test_root/release-bin"
+mkdir -p "$release_root/scripts" "$release_config" "$release_bin" \
+  "$release_home/signed-in/workspace" "$release_home/signed-in/.athanor" \
+  "$release_home/not-a-workspace" "$release_home/signed-in/workspace/.home"
+cp "$repository_root/scripts/athanor-host.sh" "$release_root/scripts/"
+sed 's#^athanor_detect_host || fail .*#athanor_os_id=debian; athanor_os_version=12; athanor_family=debian; athanor_pm=apt-get; athanor_arch=x86_64#' \
+  "$repository_root/scripts/install-native.sh" >"$release_root/scripts/install-native.sh"
+if cmp -s "$release_root/scripts/install-native.sh" "$repository_root/scripts/install-native.sh"; then
+  printf 'the host-detection line this rig replaces is no longer in the installer\n' >&2
+  exit 1
+fi
+chmod 0755 "$release_root/scripts/install-native.sh"
+# What an upgraded workspace looks like on the way in: a credential at the container root, where
+# every released version put HOME, and a `.home` inside `workspace/` that an intermediate build put
+# there and that must be left exactly where it is.
+printf 'signed-in\n' >"$release_home/signed-in/.codex-auth.json"
+printf 'agent-written\n' >"$release_home/signed-in/workspace/.home/.bashrc"
+printf 'runner-only\n' >"$release_home/signed-in/.athanor/profile"
+printf 'left-alone\n' >"$release_home/not-a-workspace/stray-file"
+printf 'runner=true\n' >"$release_config/runner.env"
+
+# A bin directory of its own rather than the one every case above shares, because two of these -
+# runuser and sudo - would otherwise replace the stand-ins the backup and restore cases depend on.
+release_fake() {
+  release_fake_name="$1"
+  shift
+  {
+    printf '#!/bin/sh\n'
+    printf '%s\n' "$@"
+  } >"$release_bin/$release_fake_name"
+  chmod 0755 "$release_bin/$release_fake_name"
+}
+release_fake chgrp 'exit 0'
+release_fake chmod '
+# macOS refuses the set-group-ID bit on a directory whose group is not the caller own, and this
+# drill runs as an ordinary user on a temporary tree. A four-digit mode is dropped to its low three
+# and passed on; everything else goes through untouched. What this rig pins is which files the
+# migration moves, and not the mode the installer asks for - that is a Linux fact and this is not a
+# Linux machine.
+mode="$1"
+case "$mode" in
+  [0-7][0-7][0-7][0-7]) shift; exec /bin/chmod "${mode#?}" "$@" ;;
+esac
+exec /bin/chmod "$@"'
+release_fake apt-get '
+printf "apt-get %s\n" "$*" >>"$ATHANOR_TEST_COMMAND_LOG"'
+# The once-only steps, each with a stand-in that says so if it is ever reached. Nothing here is
+# expected to run: reaching any of them on a box that is already serving is the mistake that would
+# regenerate a shared secret two services are holding, or re-issue a rate-limited certificate.
+for one_time_tool in useradd usermod visudo certbot initdb createuser openssl; do
+  release_fake "$one_time_tool" '
+printf "one-time tool %s ran\n" "$(basename "$0")" >>"$ATHANOR_TEST_COMMAND_LOG"'
+done
+# The sandbox helper the measurement runs, reached the way the installer reaches it: through runuser
+# and sudo. The report file is what this drill varies - present and naming a rung, or absent, which
+# is the box where the helper is not installed and the measurement cannot be taken at all.
+release_fake runuser '
+while [ "$#" -gt 0 ]; do
+  case "$1" in -u) shift 2 ;; --) shift; break ;; *) break ;; esac
+done
+exec "$@"'
+release_fake sudo '
+while [ "$#" -gt 0 ]; do
+  case "$1" in -n|-E) shift ;; *) break ;; esac
+done
+case "${1:-}" in
+  */athanor-sandbox)
+    # The helper is named by absolute path, which this drill cannot create, so the stand-in answers
+    # in its place. No report file at all is the box where the helper is not installed: nothing to
+    # run, and a non-zero exit, which is what the installer treats as "could not be measured".
+    [ -f "$ATHANOR_TEST_SANDBOX_REPORT" ] || exit 127
+    cat "$ATHANOR_TEST_SANDBOX_REPORT"
+    exit 0
+    ;;
+esac
+exec "$@"'
+sandbox_report="$test_root/sandbox-report"
+
+run_release_steps_rig() {
+  : >"$command_log"
+  PATH="$release_bin:$fake_bin:$PATH" \
+    ATHANOR_TEST_COMMAND_LOG="$command_log" \
+    ATHANOR_TEST_SANDBOX_REPORT="$sandbox_report" \
+    ATHANOR_ROOT="$release_root" \
+    ATHANOR_CONFIG="$release_config" \
+    ATHANOR_WORKSPACE_ROOT="$release_home" \
+    /bin/sh "$release_root/scripts/install-native.sh" --release-steps
+}
+
+release_setting() {
+  sed -n "s/^$1=//p" "$release_config/runner.env" | sed -n '1p'
+}
+
+printf 'user=athanor-agent\nnetwork-isolation=yes\nfilesystem=landlock\n' >"$sandbox_report"
+run_release_steps_rig >"$test_root/release-steps.out" 2>&1
+# The packages the owner's box was missing, asked for by the names this family uses. Read from the
+# capability table through the installer rather than restated, so a row added there is covered here
+# without anybody remembering to come back.
+grep -q 'apt-get install.*python3-scipy' "$command_log"
+grep -q 'apt-get install.*python3-statsmodels' "$command_log"
+# The setting that shipped present and off, written from what the helper measured.
+test "$(release_setting CONFINE_AGENT_FILESYSTEM)" = true
+test "$(release_setting AGENT_SANDBOX_HELPER)" = /usr/local/lib/athanor/athanor-sandbox
+# An operator's own value is left alone, which is what set_env_default is for.
+test "$(release_setting MAX_EXECUTION_SECONDS)" = 3600
+# The workspace whose HOME moved: the credential is carried into `.home`, the runner's own directory
+# is not, and the `.home` an intermediate build left inside `workspace/` stays exactly where it is.
+test "$(cat "$release_home/signed-in/.home/.codex-auth.json")" = "signed-in"
+test ! -e "$release_home/signed-in/.home/.athanor"
+test -d "$release_home/signed-in/workspace"
+test "$(cat "$release_home/signed-in/workspace/.home/.bashrc")" = "agent-written"
+# And a directory under the workspace root that is not a workspace is not treated as one.
+test ! -e "$release_home/not-a-workspace/.home"
+test "$(cat "$release_home/not-a-workspace/stray-file")" = "left-alone"
+# None of the once-only steps. This is the half that breaks a server rather than leaving it stale.
+if grep -q 'one-time tool' "$command_log"; then
+  printf 'the release steps reached a step that may only run on a fresh install:\n' >&2
+  grep 'one-time tool' "$command_log" >&2
+  exit 1
+fi
+test -z "$(release_setting RUNNER_SHARED_SECRET)"
+printf 'ok  the release steps install the declared packages, write the measured boundary and migrate a workspace\n'
+
+# A second run changes nothing, because an update runs these every week for as long as the box
+# lives. `mv -n` is what makes the migration repeatable, and a credential that the first run carried
+# across must not be clobbered by a file the agent has written at the root since.
+printf 'written-since\n' >"$release_home/signed-in/.codex-auth.json"
+run_release_steps_rig >/dev/null 2>&1
+test "$(cat "$release_home/signed-in/.home/.codex-auth.json")" = "signed-in"
+printf 'ok  running the release steps again moves nothing and overwrites nothing\n'
+
+# The three answers the filesystem rung has, and why it is not two. `false` is a measurement - this
+# kernel cannot - and the runner has to be told, or it asks for a ruleset the kernel rejects and
+# every command exits 125. EMPTY is "could not ask", which is not the same statement, and writing
+# `false` for it would take a working boundary off a box during an update because a probe failed.
+printf 'user=athanor-agent\nnetwork-isolation=yes\nfilesystem=none\n' >"$sandbox_report"
+run_release_steps_rig >/dev/null 2>&1
+test "$(release_setting CONFINE_AGENT_FILESYSTEM)" = false
+printf 'user=athanor-agent\nnetwork-isolation=yes\nfilesystem=landlock\n' >"$sandbox_report"
+run_release_steps_rig >/dev/null 2>&1
+test "$(release_setting CONFINE_AGENT_FILESYSTEM)" = true
+rm -f "$sandbox_report"
+unmeasured_output=$(run_release_steps_rig 2>&1)
+if [ "$(release_setting CONFINE_AGENT_FILESYSTEM)" != true ]; then
+  printf 'a host that could not be measured had its filesystem boundary rewritten anyway\n' >&2
+  exit 1
+fi
+grep -q 'could not be measured' <<EOF
+$unmeasured_output
+EOF
+printf 'ok  the filesystem boundary is written from a measurement, and left alone when there is none\n'
+
+# A step that goes wrong stops there and says so, and the steps beside it still run.
+#
+# Both halves were broken in the first arrangement of this, and the drill is what showed it. `set -e`
+# is ignored for any command that is not the last of an AND-OR list, a subshell inherits that
+# suppression, and `set -e` written inside the subshell does not re-arm it - so `(step) || note`
+# ran the settings step through fourteen consecutive failed writes to its last line and reported
+# success. Each step now re-enters the installer as its own process. This case is the one that goes
+# red if that ever becomes a subshell again: one failure, not fourteen, and a non-zero ending.
+printf 'user=athanor-agent\nfilesystem=landlock\n' >"$sandbox_report"
+failing_config="$test_root/release-etc-unwritable"
+if failing_step_output=$(
+  : >"$command_log"
+  PATH="$release_bin:$fake_bin:$PATH" \
+    ATHANOR_TEST_COMMAND_LOG="$command_log" \
+    ATHANOR_TEST_SANDBOX_REPORT="$sandbox_report" \
+    ATHANOR_ROOT="$release_root" \
+    ATHANOR_CONFIG="$failing_config" \
+    ATHANOR_WORKSPACE_ROOT="$release_home" \
+    /bin/sh "$release_root/scripts/install-native.sh" --release-steps 2>&1
+); then
+  printf 'a release step that could not write its settings reported success\n' >&2
+  exit 1
+fi
+grep -q 'did not finish: release_step_runner_settings' <<EOF
+$failing_step_output
+EOF
+if [ "$(grep -c 'mkstemp failed' <<EOF
+$failing_step_output
+EOF
+)" -ne 1 ]; then
+  printf 'the settings step carried on past its first failed write:\n%s\n' "$failing_step_output" >&2
+  exit 1
+fi
+# And the step before it was not taken down with it, which is the reason each one runs on its own:
+# a distribution mirror that is unreachable must not cost the box its security boundary.
+grep -q 'apt-get install' "$command_log"
+printf 'ok  a release step that fails stops at its first failure and does not take the others with it\n'
+
+# What the owner can see about the boundary this branch added, which until now was nothing.
+#
+# `doctor` reported the identity boundary - "agent commands run as athanor-agent, not as the runner"
+# - and said nothing at all about the filesystem. On the server this was measured on, that silence
+# was the whole of the report: `athanor-sandbox check` answered `filesystem=landlock`, the runner's
+# /healthz answered `agentFilesystemConfined: false`, and no line anywhere put those two together.
+#
+# READ FROM THE RUNNER AND NOT FROM THE SETTING, because the setting is the thing that was wrong.
+runner_health="$test_root/runner-health"
+doctor_sandbox="$runtime/usr/local/lib/athanor/athanor-sandbox"
+printf 'AGENT_SANDBOX_HELPER=%s\n' "$doctor_sandbox" >>"$config/runner.env"
+printf '{"ok":true,"agentSandbox":true,"agentFilesystemConfined":true}\n' >"$runner_health"
+printf 'user=athanor-agent\nnetwork-isolation=yes\nfilesystem=landlock\n' >"$sandbox_report"
+confined_doctor=$(run_athanor doctor 2>&1 || true)
+grep -q '^ok  *agent commands are confined to their own workspace as well as their own account' <<EOF
+$confined_doctor
+EOF
+# The box the lead measured: the kernel can, and the runner is not doing it. That is a fault with a
+# repair, and the sentence has to name the repair rather than the symptom.
+printf '{"ok":true,"agentSandbox":true,"agentFilesystemConfined":false}\n' >"$runner_health"
+unconfined_doctor=$(run_athanor doctor 2>&1 || true)
+grep -q '^fail  *this kernel can confine agent commands to their own workspace and the runner is not doing it' <<EOF
+$unconfined_doctor
+EOF
+grep -q 'sudo athanor update writes it from what this kernel measures' <<EOF
+$unconfined_doctor
+EOF
+# And the box that honestly cannot. Failing `doctor` for the life of a machine whose kernel has no
+# Landlock would make it a report nobody finishes reading, and the two boundaries that ARE in force
+# are the thing to say instead.
+printf 'user=athanor-agent\nnetwork-isolation=yes\nfilesystem=none\n' >"$sandbox_report"
+old_kernel_doctor=$(run_athanor doctor 2>&1 || true)
+if grep -q 'this kernel can confine agent commands' <<EOF
+$old_kernel_doctor
+EOF
+then
+  printf 'doctor called a kernel without Landlock a fault\n' >&2
+  exit 1
+fi
+# The LEVEL and not only the words. A machine whose kernel has no Landlock can do nothing about it,
+# and a `doctor` that fails for the life of that machine is one nobody finishes reading - so this
+# reads the prefix the line is filed under, which is the whole of the difference. Written first as a
+# words-only check, which stayed green when the note was changed to a failure.
+grep -q '^note  *agent commands are not confined to their own workspace: this kernel or util-linux has no Landlock' <<EOF
+$old_kernel_doctor
+EOF
+# A runner older than the field says nothing about it, which is not evidence either way.
+rm -f "$runner_health"
+silent_runner_doctor=$(run_athanor doctor 2>&1 || true)
+grep -q '^note  *this runner does not report whether agent commands are confined' <<EOF
+$silent_runner_doctor
+EOF
+printf 'ok  doctor reports the filesystem rung the runner is enforcing, and calls an old kernel a note\n'
+
+# The advice `doctor` gives an owner whose document tooling is incomplete. It read "On Debian and
+# Ubuntu, sudo athanor update reinstalls it" and was false on every family, because an update
+# installed no packages at all; the owner of the measured server followed it and nothing happened.
+tooling_doctor=$(run_athanor doctor 2>&1 || true)
+if grep -q 'sudo athanor update reinstalls it' <<EOF
+$tooling_doctor
+EOF
+then
+  printf 'doctor still tells the owner to run an update that will not install anything\n' >&2
+  exit 1
+fi
+grep -q "sudo athanor update installs every package this host's family has for them" <<EOF
+$tooling_doctor
+EOF
+printf 'ok  the missing-tooling advice names a command that now does what it says\n'
 
 # Uninstall, last, because it takes the runtime files every case above installed.
 #

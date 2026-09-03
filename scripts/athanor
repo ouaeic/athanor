@@ -37,6 +37,11 @@ athanor_backup_status="$athanor_state/backup.status"
 # `doctor` reports unattended updates are on and the server looks perfectly healthy because it is:
 # the rollback worked. What nothing said was that the box had stopped moving.
 athanor_update_status="$athanor_state/update.status"
+# Written by the `update install-runtime-files` phase when it has already applied what the release
+# carries, and read by the shell that started the update so it does not do it a second time. A file
+# rather than a variable because the two are different processes, and the phase is the only route a
+# release has into an update whose shell predates it.
+athanor_release_steps_marker="$athanor_state/release-steps-applied"
 # How long the unattended backup waits for the worker to go idle before standing down for the day.
 athanor_backup_idle_wait_seconds="${ATHANOR_BACKUP_IDLE_WAIT_SECONDS:-300}"
 # How long the model catalogue may go without a provider answering before `doctor` calls it a fault
@@ -665,7 +670,13 @@ doctor() {
     # something else or come from a package that family does not carry, and reporting that as a
     # broken installation made `doctor` fail forever on three families out of four. What is true is
     # narrower: the jobs needing the missing piece will not work.
-    check_warn "some document tooling is missing, so jobs needing it will fail:$missing_document_tools. On Debian and Ubuntu, sudo athanor update reinstalls it; on other families it may be packaged under another name"
+    #
+    # The advice used to read "On Debian and Ubuntu, sudo athanor update reinstalls it", and it was
+    # false in the plainest way: an update installed no packages at all, on any family. The owner of
+    # the server this was measured on followed it and nothing happened. It is true now, on all four
+    # families, because `install_release_carried_steps` runs the installer's package step - so the
+    # sentence names that command, and names the one case it still cannot fix.
+    check_warn "some document tooling is missing, so jobs needing it will fail:$missing_document_tools. sudo athanor update installs every package this host's family has for them; a capability the family carries no package for stays missing whatever you run"
   fi
   configured_ddns_provider=$(
     sed -n 's/^DDNS_PROVIDER=//p' "$athanor_config/control.env" 2>/dev/null | sed -n '1p'
@@ -832,6 +843,48 @@ doctor() {
   else
     check_fail "agent commands are not confined to their own account; re-run the installer"
   fi
+  # The other boundary, and the one the owner had no way to see at all.
+  #
+  # `doctor` reported the identity boundary above and said nothing about the filesystem, which is
+  # the newest of the three and the one that shipped switched off: no update ever wrote
+  # CONFINE_AGENT_FILESYSTEM into runner.env, so a server updated to the release that added Landlock
+  # answered `filesystem=landlock` from the helper and `agentFilesystemConfined: false` from the
+  # runner at the same moment, and nothing anywhere said so.
+  #
+  # READ FROM THE RUNNER, NOT FROM THE SETTING, because the setting is the thing that was wrong.
+  # /healthz reports what the process actually built its sandbox with; runner.env reports what
+  # somebody asked for. A runner too old to publish the field is not evidence either way and is
+  # a note.
+  #
+  # A KERNEL THAT HONESTLY CANNOT IS A NOTE AND NOT A FAULT. Landlock needs a kernel and a
+  # util-linux that have it; without them every command still runs as athanor-agent under the
+  # network policy, and calling that broken would fail `doctor` for the life of a machine whose
+  # owner can do nothing about it. So when the runner says false, the helper is asked whether the
+  # rung was available: available and not in force is a fault an update repairs, unavailable is a
+  # note that says which boundaries are.
+  #
+  # A bare `[a-z][a-z]*` rather than a `true\|false` alternation: `\|` is a GNU extension that BSD
+  # sed reads as a literal, so the whole expression matched nothing on a developer machine and this
+  # arm reported "the runner does not say" against a runner that had just said. The value is
+  # examined below instead, where anything that is neither word falls through to the same note.
+  runner_filesystem_rung=$(
+    curl -fsS --max-time 5 http://127.0.0.1:4300/healthz 2>/dev/null | tr ',' '\n' |
+      sed -n 's/.*"agentFilesystemConfined"[[:space:]]*:[[:space:]]*\([a-z][a-z]*\).*/\1/p' |
+      sed -n '1p'
+  )
+  case "$runner_filesystem_rung" in
+    true) check_ok "agent commands are confined to their own workspace as well as their own account" ;;
+    false)
+      if [ -n "$configured_sandbox" ] && [ -x "$configured_sandbox" ] &&
+        runuser -u athanor -- sudo -n "$configured_sandbox" check 2>/dev/null |
+        grep -q '^filesystem=landlock$'; then
+        check_fail "this kernel can confine agent commands to their own workspace and the runner is not doing it; CONFINE_AGENT_FILESYSTEM is missing or false in $athanor_config/runner.env - sudo athanor update writes it from what this kernel measures"
+      else
+        check_note "agent commands are not confined to their own workspace: this kernel or util-linux has no Landlock, so the account and network boundaries are the ones in force"
+      fi
+      ;;
+    *) check_note "this runner does not report whether agent commands are confined to their own workspace, so it predates that boundary" ;;
+  esac
   if [ -e /usr/local/bin/athanor-package-helper ]; then
     check_fail "the root package helper is still on the agent PATH; run sudo athanor update"
   else
@@ -2207,6 +2260,76 @@ run_update_step() {
   fi
 }
 
+# The same bound, for a step whose failure is not a reason to put a good release back.
+#
+# Returns non-zero instead of calling `fail`, and keeps its status in a variable of its own:
+# `run_update_step` never clears `update_step_status`, so writing into it here would make the next
+# `run_update_step` report a failure that had already been handled.
+run_optional_update_step() {
+  optional_step_label="$1"
+  shift
+  optional_step_status=0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --signal=TERM --kill-after=60 "$athanor_update_step_seconds" "$@" ||
+      optional_step_status=$?
+  else
+    "$@" || optional_step_status=$?
+  fi
+  if [ "$optional_step_status" -ne 0 ]; then
+    if [ "$optional_step_status" -eq 124 ] || [ "$optional_step_status" -eq 137 ]; then
+      printf 'athanor: %s passed %s minutes and was stopped.\n' \
+        "$optional_step_label" "$((athanor_update_step_seconds / 60))" >&2
+    fi
+    return 1
+  fi
+  return 0
+}
+
+# Whether the checkout's own installer answers to the release-steps entry point.
+#
+# Asked of the file for the reason `checkout_installs_its_own_runtime_files` is: `athanor update` is
+# the PREVIOUS release's copy of this script, so the only thing it can know about the revision it is
+# installing is what that revision's files say. A checkout from before the entry point existed
+# treats `--release-steps` as a bootstrap argument it does not recognise and runs a whole install -
+# accounts, sudoers, a regenerated shared secret, a certificate - on a stopped production box. That
+# is the outcome this one grep exists to prevent, and it looks for the dispatch arm rather than the
+# name, because the name also appears in prose there.
+checkout_runs_its_own_release_steps() {
+  grep -q '^  --release-steps)' "$athanor_root/scripts/install-native.sh" 2>/dev/null
+}
+
+# The steps a release carries that are not code: the packages in the capability table, the workspace
+# layout, and the runner settings measured from this kernel.
+#
+# WHY THIS CALLS THE INSTALLER RATHER THAN DOING THE WORK. Three of them shipped to the owner's
+# server present and switched off, because an update ran three steps - fetch, install dependencies,
+# build - and the runtime files, and nothing else an install does. Copying those steps here would
+# put the same list in two files, which is the shape that produced the runtime-file lag this script
+# already carries a whole phase to work around. The installer is pulled before this runs, so the
+# steps that execute are always the ones the incoming release wrote.
+#
+# A FAILURE HERE DOES NOT ROLL THE RELEASE BACK, for the reason `fetch_managed_chromium` gives: a
+# distribution mirror that is unreachable at three in the morning must not put a working release
+# back and do it again every week. What the owner gets instead is this sentence and two `doctor`
+# arms that name the consequences - the document toolchain, and the filesystem boundary the runner
+# is actually enforcing. It runs before `database_at_risk=1`, so nothing here has touched the data.
+install_release_carried_steps() {
+  if ! checkout_runs_its_own_release_steps; then
+    warn "this revision's installer has no --release-steps entry point, so the packages, workspace layout and runner settings it carries were not applied; sudo athanor doctor says what is missing"
+    return 0
+  fi
+  # Output is not captured, deliberately. Installing forty packages is the longest step in an update
+  # and it prints for minutes; held back until it ended, an operator at a terminal would watch a
+  # silent screen through the slowest part of the run and have nothing to read if it hung.
+  run_optional_update_step "applying what this release carries" \
+    /bin/sh "$athanor_root/scripts/install-native.sh" --release-steps ||
+    warn "some of what this release carries could not be applied; the release itself is installed and running. sudo athanor doctor says which part is missing"
+  # Attempted, not succeeded. What the marker answers is "has this run already been through here",
+  # and a second attempt in the same outage would fail the same way for the same reason.
+  install -d -m 0755 "$athanor_state" 2>/dev/null || true
+  : >"$athanor_release_steps_marker" 2>/dev/null || true
+}
+
 announce_outage() {
   previous_outage=$(cat "$athanor_state/last-update-outage-seconds" 2>/dev/null || printf '')
   case "$previous_outage" in
@@ -2359,6 +2482,13 @@ update_athanor() {
   # to be killed mid-flight. Re-checked here, where the remaining window is a fraction of a second.
   if [ "${athanor_require_idle:-0}" = 1 ] && ! worker_is_idle; then
     printf 'athanor: a task started while the update was preparing; the next weekly window will retry.\n'
+    # Corrected before returning, and this is the only place that can. `auto_update_run` has already
+    # written `running` pessimistically - it has to, because a run killed by its own start timeout
+    # reaches no further line - and returning through here left that record standing for ever. So a
+    # box whose worker happened to pick up a task in the last fraction of a second was reported by
+    # `doctor` as an update that started and never reported back, weekly, for as long as it lasted:
+    # the loudest thing the record can say, for the most ordinary thing that can happen.
+    record_update_status skipped 'a task started while the update was preparing'
     return 0
   fi
   # The work an idle worker does not account for, refused here rather than destroyed below.
@@ -2480,6 +2610,9 @@ update_athanor() {
   # rolls straight back, so the box could never leave the release that dropped the package.
   run_update_step "installing dependencies" env CI=true pnpm install --frozen-lockfile
   run_update_step "building" env CI=true pnpm -r build
+  # Cleared first, so that only a marker written by THIS run counts. A checkout whose phase does
+  # not apply the release steps leaves none, and this shell applies them itself below.
+  rm -f "$athanor_release_steps_marker" 2>/dev/null || true
   install_checked_out_runtime_files
   nginx -t
   systemctl daemon-reload
@@ -2492,6 +2625,17 @@ update_athanor() {
   # `doctor` reporting it healthy. Here rather than after the restart because this is the window the
   # server is already stopped for; the owner is paying for one outage either way.
   fetch_managed_chromium
+  # And everything else a release carries that is not code, from the incoming release's own
+  # installer. After install_checked_out_runtime_files on purpose: the runner settings step measures
+  # the filesystem boundary by running /usr/local/lib/athanor/athanor-sandbox, which that step is
+  # what places. Before the restart, so the runner comes up reading the settings this release wrote
+  # rather than needing a second outage to pick them up.
+  if [ -f "$athanor_release_steps_marker" ]; then
+    printf 'athanor: the packages, workspace layout and runner settings this release carries were applied by the checkout while it placed its runtime files.\n'
+  else
+    install_release_carried_steps
+  fi
+  rm -f "$athanor_release_steps_marker" 2>/dev/null || true
   # Past this line the new release is running and its migrations have had the database, so a failure
   # from here does need the backup put back.
   database_at_risk=1
@@ -4082,6 +4226,30 @@ case "$command_name" in
         need_root update install-runtime-files
         cd "$athanor_root" || fail "could not enter $athanor_root"
         install_runtime_files
+        # And what this release carries besides its files, here as well as in `update_athanor`.
+        #
+        # WHY BOTH. `athanor update` is the PREVIOUS release's copy of this script, so the release
+        # that first calls `install_release_carried_steps` from `update_athanor` cannot make itself
+        # arrive: the shell running that update has never heard of the call. This phase is the one
+        # route a release has into the shell of an update that is already under way, and it is why
+        # the phase exists at all - every revision back to the one that introduced it hands the
+        # placement to the checkout. Reaching it from here means a box whose /usr/local/bin/athanor
+        # predates the call gets the packages, the workspace layout and the runner settings on the
+        # NEXT update rather than the one after it. On the server this was measured on that is the
+        # difference between the filesystem boundary coming on next week and coming on in a
+        # fortnight.
+        #
+        # NOT TWICE. The marker below is how the shell that started the update learns this already
+        # happened; it clears it before the phase and clears it again after, so only a marker
+        # written during this run counts, and a checkout whose phase does not do this leaves none.
+        # Running the steps twice would be harmless - every one of them is idempotent and
+        # scripts/test-update.sh runs them twice to prove it - but it would cost a second package
+        # resolution in the middle of the owner's outage.
+        #
+        # After install_runtime_files, not before: the settings step measures the filesystem rung by
+        # running /usr/local/lib/athanor/athanor-sandbox, and the line above is what puts this
+        # release's copy of that helper there.
+        install_release_carried_steps
         ;;
       '') update_athanor ;;
       *) fail "usage: athanor update" ;;

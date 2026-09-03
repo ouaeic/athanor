@@ -86,6 +86,21 @@ The bootstrap clones or updates `/opt/athanor`; the native installer then:
 The package and browser caches are ordinary dependencies, not an Athanor runtime image. Installed
 applications and datasets live once on the host.
 
+### The part an update runs again
+
+Steps 2 and 4 above, the workspace layout, and the runner settings written in step 6 other than the
+generated secret are not install-only. They are the things a release carries that are not compiled,
+and `sudo athanor update` runs them by calling `scripts/install-native.sh --release-steps` from the
+revision it has just pulled - one entry point rather than a second copy of the list, so a package
+added to the capability table or a key added to `runner.env` reaches an existing box with the
+release that adds it. `scripts/check-repository.mjs` fails the build if a `runner.env` key is written
+outside that step, and `scripts/test-update.sh` runs the entry point and watches the key land.
+
+Everything else in the list above happens once. Steps 5, 7 and 12 in particular must not repeat on a
+machine that is serving: an account already exists, a regenerated secret leaves two services holding
+different halves until both restart, and certificate issuance is rate-limited at the authority.
+`--release-steps` exits before any of it.
+
 ### Install from a client
 
 The native client’s sign-in screen can install Athanor on a fresh server without making the owner

@@ -84,7 +84,7 @@ fixtures. They need no root, no network and no server, and they finish in second
 sh scripts/test-sandbox.sh          # which account an agent command really lands on
 sh scripts/test-certificate.sh      # renewal, reissue and the recorded failure alarm
 sh scripts/test-relay-endpoint.sh   # what the connection manifest advertises, relay on and off
-sh scripts/test-update.sh           # transactional update and its rollback
+sh scripts/test-update.sh           # transactional update, its rollback, and what a release carries
 sh scripts/test-native-provisioning.sh  # the browser revision, the update record, the spending cap
 sh scripts/test-system-packages.sh  # which package manager an approved install actually reaches
 sh scripts/test-doctor-retirement.sh # what doctor says about a model the provider is withdrawing
@@ -203,6 +203,29 @@ verification:
    pretending otherwise with a test that pins one example of it.
 
 A test is what is left when none of the four fit.
+
+### Adding a step to the installer
+
+`scripts/install-native.sh` does two kinds of work, and every new step is one or the other.
+
+A step a **release carries** - a package, a permission, a setting, a data migration - goes in one of
+the `release_step_*` functions near the top of that file. `sudo athanor update` runs those, and only
+those, by calling `install-native.sh --release-steps` from the revision it has just pulled, so a step
+added there reaches every existing box with the release that adds it. Say beside it why running it
+again on a machine that is serving is safe; the ones already there are safe because they converge -
+the package table is declarative, `set_env_value` replaces, the workspace migration is `mv -n`.
+
+A step an install does **once** - an account, a sudoers file, a generated secret, a certificate, the
+database cluster - stays in the body below, which `--release-steps` exits before reaching. Repeating
+one of those on a running server is how a shared secret gets regenerated under two services that are
+holding it, or a rate-limited certificate gets re-issued. A step nobody is sure about belongs there.
+
+Two things stop the first kind from quietly becoming neither: `scripts/check-repository.mjs` fails
+the build when a `runner.env` key is written outside `release_step_runner_settings`, and
+`scripts/test-update.sh` runs the entry point against a fixture release and watches what it does
+land. This existed because it did not: an update ran the build steps and nothing else an install
+does, and a Landlock boundary, two packages and a workspace migration reached an owner's server
+present and inert, under an update that printed "Update complete" and exited 0.
 
 ### Every assertion must be capable of failing
 

@@ -3,7 +3,10 @@ set -eu
 
 athanor_root="${ATHANOR_ROOT:-/opt/athanor}"
 athanor_state="/var/lib/athanor"
-athanor_config="/etc/athanor"
+# Overridable for the same reason ATHANOR_ROOT above is, and with the same default: scripts/athanor
+# already reads ATHANOR_CONFIG, and scripts/test-update.sh runs this file's release steps against a
+# temporary tree rather than against this host's /etc. Nothing in a real install sets it.
+athanor_config="${ATHANOR_CONFIG:-/etc/athanor}"
 control_user="athanor-control"
 runner_user="athanor"
 # Commands the agent runs get their own account, so a command cannot read the runner's process,
@@ -118,14 +121,302 @@ host_family="$athanor_family"
 host_pm="$athanor_pm"
 # shellcheck disable=SC2154
 host_version="${athanor_os_version:-}"
-say "Installing onto $os_id $host_version ($host_family family, $host_pm, $architecture)"
+# Not said by the single-step arm at the bottom of this section, which `run_release_steps` re-enters
+# this file through once per step: an update would otherwise print this identification and the
+# capability warning below three times over.
+if [ "${1:-}" != --release-step ]; then
+  say "Installing onto $os_id $host_version ($host_family family, $host_pm, $architecture)"
 
-# Said before anything is installed rather than discovered at the first document job. A capability
-# with no package here is not a failed install - the toolchain probe reports it and the skills that
-# need it say so - but the owner should hear it from the installer, once, in a list.
-unavailable=$(athanor_missing_for_family "$host_family" | tr '\n' ' ')
-[ -z "$unavailable" ] ||
-  warn "this host has no package for: ${unavailable}- those capabilities will be unavailable"
+  # Said before anything is installed rather than discovered at the first document job. A capability
+  # with no package here is not a failed install - the toolchain probe reports it and the skills
+  # that need it say so - but the owner should hear it from the installer, once, in a list.
+  unavailable=$(athanor_missing_for_family "$host_family" | tr '\n' ' ')
+  [ -z "$unavailable" ] ||
+    warn "this host has no package for: ${unavailable}- those capabilities will be unavailable"
+fi
+
+# --- what a release carries, which an update has to deliver too ---------------------------------
+#
+# WHAT WENT WRONG. `athanor update` ran three named steps - fetch the revision, install
+# dependencies, build - plus the runtime files and the database migrations, and nothing else an
+# install does. So three things a release carries arrived on the owner's server present and inert,
+# measured on it after an update that printed "Update complete" and exited 0.
+# CONFINE_AGENT_FILESYSTEM was absent from runner.env, so the Landlock boundary this branch built
+# was shipped switched off while `athanor-sandbox check` answered `filesystem=landlock`;
+# python3-scipy and statsmodels were in the capability table and not on the disk; and no workspace
+# had the `.home` the agent's HOME had moved to, so a workspace where a coding CLI had been signed
+# in would come up signed out.
+# `athanor doctor` then told the owner "sudo athanor update reinstalls it", which was false.
+#
+# WHY THE STEPS ARE NOT COPIED INTO scripts/athanor. Two hand-kept lists drift, and this tree has
+# both a gate against that shape ("Copied constants") and a case in scripts/test-update.sh that
+# watched a file added in one release reach an existing box a release late. So the steps stay in the
+# file that owns them and `athanor update` calls this script with `--release-steps`.
+#
+# WHAT THAT BUYS THAT A COPY DOES NOT, and it is the whole reason for the shape: the installer that
+# runs during an update is the one from the revision being installed, because the update pulls
+# before it calls this. A step added to a function below therefore lands on an existing box with the
+# release that adds it, with no second list to remember and no one-generation lag - which is exactly
+# the lag `install_checked_out_runtime_files` in scripts/athanor exists to work around for the
+# runtime-file list, and which it can only work around because that list is inside a file the update
+# re-executes. Adding a runner.env key outside `release_step_runner_settings` is refused by
+# scripts/check-repository.mjs rather than left to be noticed on a server.
+#
+# WHAT IS DELIBERATELY NOT HERE, because running it again on a box that is serving would break it:
+#   - the three system accounts, and the sudoers policies - creating them is once, and a rewritten
+#     sudoers file that fails visudo would take root helpers away from a running product;
+#   - every generated secret (the runner shared secret, the data master key, the session key, the
+#     Web Push pair, the database password) - regenerating one leaves two services holding
+#     different halves until both restart, and some of them cannot be regenerated at all without
+#     losing the rows they encrypt;
+#   - the TLS certificate - issuing has a rate limit at the certificate authority, and enabling
+#     HSTS is a decision `athanor certificate enable` makes and an update must not unmake;
+#   - the database cluster, initdb, the role and the client-authentication file;
+#   - the nginx site and the listen snippet - the update already places the site through
+#     install_runtime_files, and the listen form is chosen from the host's nginx version, which an
+#     update has no reason to re-decide;
+#   - Node itself and the NodeSource repository - a release that needs a newer Node major is a
+#     thing an owner should be told about rather than a thing a 3 a.m. timer does to their host;
+#   - the managed Chromium, which `athanor update` already fetches by itself.
+# A step nobody was sure about stays out. Adding one is a decision, and the comment beside it should
+# say why re-running it on a live box is safe.
+
+# The filesystem rung this kernel actually gives, asked of the helper rather than taken from a
+# preference.
+#
+# THREE ANSWERS, NOT TWO. `true` and `false` are measurements; EMPTY means the measurement could not
+# be taken at all - no helper on disk, or runuser/sudo refused - and that is not the same statement
+# as "this kernel cannot". Writing `false` for it would take a working Landlock boundary off a box
+# during an update because a probe failed, silently. An unmeasurable box keeps whatever runner.env
+# already says and is warned about instead.
+# Not guarded on the helper being on the disk first. The command failing IS the unmeasurable answer,
+# and one path through here rather than two is also what lets scripts/test-update.sh drive all three
+# outcomes without the drill needing to write into this host's /usr.
+measure_agent_filesystem_confinement() {
+  agent_filesystem_confinement=""
+  sandbox_measurement=$(
+    runuser -u "$runner_user" -- sudo -n /usr/local/lib/athanor/athanor-sandbox check 2>&1
+  ) || return 0
+  case "$sandbox_measurement" in
+    *filesystem=landlock*) agent_filesystem_confinement=true ;;
+    *) agent_filesystem_confinement=false ;;
+  esac
+}
+
+# The built-in skill library reaches the model, and its procedures are specific: "run build_deck.py"
+# is confident and wrong on a machine without python-pptx. Everything services/workspace-runner's
+# DOCUMENT_TOOLCHAIN declares is installed here - and the one binary apt spells differently across
+# supported releases is settled immediately after - so a vetted procedure can be followed rather
+# than read and abandoned. Carlito and Caladea are the metric-compatible stand-ins for Calibri and
+# Cambria, without which an .docx written elsewhere reflows the moment it is opened; Liberation,
+# DejaVu and Noto are what a typeset document and a rendered slide actually fall back to, and
+# without them LibreOffice substitutes whatever it can find and the page proof measures a layout
+# the owner will never see. ocrmypdf brings tesseract and ghostscript with it, which is how a
+# scanned PDF becomes readable and how an oversized one is compressed. libreoffice-gtk3 looks
+# cosmetic and is not: LibreOffice reaches the accessibility bus only through its gtk3 drawing
+# backend, and without that package it falls back to the plain X11 one without saying so, the
+# accessibility tree comes back empty, and the agent is left reading a screenshot of a document it
+# could otherwise have read the text of.
+#
+# SAFE TO REPEAT because the table is declarative and every one of the four package managers is
+# asked to converge on it rather than to add to it: apt-get install on a package that is present is
+# a no-op, and so are the dnf, zypper and pacman spellings in athanor_pm_install. A release that
+# adds a row here installs it on every existing box at that release.
+release_step_packages() {
+  say "Installing native operating-system dependencies"
+  # The names come from the host table rather than from a list written here, so the installer, the
+  # runner's toolchain probe and `athanor doctor` cannot disagree about what a capability is called.
+  # Packages this family does not have are simply absent from the list; the warning above already
+  # said which, and the toolchain probe reports the capability as missing rather than the install
+  # failing on a name that was never going to resolve.
+  athanor_pm_refresh "$host_pm"
+  # shellcheck disable=SC2046
+  athanor_pm_install "$host_pm" $(athanor_packages_for_family "$host_family")
+
+  # gnupg is the one thing that is not a capability: it dearmors the NodeSource signing key, which
+  # is an apt-only step, so it is installed where that step exists and nowhere else.
+  case "$host_family" in
+  debian) athanor_pm_install "$host_pm" gnupg ;;
+  esac
+}
+
+# Workspaces that predate the separate agent account are owner-only, so the account that now runs
+# commands could not read the home it works in. Everything except .athanor - the browser profile,
+# the desktop session and the artifact store, which stay the runner's alone - joins the group.
+#
+# SAFE TO REPEAT: chgrp and chmod converge, `install -d` on a directory that exists only re-applies
+# its mode, and the one move is `mv -n`, so a second run moves nothing.
+#
+# A BOX WITHOUT THE AGENT ACCOUNT IS LEFT ALONE. Creating accounts is an install-only step and is
+# not in this section, so on a server installed before that account existed the `install -d -g`
+# below would fail under `set -eu` and take an otherwise good update down with it. It is skipped
+# and said out loud instead; re-running the installer is what makes such a box current.
+release_step_workspace_layout() {
+  if ! id "$agent_user" >/dev/null 2>&1; then
+    warn "there is no $agent_user account on this host, so the workspace layout this release expects was not applied; re-run the installer"
+    return 0
+  fi
+  # The one place the workspace root is a variable rather than the literal it is everywhere else in
+  # this file, and it is the same override scripts/athanor already carries as ATHANOR_HOME: the
+  # migration below moves files, and scripts/test-update.sh has to be able to watch it move them
+  # somewhere other than this host's /home. Unset, it is /home/athanor.
+  for workspace_directory in "${ATHANOR_WORKSPACE_ROOT:-/home/athanor}"/*/; do
+    [ -d "$workspace_directory" ] || continue
+    chgrp "$agent_user" "$workspace_directory"
+    chmod 2770 "$workspace_directory"
+    find "$workspace_directory" -mindepth 1 -maxdepth 1 ! -name .athanor -exec \
+      chgrp -R "$agent_user" {} + 2>/dev/null || true
+    find "$workspace_directory" -mindepth 1 -maxdepth 1 ! -name .athanor -exec \
+      chmod -R g+rwX {} + 2>/dev/null || true
+    # The agent's HOME was the workspace root itself and is now `.home` inside it (execution.ts
+    # `agentHome`), which is what gives it a Landlock write grant of its own without putting a
+    # toolchain's caches inside `workspace/`, where the turn checkpoint would walk and hash them
+    # every turn. Everything the old home accumulated is carried across rather than abandoned:
+    # without this, a workspace where Codex or Claude Code was signed in comes up signed out after
+    # an upgrade, and on a box that then confines the filesystem the old copies at the root are not
+    # readable to go and fetch - $ROOT is granted nowhere, only $ROOT/workspace and $ROOT/.home are.
+    #
+    # ONE old home is carried and only one: the container root, which is where every released
+    # version has put HOME. `workspace/.home` is DELIBERATELY LEFT WHERE IT IS, and this is the
+    # decision in this block that matters.
+    #
+    # An intermediate build on this branch put HOME at `workspace/.home`, and carrying that across
+    # looks like kindness. It is not: under every version an owner can actually be running,
+    # `workspace/.home` is a directory the AGENT can write with no card and no prompt, because
+    # `assertUserDataPath` folds a bare `.home/.bashrc` into it and the worker's write
+    # classification declines the card on the stated ground that a `.bashrc` there is inert
+    # (apps/worker/src/write-classification.ts). Moving that directory into `$ROOT/.home` would make
+    # it the real one - the file `agentHome` hands every agent command, and the file the OWNER's own
+    # interactive terminal sources, since services/workspace-runner/src/server.ts points its pty at
+    # the same HOME. An upgrade would take a write nobody was asked about and promote it into the
+    # owner's login shell. That is the exact hole moving HOME to the container root was for.
+    #
+    # Nothing is lost by leaving it: it stays in `workspace/`, readable and writable by the agent,
+    # inside the checkpoint and the snapshot, and visible to the owner in the file browser. A box
+    # that ran the intermediate build comes up needing its coding CLIs signed in again, with the old
+    # credentials still on disk where a person can look at them and decide. That is the right way
+    # round: a re-sign-in is a minute, and a promoted `.bashrc` is not noticed at all.
+    #
+    # `mv -n` for the move that is made, so nothing is overwritten and a second run moves nothing -
+    # this loop runs on every install and every update and must be safe to repeat.
+    #
+    # `workspace/` gates all of it, as the one test that this directory is a workspace rather than
+    # something an operator left under /home/athanor by hand.
+    [ -d "$workspace_directory/workspace" ] || continue
+    install -d -m 2770 -o "$runner_user" -g "$agent_user" "$workspace_directory/.home"
+    # Everything at the root except `workspace`, `.athanor` and `.home` itself, because that is
+    # exactly what the ORIGINAL HOME was. What this leaves behind is a root entry whose name the new
+    # home already has; it stays at the root, where a confined command cannot read it. Deliberate:
+    # litter is cheaper than clobbering a live credential, and the file is still there to be read by
+    # the owner's own terminal, which is not confined.
+    find "$workspace_directory" -mindepth 1 -maxdepth 1 \
+      ! -name .athanor ! -name workspace ! -name .home -exec \
+      mv -n {} "$workspace_directory/.home/" \; 2>/dev/null || true
+  done
+}
+
+# Every runner setting except the shared secret, which is generated and stays with the install.
+#
+# SAFE TO REPEAT: `set_env_value` replaces one key in place and `set_env_default` writes only when
+# the key is absent, so an operator's own MAX_EXECUTION_SECONDS survives and a path this release
+# moved does not. CONFINE_AGENT_FILESYSTEM is the one that is measured rather than chosen, and it is
+# `set_env_value` for the reason written beside it.
+#
+# The runner is not restarted here. On an install it has not started yet; on an update the caller
+# restarts everything a few steps later, which is the same outage the owner is already paying for.
+release_step_runner_settings() {
+  runner_env="$athanor_config/runner.env"
+  set_env_value "$runner_env" RUNNER_HOST 127.0.0.1
+  set_env_value "$runner_env" RUNNER_PORT 4300
+  set_env_value "$runner_env" WORKSPACE_ROOT /home/athanor
+  set_env_value "$runner_env" TAR_EXECUTABLE /usr/bin/tar
+  set_env_value "$runner_env" SNAPSHOT_EXECUTABLE /usr/local/lib/athanor/athanor-snapshot
+  set_env_value "$runner_env" DESKTOP_BRIDGE_EXECUTABLE \
+    /usr/local/lib/athanor/athanor-desktop-bridge.py
+  set_env_value "$runner_env" DESKTOP_SESSION_EXECUTABLE \
+    /usr/local/lib/athanor/start-desktop-session.sh
+  set_env_value "$runner_env" SYSTEM_PACKAGE_HELPER /usr/local/lib/athanor/athanor-package-helper
+  set_env_value "$runner_env" AGENT_SANDBOX_HELPER /usr/local/lib/athanor/athanor-sandbox
+  # Written from what `athanor-sandbox check` measured on this kernel, not from a preference.
+  # `set_env_value` rather than `set_env_default` on purpose: a box that gains Landlock through a
+  # kernel upgrade, or loses it, has this rewritten by the next install or update rather than
+  # keeping whatever the first one found. The runner refuses to start if this is on and the helper
+  # is unset, so the two keys are written together.
+  #
+  # An install has already measured this a few hundred lines below, where the drop to the agent
+  # account is hard-gated; an update has not, and measures it here.
+  [ -n "${agent_filesystem_confinement:-}" ] || measure_agent_filesystem_confinement
+  if [ -n "${agent_filesystem_confinement:-}" ]; then
+    set_env_value "$runner_env" CONFINE_AGENT_FILESYSTEM "$agent_filesystem_confinement"
+  else
+    # Left exactly as it was. "Could not ask" is not "cannot confine", and the difference between
+    # them is a boundary an owner already has.
+    warn "the filesystem boundary could not be measured on this host, so CONFINE_AGENT_FILESYSTEM in $runner_env was left as it stands; sudo athanor doctor reports the rung actually in force"
+  fi
+  # Publishing a preview points the public internet at a loopback port, so the runner is told every
+  # port this installation already serves something private on: the API, the preview gateway, the
+  # database, and the worker and notification health endpoints. Its own port is added in code.
+  set_env_value "$runner_env" RESERVED_PREVIEW_PORTS 4100,4400,5432,4201,4203
+  # The transposed spelling this key carried for a while, cleared so an upgraded box does not keep
+  # a stale list under a name nothing reads.
+  remove_env_key "$runner_env" PREVIEW_RESERVED_PORTS
+  set_env_default "$runner_env" MAX_EXECUTION_SECONDS 3600
+  set_env_default "$runner_env" MAX_FILE_BYTES 2147483648
+  # A command in its own network namespace also has its own loopback, so nothing outside it - the
+  # preview proxy included - can reach a port the command is listening on. Turning this on therefore
+  # costs published previews, which is why it is off rather than on: with the sandbox helper in
+  # place it is now a working setting rather than one that made every command fail.
+  set_env_default "$runner_env" ISOLATE_AGENT_NETWORK false
+  chmod 0600 "$runner_env"
+}
+
+# The steps, named once. The dispatch below validates against this same list, so there is no second
+# copy of it to fall behind.
+release_steps='release_step_packages release_step_workspace_layout release_step_runner_settings'
+
+# Every step above, for a box that is already installed.
+#
+# EACH IN A PROCESS OF ITS OWN, and this is the bound that matters. A package mirror that is down at
+# three in the morning must not take the two steps after it with it, and the runner settings are the
+# step that carries the security boundary. A subshell is not enough and this was measured on this
+# tree: `set -e` is ignored for any command that is not the last of an AND-OR list, the suppression
+# is inherited by a subshell, and `set -e` written inside that subshell does not re-arm it - so
+# `(step) || note_failure` ran a step whose chmod had already failed all the way to its last line
+# and called it a success. Re-executing this file gives each step its own errexit and its own exit
+# status, which is the only arrangement here that actually stops at the first thing that goes wrong.
+run_release_steps() {
+  release_steps_failed=""
+  for release_step in $release_steps; do
+    /bin/sh "$0" --release-step "$release_step" ||
+      release_steps_failed="$release_steps_failed $release_step"
+  done
+  [ -z "$release_steps_failed" ] ||
+    fail "these steps this release carries did not finish:$release_steps_failed"
+}
+
+# The entry point `athanor update` calls, and the only arguments this script takes.
+#
+# It exits before the install proper: everything below creates accounts, writes sudoers, generates
+# secrets, issues a certificate and initialises a database, and none of that may happen twice on a
+# machine that is serving.
+case "${1:-}" in
+  --release-steps)
+    say "Applying what this release carries: packages, workspace layout and runner settings"
+    run_release_steps
+    exit 0
+    ;;
+  --release-step)
+    # One step, in the process `run_release_steps` gave it. The name is checked against the list
+    # above rather than run as given, so this arm can only reach a step that exists.
+    case " $release_steps " in
+      *" ${2:-} "*) "$2" ;;
+      *) fail "there is no release step called '${2:-}'" ;;
+    esac
+    exit 0
+    ;;
+  '') ;;
+  *) fail "usage: install-native.sh [--release-steps]" ;;
+esac
 
 
 [ -f "$athanor_root/package.json" ] ||
@@ -161,35 +452,8 @@ for measured_path in "$athanor_root" /var /home; do
 done
 
 export DEBIAN_FRONTEND=noninteractive
-# The built-in skill library reaches the model, and its procedures are specific: "run build_deck.py"
-# is confident and wrong on a machine without python-pptx. Everything services/workspace-runner's
-# DOCUMENT_TOOLCHAIN declares is installed here - and the one binary apt spells differently across
-# supported releases is settled immediately after - so a vetted procedure can be followed rather
-# than read and abandoned. Carlito and Caladea are the metric-compatible stand-ins for Calibri and
-# Cambria, without which an .docx written elsewhere reflows the moment it is opened; Liberation,
-# DejaVu and Noto are what a typeset document and a rendered slide actually fall back to, and
-# without them LibreOffice substitutes whatever it can find and the page proof measures a layout
-# the owner will never see. ocrmypdf brings tesseract and ghostscript with it, which is how a
-# scanned PDF becomes readable and how an oversized one is compressed. libreoffice-gtk3 looks
-# cosmetic and is not: LibreOffice reaches the accessibility bus only through its gtk3 drawing
-# backend, and without that package it falls back to the plain X11 one without saying so, the
-# accessibility tree comes back empty, and the agent is left reading a screenshot of a document it
-# could otherwise have read the text of.
-say "Installing native operating-system dependencies"
-# The names come from the host table rather than from a list written here, so the installer, the
-# runner's toolchain probe and `athanor doctor` cannot disagree about what a capability is called.
-# Packages this family does not have are simply absent from the list; the warning above already
-# said which, and the toolchain probe reports the capability as missing rather than the install
-# failing on a name that was never going to resolve.
-athanor_pm_refresh "$host_pm"
-# shellcheck disable=SC2046
-athanor_pm_install "$host_pm" $(athanor_packages_for_family "$host_family")
-
-# gnupg is the one thing that is not a capability: it dearmors the NodeSource signing key, which is
-# an apt-only step, so it is installed where that step exists and nowhere else.
-case "$host_family" in
-debian) athanor_pm_install "$host_pm" gnupg ;;
-esac
+# The same step an update runs, defined once above with what each package is for.
+release_step_packages
 
 # ImageMagick 7 is one `magick` command. ImageMagick 6 - which is what the `imagemagick` package
 # resolves to on Debian 12 and on Ubuntu 22.04 and 24.04 - provides convert, identify and mogrify
@@ -348,62 +612,9 @@ install -d -m 0755 "$athanor_state" "$athanor_state/acme" "$athanor_config" "$at
 install -d -m 0700 -o "$control_user" -g "$control_user" "$athanor_config/relay"
 install -d -m 0755 /usr/local/lib/athanor
 
-# Workspaces that predate the separate agent account are owner-only, so the account that now runs
-# commands could not read the home it works in. Everything except .athanor - the browser profile,
-# the desktop session and the artifact store, which stay the runner's alone - joins the group.
-for workspace_directory in /home/athanor/*/; do
-  [ -d "$workspace_directory" ] || continue
-  chgrp "$agent_user" "$workspace_directory"
-  chmod 2770 "$workspace_directory"
-  find "$workspace_directory" -mindepth 1 -maxdepth 1 ! -name .athanor -exec \
-    chgrp -R "$agent_user" {} + 2>/dev/null || true
-  find "$workspace_directory" -mindepth 1 -maxdepth 1 ! -name .athanor -exec \
-    chmod -R g+rwX {} + 2>/dev/null || true
-  # The agent's HOME was the workspace root itself and is now `.home` inside it (execution.ts
-  # `agentHome`), which is what gives it a Landlock write grant of its own without putting a
-  # toolchain's caches inside `workspace/`, where the turn checkpoint would walk and hash them every
-  # turn. Everything the old home accumulated is carried across rather than abandoned: without this,
-  # a workspace where Codex or Claude Code was signed in comes up signed out after an upgrade, and
-  # on a box that then confines the filesystem the old copies at the root are not readable to go and
-  # fetch - $ROOT is granted nowhere, only $ROOT/workspace and $ROOT/.home are.
-  #
-  # ONE old home is carried and only one: the container root, which is where every released version
-  # has put HOME. `workspace/.home` is DELIBERATELY LEFT WHERE IT IS, and this is the decision in
-  # this block that matters.
-  #
-  # An intermediate build on this branch put HOME at `workspace/.home`, and carrying that across
-  # looks like kindness. It is not: under every version an owner can actually be running,
-  # `workspace/.home` is a directory the AGENT can write with no card and no prompt, because
-  # `assertUserDataPath` folds a bare `.home/.bashrc` into it and the worker's write classification
-  # declines the card on the stated ground that a `.bashrc` there is inert
-  # (apps/worker/src/write-classification.ts). Moving that directory into `$ROOT/.home` would make
-  # it the real one - the file `agentHome` hands every agent command, and the file the OWNER's own
-  # interactive terminal sources, since services/workspace-runner/src/server.ts points its pty at
-  # the same HOME. An upgrade would take a write nobody was asked about and promote it into the
-  # owner's login shell. That is the exact hole moving HOME to the container root was for.
-  #
-  # Nothing is lost by leaving it: it stays in `workspace/`, readable and writable by the agent,
-  # inside the checkpoint and the snapshot, and visible to the owner in the file browser. A box that
-  # ran the intermediate build comes up needing its coding CLIs signed in again, with the old
-  # credentials still on disk where a person can look at them and decide. That is the right way
-  # round: a re-sign-in is a minute, and a promoted `.bashrc` is not noticed at all.
-  #
-  # `mv -n` for the move that is made, so nothing is overwritten and a second run moves nothing -
-  # this loop runs on every install and must be safe to repeat.
-  #
-  # `workspace/` gates all of it, as the one test that this directory is a workspace rather than
-  # something an operator left under /home/athanor by hand.
-  [ -d "$workspace_directory/workspace" ] || continue
-  install -d -m 2770 -o "$runner_user" -g "$agent_user" "$workspace_directory/.home"
-  # Everything at the root except `workspace`, `.athanor` and `.home` itself, because that is
-  # exactly what the ORIGINAL HOME was. What this leaves behind is a root entry whose name the new
-  # home already has; it stays at the root, where a confined command cannot read it. Deliberate:
-  # litter is cheaper than clobbering a live credential, and the file is still there to be read by
-  # the owner's own terminal, which is not confined.
-  find "$workspace_directory" -mindepth 1 -maxdepth 1 \
-    ! -name .athanor ! -name workspace ! -name .home -exec \
-    mv -n {} "$workspace_directory/.home/" \; 2>/dev/null || true
-done
+# The same step an update runs, defined once above with what the `.home` move does and does not
+# carry across.
+release_step_workspace_layout
 
 say "Building athanor"
 cd "$athanor_root"
@@ -980,39 +1191,14 @@ remove_env_key "$control_env" MEDIA_HEALTH_PORT
 chmod 0600 "$athanor_config/control.env"
 
 runner_env="$athanor_config/runner.env"
-set_env_value "$runner_env" RUNNER_HOST 127.0.0.1
-set_env_value "$runner_env" RUNNER_PORT 4300
+# The one runner setting an update must never touch, so it is here and not in the release step.
+# Rewriting it would leave the API holding one secret and the runner another until both restart,
+# and there is no release that has a reason to change it.
 set_env_value "$runner_env" RUNNER_SHARED_SECRET "$runner_shared_secret"
-set_env_value "$runner_env" WORKSPACE_ROOT /home/athanor
-set_env_value "$runner_env" TAR_EXECUTABLE /usr/bin/tar
-set_env_value "$runner_env" SNAPSHOT_EXECUTABLE /usr/local/lib/athanor/athanor-snapshot
-set_env_value "$runner_env" DESKTOP_BRIDGE_EXECUTABLE \
-  /usr/local/lib/athanor/athanor-desktop-bridge.py
-set_env_value "$runner_env" DESKTOP_SESSION_EXECUTABLE \
-  /usr/local/lib/athanor/start-desktop-session.sh
-set_env_value "$runner_env" SYSTEM_PACKAGE_HELPER /usr/local/lib/athanor/athanor-package-helper
-set_env_value "$runner_env" AGENT_SANDBOX_HELPER /usr/local/lib/athanor/athanor-sandbox
-# Written from what `athanor-sandbox check` measured on this kernel a few hundred lines above, not
-# from a preference. `set_env_value` rather than `set_env_default` on purpose: a box that gains
-# Landlock through a kernel upgrade, or loses it, has this rewritten by the next install rather than
-# keeping whatever the first one found. The runner refuses to start if this is on and the helper is
-# unset, so the two keys are written together.
-set_env_value "$runner_env" CONFINE_AGENT_FILESYSTEM "$agent_filesystem_confinement"
-# Publishing a preview points the public internet at a loopback port, so the runner is told every
-# port this installation already serves something private on: the API, the preview gateway, the
-# database, and the worker and notification health endpoints. Its own port is added in code.
-set_env_value "$runner_env" RESERVED_PREVIEW_PORTS 4100,4400,5432,4201,4203
-# The transposed spelling this key carried for a while, cleared so an upgraded box does not keep
-# a stale list under a name nothing reads.
-remove_env_key "$runner_env" PREVIEW_RESERVED_PORTS
-set_env_default "$runner_env" MAX_EXECUTION_SECONDS 3600
-set_env_default "$runner_env" MAX_FILE_BYTES 2147483648
-# A command in its own network namespace also has its own loopback, so nothing outside it - the
-# preview proxy included - can reach a port the command is listening on. Turning this on therefore
-# costs published previews, which is why it is off rather than on: with the sandbox helper in
-# place it is now a working setting rather than one that made every command fail.
-set_env_default "$runner_env" ISOLATE_AGENT_NETWORK false
-chmod 0600 "$athanor_config/runner.env"
+# Everything else, from the same function an update calls, so a key added to one is written by both.
+# `agent_filesystem_confinement` is already measured above, at the hard gate, and the function uses
+# that measurement rather than taking its own.
+release_step_runner_settings
 
 /usr/local/lib/athanor/athanor-network-refresh
 

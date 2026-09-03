@@ -966,6 +966,112 @@ else
     `Runtime files: the update places all ${installerPlaces.size - installOnly.size} the installer does, ${installOnly.size} install-only by decision.`
   );
 
+/**
+ * And every runner setting a fresh install writes is one an update writes too.
+ *
+ * The same defect as the runtime files, one directory over and worse: CONFINE_AGENT_FILESYSTEM was
+ * written into /etc/athanor/runner.env by the installer and by nothing else, so the Landlock
+ * boundary this branch built reached the owner's server present and switched OFF - `athanor-sandbox
+ * check` answering `filesystem=landlock` while the runner answered `agentFilesystemConfined:
+ * false`, after an update that printed "Update complete" and exited 0.
+ *
+ * `athanor update` now runs `scripts/install-native.sh --release-steps`, which runs the settings
+ * step from the incoming release rather than from a second list. THIS IS THE GATE THAT KEEPS IT
+ * THAT WAY: a key written outside `release_step_runner_settings` is a key an update does not carry,
+ * and adding one fails here rather than being noticed on somebody's box a release later.
+ *
+ * WHAT THIS DOES NOT PROVE, and the distinction matters here more than anywhere: it does not prove
+ * the update runs that step, or that the step works. It is a partition rule over one file. What
+ * runs the entry point, watches the key land in a runner.env, and watches a step that fails stop
+ * where it failed is `scripts/test-update.sh`.
+ */
+const runnerSettingsStart = installerSource.indexOf('release_step_runner_settings() {');
+const runnerSettingsEnd = installerSource.indexOf('\n}\n', runnerSettingsStart);
+const runnerSettingsBlock =
+  runnerSettingsStart === -1 ? '' : installerSource.slice(runnerSettingsStart, runnerSettingsEnd);
+// Every call to the three env writers, whatever file it names, because a gate that only recognises
+// one spelling of the target is a gate one token defeats. Measured on this tree: with the pattern
+// written as `"$runner_env"` alone, adding `set_env_value "$athanor_config/runner.env" NEW_KEY x`
+// outside the step passed this check with the same reassuring line, and NEW_KEY would have reached
+// a fresh install and no existing box - the exact defect this gate is here to refuse. So the target
+// is read rather than assumed, and an unrecognised one fails below rather than being skipped.
+const envWritePattern = /^\s*(?:set_env_value|set_env_default|remove_env_key)\s+(\S+)\s+(\S+)/gm;
+// The three spellings that exist. `"$env_file"` is `set_env_default` forwarding to `set_env_value`
+// inside the helper itself, not a setting; `"$control_env"` is the API's file, which the update
+// path does not carry and this gate says nothing about. A fourth spelling is a decision, and
+// whoever writes it has to come here and say which file it is.
+const envWriteTargets = new Map([
+  ['"$runner_env"', 'runner'],
+  ['"$control_env"', 'control'],
+  ['"$env_file"', 'helper']
+]);
+const envWritesAnywhere = [...installerSource.matchAll(envWritePattern)];
+const unrecognisedEnvTargets = [
+  ...new Set(envWritesAnywhere.map((m) => m[1]).filter((target) => !envWriteTargets.has(target)))
+].sort();
+const runnerKeysOf = (source) =>
+  new Set(
+    [...source.matchAll(envWritePattern)]
+      .filter((m) => envWriteTargets.get(m[1]) === 'runner')
+      .map((m) => m[2])
+  );
+const runnerKeysInStep = runnerKeysOf(runnerSettingsBlock);
+const runnerKeysAnywhere = runnerKeysOf(installerSource);
+// And every step this file defines is a step the entry point runs. `release_steps` is the list
+// `run_release_steps` walks and the list the `--release-step` arm validates against, so a
+// `release_step_*` function the install body calls and that list does not name is work that reaches
+// a fresh install and never an existing box - the same silence, one name over.
+const releaseStepsList = installerSource.match(/^release_steps='([^']*)'$/m);
+const releaseStepsNamed = new Set(releaseStepsList ? releaseStepsList[1].split(/\s+/) : []);
+const releaseStepsDefined = [...installerSource.matchAll(/^(release_step_[a-z_]+)\(\) \{$/gm)].map(
+  (m) => m[1]
+);
+const releaseStepsUnlisted = releaseStepsDefined.filter((name) => !releaseStepsNamed.has(name));
+// Written by an install and deliberately not by an update. Regenerating the shared secret leaves
+// the API holding one value and the runner another until both restart, and no release has a reason
+// to change it. Anything else added to this set needs the same kind of sentence.
+const runnerKeysInstallOnly = new Set(['RUNNER_SHARED_SECRET']);
+const runnerKeysNeverUpdated = [...runnerKeysAnywhere]
+  .filter((key) => !runnerKeysInStep.has(key) && !runnerKeysInstallOnly.has(key))
+  .sort();
+const staleRunnerKeyException = [...runnerKeysInstallOnly]
+  .filter((key) => !runnerKeysAnywhere.has(key))
+  .sort();
+// A floor rather than a presence test, for the reason every other list here has one: an expression
+// that quietly stops finding anything passes every time and protects nothing.
+if (runnerKeysInStep.size < 10)
+  fail(
+    `only ${runnerKeysInStep.size} runner settings were found inside release_step_runner_settings; the step is no longer being read rather than being that small`
+  );
+else if (!releaseStepsList)
+  fail(
+    `scripts/install-native.sh no longer declares a release_steps list, so nothing here can tell which steps an update runs`
+  );
+else if (releaseStepsDefined.length < 3)
+  fail(
+    `only ${releaseStepsDefined.length} release_step_* functions were found in scripts/install-native.sh; the file is no longer being read rather than having that few`
+  );
+else if (releaseStepsUnlisted.length)
+  fail(
+    `scripts/install-native.sh defines ${releaseStepsUnlisted.join(', ')} but release_steps does not name it, so sudo athanor update would never run it; add it to that list or give it a name that is not release_step_*`
+  );
+else if (unrecognisedEnvTargets.length)
+  fail(
+    `scripts/install-native.sh writes environment settings into ${unrecognisedEnvTargets.join(', ')}, which this check does not recognise; name that target beside "$runner_env" here and say which file it is, or this gate cannot tell whether an update carries what it writes`
+  );
+else if (runnerKeysNeverUpdated.length)
+  fail(
+    `scripts/install-native.sh writes ${runnerKeysNeverUpdated.join(', ')} into runner.env outside release_step_runner_settings, so sudo athanor update would never write it; move it into that step or name it install-only there and here`
+  );
+else if (staleRunnerKeyException.length)
+  fail(
+    `${staleRunnerKeyException.join(', ')} is listed as an install-only runner setting but the installer no longer writes it`
+  );
+else
+  say(
+    `Runner settings: all ${runnerKeysInStep.size} an install writes are inside the step an update runs, ${runnerKeysInstallOnly.size} install-only by decision; all ${releaseStepsDefined.length} release steps are named in the list the update walks.`
+  );
+
 /*
  * Values held in two places on purpose, against the file that owns them.
  *

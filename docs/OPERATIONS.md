@@ -18,6 +18,22 @@ headroom.
 
 Lines are prefixed `ok`, `note`, `warn`, or `fail`. Only `fail` makes the command exit non-zero.
 
+It also reports both boundaries an agent command runs inside, which used to be one. The account
+boundary - "agent commands run as athanor-agent, not as the runner" - was reported and the
+filesystem boundary was not, which is how a server came to answer `filesystem=landlock` from
+`athanor-sandbox check` and `agentFilesystemConfined: false` from the runner at the same moment with
+nothing saying so. The filesystem line is read from the runner's own health endpoint rather than
+from `CONFINE_AGENT_FILESYSTEM`, because the setting is what goes wrong, and it reads three ways:
+
+- `ok` - the runner is confining commands to their own workspace.
+- `fail` - this kernel can and the runner is not; `sudo athanor update` writes the setting from what
+  the kernel measures.
+- `note` - this kernel or util-linux has no Landlock, so the account and network boundaries are the
+  ones in force. That is a machine whose owner can do nothing about it, and it is not a failure.
+
+A runner older than the field says nothing about it, which is reported as a note and not as either
+answer.
+
 Dynamic DNS reports one of three things: `note dynamic DNS is not configured`; `ok dynamic DNS:
 NAME published through PROVIDER`; or `fail dynamic DNS has not published for two days` when the
 recorded publish is older than twice the 24-hour re-publish interval. When the last publish
@@ -346,6 +362,36 @@ helpers/systemd/Nginx definitions, refreshes network metadata, and waits for hea
 fails, it resets the managed checkout to the previous revision, reinstalls that runtime, and restores
 the pre-update backup before returning a failure. Keep the backup until login, history, files,
 browser, GUI, and one model call pass.
+
+### What an update carries besides code
+
+Between the build and the restart, `athanor update` runs `scripts/install-native.sh --release-steps`
+from the revision it has just pulled. That covers the three things a release carries that are not
+compiled:
+
+- **Operating-system packages.** Every package in the capability table for this host's family, so a
+  release that adds one installs it on an existing box rather than only on a fresh one.
+- **Workspace layout.** The permissions the agent account needs, and the move of the agent's HOME
+  into `<workspace>/.home`, which is what keeps a signed-in coding CLI signed in across an upgrade.
+- **Runner settings.** Every key in `/etc/athanor/runner.env` except the generated shared secret,
+  including `CONFINE_AGENT_FILESYSTEM`, which is written from what `athanor-sandbox check` measures
+  on this kernel rather than from a preference.
+
+Until this existed an update ran the three build steps and nothing else an install does, so those
+three arrived a release late or not at all. On the server this was found on, the Landlock boundary
+had shipped present and switched off, two Python packages in the table were missing, and `doctor`
+was telling the owner to run an update that would not have installed them.
+
+**It does not repeat what an install does once.** No account is created, no sudoers file is written,
+no secret is regenerated, no certificate is issued, and the database is not initialised - re-running
+any of those on a machine that is serving would break it. Node itself is also not upgraded: a
+release needing a newer Node major is something to be told about rather than something a weekly
+timer does to a host.
+
+A step that fails does **not** roll the release back. A distribution mirror that is unreachable at
+three in the morning would otherwise put a working release back and do it again every week. The run
+says which step could not finish, and `sudo athanor doctor` reports the consequences: the document
+toolchain, and the boundary the runner is actually enforcing.
 
 Re-running the one-command installer against an existing checkout is also merge-safe: optional
 operator/provider/privacy settings in `/etc/athanor` are retained, generated identity and encryption
