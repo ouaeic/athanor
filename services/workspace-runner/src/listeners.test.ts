@@ -12,6 +12,8 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { reachOfBindAddress } from '@athanor/core';
 import {
+  agentAccountUid,
+  agentListeningSockets,
   listeningSocketsOfGroup,
   parseListeningSockets,
   procHexAddress,
@@ -58,8 +60,8 @@ describe('procHexAddress', () => {
 });
 
 describe('parseListeningSockets', () => {
-  const row = (index: number, local: string, state: string, inode: string) =>
-    `   ${index}: ${local} 00000000:0000 ${state} 00000000:00000000 00:00000000 00000000     0        0 ${inode} 1 0000000000000000 100 0 0 10 0`;
+  const row = (index: number, local: string, state: string, inode: string, uid = 0) =>
+    `   ${index}: ${local} 00000000:0000 ${state} 00000000:00000000 00:00000000 00000000     ${uid}        0 ${inode} 1 0000000000000000 100 0 0 10 0`;
 
   it('takes the LISTEN rows and leaves the rest', () => {
     const text = [
@@ -71,8 +73,8 @@ describe('parseListeningSockets', () => {
       row(2, '0100007F:1F90', '01', '84023')
     ].join('\n');
     expect(parseListeningSockets(text)).toEqual([
-      { address: '0.0.0.0', port: 8099, inode: '84021' },
-      { address: '127.0.0.1', port: 8097, inode: '84022' }
+      { address: '0.0.0.0', port: 8099, inode: '84021', uid: 0 },
+      { address: '127.0.0.1', port: 8097, inode: '84022', uid: 0 }
     ]);
   });
 
@@ -86,7 +88,9 @@ describe('parseListeningSockets', () => {
     const text = [TCP_HEADER, row(0, '00000000000000000000000000000000:1F90', '0A', '9001')].join(
       '\n'
     );
-    expect(parseListeningSockets(text)).toEqual([{ address: '::', port: 8080, inode: '9001' }]);
+    expect(parseListeningSockets(text)).toEqual([
+      { address: '::', port: 8080, inode: '9001', uid: 0 }
+    ]);
   });
 });
 
@@ -225,5 +229,98 @@ describe('listeningSocketsOfGroup', () => {
       [row('0100007F:1F90', '01', '84021')]
     );
     expect(await listeningSocketsOfGroup(4242, root)).toEqual([]);
+  });
+});
+
+/*
+ * The reader that ships, and the reason it is not the process-group walk above.
+ *
+ * Measured on a live box: `ProtectProc=invisible` on the runner unit, and agent commands running
+ * as a different account, put `/proc/<pid>` and `/proc/<pid>/fd` out of the runner's reach - both
+ * the service and its root `sudo` wrapper were hidden - while `/proc/net/tcp` stayed readable.
+ * The uid column is the only attribution left, and it is the one that answers the question the
+ * owner was never asked: is a port an agent opened reachable from off this computer.
+ */
+describe('agentListeningSockets', () => {
+  const roots: string[] = [];
+  afterEach(async () => {
+    await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  });
+
+  const HEADER2 =
+    '  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode';
+  const line = (local: string, state: string, inode: string, uid: number) =>
+    `   0: ${local} 00000000:0000 ${state} 00000000:00000000 00:00000000 00000000     ${uid}        0 ${inode} 1 0 100 0 0 10 0`;
+
+  const buildNet = async (tcp: readonly string[], tcp6: readonly string[] = []) => {
+    const root = await mkdtemp(path.join(tmpdir(), 'athanor-net-'));
+    roots.push(root);
+    await mkdir(path.join(root, 'net'), { recursive: true });
+    await writeFile(path.join(root, 'net', 'tcp'), [HEADER2, ...tcp].join('\n'));
+    await writeFile(path.join(root, 'net', 'tcp6'), [HEADER2, ...tcp6].join('\n'));
+    return root;
+  };
+
+  it('takes the agent account\'s listeners and leaves the rest of the box alone', async () => {
+    const root = await buildNet([
+      // sshd and nginx, owned by root. The owner's own infrastructure is not agent activity.
+      line('00000000:0016', '0A', '12885', 0),
+      line('00000000:01BB', '0A', '5019783', 0),
+      // The agent's own, on every interface: the row this exists to find.
+      line('00000000:1FA0', '0A', '5637252', 997),
+      // The runner's own loopback port, owned by the runner rather than the agent.
+      line('0100007F:1004', '0A', '5637000', 1001)
+    ]);
+    expect(await agentListeningSockets(997, root)).toEqual([{ address: '0.0.0.0', port: 8096 }]);
+  });
+
+  it('reads both families and de-duplicates a port seen twice', async () => {
+    const root = await buildNet(
+      [line('0100007F:1FA1', '0A', '1', 997)],
+      [line('00000000000000000000000000000000:1F90', '0A', '2', 997)]
+    );
+    expect(await agentListeningSockets(997, root)).toEqual([
+      { address: '::', port: 8080 },
+      { address: '127.0.0.1', port: 8097 }
+    ]);
+  });
+
+  it('answers empty rather than throwing where there is no proc', async () => {
+    expect(await agentListeningSockets(997, path.join(tmpdir(), 'athanor-absent'))).toEqual([]);
+  });
+});
+
+describe('agentAccountUid', () => {
+  const roots: string[] = [];
+  afterEach(async () => {
+    await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  });
+
+  const passwd = async (text: string) => {
+    const root = await mkdtemp(path.join(tmpdir(), 'athanor-passwd-'));
+    roots.push(root);
+    const file = path.join(root, 'passwd');
+    await writeFile(file, text);
+    return file;
+  };
+
+  it('resolves the fixed agent account', async () => {
+    const file = await passwd(
+      ['root:x:0:0:root:/root:/bin/bash', 'athanor-agent:x:997:986::/nonexistent:/usr/sbin/nologin', 'athanor:x:1001:1001::/home/athanor:/bin/sh'].join('\n')
+    );
+    expect(await agentAccountUid('athanor-agent', file)).toBe(997);
+  });
+
+  /*
+   * A laptop has no second account and runs agent commands as the runner itself, so the runner's
+   * own uid IS the agent uid there. Falling back to it keeps one reader correct in both
+   * deployments rather than reporting nothing on the machine a developer is looking at.
+   */
+  it('falls back to this process where there is no such account', async () => {
+    const file = await passwd('root:x:0:0:root:/root:/bin/bash');
+    expect(await agentAccountUid('athanor-agent', file)).toBe(process.getuid?.() ?? 0);
+    expect(await agentAccountUid('athanor-agent', '/nonexistent/passwd')).toBe(
+      process.getuid?.() ?? 0
+    );
   });
 });

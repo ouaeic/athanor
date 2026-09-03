@@ -282,7 +282,15 @@ export const registerRunnerProxyRoutes = (context: RouteContext): void => {
       const user = requireUser(request.user);
       const workspace = await store.getWorkspace(user.id, request.params.workspaceId);
       if (!workspace) throw new AthanorError('workspace_not_found', 'Workspace not found');
-      return runner.request<{ processes: unknown[] }>({
+      // `agentListeners` and the two fields beside it are the ports an agent-owned process holds
+      // open on the box, which the runner measures rather than infers - a service can be reachable
+      // from the internet with every other field on the row looking exactly like a private one.
+      return runner.request<{
+        processes: unknown[];
+        agentListeners?: string[];
+        reachableFromOutsideThisComputer?: string[];
+        note?: string;
+      }>({
         workspaceId: workspace.id,
         userId: user.id,
         role: 'user',

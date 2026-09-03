@@ -31,7 +31,7 @@ import {
   type ServicePolicy,
   type ServiceRecord
 } from './services.js';
-import { listeningSocketsOfGroup } from './listeners.js';
+import { agentAccountUid, agentListeningSockets, listeningSocketsOfGroup } from './listeners.js';
 import { reachOfBindAddress } from '@athanor/core';
 import { awaitChildExit, DEFAULT_FLUSH_GRACE_MS } from './subprocess.js';
 
@@ -215,6 +215,9 @@ export class ProcessManager {
   #listenerSweep: NodeJS.Timeout | undefined;
   readonly #listenerSweepMs: number;
   readonly #observeListeners: (pid: number) => Promise<{ address: string; port: number }[]>;
+  /** Resolved once. The account is fixed, so the answer cannot change while the runner is up. */
+  #agentUid: number | undefined;
+  #agentListeners: { address: string; port: number }[] | undefined;
 
   /**
    * How long a session that has exited waits for output still in its pipes before it reports a
@@ -546,23 +549,53 @@ export class ProcessManager {
   #startListenerSweep(): void {
     if (this.#listenerSweep) return;
     const sweep = () => {
-      void Promise.all(
-        [...this.#supervised.values()].map(async (supervised) => {
-          const pid = supervised.record.pid;
-          if (pid === undefined) return;
-          const observed = await this.#observeListeners(pid);
-          // An empty answer on a host that cannot be read is indistinguishable from an empty answer
-          // on a service that binds nothing, so neither overwrites a previous observation with
-          // silence: a port seen open stays reported until the service is gone.
-          if (observed.length > 0 || supervised.listening !== undefined)
-            supervised.listening = observed;
-          this.#sayIfReachable(supervised, observed);
-        })
-      );
+      void (async () => {
+        /*
+         * TWO READERS, because neither works in both places athanor runs.
+         *
+         * The per-service walk needs `/proc/<pid>/fd`, which is exactly what the shipped
+         * `ProtectProc=invisible` takes away from the runner - measured on a live box, where the
+         * service and its root `sudo` wrapper were both hidden. It still answers on a developer's
+         * laptop, where the runner owns the processes and there is no second account, and that is
+         * the only place it answers.
+         *
+         * The uid reader needs only `/proc/net/tcp`, which stays readable, and answers on the box.
+         * What it gives up is WHICH service opened a port; what it keeps is the fact the owner was
+         * never told, which is that one is open and on what address.
+         */
+        this.#agentUid ??= await agentAccountUid();
+        const box = await agentListeningSockets(this.#agentUid);
+        if (box.length > 0 || this.#agentListeners !== undefined) this.#agentListeners = box;
+        await Promise.all(
+          [...this.#supervised.values()].map(async (supervised) => {
+            const pid = supervised.record.pid;
+            if (pid === undefined) return;
+            const observed = await this.#observeListeners(pid);
+            // An empty answer on a host that cannot be read is indistinguishable from an empty
+            // answer on a service that binds nothing, so neither overwrites a previous observation
+            // with silence: a port seen open stays reported until the service is gone.
+            if (observed.length > 0 || supervised.listening !== undefined)
+              supervised.listening = observed;
+            this.#sayIfReachable(supervised, observed);
+          })
+        );
+      })();
     };
     this.#listenerSweep = setInterval(sweep, this.#listenerSweepMs);
     this.#listenerSweep.unref?.();
     sweep();
+  }
+
+  /**
+   * Every port an agent-owned process has open on this computer, or undefined for not observed.
+   *
+   * Box-level rather than per-service, and named for what it actually is. Where the runner cannot
+   * read `/proc/<pid>`, the uid on a socket is the only attribution there is, so this cannot say
+   * which service opened a port - and a field that claimed to would be inventing the half it could
+   * not measure. The caller that needs the distinction is the owner, who is looking at one list.
+   */
+  observedAgentListeners(): { address: string; port: number }[] | undefined {
+    return this.#agentListeners;
   }
 
   /**

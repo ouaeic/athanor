@@ -20,6 +20,7 @@ import {
 } from '@athanor/contracts';
 import {
   deriveCapabilityNonce,
+  reachOfBindAddress,
   reservedPreviewPorts,
   verifyCapabilityToken,
   type CapabilityTokenClaims
@@ -781,11 +782,42 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
       // background commands stay task-private, which is what keeps one turn out of another's. A
       // person driving their own computer - or the API asking on their behalf - is asking what the
       // machine is doing, and every background process on it is part of that answer.
+      /*
+       * WHICH PORTS ARE OPEN, beside what is running.
+       *
+       * The approval card for a service is answered from the command, before the process exists,
+       * and the commonest way to open a public port states no address at all: `python3 -m
+       * http.server 8096` binds every interface with no flag. So the list of what is running was
+       * never the whole answer to "what is my computer doing" - a service could be reachable from
+       * the internet and every field here would look identical to one reachable only by this box.
+       *
+       * Box-level and named for it. Where `/proc/<pid>` is hidden from the runner, which is how
+       * athanor ships, the uid on a socket is the only attribution available, so this says that an
+       * agent-owned process holds the port and not which one. Omitted entirely when nothing could
+       * be read, because an empty list would claim the machine has nothing open.
+       */
+      const listeners = processes.observedAgentListeners();
+      const reachable = (listeners ?? []).filter(
+        (socket) => reachOfBindAddress(socket.address) !== 'self'
+      );
       return {
         processes:
           request.capability.role === 'agent'
             ? processes.list(request.params.workspaceId, request.capability.sub)
-            : processes.listWorkspace(request.params.workspaceId)
+            : processes.listWorkspace(request.params.workspaceId),
+        ...(listeners === undefined
+          ? {}
+          : { agentListeners: listeners.map((socket) => `${socket.address}:${socket.port}`) }),
+        ...(reachable.length === 0
+          ? {}
+          : {
+              reachableFromOutsideThisComputer: reachable.map(
+                (socket) => `${socket.address}:${socket.port}`
+              ),
+              note: `Anyone who can reach this computer on ${reachable
+                .map((socket) => String(socket.port))
+                .join(', ')} can reach what is served there. A port meant to stay private binds 127.0.0.1, which is what publish_preview proxies to.`
+            })
       };
     }
   );

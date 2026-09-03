@@ -27,6 +27,8 @@ export interface ListeningSocket {
   address: string;
   port: number;
   inode: string;
+  /** The account that opened it. The only attribution available where `/proc/<pid>` is hidden. */
+  uid: number;
 }
 
 /**
@@ -101,9 +103,10 @@ export const parseListeningSockets = (text: string): ListeningSocket[] => {
     if (columns[3] !== LISTEN || !addressHex || !portHex) continue;
     const address = procHexAddress(addressHex);
     const port = Number.parseInt(portHex, 16);
+    const uid = Number.parseInt(columns[7] ?? '', 10);
     const inode = columns[9];
-    if (address === null || !Number.isInteger(port) || !inode) continue;
-    found.push({ address, port, inode });
+    if (address === null || !Number.isInteger(port) || !Number.isInteger(uid) || !inode) continue;
+    found.push({ address, port, inode, uid });
   }
   return found;
 };
@@ -170,5 +173,58 @@ export const listeningSocketsOfGroup = async (
       );
     })
   );
+  return [...held.values()].sort((a, b) => a.port - b.port || a.address.localeCompare(b.address));
+};
+
+/**
+ * The account agent commands run as, or this process's own where there is no second account.
+ *
+ * The name is fixed rather than configured, for the same reason `scripts/athanor-sandbox` fixes it:
+ * the helper's whole property is that a caller gains nothing by lying to it, so neither end reads
+ * the account it drops to out of anything a caller can influence. A developer's laptop has no such
+ * account and runs agent commands as the runner itself, which is exactly what the fallback says.
+ */
+export const agentAccountUid = async (
+  account = 'athanor-agent',
+  passwdPath = '/etc/passwd'
+): Promise<number> => {
+  const own = process.getuid?.() ?? 0;
+  const passwd = await unreadable(readFile(passwdPath, 'utf8'), '');
+  for (const line of passwd.split('\n')) {
+    const fields = line.split(':');
+    if (fields[0] !== account) continue;
+    const uid = Number.parseInt(fields[2] ?? '', 10);
+    return Number.isInteger(uid) ? uid : own;
+  }
+  return own;
+};
+
+/**
+ * Every port an agent-owned process has open on this computer.
+ *
+ * NOT the process-group walk above, because that walk cannot run where athanor ships.
+ * `infra/native/athanor-runner.service` sets `ProtectProc=invisible`, and agent commands run as a
+ * different account than the runner - measured on a live box: `/proc/<pid>` for the service and for
+ * its root `sudo` wrapper were both hidden from the runner's namespace, and `/proc/<pid>/fd` was
+ * denied, while `/proc/net/tcp` stayed readable. Attribution by file descriptor is therefore
+ * unavailable to the runner by design, and weakening `ProtectProc` to buy it back would be trading
+ * isolation for observability, which is the wrong direction.
+ *
+ * The uid column is what remains, and it is enough for the question that matters. It cannot say
+ * WHICH service opened a port when several are up; it can say that a process running as the agent
+ * account has one open, and on what address - which is the fact the owner was never told.
+ */
+export const agentListeningSockets = async (
+  agentUid: number,
+  procRoot = '/proc'
+): Promise<{ address: string; port: number }[]> => {
+  const [tcp, tcp6] = await Promise.all([
+    unreadable(readFile(`${procRoot}/net/tcp`, 'utf8'), ''),
+    unreadable(readFile(`${procRoot}/net/tcp6`, 'utf8'), '')
+  ]);
+  const held = new Map<string, { address: string; port: number }>();
+  for (const socket of [...parseListeningSockets(tcp), ...parseListeningSockets(tcp6)])
+    if (socket.uid === agentUid)
+      held.set(`${socket.address}:${socket.port}`, { address: socket.address, port: socket.port });
   return [...held.values()].sort((a, b) => a.port - b.port || a.address.localeCompare(b.address));
 };
