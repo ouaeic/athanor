@@ -328,6 +328,11 @@ Two more things a script driving this API should expect:
   carries the whole trajectory, and `athanor task` deliberately does not wrap it.
 - It does not resume. `paused` and `awaiting_resource` are reported, not cleared;
   `POST /v1/tasks/:taskId/resume` is the call.
+- It does not put the computer back. `POST /v1/tasks/:taskId/trajectory` accepts
+  `rewind: "conversation"` from a bearer token and refuses `"computer"` and `"both"` with 403,
+  because those delete and rewrite the workspace tree; the other door to the same act,
+  `POST /v1/workspaces/:id/snapshots/:sid/restore`, is closed to bearer tokens for the same reason.
+  A rewind that touches files is signed in from the interface.
 
 `scripts/test-task-cli.mjs` runs the real subcommand against a stand-in API and checks each of the
 exit codes above, the shape of the outcome, and that nothing answers an approval. It costs nothing

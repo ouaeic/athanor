@@ -458,7 +458,10 @@ export const registerTrajectoryRoutes = (context: RouteContext): void => {
       if (request.apiToken && input.rewind !== 'conversation')
         throw new AthanorError(
           'api_token_scope_required',
-          'API tokens cannot put the computer back',
+          // Says the whole thing, because a bearer token meeting this has no other way to find
+          // out: which scope is missing is not the point - no scope grants it - and the door that
+          // IS open is a different one from the one being knocked on.
+          'API tokens cannot put the computer back. A rewind that restores the workspace tree is signed in from the interface only; rewind: "conversation" is available here and forks the transcript without touching the files.',
           403
         );
       return idempotent(request, reply, user, async () =>
