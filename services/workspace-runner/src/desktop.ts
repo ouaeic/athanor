@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { captureSpawnFailure, spawnFailureMessage } from './spawn-guard.js';
+import { chromiumDriver } from './playwright.js';
 import { once } from 'node:events';
 import { existsSync } from 'node:fs';
 import { readFile, rm } from 'node:fs/promises';
@@ -786,6 +787,34 @@ const parseGeometry = (value: string | undefined, fallback: DisplayGeometry): Di
   return { width: Number(parsed[1]), height: Number(parsed[2]) };
 };
 
+/**
+ * What to say when a desktop program is not here, including what IS.
+ *
+ * Measured on the box. A turn was asked to use the desktop, tried `gedit`, then `xterm`, then
+ * `mousepad`, got nothing from any of them and reported the desktop dead. It was not dead: X11,
+ * xdotool, wmctrl and xrandr are all provisioned, and the desktop was serving. What the host has
+ * no GUI application at all - the capability table in `scripts/athanor-host.sh` provisions the
+ * desktop's plumbing and no programs to run in it - except the one athanor manages itself.
+ *
+ * So the refusal names it. A browser is the surface most desktop work wants anyway, and it is the
+ * only program this computer can promise is present, because it is the one it installs. Guessing
+ * three editors and concluding the screen is broken is the failure this sentence exists to end.
+ */
+const launchAdvice = async (
+  executable: string,
+  failure: NodeJS.ErrnoException
+): Promise<string> => {
+  const said = spawnFailureMessage(executable, failure);
+  if (failure.code !== 'ENOENT') return said;
+  try {
+    const at = (await chromiumDriver()).executablePath();
+    if (!at || !existsSync(at)) return said;
+    return `${said} The one GUI program this computer manages is the browser, at ${at} - it opens on the desktop like any other window.`;
+  } catch {
+    return said;
+  }
+};
+
 export class DesktopManager {
   readonly #sessions = new Map<string, DesktopSession>();
 
@@ -1370,7 +1399,7 @@ export class DesktopManager {
     if (child.pid) session.applicationGroups.add(child.pid);
     await new Promise((resolve) => setTimeout(resolve, 350));
     const failed = spawnFailure();
-    if (failed) throw new Error(spawnFailureMessage(request.executable, failed));
+    if (failed) throw new Error(await launchAdvice(request.executable, failed));
     if (child.exitCode !== null && child.exitCode !== 0)
       throw new Error(`${path.basename(request.executable)} failed to launch`);
     return { pid: child.pid, executable: request.executable, args: request.args };

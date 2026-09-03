@@ -8,6 +8,7 @@ import WebSocket from 'ws';
 import { capabilityAudience, signCapabilityToken } from '@athanor/core';
 import type { RunnerConfig } from './config.js';
 import type { DisplayViewport } from './desktop-stream.js';
+import { chromiumDriver } from './playwright.js';
 import { buildServer } from './server.js';
 import {
   DesktopManager,
@@ -671,6 +672,40 @@ describe('desktop session lifecycle', () => {
       ).rejects.toThrow('is not installed on this computer');
       // Still serving afterwards, which is the half that matters: the runner survived.
       expect((await manager.snapshot('workspace', root, 'agent')).available).toBe(true);
+    });
+  }, 20_000);
+
+  /*
+   * And says what IS here, because the turn that found this tried three editors and concluded the
+   * screen was broken. The capability table provisions the desktop's plumbing - X11, xdotool,
+   * wmctrl, xrandr - and no programs to run in it, except the browser athanor installs itself.
+   */
+  it('names the browser it manages when the program asked for is absent', async () => {
+    /*
+     * Asserted in both directions, because whether a managed browser is on THIS host is an
+     * environment fact and not the contract. The contract is: when there is one, the refusal names
+     * it; when there is not, the refusal does not promise one. A test that only checked the first
+     * would pass on the box and fail on a laptop with no browsers installed.
+     */
+    const managed = await chromiumDriver()
+      .then((driver) => driver.executablePath())
+      .catch(() => undefined);
+    const here = managed !== undefined && managed !== '' && existsSync(managed);
+    await withSession(async (manager, root) => {
+      const refusal = await manager
+        .launch('workspace', root, {
+          executable: '/usr/bin/athanor-no-such-desktop-program',
+          args: [],
+          cwd: 'workspace',
+          env: {}
+        })
+        .then(
+          () => new Error('the launch was expected to be refused'),
+          (cause: Error) => cause
+        );
+      expect(refusal.message).toContain('is not installed on this computer');
+      if (here) expect(refusal.message).toContain(managed);
+      else expect(refusal.message).not.toContain('opens on the desktop');
     });
   }, 20_000);
 });
