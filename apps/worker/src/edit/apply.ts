@@ -471,7 +471,28 @@ export const applyEdit = (
             ok: false,
             refusal: {
               kind: 'register',
-              message: `@${op.register} was never filled: a PUT that pastes a register needs a CUT N.=M @${op.register} in the same patch. Nothing was written.`
+              /*
+               * The two intents, shown apart, because naming the rule was not enough to recover
+               * from. Measured on the box: a turn asked to add a `split` function wrote
+               * `PUT >N @split` four times in a row, was told the register was never filled each
+               * time, and rewrote the same patch each time until the repeated-failure bound
+               * stopped it. The register sigil reads as a LABEL for the edit - and the register
+               * is very often named after the thing being written, which makes it read that way
+               * even harder - when it actually means "paste back what a CUT is holding".
+               *
+               * So the refusal now separates writing new lines from moving lines you have read,
+               * and gives the shape of each at the line the patch was already addressing. It
+               * costs nothing resident: this text exists only on the failure that needs it.
+               */
+              message: [
+                `@${op.register} was never filled: a PUT that pastes a register needs a CUT N.=M @${op.register} in the same patch. Nothing was written.`,
+                'To write NEW lines, leave the register off and give the lines in the body:',
+                `  PUT ${op.side === 'before' ? '<' : '>'}${op.at}:`,
+                '  <the lines you want written>',
+                `To MOVE lines you have already read, cut them first and paste in the same patch:`,
+                `  CUT 40.=52 @${op.register}`,
+                `  PUT ${op.side === 'before' ? '<' : '>'}${op.at} @${op.register}`
+              ].join('\n')
             }
           };
         splices.push({

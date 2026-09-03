@@ -506,6 +506,30 @@ describe('the bounds that stop a patch corrupting a file', () => {
     expect(refused('PUT >1 @nothing')).toMatch(/was never filled/);
   });
 
+  /*
+   * The refusal has to be recoverable from, not merely correct.
+   *
+   * Measured on the box: a turn adding a `split` function wrote `PUT >N @split` four times in a
+   * row and was told the register was never filled each time, rewriting the same patch until the
+   * repeated-failure bound stopped the turn. The sigil reads as a label for the edit - the more so
+   * when the register is named after the thing being written - and naming the rule did not move it
+   * off that reading. So the message shows the two intents apart, at the line already addressed.
+   */
+  it('shows how to write new lines and how to move read ones, at the line addressed', () => {
+    read();
+    const message = refused('PUT >7 @split');
+    expect(message).toMatch(/To write NEW lines/);
+    expect(message).toContain('PUT >7:');
+    expect(message).toMatch(/To MOVE lines/);
+    expect(message).toContain('CUT 40.=52 @split');
+    expect(message).toContain('PUT >7 @split');
+  });
+
+  it('shows the before form when the patch addressed a line from before', () => {
+    read();
+    expect(refused('PUT <3 @body')).toContain('PUT <3:');
+  });
+
   it('refuses a block that does not close within the lines that were shown', () => {
     // A window that stops inside a function: claiming the rest of the file would be destructive, so
     // the scanner claims nothing and the applier says so by name.
