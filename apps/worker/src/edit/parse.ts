@@ -134,9 +134,17 @@ const REGISTER = /\s*@([A-Za-z0-9_-]+)\s*$/;
  * A line number, then optionally a separator and a second one.
  *
  * The second number is only consumed when a separator IS followed by digits, so `PUT 40:` reads as
- * the single line 40 with a terminator rather than as a range with a missing end.
+ * the single line 40 with a terminator rather than as a range with a missing end. That property is
+ * what makes the separator safe to widen: between two numbers a run of these characters can only be
+ * a range, and everywhere else it is not matched at all.
+ *
+ * A RUN rather than one of a list, because the list was a list of the spellings someone thought of.
+ * Measured on the box: `PUT 40.:=42:` was refused with "unexpected `.:=` after the range" - the
+ * model had blended the two spellings this file already accepts separately, `.=` and `:`, and the
+ * refusal cost a step and a retry to say so. `=`, `:=`, `...` and `. = ` fall out of the same gap.
+ * There is nothing to be gained by being strict here: the numbers are what carry the meaning.
  */
-const RANGE = /^(\d+)(?:(?:\s*(?:\.=|\.\.|\.|-|–|—|,|to|:)\s*|\s+)(\d+))?\s*/i;
+const RANGE = /^(\d+)(?:(?:\s*(?:to|(?:[.=:,\-–—]\s*)+)\s*|\s+)(\d+))?\s*/i;
 
 const CANONICAL =
   'expected PUT N:, PUT N.=M:, PUT N*:, PUT <N:, PUT >N:, CUT N.=M, CUT N.=M @name or PUT >N @name';

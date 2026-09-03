@@ -183,7 +183,18 @@ describe('forgiveness - a misspelt operation', () => {
     'PUT 3 to 4:',
     'PUT 3.=4',
     'put 3.=4:',
-    'PUT 4.=3:'
+    'PUT 4.=3:',
+    /*
+     * Runs of separator characters, because the list above was a list of the spellings someone
+     * thought of. Measured on the box: `PUT 40.:=42:` was refused with "unexpected `.:=` after the
+     * range" - the model had blended two spellings this file already accepted separately. Between
+     * two numbers there is nothing else a run of these can mean.
+     */
+    'PUT 3.:=4:',
+    'PUT 3:=4:',
+    'PUT 3=4:',
+    'PUT 3...4:',
+    'PUT 3 . = 4:'
   ])
     it(`reads "${spelling}" as PUT 3.=4:`, () => {
       read();
@@ -192,6 +203,18 @@ describe('forgiveness - a misspelt operation', () => {
       expect(out[3]).toBe('  return job.payload ?? null;');
       expect(out.length).toBe(10);
     });
+
+  /*
+   * THE COUNTER-DIRECTION, and the property that makes the run above safe to accept: a separator is
+   * only ever consumed when digits follow it. `PUT 40:` is the single line 40 with a terminator, and
+   * widening the separator must not turn its colon into the start of a range with a missing end.
+   */
+  it('still reads a terminator as a terminator, not as a separator with no number', () => {
+    read();
+    const out = toLines(applied('PUT 3:\n+  only this line'));
+    expect(out[2]).toBe('  only this line');
+    expect(out.length).toBe(10);
+  });
 
   it('says which spellings it forgave, so the next patch is written the short way', () => {
     read();
