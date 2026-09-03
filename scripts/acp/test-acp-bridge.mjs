@@ -433,8 +433,16 @@ const openSession = async (client) => {
     sessionId: session,
     prompt: [{ type: 'text', text: 'a long job' }]
   });
-  // Long enough for the task to have been created, which is what `session/cancel` needs to cancel.
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  // Not a fixed wait: `session/cancel` needs the task to exist, and on a loaded machine the bridge
+  // can take longer than any number chosen here to create it - a cancel that arrives first is
+  // answered as a refusal, and the drill then fails for a reason that has nothing to do with the
+  // bridge. So wait for the creation itself, bounded so a bridge that never creates one still fails
+  // loudly rather than hanging the drill.
+  const createdBy = Date.now() + 10_000;
+  while (!api.requests.some((entry) => entry.path === '/v1/tasks' && entry.method === 'POST')) {
+    if (Date.now() > createdBy) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
   client.notify('session/cancel', { sessionId: session });
   const answered = await turn;
 
