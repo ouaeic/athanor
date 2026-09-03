@@ -1102,7 +1102,7 @@ describe('reaching a service the declaring task has finished with', () => {
    * which is the same line the owner's own widened access was drawn along.
    */
   it(
-    'refuses to let one task speak into another task\'s service',
+    "refuses to let one task speak into another task's service",
     async () => {
       const manager = new ProcessManager();
       const { started } = await startService(manager, 'task-1', 'files');
@@ -1116,7 +1116,7 @@ describe('reaching a service the declaring task has finished with', () => {
   );
 
   it(
-    'still hides another task\'s ordinary background command entirely',
+    "still hides another task's ordinary background command entirely",
     async () => {
       const manager = new ProcessManager();
       const root = await mkdtemp(path.join(tmpdir(), 'athanor-service-'));

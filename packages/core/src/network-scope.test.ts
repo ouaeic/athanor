@@ -253,7 +253,10 @@ describe('reachOfBindAddress', () => {
       '*',
       ''
     ])
-      expect({ address, reach: reachOfBindAddress(address) }).toEqual({ address, reach: 'internet' });
+      expect({ address, reach: reachOfBindAddress(address) }).toEqual({
+        address,
+        reach: 'internet'
+      });
   });
 
   it('calls a loopback bind this computer only', () => {
@@ -273,12 +276,18 @@ describe('reachOfBindAddress', () => {
    */
   it('fails towards the internet for a name it cannot place', () => {
     for (const address of ['not an address', 'srv-07', 'deploy-target'])
-      expect({ address, reach: reachOfBindAddress(address) }).toEqual({ address, reach: 'internet' });
+      expect({ address, reach: reachOfBindAddress(address) }).toEqual({
+        address,
+        reach: 'internet'
+      });
   });
 
   it('calls a public unicast bind the internet', () => {
     for (const address of ['93.184.216.34', '::ffff:93.184.216.34', '2606:4700:4700::1111'])
-      expect({ address, reach: reachOfBindAddress(address) }).toEqual({ address, reach: 'internet' });
+      expect({ address, reach: reachOfBindAddress(address) }).toEqual({
+        address,
+        reach: 'internet'
+      });
   });
 
   it('disagrees with the outbound reader on the address that caused this', () => {

@@ -153,7 +153,10 @@ describe('listeningSocketsOfGroup', () => {
     for (const entry of processes) {
       const dir = path.join(root, String(entry.pid));
       await mkdir(path.join(dir, 'fd'), { recursive: true });
-      await writeFile(path.join(dir, 'stat'), `${entry.pid} (node) S 1 ${entry.pgrp} ${entry.pgrp} 0 -1 0 0 0`);
+      await writeFile(
+        path.join(dir, 'stat'),
+        `${entry.pid} (node) S 1 ${entry.pgrp} ${entry.pgrp} 0 -1 0 0 0`
+      );
       let fd = 3;
       for (const socket of entry.sockets) {
         // A dangling symlink, which is exactly what /proc/<pid>/fd entries are.
@@ -218,9 +221,9 @@ describe('listeningSocketsOfGroup', () => {
    * nowhere". This asserts the read fails quietly rather than throwing into a listing.
    */
   it('answers empty rather than throwing when there is no proc to read', async () => {
-    expect(await listeningSocketsOfGroup(4242, path.join(tmpdir(), 'athanor-no-proc-here'))).toEqual(
-      []
-    );
+    expect(
+      await listeningSocketsOfGroup(4242, path.join(tmpdir(), 'athanor-no-proc-here'))
+    ).toEqual([]);
   });
 
   it('ignores a connection that is not in LISTEN', async () => {
@@ -261,7 +264,7 @@ describe('agentListeningSockets', () => {
     return root;
   };
 
-  it('takes the agent account\'s listeners and leaves the rest of the box alone', async () => {
+  it("takes the agent account's listeners and leaves the rest of the box alone", async () => {
     const root = await buildNet([
       // sshd and nginx, owned by root. The owner's own infrastructure is not agent activity.
       line('00000000:0016', '0A', '12885', 0),
@@ -306,7 +309,11 @@ describe('agentAccountUid', () => {
 
   it('resolves the fixed agent account', async () => {
     const file = await passwd(
-      ['root:x:0:0:root:/root:/bin/bash', 'athanor-agent:x:997:986::/nonexistent:/usr/sbin/nologin', 'athanor:x:1001:1001::/home/athanor:/bin/sh'].join('\n')
+      [
+        'root:x:0:0:root:/root:/bin/bash',
+        'athanor-agent:x:997:986::/nonexistent:/usr/sbin/nologin',
+        'athanor:x:1001:1001::/home/athanor:/bin/sh'
+      ].join('\n')
     );
     expect(await agentAccountUid('athanor-agent', file)).toBe(997);
   });

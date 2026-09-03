@@ -158,7 +158,7 @@ on the answer could not tell those apart.
 | 0    | `completed`         | The task finished.                                                 |
 | 1    | -                   | The command could not do its job: no token, bad option, no answer. |
 | 2    | `failed`            | The task failed. `reason` and `reasonCode` say what happened.      |
-| 3    | `awaiting_approval` | The task stopped to ask: see `pendingApprovals`, or `question`.     |
+| 3    | `awaiting_approval` | The task stopped to ask: see `pendingApprovals`, or `question`.    |
 | 4    | `timed_out`         | The wait ran out. The task is still running and still spending.    |
 | 5    | `cancelled`         | The task was cancelled.                                            |
 | 6    | `blocked`           | Stopped and needing a resume: `paused` or `awaiting_resource`.     |

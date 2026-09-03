@@ -235,8 +235,9 @@ export class ProcessManager {
      * walk itself is held to a fixture `/proc` in listeners.test.ts; what this lets a test reach is
      * the half that matters to a reader - the note a service gets when it turns out to be open.
      */
-    observeListeners: (pid: number) => Promise<{ address: string; port: number }[]> =
-      listeningSocketsOfGroup
+    observeListeners: (
+      pid: number
+    ) => Promise<{ address: string; port: number }[]> = listeningSocketsOfGroup
   ) {
     this.#flushGraceMs = flushGraceMs;
     this.#policy = policy;
@@ -626,7 +627,10 @@ export class ProcessManager {
    *
    * Once per run. A five-second sweep that repeated this would bury the log it is written into.
    */
-  #sayIfReachable(supervised: Supervised, observed: readonly { address: string; port: number }[]): void {
+  #sayIfReachable(
+    supervised: Supervised,
+    observed: readonly { address: string; port: number }[]
+  ): void {
     if (supervised.saidItIsReachable) return;
     const reachable = observed.filter((socket) => reachOfBindAddress(socket.address) !== 'self');
     if (reachable.length === 0) return;
@@ -791,7 +795,14 @@ export class ProcessManager {
       record.consecutiveFailures = 0;
       record.state = 'restarting';
       record.pid = undefined;
-      this.#supervise(record.id, { record, registry, root, isolateNetwork, guards, retiring: false });
+      this.#supervise(record.id, {
+        record,
+        registry,
+        root,
+        isolateNetwork,
+        guards,
+        retiring: false
+      });
       await this.#relaunchService(record.id);
       started += 1;
     }

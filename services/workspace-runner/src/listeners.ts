@@ -40,7 +40,8 @@ export interface ListeningSocket {
  */
 const reversedBytes = (word: string): number[] => {
   const bytes: number[] = [];
-  for (let at = word.length - 2; at >= 0; at -= 2) bytes.push(Number.parseInt(word.slice(at, at + 2), 16));
+  for (let at = word.length - 2; at >= 0; at -= 2)
+    bytes.push(Number.parseInt(word.slice(at, at + 2), 16));
   return bytes;
 };
 
@@ -53,7 +54,8 @@ export const procHexAddress = (hex: string): string | null => {
   }
   if (hex.length !== 32) return null;
   const bytes: number[] = [];
-  for (let word = 0; word < 4; word += 1) bytes.push(...reversedBytes(hex.slice(word * 8, word * 8 + 8)));
+  for (let word = 0; word < 4; word += 1)
+    bytes.push(...reversedBytes(hex.slice(word * 8, word * 8 + 8)));
   const groups: string[] = [];
   for (let at = 0; at < 16; at += 2)
     groups.push((((bytes[at] ?? 0) << 8) | (bytes[at + 1] ?? 0)).toString(16));
@@ -117,12 +119,16 @@ export const socketInode = (link: string): string | null =>
 
 /** Field 5 of /proc/<pid>/stat is the process group, and the command in field 2 may contain spaces. */
 export const processGroupOf = (stat: string): number | null => {
-  const after = stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/);
+  const after = stat
+    .slice(stat.lastIndexOf(')') + 1)
+    .trim()
+    .split(/\s+/);
   const pgrp = Number.parseInt(after[2] ?? '', 10);
   return Number.isInteger(pgrp) ? pgrp : null;
 };
 
-const unreadable = async <T>(work: Promise<T>, fallback: T): Promise<T> => work.catch(() => fallback);
+const unreadable = async <T>(work: Promise<T>, fallback: T): Promise<T> =>
+  work.catch(() => fallback);
 
 /**
  * Every socket in LISTEN held by any process in `pgid`'s group.
@@ -168,7 +174,11 @@ export const listeningSocketsOfGroup = async (
           const link = await unreadable(readlink(`${procRoot}/${pid}/fd/${fd}`), '');
           const inode = link ? socketInode(link) : null;
           const socket = inode ? byInode.get(inode) : undefined;
-          if (socket) held.set(`${socket.address}:${socket.port}`, { address: socket.address, port: socket.port });
+          if (socket)
+            held.set(`${socket.address}:${socket.port}`, {
+              address: socket.address,
+              port: socket.port
+            });
         })
       );
     })

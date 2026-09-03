@@ -235,14 +235,16 @@ const isUnspecifiedAddress = (host: string): boolean => {
  * - `internet` is a public address, a name this cannot resolve, or every interface at once.
  */
 export const reachOfBindAddress = (raw: string): NetworkReach => {
-  let host = raw.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  let host = raw
+    .trim()
+    .toLowerCase()
+    .replace(/^\[|\]$/g, '');
   if (host.length > 1 && host.endsWith('.')) host = host.slice(0, -1);
   if (isUnspecifiedAddress(host)) return 'internet';
   if (isLoopbackHost(host)) return 'self';
   if (isInternalHostname(host)) return 'estate';
   return !isIP(host) || isPublicInternetAddress(host) ? 'internet' : 'estate';
 };
-
 
 /**
  * The syntactic check plus the one it cannot make: a name the caller controls can point anywhere,

@@ -816,7 +816,9 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
               ),
               note: `Anyone who can reach this computer on ${reachable
                 .map((socket) => String(socket.port))
-                .join(', ')} can reach what is served there. A port meant to stay private binds 127.0.0.1, which is what publish_preview proxies to.`
+                .join(
+                  ', '
+                )} can reach what is served there. A port meant to stay private binds 127.0.0.1, which is what publish_preview proxies to.`
             })
       };
     }
