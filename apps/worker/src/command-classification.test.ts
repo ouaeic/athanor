@@ -2321,6 +2321,21 @@ describe('statedBindReach', () => {
   });
 
   /*
+   * A script is one token on the raw invocation, so the positional `host:port` rule sees the whole
+   * of it. These are the shapes where the tail of a script looks like an address and is not: a
+   * timestamp, a ratio, a sed range. Each falls out on the value, which is the property the
+   * positional rule depends on and the reason it can be there at all.
+   */
+  it('does not read the tail of a script as an address', () => {
+    for (const args of [
+      shell('bash', '-lc', 'npm run build && echo finished at 12:30'),
+      shell('bash', '-lc', "awk -F: '{print $1}' /etc/passwd | head -20"),
+      shell('bash', '-lc', 'npm start -- --host 0.0.0.0:3000'.replace('0.0.0.0', 'localhost'))
+    ])
+      expect({ args, reach: statedBindReach(args) }).not.toEqual({ args, reach: 'internet' });
+  });
+
+  /*
    * The short flags are in the table because the servers use them, and they are only safe there
    * because nothing is read off the flag alone. These are the collisions: a port after `nc -l`, an
    * archive flag on tar, an identity file on ssh, a word that is not an address after `--host`.
