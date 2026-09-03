@@ -199,6 +199,52 @@ export const reachOfHttpUrl = (raw: string): NetworkReach => {
 export const isPublicHttpUrl = (raw: string): boolean => reachOfHttpUrl(raw) === 'internet';
 
 /**
+ * The unspecified address, in every spelling that reaches a bind call: `0.0.0.0`, `::`, the padded
+ * IPv6 forms, and the IPv4-mapped `::ffff:0.0.0.0`. An empty operand is here too because a bind
+ * argument that was never given is the same request - `--bind` with nothing after it, and the
+ * servers whose default is every interface, both arrive as "no address stated".
+ */
+const isUnspecifiedAddress = (host: string): boolean => {
+  if (host === '' || host === '*') return true;
+  const unwrapped = mappedIpv4(host) ?? host;
+  if (unwrapped === '0.0.0.0') return true;
+  return isIP(unwrapped) === 6 && /^[0:]+$/.test(unwrapped) && unwrapped.includes(':');
+};
+
+/**
+ * Who can reach a socket this computer is about to open, which is NOT `reachOfHttpUrl` with the
+ * arrow turned round.
+ *
+ * The two questions share the address space and nothing else, and the difference is the whole
+ * reason this exists separately. Outbound, `0.0.0.0` is a malformed destination and the safe way
+ * to be wrong is to call an unreadable address `estate` and charge for it. Inbound, `0.0.0.0` is
+ * the WIDEST answer available - every interface the box has, which on a self-hosted install is a
+ * public one - and the safe way to be wrong is `internet`. So this fails towards `internet` where
+ * its outbound twin fails towards `estate`: for an address that will not parse, and for the
+ * unspecified address that `isPublicInternetAddress` calls non-public because as a destination it
+ * means "this network".
+ *
+ * That last clause is the measured defect. A service was declared with `--bind 0.0.0.0`, and the
+ * only reach vocabulary in the tree answered `estate` for it, because 0.0.0.0/8 is reserved.
+ * The port was open to the internet on a box with no firewall.
+ *
+ * - `self` is a loopback bind: only this computer, which is what a preview is for. The preview
+ *   proxy connects to `127.0.0.1` (services/workspace-runner/src/preview.ts), so loopback is not
+ *   merely safe here, it is the binding that the publishing path is built on.
+ * - `estate` is a bind to one reserved, non-loopback address: reachable from the building.
+ * - `internet` is a public address, a name this cannot resolve, or every interface at once.
+ */
+export const reachOfBindAddress = (raw: string): NetworkReach => {
+  let host = raw.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (host.length > 1 && host.endsWith('.')) host = host.slice(0, -1);
+  if (isUnspecifiedAddress(host)) return 'internet';
+  if (isLoopbackHost(host)) return 'self';
+  if (isInternalHostname(host)) return 'estate';
+  return !isIP(host) || isPublicInternetAddress(host) ? 'internet' : 'estate';
+};
+
+
+/**
  * The syntactic check plus the one it cannot make: a name the caller controls can point anywhere,
  * so every address it resolves to has to be public before the request is allowed to leave. Callers
  * that then make the request themselves must pin these addresses or re-check after redirects -

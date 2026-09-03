@@ -31,6 +31,8 @@ import {
   type ServicePolicy,
   type ServiceRecord
 } from './services.js';
+import { listeningSocketsOfGroup } from './listeners.js';
+import { reachOfBindAddress } from '@athanor/core';
 import { awaitChildExit, DEFAULT_FLUSH_GRACE_MS } from './subprocess.js';
 
 const BackgroundRequest = z.object({
@@ -115,6 +117,16 @@ interface Supervised {
   restart?: NodeJS.Timeout;
   /** Set before a deliberate kill so the exit that follows is not read as a death to recover from. */
   retiring: boolean;
+  /**
+   * What the kernel says this service is listening on, or undefined for not yet observed.
+   *
+   * UNDEFINED IS NOT "NOTHING". A host with no `/proc`, a service that has not bound yet, a walk
+   * that lost a race with an exiting pid: all three arrive here as undefined, and a reader that
+   * treats them as "listening on nothing" would report a public port as private.
+   */
+  listening?: { address: string; port: number }[];
+  /** Set once the note below has been written, so a five-second sweep does not repeat it. */
+  saidItIsReachable?: boolean;
 }
 
 /**
@@ -175,6 +187,16 @@ export const ownerStopNote = (stopped: number, services: string[]): string => {
 type OutputCollector = ReturnType<typeof boundedCollector>;
 
 /** A runner-written sentence about why this session stopped, on the session's own stderr. */
+/**
+ * How often the listening sockets of every service are re-read.
+ *
+ * Slow on purpose. A bind happens once, within a second or two of the process starting, and the
+ * answer then holds for the life of the service - so this is a safety net for the late binder and
+ * for a service that opens a second port, not a health check. Five seconds costs one read of
+ * `/proc/net/tcp` and one walk of `/proc` per interval, whatever number of services are up.
+ */
+const DEFAULT_LISTENER_SWEEP_MS = 5_000;
+
 const noteOnStderr = (session: Session, note: string): void => {
   session.stderr.push(Buffer.from(`\n${note}`));
 };
@@ -185,6 +207,14 @@ export class ProcessManager {
   readonly #registries = new Map<string, ServiceRegistry>();
   readonly #flushGraceMs: number;
   readonly #policy: ServicePolicy;
+  /**
+   * One sweep for every service on the box rather than a timer each, because the expensive part -
+   * reading `/proc/net/tcp` and walking `/proc` - is paid once however many services are up.
+   * Started when the first service is supervised and stopped when the last one goes.
+   */
+  #listenerSweep: NodeJS.Timeout | undefined;
+  readonly #listenerSweepMs: number;
+  readonly #observeListeners: (pid: number) => Promise<{ address: string; port: number }[]>;
 
   /**
    * How long a session that has exited waits for output still in its pipes before it reports a
@@ -195,10 +225,20 @@ export class ProcessManager {
    */
   constructor(
     flushGraceMs: number = DEFAULT_FLUSH_GRACE_MS,
-    policy: ServicePolicy = DEFAULT_SERVICE_POLICY
+    policy: ServicePolicy = DEFAULT_SERVICE_POLICY,
+    listenerSweepMs: number = DEFAULT_LISTENER_SWEEP_MS,
+    /*
+     * The kernel read, as a parameter, so the behaviour built on it can be tested off Linux. The
+     * walk itself is held to a fixture `/proc` in listeners.test.ts; what this lets a test reach is
+     * the half that matters to a reader - the note a service gets when it turns out to be open.
+     */
+    observeListeners: (pid: number) => Promise<{ address: string; port: number }[]> =
+      listeningSocketsOfGroup
   ) {
     this.#flushGraceMs = flushGraceMs;
     this.#policy = policy;
+    this.#listenerSweepMs = listenerSweepMs;
+    this.#observeListeners = observeListeners;
   }
 
   async start(
@@ -486,8 +526,78 @@ export class ProcessManager {
       guards: options.guards,
       retiring: false
     });
+    this.#startListenerSweep();
     await registry.put(record);
     return this.#view(session, false);
+  }
+
+  /**
+   * Which addresses each service is actually listening on, measured rather than parsed.
+   *
+   * The approval card is answered from the command, before the process exists - and the commonest
+   * way to open a public port states no address at all: `python3 -m http.server 8099` binds every
+   * interface, and so do a good many servers whose default arrived with a container image. This is
+   * the half that catches those, and it is the only half that can.
+   *
+   * Best effort by construction. `listeningSocketsOfGroup` swallows every read failure, so a host
+   * without `/proc` sweeps to no answer at all rather than to an empty one, and the view below
+   * omits the field instead of claiming the service is private.
+   */
+  #startListenerSweep(): void {
+    if (this.#listenerSweep) return;
+    const sweep = () => {
+      void Promise.all(
+        [...this.#supervised.values()].map(async (supervised) => {
+          const pid = supervised.record.pid;
+          if (pid === undefined) return;
+          const observed = await this.#observeListeners(pid);
+          // An empty answer on a host that cannot be read is indistinguishable from an empty answer
+          // on a service that binds nothing, so neither overwrites a previous observation with
+          // silence: a port seen open stays reported until the service is gone.
+          if (observed.length > 0 || supervised.listening !== undefined)
+            supervised.listening = observed;
+          this.#sayIfReachable(supervised, observed);
+        })
+      );
+    };
+    this.#listenerSweep = setInterval(sweep, this.#listenerSweepMs);
+    this.#listenerSweep.unref?.();
+    sweep();
+  }
+
+  /**
+   * Says out loud, once, that a service turned out to be reachable from off this computer.
+   *
+   * The approval card is answered before the process exists, from the command - and the commonest
+   * way to open a public port states no address at all. `python3 -m http.server 8099` binds every
+   * interface, so the card the owner read described a service that outlives its task and said
+   * nothing about who could reach it, which was true of the words and wrong about the effect.
+   *
+   * This is the correction, on the evidence, in the one channel that reaches the agent that started
+   * it: the session's own error output, which is what a `poll` returns. It names the address, says
+   * what it means in the owner's terms, and says what to do instead - because the agent reading it
+   * is the one that can fix it, and the fix is a flag.
+   *
+   * Once per run. A five-second sweep that repeated this would bury the log it is written into.
+   */
+  #sayIfReachable(supervised: Supervised, observed: readonly { address: string; port: number }[]): void {
+    if (supervised.saidItIsReachable) return;
+    const reachable = observed.filter((socket) => reachOfBindAddress(socket.address) !== 'self');
+    if (reachable.length === 0) return;
+    supervised.saidItIsReachable = true;
+    const session = this.#sessions.get(supervised.record.id);
+    if (!session) return;
+    const where = reachable.map((socket) => `${socket.address}:${socket.port}`).join(', ');
+    noteOnStderr(
+      session,
+      `athanor: "${supervised.record.name}" is listening on ${where}, which is not this computer only - anyone who can reach this computer on that port can reach what it serves. If it was meant to be private, bind 127.0.0.1 and use publish_preview, which proxies to loopback.`
+    );
+  }
+
+  #stopListenerSweepIfIdle(): void {
+    if (this.#supervised.size > 0 || !this.#listenerSweep) return;
+    clearInterval(this.#listenerSweep);
+    this.#listenerSweep = undefined;
   }
 
   #serviceDied(id: string): void {
@@ -655,6 +765,7 @@ export class ProcessManager {
     if (supervised.restart) clearTimeout(supervised.restart);
     delete supervised.restart;
     this.#supervised.delete(supervised.record.id);
+    this.#stopListenerSweepIfIdle();
     void supervised.registry.remove(supervised.record.id);
   }
 
@@ -706,9 +817,27 @@ export class ProcessManager {
     return { commands, longestRemainingMs };
   }
 
+  /**
+   * What this task started, PLUS every declared service in the workspace.
+   *
+   * The owner filter is right for an ordinary background command: it belongs to one turn, it dies
+   * with that turn's hour, and no other turn has business polling or killing it. A DECLARED SERVICE
+   * is the opposite thing by definition - naming it is what asks the computer to keep it past the
+   * task - and applying the same filter to it meant that the moment the declaring task ended, no
+   * agent could ever see it again.
+   *
+   * Measured: a service was left listening on a public port, and the next turn asked to stop it
+   * listed the processes, got an empty array, and reported that nothing was running. The service
+   * was in `.athanor/services.json` and in the owner's own panel the whole time. A thing the
+   * product will restart across reboots, that no agent can name, cannot be turned off by asking.
+   */
   list(workspaceId: string, owner: string) {
     return [...this.#sessions.values()]
-      .filter((session) => session.workspaceId === workspaceId && session.owner === owner)
+      .filter(
+        (session) =>
+          session.workspaceId === workspaceId &&
+          (session.owner === owner || this.#supervised.has(session.id))
+      )
       .map((session) => this.#view(session, false));
   }
 
@@ -748,10 +877,23 @@ export class ProcessManager {
       })
       .parse(value);
     const session = this.#sessions.get(id);
+    /*
+     * A declared service is reachable by any task in its workspace, for exactly the two verbs the
+     * owner's own null case was widened to, and for the same stated reason: stopping and reading
+     * cannot be aimed at another turn's reasoning, and `write` - chosen bytes onto the stdin of
+     * somebody else's process - can. So a later turn can list a service, read it and stop it, and
+     * still cannot speak into one.
+     *
+     * Without this, `list` above would have been a worse defect than the one it fixed: a service
+     * the agent can finally see and still cannot act on is a row that reads as a bug in the tool.
+     */
+    const durable = this.#supervised.has(id) && session?.workspaceId === workspaceId;
+    const mayReach =
+      owner === null || session?.owner === owner || (durable && request.action !== 'write');
     if (
       !session ||
       session.workspaceId !== workspaceId ||
-      (owner !== null && session.owner !== owner) ||
+      !mayReach ||
       (owner === null && request.action === 'write')
     )
       throw new Error('Background process not found');
@@ -782,6 +924,7 @@ export class ProcessManager {
       if (supervised.restart) clearTimeout(supervised.restart);
     }
     this.#supervised.clear();
+    this.#stopListenerSweepIfIdle();
     for (const session of this.#sessions.values()) {
       if (session.timeout) clearTimeout(session.timeout);
       if (session.diskFloor) clearInterval(session.diskFloor);
@@ -803,6 +946,7 @@ export class ProcessManager {
       this.#supervised.delete(id);
       if (options.forget) void supervised.registry.remove(id);
     }
+    this.#stopListenerSweepIfIdle();
     if (options.forget) this.#registries.delete(workspaceId);
     for (const [id, session] of this.#sessions) {
       if (session.workspaceId !== workspaceId) continue;
@@ -927,7 +1071,26 @@ export class ProcessManager {
       // The session's own status stays the truth about the process - a service in its backoff
       // reads `failed`, not `running`, because a row that claims a dead thing is alive is the bug
       // this primitive exists to end. `service` is the durable record beside it.
-      ...(supervised ? { service: serviceView(supervised.record) } : {}),
+      ...(supervised
+        ? {
+            service: {
+              ...serviceView(supervised.record),
+              /*
+               * Omitted rather than empty when nothing has been observed, because the two are
+               * different claims and only one of them is safe to make. An absent field says "not
+               * measured here"; `listening: []` would say "this service is reachable from nowhere",
+               * which is exactly the sentence a host without `/proc` must never produce.
+               */
+              ...(supervised.listening === undefined
+                ? {}
+                : {
+                    listening: supervised.listening.map(
+                      (socket) => `${socket.address}:${socket.port}`
+                    )
+                  })
+            }
+          }
+        : {}),
       ...(includeLogs
         ? { stdout: session.stdout.text('stdout'), stderr: session.stderr.text('stderr') }
         : {})

@@ -47,8 +47,18 @@ const settledStatus = async (
   return manager.action('workspace-1', 'task-1', sessionId, { action: 'poll' });
 };
 
+/*
+ * Retried, because `close()` is synchronous and the service records behind it are not: a supervisor
+ * can still be writing `.athanor/services.json` while the tree is being removed, and the removal
+ * fails ENOTEMPTY on a file that appeared mid-walk. services.test.ts met this first and answers it
+ * the same way.
+ */
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  await Promise.all(
+    roots
+      .splice(0)
+      .map((root) => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 }))
+  );
 });
 
 describe('background process manager', () => {
@@ -1007,6 +1017,211 @@ describe('what a restart would destroy', () => {
 
       manager.action('workspace-1', 'task-1', short.sessionId, { action: 'kill' });
       expect(manager.backgroundWork()).toEqual({ commands: 0, longestRemainingMs: null });
+      manager.close();
+    },
+    TEST_TIMEOUT_MS
+  );
+});
+
+/*
+ * A declared service outlives the task that declared it, so every later task has to be able to
+ * find it.
+ *
+ * Measured on a live box: a service was left listening on a public port. The next turn was asked
+ * to stop it, listed the processes, was handed an empty array because `list` filtered on the
+ * declaring task, and reported that nothing was running. The service was in the owner's own panel
+ * and in `.athanor/services.json` the whole time, and the runner brings it back across reboots.
+ */
+describe('reaching a service the declaring task has finished with', () => {
+  const startService = async (manager: ProcessManager, owner: string, name: string) => {
+    const root = await mkdtemp(path.join(tmpdir(), 'athanor-service-'));
+    roots.push(root);
+    await mkdir(path.join(root, 'workspace'));
+    return {
+      root,
+      started: await manager.start(
+        root,
+        'workspace-1',
+        owner,
+        { executable: '/bin/sh', args: ['-c', 'sleep 30'], service: name },
+        30,
+        false
+      )
+    };
+  };
+
+  it(
+    'shows a later task the service, and still hides an ordinary background command',
+    async () => {
+      const manager = new ProcessManager();
+      const { root, started } = await startService(manager, 'task-1', 'files');
+      const ephemeral = await manager.start(
+        root,
+        'workspace-1',
+        'task-1',
+        { executable: '/bin/sh', args: ['-c', 'sleep 30'], timeoutSeconds: 30 },
+        30,
+        false
+      );
+
+      const seenByLaterTask = manager.list('workspace-1', 'task-2').map((view) => view.sessionId);
+      expect(seenByLaterTask).toContain(started.sessionId);
+      expect(seenByLaterTask).not.toContain(ephemeral.sessionId);
+      expect(manager.list('workspace-1', 'task-1').map((view) => view.sessionId)).toContain(
+        ephemeral.sessionId
+      );
+      manager.close();
+    },
+    TEST_TIMEOUT_MS
+  );
+
+  it(
+    'lets a later task read and stop the service it can now see',
+    async () => {
+      const manager = new ProcessManager();
+      const { started } = await startService(manager, 'task-1', 'files');
+
+      expect(
+        manager.action('workspace-1', 'task-2', started.sessionId, { action: 'poll' }).service
+      ).toMatchObject({ name: 'files' });
+      // The kill's own answer is the evidence, because stopping a service RETIRES it: it is no
+      // longer durable, so the task that stopped it is no longer the task it is durable for. The
+      // declaring task still holds the session, and the owner still sees it in the workspace list.
+      expect(
+        manager.action('workspace-1', 'task-2', started.sessionId, { action: 'kill' }).status
+      ).toBe('stopped');
+      expect(manager.listWorkspace('workspace-1').map((view) => view.status)).toEqual(['stopped']);
+      manager.close();
+    },
+    TEST_TIMEOUT_MS
+  );
+
+  /*
+   * The counter-direction, and the reason `write` is excluded by name. Reading and stopping cannot
+   * be aimed at another turn's reasoning; chosen bytes on the stdin of somebody else's process can,
+   * which is the same line the owner's own widened access was drawn along.
+   */
+  it(
+    'refuses to let one task speak into another task\'s service',
+    async () => {
+      const manager = new ProcessManager();
+      const { started } = await startService(manager, 'task-1', 'files');
+
+      expect(() =>
+        manager.action('workspace-1', 'task-2', started.sessionId, { action: 'write', data: 'x' })
+      ).toThrow('Background process not found');
+      manager.close();
+    },
+    TEST_TIMEOUT_MS
+  );
+
+  it(
+    'still hides another task\'s ordinary background command entirely',
+    async () => {
+      const manager = new ProcessManager();
+      const root = await mkdtemp(path.join(tmpdir(), 'athanor-service-'));
+      roots.push(root);
+      await mkdir(path.join(root, 'workspace'));
+      const ephemeral = await manager.start(
+        root,
+        'workspace-1',
+        'task-1',
+        { executable: '/bin/sh', args: ['-c', 'sleep 30'], timeoutSeconds: 30 },
+        30,
+        false
+      );
+
+      expect(() =>
+        manager.action('workspace-1', 'task-2', ephemeral.sessionId, { action: 'poll' })
+      ).toThrow('Background process not found');
+      manager.close();
+    },
+    TEST_TIMEOUT_MS
+  );
+});
+
+/*
+ * A service that turns out to be reachable from off this computer, said out loud on the evidence.
+ *
+ * The approval card is answered from the command before the process exists, and the commonest way
+ * to open a public port states no address at all: `python3 -m http.server 8099` binds every
+ * interface. So the card the owner read was true of the words and wrong about the effect, and this
+ * is the correction - measured from the kernel, delivered into the one channel the agent that
+ * started the service actually reads back.
+ */
+describe('saying that a service is reachable from outside this computer', () => {
+  const startService = async (manager: ProcessManager, name: string) => {
+    const root = await mkdtemp(path.join(tmpdir(), 'athanor-listen-'));
+    roots.push(root);
+    await mkdir(path.join(root, 'workspace'));
+    return manager.start(
+      root,
+      'workspace-1',
+      'task-1',
+      { executable: '/bin/sh', args: ['-c', 'sleep 30'], service: name },
+      30,
+      false
+    );
+  };
+
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 60));
+
+  it(
+    'names the address, reports it on the service, and says it exactly once',
+    async () => {
+      const manager = new ProcessManager(undefined, undefined, 20, async () => [
+        { address: '0.0.0.0', port: 8099 }
+      ]);
+      const started = await startService(manager, 'files');
+      await settle();
+
+      const view = manager.action('workspace-1', 'task-1', started.sessionId, { action: 'log' });
+      expect(view.service).toMatchObject({ name: 'files', listening: ['0.0.0.0:8099'] });
+      expect(view.stderr).toContain('0.0.0.0:8099');
+      expect(view.stderr).toContain('anyone who can reach this computer');
+      // Written once, however many times the sweep runs: at 20ms it has run several times by now.
+      expect(view.stderr?.match(/is listening on/g)?.length).toBe(1);
+      manager.close();
+    },
+    TEST_TIMEOUT_MS
+  );
+
+  /*
+   * THE COUNTER-DIRECTION. Loopback is the ordinary, correct way to run an app here - the preview
+   * proxy connects to 127.0.0.1 - so it is reported as observed and says nothing at all.
+   */
+  it(
+    'reports a loopback service without warning about it',
+    async () => {
+      const manager = new ProcessManager(undefined, undefined, 20, async () => [
+        { address: '127.0.0.1', port: 8097 }
+      ]);
+      const started = await startService(manager, 'files');
+      await settle();
+
+      const view = manager.action('workspace-1', 'task-1', started.sessionId, { action: 'log' });
+      expect(view.service).toMatchObject({ listening: ['127.0.0.1:8097'] });
+      expect(view.stderr ?? '').not.toContain('anyone who can reach this computer');
+      manager.close();
+    },
+    TEST_TIMEOUT_MS
+  );
+
+  /*
+   * A host with no `/proc` answers exactly as a service binding nothing does, so the field is
+   * OMITTED rather than empty. `listening: []` would be a claim that the service is reachable from
+   * nowhere, which is the one sentence this must never produce on a machine it could not read.
+   */
+  it(
+    'omits the field entirely when nothing could be observed',
+    async () => {
+      const manager = new ProcessManager(undefined, undefined, 20, async () => []);
+      const started = await startService(manager, 'files');
+      await settle();
+
+      const view = manager.action('workspace-1', 'task-1', started.sessionId, { action: 'poll' });
+      expect(view.service).toMatchObject({ name: 'files' });
+      expect(view.service).not.toHaveProperty('listening');
       manager.close();
     },
     TEST_TIMEOUT_MS

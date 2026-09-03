@@ -16,6 +16,8 @@
  * `gitSubcommand` and the package-manager sets - would close a cycle between the two.
  */
 import { posix } from 'node:path';
+import { isIP } from 'node:net';
+import { reachOfBindAddress, type NetworkReach } from '@athanor/core';
 import { classifyDestination } from './egress.js';
 import { textValue } from './values.js';
 
@@ -3233,6 +3235,160 @@ export const outboundDestinations = (
  * for. Declared here rather than beside the classifier in the agent loop because both the file
  * readers and `shell` have to agree on it, and two lists would drift.
  */
+/**
+ * The flags a server is told to listen on an address with.
+ *
+ * The short ones are here despite `-a`, `-l` and `-i` meaning something else on half the commands
+ * that take them, because nothing is read off the flag alone: `bindOperandAddress` has to be able
+ * to place the value before the pair counts, so `tar -a` and `nc -l 1234` fall out on the value
+ * rather than needing to be named here.
+ */
+const BIND_FLAGS = new Set([
+  '--bind',
+  '--bind-address',
+  '--host',
+  '--hostname',
+  '--address',
+  '--addr',
+  '--listen',
+  '--listen-address',
+  '--http-address',
+  '--interface',
+  '-b',
+  '-H',
+  '-a',
+  '-l'
+]);
+
+/** The environment names a server reads a listen address out of when no flag carries it. */
+const BIND_ASSIGNMENTS =
+  /^(HOST|HOSTNAME|BIND|BIND_ADDRESS|BIND_HOST|ADDRESS|LISTEN|LISTEN_ADDRESS|SERVER_HOST|HTTP_HOST)=(.*)$/i;
+
+/**
+ * The address inside one operand, or null when this cannot say the operand is an address at all.
+ *
+ * NULL IS THE IMPORTANT RETURN. It is "not stated here", and it is what keeps a heuristic flag
+ * table from inventing exposure: `--host production` is a word that cannot be bound, `-l 1234` is
+ * a port, and both have to come back null rather than fail wide, because the caller escalates on
+ * what this returns. The fail-wide rule belongs one level up, in `reachOfBindAddress`, where the
+ * value is already known to be an address.
+ *
+ * So a bare name is taken only when it can actually be placed - `localhost`, and the estate
+ * suffixes - and any other single word is refused. The cost is a bind to a public HOSTNAME, which
+ * would have to resolve to an interface this box already holds; the gain is that no ordinary
+ * service declaration is carded for a word that was never an address.
+ */
+const bindOperandAddress = (raw: string): string | null => {
+  let value = raw.trim();
+  if (!value) return null;
+  const scheme = value.match(/^[a-z][a-z0-9+.-]*:\/\/(.*)$/i);
+  if (scheme) value = scheme[1] ?? '';
+  value = value.replace(/\/.*$/, '');
+  if (!value) return null;
+  const bracketed = value.match(/^\[([^\]]*)\](?::\d+)?$/);
+  if (bracketed) return bracketed[1] ?? '';
+  // `--listen :8080` and `--listen *:8080`: a port with no address is every interface.
+  if (/^:\d+$/.test(value)) return '';
+  if (/^\*(?::\d+)?$/.test(value)) return '*';
+  const segments = value.split(':');
+  if (segments.length === 2 && /^\d+$/.test(segments[1] ?? '')) value = segments[0] ?? '';
+  else if (segments.length > 2 && !isIP(value)) return null;
+  if (!value) return '';
+  if (isIP(value)) return value;
+  return reachOfBindAddress(value) === 'internet' ? null : value;
+};
+
+/** An operand that carries its own port is a listen address wherever it sits: `php -S 0.0.0.0:80`. */
+const addressWithPort = (raw: string): string | null => {
+  const value = raw.trim().replace(/^[a-z][a-z0-9+.-]*:\/\//i, '');
+  if (!/:\d+$/.test(value) && !/^\[[^\]]*\]:\d+$/.test(value)) return null;
+  return bindOperandAddress(raw);
+};
+
+const commandBindAddresses = (tokens: readonly string[]): string[] => {
+  const found: string[] = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = unquoted(tokens[index] ?? '');
+    const assignment = token.match(BIND_ASSIGNMENTS);
+    if (assignment) {
+      /*
+       * Up to the first space, and its own quotes off. `HOST=0.0.0.0 npm start` arrives here as a
+       * single token whenever the shell parser ahead of this one dropped the assignment prefix
+       * rather than splitting on it, and reading the whole tail as the address answered null for
+       * the plainest spelling of the case this exists to catch.
+       */
+      const stated = (assignment[2] ?? '').trim().split(/\s+/)[0] ?? '';
+      const address = bindOperandAddress(stated.replace(/^["']|["']$/g, ''));
+      if (address !== null) found.push(address);
+      continue;
+    }
+    const split = token.indexOf('=');
+    const flag = split > 0 ? token.slice(0, split) : token;
+    // Short flags are matched case-sensitively on purpose: `-H` is a bind on several servers and
+    // `-h` is help on nearly all of them, and folding the case made the first unreadable.
+    const isBindFlag =
+      BIND_FLAGS.has(flag) || (flag.startsWith('--') && BIND_FLAGS.has(flag.toLowerCase()));
+    if (!isBindFlag) {
+      const positional = addressWithPort(token);
+      if (positional !== null) found.push(positional);
+      continue;
+    }
+    if (split > 0) {
+      const address = bindOperandAddress(token.slice(split + 1));
+      if (address !== null) found.push(address);
+      continue;
+    }
+    const next = tokens[index + 1];
+    /*
+     * `vite --host` with nothing after it is documented as every interface, and a bind flag whose
+     * value is the next flag is the same statement. The flag was named; only the value is missing.
+     *
+     * LONG SPELLINGS ONLY, which is the whole of the difference between a rule and a guess.
+     * `tar -a -c -f out.tar` was read as a public bind by the version above: `-a` is in the table
+     * for http-server, `-c` begins with a dash, and an archive became a socket on every interface.
+     * A short flag with no value is not evidence of anything.
+     */
+    if (next === undefined || unquoted(next).startsWith('-')) {
+      if (flag.startsWith('--')) found.push('');
+      continue;
+    }
+    const address = bindOperandAddress(unquoted(next));
+    if (address !== null) {
+      found.push(address);
+      index += 1;
+    }
+  }
+  return found;
+};
+
+/**
+ * The widest reach any address stated in this invocation opens, or null when none was stated.
+ *
+ * WIDEST rather than first, because a declaration that says both is only as private as its most
+ * open half: `bash -lc 'npm run build -- --host 127.0.0.1 && npm start -- --host 0.0.0.0'` is a
+ * public port, and reading the first would have called it loopback.
+ *
+ * Null is a real answer and its own case. Most servers say where they listen in their own source -
+ * `npm start` states nothing here - so this cannot be the only place the question is asked, and
+ * the caller must not read null as loopback. What the service actually bound is observed after it
+ * starts; this is the half that can be known before the owner is asked.
+ */
+export const statedBindReach = (args: Record<string, unknown>): NetworkReach | null => {
+  const commandArgs = Array.isArray(args.args) ? args.args.map(String) : [];
+  const invocations: readonly (readonly string[])[] = [
+    [textValue(args.executable), ...commandArgs],
+    ...effectiveCommands(args)
+  ];
+  const order: readonly NetworkReach[] = ['self', 'estate', 'internet'];
+  let widest: NetworkReach | null = null;
+  for (const tokens of invocations)
+    for (const address of commandBindAddresses(tokens)) {
+      const reach = reachOfBindAddress(address);
+      if (widest === null || order.indexOf(reach) > order.indexOf(widest)) widest = reach;
+    }
+  return widest;
+};
+
 export const DOWNLOAD_QUARANTINE_PREFIXES = [
   'workspace/downloads/',
   'downloads/',

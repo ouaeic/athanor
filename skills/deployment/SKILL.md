@@ -1,6 +1,6 @@
 ---
 name: deployment
-description: Get a built application running and reachable, on this computer or the owner's own host, with the two facts about this machine that decide whether it works — bind 0.0.0.0, and choose deliberately between a process that ends and a service the computer keeps running — stated plainly to the owner along with the rollback command. Use when the owner asks to run, preview, publish or deploy an application. Do not use to publish anything publicly without explicit approval, do not use for third-party paid hosting platforms, and never claim a systemd unit was installed, because the agent account cannot install one.
+description: Get a built application running and reachable, on this computer or the owner's own host, with the two facts about this machine that decide whether it works — bind 127.0.0.1, and choose deliberately between a process that ends and a service the computer keeps running — stated plainly to the owner along with the rollback command. Use when the owner asks to run, preview, publish or deploy an application. Do not use to publish anything publicly without explicit approval, do not use for third-party paid hosting platforms, and never claim a systemd unit was installed, because the agent account cannot install one.
 license: AGPL-3.0-or-later
 compatibility: Requires the application's own runtime. A service the computer keeps running is supervised by athanor's own workspace runtime and needs no root. systemctl and journalctl exist here but the agent account has no root, so a systemd unit file is written for the owner to install rather than installed here; neither binary is part of the document toolchain and neither is installed by athanor.
 allowed-tools: shell process publish_preview file_read file_write files_list browser_snapshot browser_action
@@ -20,8 +20,17 @@ switch, not after it fails.
 
 Both are invisible until they bite, and between them they cause most failed demos here.
 
-**Bind to `0.0.0.0`, never `127.0.0.1`.** The preview proxy cannot reach a loopback-bound socket.
-The app is fine, the port is listening, and the link answers with a proxy error.
+**Bind to `127.0.0.1`, never `0.0.0.0`.** The preview proxy connects to `127.0.0.1` and nothing
+else, so loopback is what publishing is built on — `previewTarget` in the runner's `preview.ts`
+builds `http://127.0.0.1:<port>/`. A socket on `0.0.0.0` is on every interface this computer has,
+including the public one, where it is reachable by anyone who can reach the box whether or not the
+preview was ever published. That is a different act from previewing and now raises its own
+approval card; a loopback bind is the ordinary case and does not.
+
+This file used to say the opposite, and said it in its own description, where every agent read it
+before deciding anything. It was wrong on the day it was written: no version of the proxy has ever
+connected to anything but loopback. A service was declared `--bind 0.0.0.0` on that advice and
+served the workspace directory to the internet after the owner had declined to publish it.
 
 **A plain background process ends; a named service does not.** Pick one deliberately and say which
 one the owner got.

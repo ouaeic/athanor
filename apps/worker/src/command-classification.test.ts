@@ -12,6 +12,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   isQuarantinedDownloadPath,
+  statedBindReach,
   AGENT_HOME,
   callDestinations,
   CHECKPOINT_CONTENT,
@@ -2240,5 +2241,97 @@ describe('the paths the quarantine rule treats as downloaded', () => {
       './workspace/mailbox-notes.md'
     ])
       expect(isQuarantinedDownloadPath(spelling), spelling).toBe(false);
+  });
+});
+
+/*
+ * Where a declared service says it will listen, read off the invocation.
+ *
+ * The case that made this necessary: `python3 -m http.server 8099 --bind 0.0.0.0` was declared as
+ * a service on a box with no firewall, after the owner had DECLINED to publish the same directory.
+ * It raised the ordinary service card, which describes how long a service lasts and never says
+ * who can reach it, so nothing the owner read mentioned the internet.
+ *
+ * Both directions are asserted, and the second is the one that keeps this honest: a loopback bind
+ * is the ordinary, correct way to run an app here - the preview proxy connects to 127.0.0.1 - and
+ * it must not be dragged up with the public one.
+ */
+describe('statedBindReach', () => {
+  const shell = (executable: string, ...args: string[]) => ({ executable, args });
+
+  it('reads the public bind out of every shape a model writes it in', () => {
+    for (const args of [
+      shell('python3', '-m', 'http.server', '8099', '--bind', '0.0.0.0'),
+      shell('python3', '-m', 'http.server', '8099', '--bind=0.0.0.0'),
+      shell('uvicorn', 'app:app', '--host', '0.0.0.0', '--port', '8000'),
+      shell('gunicorn', '-b', '0.0.0.0:8000', 'app:app'),
+      shell('php', '-S', '0.0.0.0:8000'),
+      shell('caddy', 'file-server', '--listen', ':8080'),
+      shell('serve', '-l', 'tcp://0.0.0.0:3000'),
+      shell('next', 'dev', '-H', '::'),
+      shell('bash', '-lc', 'npm run dev -- --host 0.0.0.0 --port 5173'),
+      shell('bash', '-lc', 'HOST=0.0.0.0 npm start'),
+      // A bind flag with nothing after it is the flag's documented "every interface".
+      shell('vite', '--host'),
+      shell('vite', '--host', '--port', '5173')
+    ])
+      expect({ args, reach: statedBindReach(args) }).toEqual({ args, reach: 'internet' });
+  });
+
+  it('leaves a loopback bind exactly where it was', () => {
+    for (const args of [
+      shell('python3', '-m', 'http.server', '8097', '--bind', '127.0.0.1'),
+      shell('uvicorn', 'app:app', '--host', 'localhost'),
+      shell('gunicorn', '-b', '127.0.0.1:8000', 'app:app'),
+      shell('php', '-S', '127.0.0.1:8000'),
+      shell('bash', '-lc', 'npm run dev -- --host 127.0.0.1'),
+      shell('next', 'dev', '-H', '::1')
+    ])
+      expect({ args, reach: statedBindReach(args) }).toEqual({ args, reach: 'self' });
+  });
+
+  it('reads a bind the rest of the building can reach as the estate', () => {
+    expect(statedBindReach(shell('uvicorn', 'app:app', '--host', '192.168.1.50'))).toBe('estate');
+  });
+
+  /*
+   * The widest, not the first. A declaration that states both is only as private as its most open
+   * half, and reading left to right would have called this one loopback.
+   */
+  it('takes the widest reach when one declaration states two', () => {
+    expect(
+      statedBindReach(
+        shell('bash', '-lc', 'npm run build -- --host 127.0.0.1 && npm start -- --host 0.0.0.0')
+      )
+    ).toBe('internet');
+  });
+
+  /*
+   * NULL IS NOT LOOPBACK. Most servers state the address in their own source, so an unstated bind
+   * is unknown - and a flag table that guessed `self` here would have been a worse lie than the
+   * card that said nothing.
+   */
+  it('says nothing about a command that states no address', () => {
+    for (const args of [
+      shell('npm', 'start'),
+      shell('node', 'server.js'),
+      shell('bash', '-lc', 'pnpm dev')
+    ])
+      expect({ args, reach: statedBindReach(args) }).toEqual({ args, reach: null });
+  });
+
+  /*
+   * The short flags are in the table because the servers use them, and they are only safe there
+   * because nothing is read off the flag alone. These are the collisions: a port after `nc -l`, an
+   * archive flag on tar, an identity file on ssh, a word that is not an address after `--host`.
+   */
+  it('refuses to read an address out of a flag that means something else', () => {
+    for (const args of [
+      shell('nc', '-l', '1234'),
+      shell('tar', '-a', '-c', '-f', 'out.tar', 'workspace'),
+      shell('ssh', '-i', 'key.pem', 'user@example.com'),
+      shell('bash', '-lc', 'deploy --host production')
+    ])
+      expect({ args, reach: statedBindReach(args) }).toEqual({ args, reach: null });
   });
 });

@@ -4,7 +4,8 @@ import {
   isPublicHttpUrl,
   isPublicInternetAddress,
   matchingHostSuffix,
-  reachOfHttpUrl
+  reachOfHttpUrl,
+  reachOfBindAddress
 } from './network-scope.js';
 
 describe('public internet addresses', () => {
@@ -228,5 +229,60 @@ describe('which suffix a host sits under', () => {
   it('still answers the yes-or-no question every connector asks', () => {
     expect(hostMatchesSuffix('mail.example.com', ['example.com'])).toBe(true);
     expect(hostMatchesSuffix('notexample.com', ['example.com'])).toBe(false);
+  });
+});
+
+/*
+ * The inbound half, which is not the outbound half backwards.
+ *
+ * The measured defect: a service was declared `--bind 0.0.0.0`, the only reach vocabulary in the
+ * tree was `reachOfHttpUrl`, and 0.0.0.0/8 is reserved - so the one address that means EVERY
+ * interface came back `estate`, the middle answer, on a box whose interfaces include a public one.
+ */
+describe('reachOfBindAddress', () => {
+  it('calls every spelling of the unspecified address the internet', () => {
+    for (const address of [
+      '0.0.0.0',
+      '0.0.0.0:8099',
+      '::',
+      '[::]',
+      '[::]:8080',
+      '::0',
+      '0:0:0:0:0:0:0:0',
+      '::ffff:0.0.0.0',
+      '*',
+      ''
+    ])
+      expect({ address, reach: reachOfBindAddress(address) }).toEqual({ address, reach: 'internet' });
+  });
+
+  it('calls a loopback bind this computer only', () => {
+    for (const address of ['127.0.0.1', '127.0.0.53', '::1', '[::1]', 'localhost', 'localhost.'])
+      expect({ address, reach: reachOfBindAddress(address) }).toEqual({ address, reach: 'self' });
+  });
+
+  it('calls a reserved non-loopback bind the estate', () => {
+    for (const address of ['192.168.1.50', '10.0.0.5', '172.16.4.4', 'fe80::1', 'nas.local'])
+      expect({ address, reach: reachOfBindAddress(address) }).toEqual({ address, reach: 'estate' });
+  });
+
+  /*
+   * Fails towards `internet` where its outbound twin fails towards `estate`, and the inversion is
+   * the whole reason the two are separate functions. Outbound, the expensive mistake is clearing
+   * an address nobody can read; inbound, it is calling an open socket private.
+   */
+  it('fails towards the internet for a name it cannot place', () => {
+    for (const address of ['not an address', 'srv-07', 'deploy-target'])
+      expect({ address, reach: reachOfBindAddress(address) }).toEqual({ address, reach: 'internet' });
+  });
+
+  it('calls a public unicast bind the internet', () => {
+    for (const address of ['93.184.216.34', '::ffff:93.184.216.34', '2606:4700:4700::1111'])
+      expect({ address, reach: reachOfBindAddress(address) }).toEqual({ address, reach: 'internet' });
+  });
+
+  it('disagrees with the outbound reader on the address that caused this', () => {
+    expect(reachOfBindAddress('0.0.0.0')).toBe('internet');
+    expect(reachOfHttpUrl('http://0.0.0.0:8099/')).toBe('estate');
   });
 });

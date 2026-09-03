@@ -41,6 +41,7 @@ import {
   scriptDestroysAStore,
   sendsDataOverNetwork,
   signalStopsThisComputer,
+  statedBindReach,
   type DestructionOperation
 } from './command-classification.js';
 import {
@@ -600,10 +601,45 @@ const serviceRequirement = (
     textValue(args.executable, 'command'),
     ...(Array.isArray(args.args) ? args.args.map(String) : [])
   ].join(' ');
+  /*
+   * WHO CAN REACH IT, which is a different question from how long it lasts and was the half this
+   * card did not ask.
+   *
+   * Every sentence above is about persistence - no timeout, restarted, survives a reboot - and a
+   * service reached from the internet raised exactly the same `external_reversible` card as one
+   * reached only by this computer. The owner denied a public preview and then approved a service
+   * whose card never said the word public; the port was open to the internet on a box with no
+   * firewall, serving the workspace directory. The publishing path had a floor for reach and the
+   * service path had none, so the cheapest way past the first was to declare the second.
+   *
+   * A stated non-loopback bind is now the same act as publishing and is charged like one. Loopback
+   * is left exactly where it was - the ordinary case, still one card, and now a card that SAYS it
+   * is private, because the deployment skill spent this whole time telling agents that loopback
+   * could not be reached by the preview proxy when `services/workspace-runner/src/preview.ts`
+   * connects to 127.0.0.1 and nothing else.
+   *
+   * `null` is not loopback. Most servers state the address in their own source rather than on the
+   * command line, so an unstated bind is unknown, and it keeps the card it always had.
+   */
+  const bindReach = statedBindReach(args);
+  const reachNote =
+    bindReach === 'internet'
+      ? ` It listens on every network interface this computer has, so anyone who can reach this computer on that port can reach what ${service} serves.`
+      : bindReach === 'estate'
+        ? ` It listens on an address other computers on this network can reach, not only this one.`
+        : bindReach === 'self'
+          ? ` It listens on this computer only, so nothing off this machine can reach it directly.`
+          : '';
   return {
-    sideEffect: taintSources.length ? 'external_consequential' : 'external_reversible',
-    action: `Keep ${service} running on this computer`,
-    preview: `Run ${command} as a service called ${service}. It has no time limit, is started again whenever it stops, and comes back after this computer restarts, so it outlives this task.${
+    sideEffect:
+      taintSources.length || bindReach === 'internet' || bindReach === 'estate'
+        ? 'external_consequential'
+        : 'external_reversible',
+    action:
+      bindReach === 'internet'
+        ? `Keep ${service} running on this computer, reachable from outside it`
+        : `Keep ${service} running on this computer`,
+    preview: `Run ${command} as a service called ${service}. It has no time limit, is started again whenever it stops, and comes back after this computer restarts, so it outlives this task.${reachNote}${
       taintSources.length
         ? ` This turn has read untrusted content (${taintSources.slice(0, 3).join(', ')}).`
         : ''

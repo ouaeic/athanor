@@ -1,6 +1,6 @@
 id: deployment
 version: 2.0.0
-catalog_line: 'Run an app here: bind 0.0.0.0, prove it with curl, then keep it up as a named service.'
+catalog_line: 'Run an app here: bind 127.0.0.1, prove it with curl, then keep it up as a named service.'
 
 lineage:
   origin: builtin

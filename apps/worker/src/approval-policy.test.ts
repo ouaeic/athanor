@@ -2040,6 +2040,74 @@ describe('declaring a service the computer keeps running', () => {
       approvalRequirement('shell', { executable: 'npm', args: ['test'], background: true })
     ).toBeNull();
   });
+
+  /*
+   * WHO CAN REACH IT, which the card did not say.
+   *
+   * Measured on a live box: the owner declined `publish_preview` for a directory, then approved a
+   * service declared `python3 -m http.server 8099 --bind 0.0.0.0` over the workspace. Both cards
+   * were read and answered as intended. The port was open to the internet, because the service
+   * card describes only how long a service lasts - no timeout, restarted, survives a reboot - and
+   * the publishing card was the only one in the tree that had ever mentioned reach. Declaring the
+   * service was the cheaper of the two ways to serve the same bytes to the same audience.
+   */
+  it('charges a service reachable from outside this computer like publishing', () => {
+    const card = approvalRequirement('shell', {
+      executable: 'python3',
+      args: ['-m', 'http.server', '8099', '--bind', '0.0.0.0'],
+      background: true,
+      service: 'files'
+    });
+    expect(card?.sideEffect).toBe('external_consequential');
+    expect(card?.action).toContain('reachable from outside');
+    expect(card?.preview).toContain('anyone who can reach this computer');
+  });
+
+  it('says the estate out loud when the bind reaches the rest of the building', () => {
+    const card = approvalRequirement('shell', {
+      executable: 'uvicorn',
+      args: ['app:app', '--host', '192.168.1.50'],
+      background: true,
+      service: 'api'
+    });
+    expect(card?.sideEffect).toBe('external_consequential');
+    expect(card?.preview).toContain('other computers on this network');
+  });
+
+  /*
+   * THE COUNTER-DIRECTION, and the one that decides whether this is worth having. Loopback is the
+   * ordinary, correct way to run an app here: the preview proxy connects to 127.0.0.1 and nothing
+   * else. It keeps the one card it always had, at the class it always had, and gains a sentence
+   * saying it is private - which is what the deployment skill should have said all along instead
+   * of telling agents that the proxy could not reach loopback.
+   */
+  it('leaves a loopback service exactly where it was, and now says it is private', () => {
+    const card = approvalRequirement('shell', {
+      executable: 'python3',
+      args: ['-m', 'http.server', '8097', '--bind', '127.0.0.1'],
+      background: true,
+      service: 'files'
+    });
+    expect(card?.sideEffect).toBe('external_reversible');
+    expect(card?.action).not.toContain('reachable from outside');
+    expect(card?.preview).toContain('nothing off this machine can reach it');
+  });
+
+  /*
+   * An unstated bind is unknown, not private. `npm start` says nothing about where it listens, so
+   * the card it raises is the one it always raised - neither escalated on a guess, nor given a
+   * sentence claiming a privacy this cannot see.
+   */
+  it('does not invent a reach for a command that states no address', () => {
+    const card = approvalRequirement('shell', {
+      executable: 'npm',
+      args: ['start'],
+      background: true,
+      service: 'dashboard'
+    });
+    expect(card?.sideEffect).toBe('external_reversible');
+    expect(card?.preview).not.toContain('reach');
+  });
 });
 
 describe('the mailbox and the calendar as tools', () => {
