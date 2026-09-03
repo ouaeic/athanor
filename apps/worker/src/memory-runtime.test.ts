@@ -74,6 +74,12 @@ import {
   type MemoryRecallStore
 } from './memory-runtime.js';
 
+// Assembled rather than written whole, the way packages/core/src/redaction.test.ts does it
+// and for the reason stated there: the run-time value is exactly the shape a credential
+// scanner hunts for, which is the point of the fixture, and a literal of that shape in a
+// public repository is an alert somebody has to dismiss.
+const shapedSecret = (...parts: string[]): string => parts.join('');
+
 const dataKey = Buffer.alloc(32, 7);
 const indexKey = memoryIndexKey(dataKey);
 const workspaceId = '11111111-1111-4111-8111-111111111111';
@@ -1241,7 +1247,7 @@ describe('turn capture write path', () => {
       remainingRisks: [],
       // artifacts reconstruct shell command lines, which is exactly where an inline token shows up.
       artifacts: [
-        'curl -H "Authorization: Bearer ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" https://api'
+        `curl -H "Authorization: Bearer ${shapedSecret('gh', 'p_', 'A'.repeat(36))}" https://api`
       ],
       occurredAt: new Date('2026-07-31T09:00:00.000Z')
     });
@@ -1258,7 +1264,7 @@ describe('turn capture write path', () => {
     for (const secret of [
       'sk-live-4f9ab21c77de40aabc31',
       'hunter2',
-      'ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+      shapedSecret('gh', 'p_', 'A'.repeat(36))
     ])
       expect(everything, `${secret} reached durable memory`).not.toContain(secret);
     // The surrounding words survive, so the episode is still worth recalling.

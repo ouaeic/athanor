@@ -25,6 +25,12 @@ import {
 } from './skills.js';
 import { agentTools } from './tools.js';
 
+// Assembled rather than written whole, the way packages/core/src/redaction.test.ts does it
+// and for the reason stated there: the run-time value is exactly the shape a credential
+// scanner hunts for, which is the point of the fixture, and a literal of that shape in a
+// public repository is an alert somebody has to dismiss.
+const shapedSecret = (...parts: string[]): string => parts.join('');
+
 const roots: string[] = [];
 
 const fixtureRoot = (
@@ -715,9 +721,11 @@ describe('the shipped built-in library', () => {
 
 describe('what the approval card is told about a proposed procedure', () => {
   it('names a credential and an absolute path that pins the procedure to one run', () => {
-    expect(scanSkillBodyForSecrets('Authenticate with ghp_abcdefghijklmnopqrstuvwxyz01.')).toEqual([
-      'a GitHub token'
-    ]);
+    expect(
+      scanSkillBodyForSecrets(
+        `Authenticate with ${shapedSecret('gh', 'p_', 'abcdefghijklmnopqrstuvwxyz01')}.`
+      )
+    ).toEqual(['a GitHub token']);
     expect(scanSkillBodyForSecrets('Run the reconcile script, then compare totals.')).toEqual([]);
     expect(scanSkillBodyForPaths('Read /home/athanor/ws-31/data/ledger.csv first.')).toEqual([
       '/home/athanor/ws-31/data/ledger.csv'

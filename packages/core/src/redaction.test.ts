@@ -21,11 +21,11 @@ describe('the last net before a secret reaches somewhere it can be read', () => 
     const shape = (...parts: string[]): string => parts.join('');
     for (const secret of [
       shape('sk-ant-', 'api03-abcdefghijklmnopqrstuv'),
-      shape('ghp_', 'abcdefghijklmnopqrstuvwxyz012345'),
+      shape('gh', 'p_', 'abcdefghijklmnopqrstuvwxyz012345'),
       shape('github_pat_', '11ABCDEFG0abcdefghij'),
       shape('xoxb-', '1234567890-abcdefghijkl'),
       shape('glpat-', 'abcdefghijklmnopqrst'),
-      shape('AKIA', 'IOSFODNN7EXAMPLE'),
+      shape('AK', 'IA', 'IOSFODNN7EXAMPLE'),
       shape('AIzaSy', 'A0123456789abcdefghijklmnopqrstuv'),
       shape('eyJhbGciOiJIUzI1NiJ9.', 'eyJzdWIiOiIxMjM0NSJ9.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1g')
     ]) {
@@ -70,12 +70,17 @@ describe('the last net before a secret reaches somewhere it can be read', () => 
   });
 
   it('still redacts by key, and still walks arrays and nesting to a bounded depth', () => {
+    // Assembled for the reason the case above states: the run-time value is the same shape a
+    // scanner hunts for, and no literal here is one.
+    const shape = (...parts: string[]): string => parts.join('');
+    const token = shape('gh', 'p_', 'abcdefghijklmnopqrstuvwxyz012345');
+    const keyId = shape('AK', 'IA', 'IOSFODNN7EXAMPLE');
     expect(
       redactObject({
         code: 'refused',
         Authorization: 'anything',
-        nested: { detail: 'contact ghp_abcdefghijklmnopqrstuvwxyz012345' },
-        list: ['AKIAIOSFODNN7EXAMPLE']
+        nested: { detail: `contact ${token}` },
+        list: [keyId]
       })
     ).toEqual({
       code: 'refused',
@@ -83,7 +88,7 @@ describe('the last net before a secret reaches somewhere it can be read', () => 
       nested: { detail: 'contact [REDACTED]' },
       list: ['[REDACTED]']
     });
-    let deep: unknown = 'ghp_abcdefghijklmnopqrstuvwxyz012345';
+    let deep: unknown = token;
     for (let level = 0; level < 12; level += 1) deep = { deep };
     expect(JSON.stringify(redactObject(deep))).toContain('[MAX_DEPTH]');
     expect(JSON.stringify(redactObject(deep))).not.toContain('ghp_');

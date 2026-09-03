@@ -21,6 +21,12 @@ import { surfaceActionRequest } from './surface-actions.js';
 import { resolvedTranscriptionRoute, transcriptionEstimateUsd } from './media.js';
 import { SKILL_BUDGET } from './skills.js';
 
+// Assembled rather than written whole, the way packages/core/src/redaction.test.ts does it
+// and for the reason stated there: the run-time value is exactly the shape a credential
+// scanner hunts for, which is the point of the fixture, and a literal of that shape in a
+// public repository is an alert somebody has to dismiss.
+const shapedSecret = (...parts: string[]): string => parts.join('');
+
 /** A stored media route, as the API seals one into the credential this worker decrypts. */
 const mediaOption = (
   overrides: Partial<MediaModelOption> & Pick<MediaModelOption, 'id'>
@@ -477,7 +483,7 @@ describe('agent approval policy', () => {
         action: 'upsert',
         name: 'ledger-reconcile',
         description: 'Reconcile the ledger',
-        content: 'Authenticate with ghp_abcdefghijklmnopqrstuvwxyz01 before running it.'
+        content: `Authenticate with ${shapedSecret('gh', 'p_', 'abcdefghijklmnopqrstuvwxyz01')} before running it.`
       })?.preview
     ).toMatch(/appears to contain a GitHub token/);
   });
@@ -1355,7 +1361,7 @@ describe('when a memory write is worth stopping the owner for', () => {
       reason({
         action: 'add',
         target: 'workspace',
-        content: 'token ghp_0123456789abcdef0123456789abcdef0123',
+        content: `token ${shapedSecret('gh', 'p_', '0123456789abcdef0123456789abcdef0123')}`,
         validUntil: soon
       })
     ).toMatch(/never be stored/);

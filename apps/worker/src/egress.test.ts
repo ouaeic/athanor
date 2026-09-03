@@ -12,6 +12,12 @@ import {
   rememberOrigin
 } from './egress.js';
 
+// Assembled rather than written whole, the way packages/core/src/redaction.test.ts does it
+// and for the reason stated there: the run-time value is exactly the shape a credential
+// scanner hunts for, which is the point of the fixture, and a literal of that shape in a
+// public repository is an alert somebody has to dismiss.
+const shapedSecret = (...parts: string[]): string => parts.join('');
+
 const context = (overrides: Partial<Parameters<typeof classifyDestination>[1]> = {}) => ({
   knownOrigins: ['docs.example.com'],
   ownerText: 'read the pricing page on docs.example.com',
@@ -329,7 +335,7 @@ describe('what an address is charged', () => {
   it('charges a segment that carries the corpus rather than pointing into it', () => {
     const secrets = [
       owner,
-      'AKIA7SAMPLEKEYID0000',
+      shapedSecret('AK', 'IA', '7SAMPLEKEYID0000'),
       'staging-db-password-4f2c9a',
       'terms: 40% net 30'
     ];

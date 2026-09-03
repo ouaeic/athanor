@@ -27,6 +27,12 @@ import {
   subscriptionAgentName
 } from './subscription-agent.js';
 
+// Assembled rather than written whole, the way packages/core/src/redaction.test.ts does it
+// and for the reason stated there: the run-time value is exactly the shape a credential
+// scanner hunts for, which is the point of the fixture, and a literal of that shape in a
+// public repository is an alert somebody has to dismiss.
+const shapedSecret = (...parts: string[]): string => parts.join('');
+
 describe('which calls count as changing something', () => {
   it('treats writes, external actions and consequential commands as changes', () => {
     expect(isMutatingToolCall('file_write', { path: 'a', content: 'b' })).toBe(true);
@@ -409,7 +415,7 @@ describe('what the catalogue declares and the classifiers actually read', () => 
         {
           action: 'add',
           target: 'workspace',
-          content: 'Deploy with ghp_abcdefghijklmnopqrstuvwxyz01.',
+          content: `Deploy with ${shapedSecret('gh', 'p_', 'abcdefghijklmnopqrstuvwxyz01')}.`,
           validUntil: soon
         },
         now

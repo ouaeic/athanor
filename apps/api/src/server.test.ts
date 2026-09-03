@@ -2476,25 +2476,35 @@ describe('memory about the owner', () => {
     disposers.push(() => app.close());
     const { cookie, workspaceId } = await seedOwner(app, 'owner-secret');
 
-    const token = `sk-or-v1-${'0123456789abcdef'.repeat(4)}`;
+    /*
+     * Every shape below is assembled, the way packages/core/src/redaction.test.ts does it and for
+     * the reason stated there: what this case measures is that a credential-shaped string never
+     * reaches durable memory, so the shapes have to be exact - and an exact literal in a public
+     * repository is an alert somebody has to dismiss, on a file whose whole subject is not leaking
+     * secrets. The run-time values are unchanged.
+     */
+    const shaped = (...parts: string[]): string => parts.join('');
+    const pem = (kind: string, body: string): string =>
+      `${shaped('---', '--BEGIN ', kind, 'PRIVATE KEY---', '--')}\n${body}\n${shaped('---', '--END ', kind, 'PRIVATE KEY---', '--')}`;
+    const token = shaped('sk', '-or-', 'v1-', '0123456789abcdef'.repeat(4));
     const secrets = [
       `Here is my openrouter key: ${token}`,
       `heres the openrouter api key thats credit limited: ${token}`,
       `Here is the credit limited openrouter api key you can use to do this yourself: ${token}`,
       `Limited spending openrouter api key for asset generation etc: ${token}`,
-      'Use ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789 for the release job.',
-      `The slack bot is ${['xo', 'xb-', '123456789012-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx'].join('')}.`,
-      'Deploy with glpat-AbCdEfGhIjKlMnOpQrSt.',
-      'The AWS identity is AKIAIOSFODNN7EXAMPLE.',
-      'Maps uses AIzaSyD01234567890abcdefghijklmnopqrstu.',
+      `Use ${shaped('gh', 'p_', 'AbCdEfGhIjKlMnOpQrStUvWxYz0123456789')} for the release job.`,
+      `The slack bot is ${shaped('xo', 'xb-', '123456789012-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx')}.`,
+      `Deploy with ${shaped('gl', 'pat-', 'AbCdEfGhIjKlMnOpQrSt')}.`,
+      `The AWS identity is ${shaped('AK', 'IA', 'IOSFODNN7EXAMPLE')}.`,
+      `Maps uses ${shaped('AI', 'za', 'SyD01234567890abcdefghijklmnopqrstu')}.`,
       'Session eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW.',
       'The dav mount is https://jo:app-password-here@cloud.example/dav/.',
       'Set password = correcthorsebatterystaple9 in the env file.',
       // The key types the narrower list admitted while the capture path redacted them, which is
       // the gate being weaker than the entrance it exists to be at least as strong as.
-      '-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIFHDBOBgkqhkiG9w0BBQ0wQTAp\n-----END ENCRYPTED PRIVATE KEY-----',
-      '-----BEGIN DSA PRIVATE KEY-----\nMIIBuwIBAAKBgQD1kGjTBqbWqM9B\n-----END DSA PRIVATE KEY-----',
-      '-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAA\n-----END PRIVATE KEY-----'
+      pem('ENCRYPTED ', 'MIIFHDBOBgkqhkiG9w0BBQ0wQTAp'),
+      pem('DSA ', 'MIIBuwIBAAKBgQD1kGjTBqbWqM9B'),
+      pem('', 'MIIEvQIBADANBgkqhkiG9w0BAQEFAA')
     ];
     const storable = [
       'Never use skateboarding metaphors in the docs.',
@@ -2638,7 +2648,7 @@ describe('memory about the owner', () => {
       url: '/v1/account/memory-block',
       headers: { cookie },
       payload: {
-        text: 'Here is my openrouter key: sk-or-v1-0123456789abcdef0123456789abcdef',
+        text: `Here is my openrouter key: ${['sk', '-or-', 'v1-', '0123456789abcdef'.repeat(2)].join('')}`,
         expectedVersion: 1
       }
     });
