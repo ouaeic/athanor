@@ -6,7 +6,11 @@
     },
     "anchor-off-by-one-repeated-evidence": {
       "cost": 1,
-      "verdict": "over-refused"
+      "verdict": "refused"
+    },
+    "anchor-off-by-one-repeated-resolvable": {
+      "cost": 0,
+      "verdict": "landed"
     },
     "anchor-off-by-one-backwards": {
       "cost": 0,
@@ -380,11 +384,11 @@
     }
   },
   "totals": {
-    "cases": 69,
-    "free": 36,
+    "cases": 70,
+    "free": 37,
     "oneTrip": 30,
     "twoTrips": 2,
-    "overRefused": 1,
+    "overRefused": 0,
     "defects": 1
   }
 }

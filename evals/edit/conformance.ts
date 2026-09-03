@@ -196,11 +196,25 @@ export const CASES: readonly ConformanceCase[] = [
   {
     id: 'anchor-off-by-one-repeated-evidence',
     group: 'anchor',
-    what: 'anchor one line late, quoting one of six identical `return null;` lines',
+    what: 'anchor one line late, and TWO identical `return null;` lines inside the correction window',
     edit: 'PUT 12:\n-    return null;\n+    return undefined;',
-    want: { kind: 'apply', after: (live) => splice(live, 11, 11, ['    return undefined;']) },
+    want: { kind: 'refuse', fixableFrom: 'content' },
     finding:
-      'THE CORRECTION INHERITS THE INCUMBENT’S UNIQUENESS REQUIREMENT. `placeWithEvidence` searches the WHOLE file for the quoted text and gives up when it is not unique, so on the repetitive file this format was bought for, the off-by-one it is proudest of correcting is a refusal instead. Searching the three lines the correction radius already allows would resolve it: within that window the text occurs once. Cheap refusal, but a needless one'
+      'THIS CASE EXPECTED THE WRONG ANSWER, and its own finding said why in a sentence that is not true. It read: "Searching the three lines the correction radius already allows would resolve it: within that window the text occurs once." Measured on the corpus file: `return null;` stands at lines 8, 11, 15, 24 and 27, and the window `placeWithEvidence` actually searches for `PUT 12` is lines 9 to 15 - which holds TWO of them, 11 and 15, both within the radius. There is no unambiguous answer to pick, and picking the nearer one would be the guess the applier says by name is the one failure that corrupts code rather than wasting a round trip. The window search the finding asked for was implemented, and the case kept failing because the case was wrong, not the code. `anchor-off-by-one-repeated-resolvable` below is the case that actually exercises it'
+  },
+  {
+    /*
+     * What the window is FOR, which the case above was mistaken for.
+     *
+     * Five identical `return null;` lines in the file, so a whole-file uniqueness search refuses.
+     * Exactly one of them inside the window this anchor is allowed to reach, so the correction is
+     * not a guess: it is the only reading the radius admits.
+     */
+    id: 'anchor-off-by-one-repeated-resolvable',
+    group: 'anchor',
+    what: 'anchor one line late on a repetitive file, with ONE match inside the correction window',
+    edit: 'PUT 16:\n-    return null;\n+    return undefined;',
+    want: { kind: 'apply', after: (live) => splice(live, 15, 15, ['    return undefined;']) }
   },
   {
     id: 'anchor-off-by-one-backwards',
