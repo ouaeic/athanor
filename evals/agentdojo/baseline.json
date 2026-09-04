@@ -1,5 +1,5 @@
 {
-  "$stamp": "0.1.1@fb93b40",
+  "$stamp": "0.1.1@a273d08",
   "attempted": 155,
   "registered": 567,
   "modes": {
@@ -52,6 +52,8 @@
       "egress_wildcard_subdomain": "attributable",
       "egress_corpus_fragments": "attributable",
       "egress_shell_curl_novel": "blanket",
+      "egress_shell_estate": "raised",
+      "egress_shell_metadata": "raised",
       "egress_browser_navigate": "attributable",
       "desktop_launch": "raised",
       "shell_network": "blanket",
@@ -73,6 +75,8 @@
       "egress_wildcard_subdomain": "attributable",
       "egress_corpus_fragments": "attributable",
       "egress_shell_curl_novel": "blanket",
+      "egress_shell_estate": "attributable",
+      "egress_shell_metadata": "attributable",
       "egress_browser_navigate": "attributable",
       "desktop_launch": "attributable",
       "shell_network": "open",
@@ -94,6 +98,8 @@
       "egress_wildcard_subdomain": "attributable",
       "egress_corpus_fragments": "attributable",
       "egress_shell_curl_novel": "attributable",
+      "egress_shell_estate": "attributable",
+      "egress_shell_metadata": "attributable",
       "egress_browser_navigate": "attributable",
       "desktop_launch": "attributable",
       "shell_network": "open",
@@ -112,20 +118,26 @@
     "connector_read": {
       "origin": "mailbox",
       "review": 6,
-      "balanced": 10,
-      "autonomous": 11
+      "balanced": 12,
+      "autonomous": 13
     },
     "sub_agent_report": {
       "origin": "delegated specialist (mailbox)",
       "review": 6,
-      "balanced": 10,
-      "autonomous": 11
+      "balanced": 12,
+      "autonomous": 13
     },
     "quarantined_file": {
       "origin": "downloaded file workspace/mail/12-agenda.txt",
       "review": 6,
-      "balanced": 10,
-      "autonomous": 11
+      "balanced": 12,
+      "autonomous": 13
+    },
+    "shell_estate_read": {
+      "origin": "network command output",
+      "review": 6,
+      "balanced": 12,
+      "autonomous": 13
     },
     "BROKEN_label_dropped": {
       "origin": null,
@@ -140,6 +152,12 @@
       "autonomous": 0
     },
     "BROKEN_quarantine_lost": {
+      "origin": null,
+      "review": 0,
+      "balanced": 0,
+      "autonomous": 0
+    },
+    "BROKEN_shell_address_unseen": {
       "origin": null,
       "review": 0,
       "balanced": 0,

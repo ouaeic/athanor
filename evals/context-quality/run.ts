@@ -251,6 +251,10 @@ if (flag('accept')) {
 const regressions = flag('ci')
   ? measurements.flatMap((measurement) => check(measurement, baseline))
   : [];
+// Printed, every one. A regression that only moved the exit code sent a reader to the JSON and
+// the report module to learn which row had moved - an exit 1 with nothing beside it is a rig that
+// knows the answer and keeps it.
+for (const regression of regressions) process.stderr.write(`REGRESSION: ${regression}\n`);
 // `rigFailures` counts on every run, not only under `--ci`: a baseline regression is a decision
 // about athanor, but a degenerate control or a frozen probe column means the numbers printed above
 // are not measurements at all, and that is not something a flag should be able to hide.

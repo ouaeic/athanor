@@ -3411,12 +3411,19 @@ export const fixtures: readonly Fixture[] = [
       verification: 'not_applicable',
       // Every one of the six threw, which is the shape being bounded.
       noFailedTools: false,
-      // Six failures, one reason, in the words the model was given - which is what "the same way"
-      // in this row's own title means and what nothing here could previously check.
-      toolFailures: Array.from(
-        { length: 6 },
-        () => 'patch_conflict:No read of workspace/importer.py is on record for this task'
-      ),
+      // Six failures, one reason - which is what "the same way" in this row's own title means and
+      // what nothing here could previously check. The WORDS change after the first: the editor's
+      // own bound on a patch resent byte for byte answers the second and every later one with the
+      // fix rather than the reason again (`apps/worker/src/edit/refusals.ts`), and the code the
+      // loop's counter is keyed on stays `patch_conflict` throughout, which is why the six are
+      // still one failure to the guard this row is about.
+      toolFailures: [
+        'patch_conflict:No read of workspace/importer.py is on record for this task',
+        ...Array.from(
+          { length: 5 },
+          () => 'patch_conflict:This is byte-for-byte the patch just refused'
+        )
+      ],
       // And nothing reached disk in six attempts, which is the other half of "the same way": a
       // bound that stopped a turn after it had quietly landed one of the six would be a different
       // and much worse mechanism, and no expectation above could tell the two apart.

@@ -45,7 +45,7 @@
       "verdict": "landed"
     },
     "anchor-overlapping-ranges": {
-      "cost": 2,
+      "cost": 1,
       "verdict": "refused"
     },
     "anchor-outside-the-window": {
@@ -69,6 +69,170 @@
       "verdict": "refused"
     },
     "anchor-relocation-unique": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "anchored-at-n": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "anchored-off-by-one": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "anchored-off-by-five": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "anchored-prefix-eight-chars": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "anchored-weak-brace-neighbour-resolves": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "anchored-leaked-prefix-same-number": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "anchored-curly-quotes": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "anchored-crlf-patch": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "anchored-on-cut": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "anchored-on-insert": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "anchored-on-insert-after": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "anchored-on-block": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "anchored-renumbered-after-own-patch": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "anchored-body-identical-no-op": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "anchored-file-shifted-under-read": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "anchored-insert-after-shifted-weak-anchor": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "anchored-same-prefix-line-inserted-above": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "anchored-en-dash": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "anchored-no-break-space": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "body-row-leaked-prefix-same-number": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "body-row-genuine-digit-colon-content": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "body-row-genuine-digit-bar-grid": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "plain-range-carries-the-nudge": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "anchored-off-by-six-unique-elsewhere": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "anchored-two-candidates-in-window": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "anchored-nowhere": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "anchored-weak-brace-ambiguous": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "anchored-leaked-prefix-other-number": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "retry-identical-after-refusal": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "retry-identical-small-file-names-file_write": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "attack-anchor-matches-live-not-ledger": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "attack-anchor-hit-outside-shown-window": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "attack-two-hits-nearest-not-chosen": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "attack-weak-anchor-neighbour-mismatch": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "attack-ledger-relocates-anchor-disagrees": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "attack-prefix-strip-cannot-move": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "attack-cut-relocation-past-shown-end": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "attack-weak-anchor-stale-neighbour-is-ambiguity": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "attack-whole-quote-past-shown-end": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "attack-whole-quote-matches-live-not-ledger": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "attack-body-never-folded": {
       "cost": 0,
       "verdict": "landed"
     },
@@ -116,9 +280,25 @@
       "cost": 1,
       "verdict": "refused"
     },
-    "body-on-the-operation-row": {
+    "body-dropped-plus-mid-body-more-plus-rows-follow": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "body-unmarked-trailing-prose": {
       "cost": 1,
       "verdict": "refused"
+    },
+    "body-unmarked-mid-row-is-the-next-operation": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "body-unmarked-mid-row-is-a-malformed-operation": {
+      "cost": 1,
+      "verdict": "refused"
+    },
+    "body-on-the-operation-row": {
+      "cost": 0,
+      "verdict": "landed"
     },
     "body-unmarked-content-that-reads-as-a-verb": {
       "cost": 1,
@@ -141,14 +321,22 @@
       "verdict": "refused"
     },
     "body-minus-rows-under-an-insert": {
-      "cost": 1,
-      "verdict": "refused"
+      "cost": 0,
+      "verdict": "landed"
     },
     "body-evidence-does-not-match": {
-      "cost": 1,
-      "verdict": "refused"
+      "cost": 0,
+      "verdict": "landed"
     },
     "ws-crlf-file": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "ws-crlf-file-anchored-two-rows": {
+      "cost": 0,
+      "verdict": "landed"
+    },
+    "ws-crlf-file-edited-on-its-last-line": {
       "cost": 0,
       "verdict": "landed"
     },
@@ -157,8 +345,8 @@
       "verdict": "landed"
     },
     "ws-tabs-in-evidence": {
-      "cost": 1,
-      "verdict": "refused"
+      "cost": 0,
+      "verdict": "landed"
     },
     "ws-no-trailing-newline": {
       "cost": 0,
@@ -177,7 +365,7 @@
       "verdict": "refused"
     },
     "register-pasted-into-its-own-cut": {
-      "cost": 2,
+      "cost": 1,
       "verdict": "refused"
     },
     "register-pasted-twice": {
@@ -338,7 +526,7 @@
         "chars": 374
       },
       "byLine": {
-        "cost": 2,
+        "cost": 1,
         "chars": 158
       }
     },
@@ -378,16 +566,16 @@
         "chars": 399
       },
       "byLine": {
-        "cost": 2,
+        "cost": 1,
         "chars": 66
       }
     }
   },
   "totals": {
-    "cases": 70,
-    "free": 37,
-    "oneTrip": 30,
-    "twoTrips": 2,
+    "cases": 117,
+    "free": 69,
+    "oneTrip": 47,
+    "twoTrips": 0,
     "overRefused": 0,
     "defects": 1
   }
