@@ -46,6 +46,7 @@ import {
 } from './edit-arm.js';
 import { TASKS as CORPUS, fileText, type EditTask } from '../edit/corpus.js';
 import { renderNumbered, toLines } from '../../apps/worker/src/edit/format.js';
+import { providerModelIdOf } from '../bench/provider.js';
 import { settingsFor } from './arms.js';
 
 /** Four characters to the token, the same conversion `measure.ts` and `evals/harness.ts` use. */
@@ -260,7 +261,9 @@ export const ratesFor = async (
   const rates: Rate[] = [];
   const missing: string[] = [];
   for (const model of models) {
-    const found = byId.get(model);
+    // A tier is named by its release id, `openrouter/<slug>`, and the catalogue lists it under the
+    // slug alone - the same cut the request itself is sent with. The row keeps the release id.
+    const found = byId.get(providerModelIdOf(model));
     const prompt = Number(found?.pricing?.prompt);
     const completion = Number(found?.pricing?.completion);
     if (!found || !Number.isFinite(prompt) || !Number.isFinite(completion)) {

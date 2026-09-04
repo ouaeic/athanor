@@ -15,6 +15,7 @@
  *   pnpm eval:arms -- --edit                the edit axis: its sample, its bound, and what a run costs
  *   pnpm eval:arms -- --edit --live         and the price at the provider's own current rates
  *   pnpm eval:arms -- --edit --live --yes   and the only half that can settle it, which costs money
+ *   pnpm eval:arms -- --edit --live --yes --model <release id>   one tier of the owner's choosing
  *
  * Deliberately not part of `pnpm check`, for the reason `evals/run.ts` gives about itself: a
  * behavioural suite that blocks every commit is one somebody deletes the first week it is wrong
@@ -30,6 +31,7 @@ import { fileURLToPath } from 'node:url';
 
 import { ARMS, EDIT_ARM, ROOT_ARM } from './arms.js';
 import { EDIT_TASKS, runEditLive } from './edit-arm.js';
+import { gatewayTransport } from './edit-live.js';
 import { estimateCalls, resolveKey, runLive, WEAK_TIER } from './live.js';
 import { measureAll } from './measure.js';
 import {
@@ -48,11 +50,14 @@ import {
   type Baseline
 } from './report.js';
 import { ratesFor, type Rates } from './price.js';
+import { PROVIDER_KEY_VARIABLES, providerCredential } from '../bench/provider.js';
 import { TASKS, sampleOf } from './tasks.js';
 import { cutSizes, incumbentEntry, readCut } from './wire.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const baselinePath = path.join(here, 'baseline.json');
+/** The route the price catalogue is about; a run sent anywhere else is priced by a stranger. */
+const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 
 const argument = (name: string): string | undefined => {
   const index = process.argv.indexOf(`--${name}`);
@@ -125,8 +130,16 @@ if (flag('edit')) {
    * it. Neither is invented, and where there is no second tier this refuses to spend rather than
    * printing half a decision.
    */
+  /*
+   * `--model` names the weak tier, and names it as a release id - `openrouter/z-ai/glm-5.3-flash`
+   * - because that is what the gateway seam takes. Given explicitly, one tier is allowed to run:
+   * a run the owner chose the model for is a run they are reading as one row, and the verdict
+   * below still says which half of the rule it can and cannot settle.
+   */
+  const chosen = argument('model');
+  const weak = chosen ?? WEAK_TIER;
   const strong = argument('strong') ?? process.env.AI_DEFAULT_MODEL;
-  const tiers = [WEAK_TIER, ...(strong && strong !== WEAK_TIER ? [strong] : [])];
+  const tiers = [weak, ...(strong && strong !== weak ? [strong] : [])];
   const seeds = Number(argument('seeds') ?? 1);
   const incumbent = incumbentEntry();
   process.stdout.write(
@@ -135,7 +148,8 @@ if (flag('edit')) {
   );
   process.stdout.write(renderEditSample());
   process.stdout.write(renderEditBound());
-  const key = resolveKey(flag('live'), process.env);
+  // The same two variables, in the same order, as the transport below reads them.
+  const key = resolveKey(flag('live'), process.env, PROVIDER_KEY_VARIABLES);
   /*
    * The rate is fetched whether or not anybody is about to spend, because the decision this rig
    * exists to inform is taken BEFORE the spend and there is no point pricing a run only for
@@ -146,12 +160,18 @@ if (flag('edit')) {
   const rates: Rates | null = flag('no-price') ? null : await ratesFor(tiers);
   process.stdout.write(renderEditPrice(measureAll(editArms, cut), editArms, tiers, seeds, rates));
   process.stdout.write(`  ${key.note}\n`);
+  const credential = flag('live') ? providerCredential(process.env) : null;
+  if (rates && credential && credential.baseUrl !== OPENROUTER_BASE_URL)
+    process.stdout.write(
+      `  The price above is read from the OpenRouter catalogue; this run is routed to ${credential.baseUrl} through ${credential.variable}, whose rates that catalogue does not carry.\n`
+    );
   if (flag('live') && key.apiKey) {
-    if (tiers.length < 2)
+    if (tiers.length < 2 && !chosen)
       process.stdout.write(
         '\n  ONE TIER. The pre-registered rule says both, so this run cannot settle the question and\n' +
           '  nothing here will spend money on half of it. Set AI_DEFAULT_MODEL to the model this\n' +
-          '  installation actually runs, or pass --strong <model id>.\n'
+          '  installation actually runs, pass --strong <model id>, or name the one tier you want\n' +
+          '  with --model <release id> to run it as one row.\n'
       );
     else if (!flag('yes'))
       process.stdout.write(
@@ -163,12 +183,27 @@ if (flag('edit')) {
       // mark and pays for twice.
       let done = 0;
       const total = editArms.length * EDIT_TASKS.length * tiers.length * seeds;
-      const rows = await runEditLive(key.apiKey, editArms, EDIT_TASKS, tiers, seeds, (row) => {
-        done += 1;
-        process.stderr.write(
-          `  [${done}/${total}] ${row.armId} ${row.tier} ${row.taskId} ${row.correct ? 'correct' : 'wrong'} ${row.editApplied}/${row.editCalls} applied${row.unrecovered ? `, ${row.unrecovered} unrecovered` : ''}\n`
+      if (tiers.length < 2)
+        process.stdout.write(
+          `\n  ONE TIER, by request: ${weak}. The rule needs both; this run informs and does not settle.\n`
         );
-      });
+      // Through athanor's own gateway - the worker's client, retry policy and usage parsing - so
+      // the row carries the same request the worker would have sent. @see `edit-live.ts`.
+      const transport = gatewayTransport(process.env);
+      const rows = await runEditLive(
+        key.apiKey,
+        editArms,
+        EDIT_TASKS,
+        tiers,
+        seeds,
+        (row) => {
+          done += 1;
+          process.stderr.write(
+            `  [${done}/${total}] ${row.armId} ${row.tier} ${row.taskId} ${row.correct ? 'correct' : 'wrong'} ${row.editApplied}/${row.editCalls} applied${row.unrecovered ? `, ${row.unrecovered} unrecovered` : ''}${row.anchorPresent ? `, ${row.anchorPresent} anchored` : ''}\n`
+          );
+        },
+        transport
+      );
       const scores = scoreEditArms(rows);
       process.stdout.write(renderEditLive(scores));
       process.stdout.write(renderEditVerdict(scores));

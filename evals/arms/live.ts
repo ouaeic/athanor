@@ -42,21 +42,30 @@ export interface KeyState {
   readonly fatal: boolean;
 }
 
+/**
+ * `variables` is which environment variables may answer, in order of preference. The general half
+ * posts to one provider with a bare fetch and reads the one variable that route takes; the edit
+ * axis sends through the worker's own gateway, which reads the worker's two variables in the
+ * worker's order (`evals/bench/provider.ts`), and the gate that decides whether the run starts
+ * has to read the same ones or a box configured the worker's way is told it has no key.
+ */
 export const resolveKey = (
   requested: boolean,
-  environment: NodeJS.ProcessEnv = process.env
+  environment: NodeJS.ProcessEnv = process.env,
+  variables: readonly string[] = ['OPENROUTER_API_KEY']
 ): KeyState => {
-  const apiKey = environment.OPENROUTER_API_KEY ?? '';
+  const answered = variables.find((name) => (environment[name] ?? '').trim() !== '');
+  const apiKey = answered === undefined ? '' : (environment[answered] as string);
   if (!requested)
     return {
       apiKey: null,
       note: 'live run: not requested. The offline half prices what each arm carries on every request, exactly; it cannot say whether an arm finishes the work, and a tie in its table means the instrument is blind there rather than that the candidate is free.',
       fatal: false
     };
-  if (apiKey) return { apiKey, note: 'live run: OPENROUTER_API_KEY found.', fatal: false };
+  if (apiKey) return { apiKey, note: `live run: ${answered} found.`, fatal: false };
   return {
     apiKey: null,
-    note: 'live run: --live was asked for and OPENROUTER_API_KEY is not set. This repository holds no provider credential by design; export the key the way scripts/live-drill.mjs takes it.',
+    note: `live run: --live was asked for and ${variables.join(' or ')} is not set. This repository holds no provider credential by design; export the key the way scripts/live-drill.mjs takes it.`,
     fatal: !!environment.GITHUB_ACTIONS
   };
 };
@@ -98,11 +107,11 @@ export interface RunRow {
   readonly error?: string;
 }
 
-interface Usage {
+export interface Usage {
   readonly prompt_tokens?: number;
   readonly completion_tokens?: number;
 }
-interface Choice {
+export interface Choice {
   readonly message?: {
     readonly content?: string | null;
     readonly tool_calls?: Array<{
@@ -112,18 +121,39 @@ interface Choice {
   };
 }
 
-const openAiTools = (armId: string) =>
+/** A tool as it travels on the wire, which is the one shape every transport below has to accept. */
+export interface WireTool {
+  readonly type: 'function';
+  readonly function: {
+    readonly name: string;
+    readonly description: string;
+    readonly parameters: Record<string, unknown>;
+  };
+}
+
+/**
+ * The wire, as a function: one request out, one choice and one usage frame back.
+ *
+ * It is a parameter of `runOne` so the edit axis can carry its calls through athanor's own
+ * gateway - the worker's client, retry policy and usage parsing - while the general half keeps
+ * the bare fetch it has always used. Both answer in the same shape, so the loop that reads the
+ * answer does not know which one it is holding. @see `edit-live.ts`.
+ */
+export type Transport = (
+  apiKey: string,
+  model: string,
+  messages: readonly unknown[],
+  tools: readonly WireTool[]
+) => Promise<{ readonly choice: Choice; readonly usage: Usage | null }>;
+
+const openAiTools = (armId: string): WireTool[] =>
   toolsFor(settingsFor(armId)).map((tool) => ({
     type: 'function' as const,
     function: { name: tool.name, description: tool.description, parameters: tool.parameters }
   }));
 
-const post = async (
-  apiKey: string,
-  model: string,
-  messages: readonly unknown[],
-  tools: ReturnType<typeof openAiTools>
-): Promise<{ choice: Choice; usage: Usage | null }> => {
+/** The bare fetch against the one route the key names, which is what the general half runs. */
+export const openRouterTransport: Transport = async (apiKey, model, messages, tools) => {
   const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
     headers: { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' },
@@ -160,7 +190,8 @@ export const runOne = async (
   // The world is a parameter because the edit arm asks the same questions of a different one. It
   // is reset here rather than by the caller: a world the caller has to remember to reset is a world
   // whose first forgotten reset shows up as one arm reading a file the previous arm wrote.
-  oracle: Oracle = WORLD_ORACLE
+  oracle: Oracle = WORLD_ORACLE,
+  transport: Transport = openRouterTransport
 ): Promise<RunRow> => {
   oracle.reset();
   const settings = settingsFor(armId);
@@ -179,7 +210,7 @@ export const runOne = async (
   let sawAnything = false;
   try {
     while (modelCalls < MAX_STEPS && !completed) {
-      const { choice, usage } = await post(apiKey, model, messages, tools);
+      const { choice, usage } = await transport(apiKey, model, messages, tools);
       modelCalls += 1;
       if (usage?.prompt_tokens === undefined || usage?.completion_tokens === undefined)
         metered = false;

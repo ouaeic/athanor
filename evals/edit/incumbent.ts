@@ -391,8 +391,9 @@ export const PAIRED: readonly PairedIntent[] = [
     path: QUEUE,
     file: queue,
     live: queue.replace(/\n/g, '\r\n'),
+    // The new line ends the way every line of this file ends.
     after: splice(queue.replace(/\n/g, '\r\n'), 14, 14, [
-      "    logger.error('job expired', { id: job.id });"
+      "    logger.error('job expired', { id: job.id });\r"
     ]),
     patches: [
       {

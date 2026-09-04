@@ -13,7 +13,7 @@
  * costs a round trip is barely better than the wrong edit it prevented.
  */
 import { beforeEach, describe, expect, it } from 'vitest';
-import { applyEdit } from './apply.js';
+import { applyEdit, NO_ANCHOR_NOTE } from './apply.js';
 import { blockAt } from './block.js';
 import { normaliseLine, renderNumbered, sameLine, toLines } from './format.js';
 import { parseEdit } from './parse.js';
@@ -276,6 +276,84 @@ describe('forgiveness - a model that reached for a unified diff', () => {
     read();
     expect(refused('CUT 3.=4\n+  return null;')).toMatch(/only deletes/);
   });
+
+  /*
+   * A body row that begins with none of `+ - space`, in the MIDDLE of a body with at least one `+`
+   * row after it, has exactly one reading: a `+` the model dropped. Forgiving it changes nothing
+   * about which lines are touched, so it lands with a note. Watched live, three times in one turn
+   * from a cheap model, with blank `+` rows above it and a docstring row below it.
+   */
+  it('forgives a mid-body row whose + was dropped when + rows follow it, and says so', () => {
+    read();
+    const result = apply('PUT >4:\n+\n+\ndef nth_prime(n):\n+    """Return the n-th prime."""');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      const out = toLines(result.text);
+      expect(out.slice(4, 8)).toEqual([
+        '',
+        '',
+        'def nth_prime(n):',
+        '    """Return the n-th prime."""'
+      ]);
+      expect(out).toHaveLength(14);
+      expect(result.notes.join(' ')).toMatch(/patch row 4 .*dropped/);
+    }
+  });
+
+  it('still refuses an unmarked row at the END of a body, where prose after a patch lives', () => {
+    read();
+    expect(
+      refused('PUT 3:\n+  if (!job) return undefined;\nThat replaces the null return.')
+    ).toMatch(/not an operation: That replaces/);
+  });
+
+  it('still reads a mid-body row that is a real operation as the next operation', () => {
+    read();
+    const out = toLines(
+      applied('PUT 3:\n+  if (!job) return undefined;\nPUT 8:\n+  if (!queue) return 0;')
+    );
+    expect(out[2]).toBe('  if (!job) return undefined;');
+    expect(out[7]).toBe('  if (!queue) return 0;');
+    expect(out).toHaveLength(10);
+    // A CUT and a paste are operations too, whatever follows them: the CUT owns the + row under
+    // it and refuses it, and the paste takes no body, so the + row under it is an orphan.
+    expect(refused('PUT 3:\n+  a;\nCUT 8.=9\n+  b;')).toMatch(/only deletes/);
+    expect(refused('PUT 3:\n+  a;\nPUT >8 @none\n+  b;')).toMatch(/no operation above it/);
+  });
+
+  /*
+   * The next operation, misspelt. `PUT line 15:` is an operation the model reached for and got
+   * wrong, and a body that swallowed it would land the words as text on line 4, leave line 15
+   * untouched and report success - visible only in the write echo. A row whose verb is upper-case
+   * and stands alone or before whitespace is an operation attempt, and it is refused by name at
+   * its own row, exactly as it is when it stands under nothing.
+   */
+  it('still refuses a malformed operation under a body by name, rather than landing it as text', () => {
+    read();
+    expect(refused('PUT 3:\n+a\nPUT line 15:\n+b')).toMatch(/PUT needs a line number/);
+    expect(refused('PUT 3:\n+a\nPUT L15:\n+b')).toMatch(/PUT needs a line number/);
+    expect(refused('PUT 3:\n+a\nPUT\n+b')).toMatch(/PUT needs a line number/);
+    expect(refused('PUT 3:\n+a\nPUT15:\n+b')).toMatch(/not an operation: PUT15:/);
+    expect(refused('PUT 3:\n+a\nREM 5\n+b')).toMatch(/cannot delete one/);
+    expect(refused('PUT 3:\n+a\nDEL 5\n+b')).toMatch(/cannot delete one/);
+    expect(refused('PUT 3:\n+a\nMV a b\n+b')).toMatch(/cannot rename or move one/);
+    const result = parseEdit('PUT 3:\n+a\nPUT line 15:\n+b');
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.failure.row).toBe(3);
+  });
+
+  it('still forgives a code row that merely begins with a verb', () => {
+    read();
+    for (const row of ['put(x)', 'cut = 3', 'del cache[key]', 'rm_stale = True', 'move(a, b)']) {
+      const out = toLines(applied(`PUT 3:\n+a\n${row}\n+b`));
+      expect(out.slice(2, 5), row).toEqual(['a', row, 'b']);
+    }
+  });
+
+  it('still ends a body at a blank row, which is how operations are spaced out', () => {
+    read();
+    expect(refused('PUT 3:\n+  a;\n\n+  b;')).toMatch(/a body row with no operation above it/);
+  });
 });
 
 describe('forgiveness - a model that pasted the whole diff', () => {
@@ -389,7 +467,8 @@ describe('forgiveness - a miscounted anchor', () => {
     const twins = ['const x = 1;', '  same();', '  same();', 'const y = 2;'].join('\n');
     read(twins);
     const message = refused('PUT 1:\n-  same();\n+  same(2);', twins);
-    expect(message).toMatch(/appears more than once/);
+    // Both candidates are named, and neither is chosen: nearest is a guess.
+    expect(message).toMatch(/2 and 3/);
     expect(message).toMatch(/1:const x = 1;/);
     // Untouched, which is the assertion that matters: an ambiguous correction writes nothing.
     expect(applyEdit(PATH, 'PUT 1:\n+const x = 2;', twins, readsOf(TASK, PATH)).ok).toBe(true);
@@ -407,7 +486,7 @@ describe('forgiveness - a miscounted anchor', () => {
     const message = refused(
       'PUT 3:\n-  if (!job) throw new Error();\n+  if (!job) return undefined;'
     );
-    expect(message).toMatch(/not in the file/);
+    expect(message).toMatch(/is not in workspace\/queue\.ts at all/);
     expect(message).toMatch(/3: {2}if \(!job\) return null;/);
   });
 
@@ -562,15 +641,34 @@ describe('the bounds that stop a patch corrupting a file', () => {
    */
   it('shows a whole valid patch on every parse failure, whichever rule was tripped', () => {
     read();
-    for (const bad of [
-      'PUT 3:+from ivl.intervals import merge',
-      'def test_split_empty():',
-      'CUT'
-    ]) {
+    for (const bad of ['PUT 3: junk after the colon', 'def test_split_empty():', 'CUT']) {
       const message = refused(bad);
       expect(message, bad).toContain('PUT 12.=14:');
       expect(message, bad).toContain('marker per body row');
     }
+  });
+
+  /*
+   * Of the three shapes that earned the example above, this one is answered without it. Watched on
+   * the box twice in one turn: a body on the operation's own row that does not parse leaves the
+   * next real body row to be read as an operation, so one habit costs two refusals. The text after
+   * the colon is the first body row, and the note says where the body belongs.
+   */
+  it('reads a body written on the operation row as the first body row', () => {
+    read();
+    const result = apply('PUT 3:+  if (!job) return undefined;');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(toLines(result.text)[2]).toBe('  if (!job) return undefined;');
+      expect(toLines(result.text)).toHaveLength(10);
+      expect(result.notes.join(' ')).toMatch(/text after the colon/);
+    }
+    // And with more body rows below it, all of them land in order.
+    const out = toLines(applied('PUT 3:+  a;\n+  b;'));
+    expect(out[2]).toBe('  a;');
+    expect(out[3]).toBe('  b;');
+    // Only a marker may follow the colon; anything else is still not an operation.
+    expect(refused('PUT 3: junk')).toMatch(/unexpected "junk"/);
   });
 
   it('refuses a block that does not close within the lines that were shown', () => {
@@ -727,13 +825,404 @@ describe('the resident cost', () => {
 
   it('says nothing about what the parser forgives', () => {
     /*
-     * Deliberate, and the reason is that a leniency is not a feature. Documenting `-` rows would
-     * spend resident bytes teaching a longer way to write the same edit, and the model would then
-     * write it that way on every hunk - which is the whole cost the format exists to remove. The
-     * leniency is for a model that reaches for a habit anyway.
+     * Deliberate, and the reason is that a leniency is not a feature. Documenting the unified-diff
+     * hunk or the lower-case verb would spend resident bytes teaching a longer way to write the
+     * same edit, and the model would then write it that way on every hunk - which is the whole
+     * cost the format exists to remove. The leniency is for a model that reaches for a habit
+     * anyway. The one `-` row IS taught, and it is taught because it is not a leniency: it is the
+     * anchor that closes the format's one hole, and the test below holds the spec to it.
      */
     for (const leniency of ['@@', 'unified', 'lower-case', 'optional'])
       expect(EDIT_FORMAT_SPEC.toLowerCase()).not.toContain(leniency.toLowerCase());
+  });
+
+  it('teaches the one - row, as a prefix, and shows it in the example', () => {
+    expect(EDIT_FORMAT_SPEC).toMatch(/One - row first/);
+    expect(EDIT_FORMAT_SPEC).toMatch(/8\+ characters/);
+    expect(EDIT_FORMAT_SPEC).toContain('\n  -  if (!job) return null;\n');
+  });
+});
+
+describe('the content anchor', () => {
+  it('applies where the anchor holds at the addressed line, with no note about it', () => {
+    read();
+    const result = apply('PUT 3:\n-  if (!job) return null;\n+  if (!job) return undefined;');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(toLines(result.text)[2]).toBe('  if (!job) return undefined;');
+      expect(result.notes).toEqual([]);
+    }
+  });
+
+  it('corrects the number when the anchor is one line away, and says so', () => {
+    read();
+    const result = apply('PUT 4:\n-  if (!job) ret\n+  if (!job) return undefined;');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(toLines(result.text)[2]).toBe('  if (!job) return undefined;');
+      expect(toLines(result.text)[3]).toBe('  return job.payload;');
+      expect(result.notes.join(' ')).toMatch(/off by 1; the edit was applied at 3/);
+    }
+  });
+
+  it('reaches five lines when nothing nearer carries the anchor', () => {
+    read();
+    // Line 8 addressed, anchor is line 3 and nowhere else.
+    const result = apply('PUT 8:\n-  if (!job) return\n+  if (!job) return undefined;');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(toLines(result.text)[2]).toBe('  if (!job) return undefined;');
+      expect(toLines(result.text)[7]).toBe('  if (!queue) return null;');
+      expect(result.notes.join(' ')).toMatch(/off by 5/);
+    }
+  });
+
+  it('asks the near ring first, so a second copy four lines out does not refuse an off-by-one', () => {
+    // Line 3 and line 8 both begin `  if (!`; addressed 4, the anchor is one line away at 3 and
+    // four lines away at 8. One wide window would see both and refuse; the near ring sees one.
+    read();
+    const result = apply('PUT 4:\n-  if (!\n+  changed;');
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(toLines(result.text)[2]).toBe('  changed;');
+  });
+
+  it('shifts a range by the anchor and never widens it', () => {
+    read();
+    const out = toLines(applied('PUT 4.=5:\n-  if (!job) return null;\n+  merged;'));
+    // 3-4 replaced, not 3-5: the range said two lines and two lines went.
+    expect(out[2]).toBe('  merged;');
+    expect(out[3]).toBe('};');
+    expect(out).toHaveLength(9);
+  });
+
+  it('refuses two candidates in the ring, naming both, and chooses neither', () => {
+    const twins = [
+      'const x = 1;',
+      '  return x + 1;',
+      '  fill();',
+      '  return x + 1;',
+      'const y = 2;'
+    ].join('\n');
+    read(twins);
+    const message = refused('PUT 3:\n-  return x + 1;\n+  return x + 2;', twins);
+    expect(message).toMatch(/2 and 4/);
+    expect(message).toMatch(/2: {2}return x \+ 1;/);
+  });
+
+  it('names the one line elsewhere that carries the anchor, and asks for the body against it', () => {
+    read();
+    const message = refused('PUT 1:\n-  return queue.length\n+  return 0;');
+    expect(message).toMatch(/at 9, but you addressed 1/);
+    expect(message).toMatch(/Send the same body against 9/);
+    expect(message).toMatch(/1:export const drain/);
+  });
+
+  it('refuses a weak anchor whose neighbours do not read as the ledger recorded them', () => {
+    read();
+    // `}` is on lines 5 and 10, and the file has drifted around both: line 4 and line 9 changed.
+    const drifted = toLines(FILE)
+      .map((line, index) => (index === 3 || index === 8 ? '  // changed' : line))
+      .join('\n');
+    const message = refused('PUT 7:\n-};\n+// closed', drifted);
+    expect(message).toMatch(/nothing was written/);
+    expect(message).toMatch(/7:export const size/);
+  });
+
+  it('accepts a weak anchor where its neighbours still read as recorded', () => {
+    read();
+    const result = apply('PUT >6:\n-};\n+// after the first function');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(toLines(result.text)[5]).toBe('// after the first function');
+      expect(result.notes.join(' ')).toMatch(/off by 1/);
+    }
+  });
+
+  it('checks the anchor where the ledger relocated the span, never around the old number', () => {
+    read();
+    const shifted = `// a\n// b\n// c\n${FILE}`;
+    // Line 3 moved to 6; the anchor quotes line 4's text, so it disagrees where the span went.
+    const message = refused('PUT 3:\n-  return job.payload;\n+  changed;', shifted);
+    expect(message).toMatch(/had moved to 6/);
+    expect(message).toMatch(/6: {2}if \(!job\) return null;/);
+  });
+
+  it('refuses to correct onto a line no read has shown, naming it', () => {
+    recordRead(TASK, PATH, 1, toLines(FILE).slice(0, 4).join('\n'));
+    const message = refused('PUT 2:\n-  return queue.length;\n+  return 0;');
+    expect(message).toMatch(/9, has never been shown to you/);
+    expect(message).toMatch(/2: {2}const job/);
+  });
+
+  it('refuses a corrected range that would run past the lines shown', () => {
+    recordRead(TASK, PATH, 1, toLines(FILE).slice(0, 4).join('\n'));
+    // 3-4 shifted by the anchor at 4 would be 4-5, and 5 was never displayed.
+    const message = refused('PUT 3.=4:\n-  return job.payload;\n+  a;\n+  b;');
+    expect(message).toMatch(/runs past the lines you have been shown/);
+    expect(message).toMatch(/3: {2}if \(!job\) return null;/);
+  });
+
+  it('never lands where the live file carries the anchor but the ledger does not', () => {
+    read();
+    // Somebody wrote the anchor text onto line 2 after the read. The ledger says line 2 is
+    // `const job = queue.shift();`, so line 2 is not a candidate whatever the file says now.
+    const drifted = toLines(FILE)
+      .map((line, index) => (index === 1 ? '  if (!job) throw new Error();' : line))
+      .join('\n');
+    const message = refused('PUT 3:\n-  if (!job) throw\n+  changed;', drifted);
+    expect(message).toMatch(/did not when you read it/);
+    expect(toLines(drifted)[1]).toBe('  if (!job) throw new Error();');
+  });
+
+  it('folds curly quotes, dashes and tabs on the anchor and never on the body', () => {
+    const tabbed = 'export const run = () => {\n\tconst label = "a - b";\n\treturn label;\n};';
+    read(tabbed);
+    const result = apply('PUT 2:\n-  const label = “a – b”;\n+\tconst label = “a – b”;', tabbed);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(toLines(result.text)[1]).toBe('\tconst label = “a – b”;');
+  });
+
+  it('reads a patch whose rows end in CR', () => {
+    read();
+    const out = toLines(applied('PUT 3:\r\n-  if (!job) return null;\r\n+  changed;\r\n'));
+    expect(out[2]).toBe('  changed;');
+    expect(out).toHaveLength(10);
+  });
+
+  it('strips a leaked line-number prefix only where the number is the row it stands at', () => {
+    read();
+    const result = apply('PUT 3:\n-3:  if (!job) return null;\n+3:  if (!job) return undefined;');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(toLines(result.text)[2]).toBe('  if (!job) return undefined;');
+      expect(result.notes.join(' ')).toMatch(/leaked line-number prefix/);
+    }
+    // A different number is left byte for byte, and cannot move the edit.
+    const message = refused('PUT 3:\n-2:  const job = queue.shift();\n+  changed;');
+    expect(message).toMatch(/not in workspace\/queue\.ts at all/);
+    const literal = applied('PUT 3:\n+2:  literal;');
+    expect(toLines(literal)[2]).toBe('2:  literal;');
+  });
+
+  it('anchors a CUT, an insert and a block on line N', () => {
+    read();
+    expect(toLines(applied('CUT 7.=10\n-export const size'))).toHaveLength(6);
+    // Addressed one line late: the range moves with the anchor and keeps its length, so 7-9 go
+    // and the closing brace at 10 stays - a range is never widened to what it "must have meant".
+    const late = toLines(applied('CUT 8.=10\n-export const size'));
+    expect(late).toHaveLength(7);
+    expect(late[6]).toBe('};');
+    expect(toLines(applied('PUT <7:\n-export const size\n+// size'))[6]).toBe('// size');
+    expect(toLines(applied('PUT 6*:\n-export const size\n+export const size = () => 0;'))).toEqual([
+      ...toLines(FILE).slice(0, 6),
+      'export const size = () => 0;'
+    ]);
+    // Two - rows under an insert are still the deletion nobody asked for.
+    expect(refused('PUT >7:\n-a\n-b\n+c')).toMatch(/deletion nobody asked for/);
+  });
+
+  it('notes a body that already reads that way, and applies it', () => {
+    read();
+    const result = apply('PUT 3:\n-  if (!job) return null;\n+  if (!job) return null;');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.text).toBe(FILE);
+      expect(result.notes.join(' ')).toMatch(/already read that way/);
+    }
+  });
+
+  it('nudges a patch with no anchor at all, once, and not one that has one', () => {
+    read();
+    const plain = apply('PUT 3:\n+  a;\nPUT 8:\n+  b;');
+    expect(plain.ok).toBe(true);
+    if (plain.ok) expect(plain.notes).toEqual([NO_ANCHOR_NOTE]);
+    const anchored = apply('PUT 3:\n-  if (!job)\n+  a;\nPUT 8:\n+  b;');
+    expect(anchored.ok).toBe(true);
+    if (anchored.ok) expect(anchored.notes).not.toContain(NO_ANCHOR_NOTE);
+  });
+
+  it('names the merged spelling when two operations overlap', () => {
+    read();
+    expect(refused('PUT 3.=4:\n+a\nPUT 4:\n+b')).toMatch(/PUT 3\.=4:/);
+  });
+
+  it('reports the new numbering, cumulatively, so the next patch needs no read', () => {
+    read();
+    const result = apply('PUT 3:\n+  a;\n+  b;\n+  c;\nCUT 8.=9');
+    expect(result.ok).toBe(true);
+    if (result.ok)
+      expect(result.renumbered).toEqual([
+        'lines after 3 are now +2',
+        'lines after 9 are now 0',
+        'net: lines after 9 are now 0'
+      ]);
+    const one = apply('PUT >5:\n+// tail');
+    expect(one.ok).toBe(true);
+    if (one.ok) expect(one.renumbered).toEqual(['lines after 5 are now +1']);
+    const none = apply('PUT 3:\n+  a;');
+    expect(none.ok).toBe(true);
+    if (none.ok) expect(none.renumbered).toEqual([]);
+  });
+
+  /*
+   * THE TWO-PATCH PROOF. Read lines 1-57, add a line at 12, then address line 41 in the NEW
+   * numbering with an anchor and no read between: the ledger moved by the same amount the
+   * result reported, so the anchor holds where the number says and nothing is corrected.
+   */
+  it('lets the next patch address the new numbers, anchored, with no read between', () => {
+    const long = Array.from({ length: 57 }, (_, line) => `line ${line + 1} of the file;`).join(
+      '\n'
+    );
+    read(long);
+    const once = apply('PUT 12:\n-line 12 of\n+line 12 of the file;\n+line 12 and a half;', long);
+    expect(once.ok).toBe(true);
+    if (!once.ok) return;
+    expect(once.renumbered).toEqual(['lines after 12 are now +1']);
+    recordWrite(TASK, PATH, once.text, once.changed);
+    // Old line 40 is new line 41, and the anchor quotes what is there now.
+    const twice = apply('PUT 41:\n-line 40 of the\n+line 40, changed;', once.text);
+    expect(twice.ok).toBe(true);
+    if (twice.ok) {
+      expect(toLines(twice.text)[40]).toBe('line 40, changed;');
+      expect(twice.notes).toEqual([]);
+    }
+  });
+});
+
+describe('the anchor against a file that moved, and the rows that only look like a display', () => {
+  it('applies a correct anchor where the ledger followed the addressed lines', () => {
+    read();
+    // Two lines prepended: line 3 is now line 5, and the anchor quotes exactly what was read at 3.
+    const shifted = `// added\n// added\n${FILE}`;
+    const result = apply(
+      'PUT 3:\n-  if (!job) return null;\n+  if (!job) return undefined;',
+      shifted
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(toLines(result.text)[4]).toBe('  if (!job) return undefined;');
+      expect(result.notes.join(' ')).toMatch(/3 had moved to 5/);
+    }
+  });
+
+  it('applies a weak anchor on an insert where the ledger followed the line it hangs off', () => {
+    read();
+    const shifted = `// added\n${FILE}`;
+    const result = apply('PUT >5:\n-};\n+// after drain', shifted);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(toLines(result.text)[6]).toBe('// after drain');
+  });
+
+  it('follows the target past a same-prefix line inserted directly above it', () => {
+    read();
+    const grown = toLines(FILE);
+    grown.splice(2, 0, '  if (!job) log();');
+    const result = apply('PUT 3:\n-  if (!job) return null;\n+  changed;', grown.join('\n'));
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(toLines(result.text)[2]).toBe('  if (!job) log();');
+      expect(toLines(result.text)[3]).toBe('  changed;');
+    }
+  });
+
+  it('names both braces when the one meant has a stale neighbour and a further one has not', () => {
+    const braces = [
+      'function a() {',
+      '  if (x) {',
+      '    y();',
+      '    z();',
+      '  }',
+      '  if (w) {',
+      '    v();',
+      '  }',
+      '}'
+    ].join('\n');
+    read(braces);
+    const drifted = braces.replace('    z();', '    z(1);');
+    const result = apply('PUT 6:\n-  }\n+  } // end if x', drifted);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.refusal.message).toMatch(/lines 5 and 8 near 6/);
+      expect(result.refusal.message).toMatch(/beside 5 the file has changed/);
+      expect(result.refusal.message).toMatch(/8: {2}}/);
+    }
+    expect(toLines(drifted)[7]).toBe('  }');
+  });
+
+  it('leaves the leading digits of a row alone where the file begins that line with digits', () => {
+    const schedule = '1:00 open\n2:00 standup\n3:00 review\n4:00 lunch\n5:00 close';
+    read(schedule);
+    const result = apply('PUT 4:\n-4:00 lunch\n+4:15 lunch', schedule);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(toLines(result.text)[3]).toBe('4:15 lunch');
+      expect(result.notes.join(' ')).not.toMatch(/leaked/);
+    }
+    const grid = '1|a|b\n2|c|d\n3|e|f';
+    read(grid);
+    expect(toLines(applied('PUT 2:\n+2|C|D', grid))[1]).toBe('2|C|D');
+    const tabs = '1\tone\n2\ttwo';
+    read(tabs);
+    expect(toLines(applied('PUT 2:\n+2\tTWO', tabs))[1]).toBe('2\tTWO');
+  });
+
+  it('keeps a CRLF file CRLF on the rows it inserts, and bare on a last line with no newline', () => {
+    read();
+    const crlf = FILE.replace(/\n/g, '\r\n');
+    const result = apply(
+      'PUT 3:\n-  if (!job) return null;\n+  if (!job) return undefined;\n+  // two rows',
+      crlf
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      const rows = result.text.split('\n');
+      expect(rows[2]).toBe('  if (!job) return undefined;\r');
+      expect(rows[3]).toBe('  // two rows\r');
+      expect(rows.slice(0, -1).every((row) => row.endsWith('\r'))).toBe(true);
+      expect(rows[rows.length - 1]).toBe('};');
+    }
+    // No trailing newline: the last line carries no CR, so the new last line carries none.
+    const short = 'alpha\r\nbeta\r\ngamma';
+    read(short);
+    expect(applied('PUT 3:\n-gamma\n+GAMMA', short)).toBe('alpha\r\nbeta\r\nGAMMA');
+    // A last line that ends in a bare CR is the file's own, and an edit above it leaves it alone.
+    const bareTail = 'alpha\r\nbeta\r';
+    read(bareTail);
+    expect(applied('PUT 1:\n+ALPHA', bareTail)).toBe('ALPHA\r\nbeta\r');
+    // Appending after the last line of a CRLF file that ends in a newline.
+    const ending = 'alpha\r\nbeta\r\n';
+    read(ending);
+    expect(applied('PUT >2:\n+gamma', ending)).toBe('alpha\r\nbeta\r\ngamma\r\n');
+    // A file that already mixes its endings is left to mix them.
+    const mixed = 'alpha\r\nbeta\ngamma\r\n';
+    read(mixed);
+    expect(applied('PUT 2:\n+BETA', mixed)).toBe('alpha\r\nBETA\ngamma\r\n');
+  });
+
+  it('refuses a whole quote whose corrected range runs past the lines shown', () => {
+    recordRead(TASK, PATH, 1, toLines(FILE).slice(0, 4).join('\n'));
+    // Quoting lines 4 and 5 under PUT 3.=4: the correction would end on 5, never displayed.
+    const message = refused('PUT 3.=4:\n-  return job.payload;\n-};\n+  merged;');
+    expect(message).toMatch(/4-5 runs past the lines you have been shown/);
+    expect(message).toMatch(/3: {2}if \(!job\) return null;/);
+  });
+
+  it('refuses a whole quote that matches the live file where the ledger read differently', () => {
+    read();
+    const drifted = toLines(FILE)
+      .map((line, index) => (index === 4 ? '}; // rewritten' : line))
+      .join('\n');
+    const message = refused('PUT 3.=4:\n-  return job.payload;\n-}; // rewritten\n+  x;', drifted);
+    expect(message).toMatch(/did not read that way when you read it/);
+    expect(message).toMatch(/5:}; \/\/ rewritten/);
+  });
+
+  it('refuses a whole quote that disagrees with where the ledger followed the lines', () => {
+    read();
+    const shifted = `// added\n// added\n${FILE}`;
+    const message = refused('PUT 3.=4:\n-  return job.payload;\n-};\n+  x;', shifted);
+    expect(message).toMatch(/had moved to 5-6/);
+    expect(message).toMatch(/5: {2}if \(!job\) return null;/);
   });
 });
 

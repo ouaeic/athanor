@@ -60,6 +60,7 @@ const pad = (value: string | number, width: number): string => String(value).pad
 
 const GROUPS: readonly Group[] = [
   'anchor',
+  'anchored',
   'header',
   'body',
   'whitespace',

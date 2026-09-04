@@ -24,6 +24,12 @@
  * somebody having remembered to run a second file reports a confident wrong number on the machine
  * where they did not.
  */
+import {
+  anchorPrefixes,
+  foldAnchor,
+  isWeakAnchor,
+  STRONG_ANCHOR_CHARS
+} from '../../apps/worker/src/edit/format.js';
 import { carriesLiveText, namesAShape, runConformance, sourceOf, CASES } from './conformance.js';
 import { assertIncumbentRetired, PAIRED } from './incumbent.js';
 
@@ -61,6 +67,28 @@ export const selfTest = (): string[] => {
     problems.push('namesAShape accepts prose that names no spelling');
   if (!namesAShape('expected PUT N:, PUT N.=M:, CUT N.=M'))
     problems.push('namesAShape rejects the sentence the parser actually sends');
+
+  /*
+   * 2b. The anchor fold and the weak-anchor threshold, on inputs whose answers are known. Every
+   * `anchored` row rests on these two functions, and a fold that quietly widened - or a threshold
+   * that quietly moved - would move every row in the group without any case saying so.
+   */
+  if (foldAnchor('“x” – ‘y’ z') !== '"x" - \'y\' z')
+    problems.push('foldAnchor does not fold curly quotes, the en dash and the no-break space');
+  if (foldAnchor('\t\tfoo') !== foldAnchor('    foo'))
+    problems.push('foldAnchor does not put tab and space indentation in one class');
+  if (foldAnchor('foo') === foldAnchor('  foo'))
+    problems.push('foldAnchor folds an unindented line onto an indented one');
+  if (foldAnchor('return a - b') !== 'return a - b')
+    problems.push('foldAnchor changes a line that is already ASCII');
+  if (!isWeakAnchor('}') || !isWeakAnchor('return;') || !isWeakAnchor(''))
+    problems.push('isWeakAnchor lets a brace, a seven-character row or a blank stand alone');
+  if (isWeakAnchor('return 1;') || STRONG_ANCHOR_CHARS !== 8)
+    problems.push('the weak-anchor threshold is not eight non-space characters');
+  if (!anchorPrefixes('  if (!job)', '\tif (!job) return null;'))
+    problems.push('anchorPrefixes rejects a folded prefix');
+  if (anchorPrefixes('  if (!job) return null;', '  if (!job)'))
+    problems.push('anchorPrefixes accepts an anchor longer than the line');
 
   // 3. The process-global snapshot store must not carry anything between cases.
   const second = runConformance();

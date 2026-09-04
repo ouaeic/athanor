@@ -77,9 +77,10 @@
  * table prints input tokens beside output tokens for that reason. Netting the two silently would
  * be arguing for a conclusion.
  */
-import { applyEdit } from '../../apps/worker/src/edit/apply.js';
+import { applyEdit, NO_ANCHOR_NOTE } from '../../apps/worker/src/edit/apply.js';
 import { blockAt } from '../../apps/worker/src/edit/block.js';
 import { renderNumbered, toLines } from '../../apps/worker/src/edit/format.js';
+import { parseEdit } from '../../apps/worker/src/edit/parse.js';
 import {
   forgetPath,
   readsOf,
@@ -91,7 +92,8 @@ import { countOccurrences } from '../../apps/worker/src/values.js';
 import { FILES, TASKS as CORPUS, fileText, type Change, type EditTask } from '../edit/corpus.js';
 import { minimalUnique, region } from '../edit/encode.js';
 import { settingsFor } from './arms.js';
-import { runOne, type RunRow } from './live.js';
+import { openRouterTransport, runOne, type RunRow, type Transport } from './live.js';
+import type { LineChange } from '../../apps/worker/src/edit/snapshots.js';
 import type { ArmTask } from './tasks.js';
 import type { Oracle, OracleResult } from './world.js';
 
@@ -452,7 +454,24 @@ export interface EditCall {
   readonly refusedAs?: string;
   /** Leniencies the applier reported, verbatim. Non-empty means a malformed emission that landed. */
   readonly notes: readonly string[];
+  /** The call carried at least one `-` row anchor - the taught form. */
+  readonly anchored?: boolean;
+  /** The call applied with an anchor and left the file other than the task asked: an echo miss. */
+  readonly echoMiss?: boolean;
 }
+
+/** What the applier's notes say, in the words it uses, so a count here cannot drift from them. */
+const CORRECTED = /the number was off by/;
+const PREFIX_STRIPPED = /leaked line-number prefix/;
+/**
+ * Notes that report something about a well-formed patch rather than forgive a malformed one: the
+ * nudge on a patch with no anchor, and a body that already read that way. Neither is the harness
+ * absorbing a mistake, so neither counts as forgiveness - a clean call carrying the nudge is still
+ * a clean call.
+ */
+const NOT_FORGIVENESS = [NO_ANCHOR_NOTE, /already read that way/];
+const forgave = (note: string): boolean =>
+  !NOT_FORGIVENESS.some((plain) => (typeof plain === 'string' ? note === plain : plain.test(note)));
 
 /**
  * Refused calls with no later applied call in the same turn.
@@ -494,6 +513,8 @@ let worlds = 0;
 export class EditWorld implements Oracle {
   private files = new Map<string, string>();
   private taskId = '';
+  /** Where a correct turn leaves each file, so an applied-but-wrong anchored edit can be counted. */
+  private wanted = new Map<string, string>();
   /** Every call to the edit tool, in order, whether or not it landed. */
   calls: EditCall[] = [];
   refusals: EditRefusal[] = [];
@@ -512,11 +533,44 @@ export class EditWorld implements Oracle {
 
   /** Applied calls the harness had to forgive a malformed spelling to accept. */
   get editForgiven(): number {
-    return this.calls.filter((call) => call.applied && call.notes.length).length;
+    return this.calls.filter((call) => call.applied && call.notes.some(forgave)).length;
   }
 
   get unrecovered(): number {
     return unrecoveredIn(this.calls);
+  }
+
+  /*
+   * The five numbers the anchored form is measured by, per model, which nothing offline can give:
+   * how often a model writes the `-` row at all, how often the row corrected a number, how often
+   * it refused as ambiguous or absent, how often an anchored edit still left the wrong file, and
+   * how often a display prefix had to be taken off a row. Every one is read from the applier's
+   * own notes and refusal kinds, never inferred from the file.
+   */
+  get anchorPresent(): number {
+    return this.calls.filter((call) => call.anchored).length;
+  }
+
+  get corrected(): number {
+    return this.calls.filter((call) => call.notes.some((note) => CORRECTED.test(note))).length;
+  }
+
+  get refusedAmbiguous(): number {
+    return this.calls.filter((call) => !call.applied && call.refusedAs === 'evidence').length;
+  }
+
+  get echoMiss(): number {
+    return this.calls.filter((call) => call.echoMiss).length;
+  }
+
+  get prefixStripped(): number {
+    return this.calls.filter((call) => call.notes.some((note) => PREFIX_STRIPPED.test(note)))
+      .length;
+  }
+
+  /** What the task wants `path` to read afterwards. Set before the run, read by `lineEdit`. */
+  expect(path: string, text: string): void {
+    this.wanted.set(path, text);
   }
 
   reset(): void {
@@ -529,6 +583,7 @@ export class EditWorld implements Oracle {
     this.taskId = `arms-edit-${worlds}`;
     this.calls = [];
     this.refusals = [];
+    this.wanted = new Map();
   }
 
   /** The file as the turn left it, for scoring. `null` where the turn deleted or renamed it. */
@@ -565,8 +620,21 @@ export class EditWorld implements Oracle {
     return renderNumbered(toLines(body), 1);
   }
 
-  private note(applied: boolean, tool: string, kind?: string, notes: readonly string[] = []): void {
-    this.calls.push({ applied, notes, ...(kind ? { refusedAs: kind } : {}) });
+  private note(
+    applied: boolean,
+    tool: string,
+    kind?: string,
+    notes: readonly string[] = [],
+    anchored?: boolean,
+    echoMiss?: boolean
+  ): void {
+    this.calls.push({
+      applied,
+      notes,
+      ...(kind ? { refusedAs: kind } : {}),
+      ...(anchored ? { anchored } : {}),
+      ...(echoMiss ? { echoMiss } : {})
+    });
     if (!applied) this.refusals.push({ tool, kind: kind ?? 'refused' });
   }
 
@@ -668,13 +736,14 @@ export class EditWorld implements Oracle {
         'file_patch takes a `patches` array of {path, edit}, where edit addresses the line numbers file_read returned. Nothing was applied.'
       );
     }
-    const staged = new Map<string, string>();
+    const staged = new Map<string, { text: string; changed: LineChange[] }>();
     const problems: string[] = [];
     const notes: string[] = [];
+    let anchored = false;
     for (const one of patches) {
       const path = text(one.path);
       const edit = text(one.edit);
-      const before = staged.get(path) ?? this.files.get(path);
+      const before = staged.get(path)?.text ?? this.files.get(path);
       if (before === undefined) {
         problems.push(
           `${path} could not be read. Check the path with files_list before patching it.`
@@ -685,24 +754,32 @@ export class EditWorld implements Oracle {
         problems.push('Every patch requires a path and a non-empty edit.');
         continue;
       }
+      // Read off the parser rather than off the notes: an anchor that holds at its line leaves no
+      // note at all, and that silent case is the one the anchor-present rate is mostly made of.
+      const parsed = parseEdit(edit);
+      if (parsed.ok && parsed.ops.some((op) => 'anchor' in op && op.anchor !== undefined))
+        anchored = true;
       const result = applyEdit(path, edit, before, readsOf(this.taskId, path));
       if (!result.ok) {
         problems.push(`${result.refusal.kind}: ${result.refusal.message}`);
         continue;
       }
       notes.push(...result.notes);
-      staged.set(path, result.text);
+      staged.set(path, { text: result.text, changed: [...result.changed] });
     }
     if (!staged.size) {
       const kind = /^([a-z_]+):/.exec(problems[0] ?? '')?.[1] ?? 'refused';
-      this.note(false, 'file_patch', kind);
+      this.note(false, 'file_patch', kind, [], anchored);
       return ok(problems.join('\n\n') || 'No patch could be applied.');
     }
+    let echoMiss = false;
     for (const [path, after] of staged) {
-      this.files.set(path, after);
-      recordWrite(this.taskId, path, after);
+      this.files.set(path, after.text);
+      recordWrite(this.taskId, path, after.text, after.changed);
+      const wanted = this.wanted.get(path);
+      if (anchored && wanted !== undefined && after.text !== wanted) echoMiss = true;
     }
-    this.note(true, 'file_patch', undefined, notes);
+    this.note(true, 'file_patch', undefined, notes, anchored, echoMiss);
     return ok(
       `Patched ${[...staged.keys()].join(', ')}.${notes.length ? `\n${notes.join('\n')}` : ''}${
         problems.length ? ` ${problems.length} patch(es) did not apply: ${problems.join(' ')}` : ''
@@ -838,6 +915,16 @@ export interface EditRow extends RunRow {
   readonly editApplied: number;
   readonly editForgiven: number;
   readonly unrecovered: number;
+  /** Edit calls that carried a `-` row anchor. The rate at which a model writes the taught form. */
+  readonly anchorPresent: number;
+  /** Applied calls where the anchor corrected a miscounted number. */
+  readonly corrected: number;
+  /** Calls refused because the anchor was ambiguous or absent - the `evidence` kind. */
+  readonly refusedAmbiguous: number;
+  /** Anchored calls that applied and still left the file other than the task asked. */
+  readonly echoMiss: number;
+  /** Calls where a display prefix was taken off a row. */
+  readonly prefixStripped: number;
   readonly refusals: readonly EditRefusal[];
 }
 
@@ -855,10 +942,18 @@ export const runEditOne = async (
   model: string,
   armId: string,
   task: EditArmTask,
-  seed: number
+  seed: number,
+  transport: Transport = openRouterTransport
 ): Promise<EditRow> => {
   const world = new EditWorld(settingsFor(armId).edit);
-  const row = await runOne(apiKey, model, armId, task, seed, {}, world);
+  // `runOne` resets the world before the first call, so what the task wants is handed over
+  // through a hook the reset does not clear rather than set once here and lost.
+  const wanting = world.reset.bind(world);
+  world.reset = (): void => {
+    wanting();
+    world.expect(task.renamedTo ?? task.path, task.wanted);
+  };
+  const row = await runOne(apiKey, model, armId, task, seed, {}, world, transport);
   const score = scoreEdit(world, task);
   return {
     ...row,
@@ -868,6 +963,11 @@ export const runEditOne = async (
     editApplied: world.editApplied,
     editForgiven: world.editForgiven,
     unrecovered: world.unrecovered,
+    anchorPresent: world.anchorPresent,
+    corrected: world.corrected,
+    refusedAmbiguous: world.refusedAmbiguous,
+    echoMiss: world.echoMiss,
+    prefixStripped: world.prefixStripped,
     refusals: world.refusals
   };
 };
@@ -878,14 +978,15 @@ export const runEditLive = async (
   tasks: readonly EditArmTask[],
   tiers: readonly string[],
   seeds: number,
-  onRow: (row: EditRow) => void = () => {}
+  onRow: (row: EditRow) => void = () => {},
+  transport: Transport = openRouterTransport
 ): Promise<readonly EditRow[]> => {
   const rows: EditRow[] = [];
   for (const tier of tiers)
     for (const armId of armIds)
       for (const task of tasks)
         for (let seed = 0; seed < seeds; seed += 1) {
-          const row = await runEditOne(apiKey, tier, armId, task, seed);
+          const row = await runEditOne(apiKey, tier, armId, task, seed, transport);
           rows.push(row);
           onRow(row);
         }

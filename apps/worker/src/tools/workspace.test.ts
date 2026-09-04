@@ -3,7 +3,7 @@ import { AthanorError } from '@athanor/core';
 import { type ModelToolCall } from '@athanor/model-gateway';
 import { countPostEditPaths, executeWorkspaceTool, forgetPostEditChecks } from './workspace.js';
 import { POST_EDIT_CHECKED_LANGUAGES } from './diagnostics.js';
-import { forgetReads, recordRead, toLines } from '../edit/index.js';
+import { forgetReads, forgetRefusals, recordRead, toLines } from '../edit/index.js';
 import { RECENT_TOOL_OUTPUT_CHARS, serializeToolResultForModel } from '../context.js';
 import { type AgentState } from '../agent-state.js';
 import { CHECKPOINT_EXEMPT_TOOLS } from '../turn-bounds.js';
@@ -66,6 +66,9 @@ interface Applied {
  */
 beforeEach(() => {
   forgetPostEditChecks();
+  // The repeated-patch record is keyed by task and path too, and every helper here drives the same
+  // task id: without this, a patch one test refuses is "the patch just refused" in the next.
+  forgetRefusals();
 });
 
 const patch = async (
@@ -192,6 +195,90 @@ describe('the diff a model reaches for when it does not reach for this one', () 
         }
       ])
     ).rejects.toThrow(/removes no lines, but this hunk carries - rows/);
+  });
+});
+
+describe('what the arm hands back beside the echo', () => {
+  it('reports the new numbering, so the next patch to the file needs no read', async () => {
+    const { result } = await patch([
+      { path: 'workspace/queue.ts', edit: 'PUT <3:\n+// a\n+// b\n' }
+    ]);
+    expect(result.renumbered).toEqual(['workspace/queue.ts: lines after 2 are now +2']);
+    const same = await patch([
+      { path: 'workspace/queue.ts', edit: 'PUT 4:\n+  const job = queue.pop();\n' }
+    ]);
+    expect(same.result.renumbered).toBeUndefined();
+  });
+
+  it('lets the next patch address the new numbers with an anchor, and no read between', async () => {
+    const { run, written } = await turn({ 'workspace/queue.ts': QUEUE }, [
+      { name: 'file_read', args: { path: 'workspace/queue.ts' } }
+    ]);
+    const first = await run('file_patch', {
+      patches: [{ path: 'workspace/queue.ts', edit: 'PUT <3:\n+// a\n+// b\n' }]
+    });
+    expect(first.renumbered).toEqual(['workspace/queue.ts: lines after 2 are now +2']);
+    // Old line 4 is new line 6; the anchor quotes what is there and nothing is corrected.
+    const second = await run('file_patch', {
+      patches: [
+        {
+          path: 'workspace/queue.ts',
+          edit: 'PUT 6:\n-  const job = queue.shift\n+  const job = queue.pop();\n'
+        }
+      ]
+    });
+    expect(second).toMatchObject({ patchCount: 1 });
+    expect(second.notes).toBeUndefined();
+    expect(toLines(written.get('workspace/queue.ts') ?? '')[5]).toBe('  const job = queue.pop();');
+  });
+
+  it('answers the same refused bytes a second time with the fix, and names file_write', async () => {
+    const { run, written } = await turn({ 'workspace/queue.ts': QUEUE }, [
+      { name: 'file_read', args: { path: 'workspace/queue.ts' } }
+    ]);
+    const edit = 'PUT 4:\n-  const nothing = here();\n+  const job = queue.pop();\n';
+    const first = run('file_patch', { patches: [{ path: 'workspace/queue.ts', edit }] });
+    await expect(first).rejects.toThrow(/is not in workspace\/queue\.ts at all/);
+    const second = run('file_patch', { patches: [{ path: 'workspace/queue.ts', edit }] });
+    await expect(second).rejects.toThrow(/byte-for-byte the patch just refused/);
+    await expect(second).rejects.toThrow(/The one change that fixes it: drop the - row/);
+    // Eleven lines, all of them shown, so the whole-file way out is named.
+    await expect(second).rejects.toThrow(/send the whole 11-line file with file_write/);
+    // And the file's text is still in the second refusal, so the retry is still a re-emit.
+    await expect(second).rejects.toThrow(/4: {2}const job = queue\.shift\(\);/);
+    expect(written.get('workspace/queue.ts')).toBe(QUEUE);
+  });
+
+  it('names the first syntax fault of what it just wrote, as a note and never a refusal', async () => {
+    const { written, result } = await patch([
+      { path: 'workspace/queue.ts', edit: 'PUT 4:\n+  const job = queue.shift(;\n' }
+    ]);
+    // Written regardless: a file mid-change is allowed to be unparseable between two patches.
+    expect(toLines(written.get('workspace/queue.ts') ?? '')[3]).toBe('  const job = queue.shift(;');
+    const notes = (result.notes ?? []) as string[];
+    const fault = notes.find((note) => note.startsWith('syntax workspace/queue.ts line 4:'));
+    expect(fault).toBeDefined();
+    expect(fault).toMatch(/\n4: {2}const job = queue\.shift\(;/);
+    expect(result).toMatchObject({ patchCount: 1 });
+  });
+
+  it('says nothing about syntax when the file still parses, or cannot be parsed here', async () => {
+    const fine = await patch([
+      { path: 'workspace/queue.ts', edit: 'PUT 4:\n+  const job = queue.pop();\n' }
+    ]);
+    expect(((fine.result.notes ?? []) as string[]).some((note) => note.startsWith('syntax'))).toBe(
+      false
+    );
+    const json = await patch(
+      [{ path: 'workspace/acl.json', edit: 'PUT 2:\n+  "b": 2,\n' }],
+      { 'workspace/acl.json': '{\n  "a": 1\n}\n' },
+      ['workspace/acl.json']
+    );
+    const faults = ((json.result.notes ?? []) as string[]).filter((note) =>
+      note.startsWith('syntax')
+    );
+    expect(faults).toHaveLength(1);
+    expect(faults[0]).toMatch(/^syntax workspace\/acl\.json line 3:/);
   });
 });
 

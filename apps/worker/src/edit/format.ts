@@ -93,3 +93,90 @@ export const numberedWindow = (
 /** `41` for a single line, `41-48` for a run - the spelling every message in this module uses. */
 export const sayRange = (from: number, to: number): string =>
   from === to ? `${from}` : `${from}-${to}`;
+
+/**
+ * How many non-space characters an anchor needs before it can find a line on its own.
+ *
+ * Below this a `-` row is a lone brace, a `return;`, a blank - text that stands on a dozen lines
+ * of any file - and matching it against the file would be matching nothing. Such an anchor is
+ * still accepted, but only where the lines beside it also read as the ledger recorded them, which
+ * is the one piece of evidence a short row cannot carry by itself.
+ */
+export const STRONG_ANCHOR_CHARS = 8;
+
+/**
+ * The characters a serialiser, a chat surface or a keyboard swaps for their ASCII neighbours.
+ *
+ * Curly quotes, the dash family and the no-break space render as the ASCII character they stand
+ * in for, so a model that copied a line out of its own context cannot see that it sent a
+ * different byte. They are folded on BOTH sides of an anchor comparison and never in a body: an
+ * anchor only has to find a line, and a body is the text that lands.
+ */
+const LOOKALIKES: ReadonlyArray<readonly [RegExp, string]> = [
+  [/[‘’‚‛′]/g, "'"],
+  [/[“”„‟″]/g, '"'],
+  [/[‐‑‒–—―−]/g, '-'],
+  [/\u00A0/g, ' ']
+];
+
+/**
+ * A line as an anchor comparison sees it - and ONLY an anchor comparison.
+ *
+ * Trailing whitespace goes the way it goes everywhere here. Then the lookalikes above, and then the
+ * whole run of leading whitespace collapses to one tab, so a `-` row retyped with spaces finds a
+ * tab-indented line: leading whitespace is content in the file and stays content in every body
+ * row, but a row whose only job is to say WHICH line is meant does not need to spell the
+ * indentation right to say it. Nothing here is edit distance, and nothing here ever will be:
+ * the field's measured record of fuzzy anchors is that they either never fire or corrupt files.
+ */
+export const foldAnchor = (line: string): string => {
+  let out = normaliseLine(line);
+  for (const [pattern, ascii] of LOOKALIKES) out = out.replace(pattern, ascii);
+  return out.replace(/^[ \t]+/, '\t');
+};
+
+/** Whether an anchor is too short to find a line on its own. @see STRONG_ANCHOR_CHARS */
+export const isWeakAnchor = (anchor: string): boolean =>
+  foldAnchor(anchor).replace(/\s/g, '').length < STRONG_ANCHOR_CHARS;
+
+/**
+ * Whether `anchor` is the start of `line`, once both are folded.
+ *
+ * A prefix and not an equality, because the spec asks for the START of the line: a model that
+ * quotes eight characters has said which line it means, and asking it to type the rest is asking
+ * it to pay for the quoted editor this format replaced. A blank anchor matches only a blank line.
+ */
+export const anchorPrefixes = (anchor: string, line: string): boolean => {
+  const wanted = foldAnchor(anchor);
+  const folded = foldAnchor(line);
+  return wanted === '' ? folded === '' : folded.startsWith(wanted);
+};
+
+/** Whether a line begins the way a numbered display begins: digits, then `:`, `|` or a tab. */
+export const looksNumbered = (line: string): boolean => /^\d+(?::|\||\t)/.test(line);
+
+/**
+ * A row that begins with the display's own line number, and the text behind it.
+ *
+ * `12:    return null;` copied straight out of a read, or `12|` and `12<tab>` from the displays
+ * other tools use. The prefix is only taken off when the number is the one the row was already
+ * addressed at - `expected` - because then it says nothing the operation row did not say. A row
+ * whose number disagrees is left byte for byte as it came: it may be a real line beginning with
+ * digits, and a stripped prefix that moved an edit would be worse than any refusal.
+ *
+ * `standing` is what the file itself holds at that line, when the caller knows. A file whose line
+ * 4 reads `4:00 lunch` - a schedule, a verse reference, a ratio table, a `4|` grid row - has
+ * lines that begin the way a display begins, and a row copied from it is content that only looks
+ * leaked. So a prefix is never taken off where the line it lands on already carries one: the
+ * digits at the front of that line are evidence the digits at the front of the row are text.
+ */
+export const stripLeakedPrefix = (
+  row: string,
+  expected: number,
+  standing?: string
+): { readonly text: string; readonly stripped: boolean } => {
+  const leaked = /^(\d+)(?::|\||\t)([\s\S]*)$/.exec(row);
+  if (!leaked || Number(leaked[1]) !== expected) return { text: row, stripped: false };
+  if (standing !== undefined && looksNumbered(standing)) return { text: row, stripped: false };
+  return { text: leaked[2] as string, stripped: true };
+};

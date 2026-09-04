@@ -50,6 +50,7 @@ import { MAX_STEPS, resolveKey, runOne, type RunRow } from './live.js';
 import { measureArm } from './measure.js';
 import { renderEditVerdict, scoreArms, scoreEditArms } from './report.js';
 import { cost, dollars, estimateArm, ratesFor, type Rate } from './price.js';
+import { PROVIDER_KEY_VARIABLES } from '../bench/provider.js';
 import { TASKS, sampleOf, type ArmTask } from './tasks.js';
 import {
   EDIT_TOOL,
@@ -335,6 +336,32 @@ expect(
 expect(
   resolveKey(true, inCi).fatal,
   'asked for on a CI runner with no key, the live half fails - an optional check that skips silently has stopped running'
+);
+/*
+ * The edit axis sends through the worker's gateway, which reads the worker's two variables in the
+ * worker's order, so the gate that decides whether it starts reads the same two: a box with only
+ * `AI_API_KEY` set is a box the worker runs on, and it must not be told it has no key.
+ */
+const workerWay = { AI_API_KEY: 'sk-ai', OPENROUTER_API_KEY: '' } as NodeJS.ProcessEnv;
+const bothWays = { AI_API_KEY: 'sk-ai', OPENROUTER_API_KEY: 'sk-or' } as NodeJS.ProcessEnv;
+expect(
+  resolveKey(true, workerWay).apiKey === null,
+  'the general half posts to one route with a bare fetch and reads only the variable that route takes'
+);
+expect(
+  resolveKey(true, workerWay, PROVIDER_KEY_VARIABLES).apiKey === 'sk-ai' &&
+    resolveKey(true, workerWay, PROVIDER_KEY_VARIABLES).note.includes('AI_API_KEY found'),
+  "told the worker's variables, the gate accepts AI_API_KEY alone and names it"
+);
+expect(
+  resolveKey(true, bothWays, PROVIDER_KEY_VARIABLES).apiKey === 'sk-ai',
+  'with both set, the gate passes on the same variable the transport bills through - AI_API_KEY first'
+);
+expect(
+  resolveKey(true, withoutKey, PROVIDER_KEY_VARIABLES).note.includes(
+    'AI_API_KEY or OPENROUTER_API_KEY is not set'
+  ),
+  'refused for want of a key, the gate names every variable that would have answered'
 );
 
 /* ------------------------------------------- the live loop, against a provider that is not real */
@@ -787,6 +814,11 @@ const fakeScore = (
   editApplied: calls - unrecovered,
   editForgiven: 0,
   unrecovered,
+  anchorPresent: 0,
+  corrected: 0,
+  refusedAmbiguous: 0,
+  echoMiss: 0,
+  prefixStripped: 0,
   meanTokensOut: 100,
   meanTokensIn: 9000,
   meanModelCalls: 3,
@@ -902,6 +934,28 @@ expect(
     madeUp.rates[0]?.outPerMillion === 1.6 &&
     madeUp.missing.includes('c/d'),
   'per-token prices must be read as published and converted per million, and a tier the catalogue does not carry must be named rather than dropped'
+);
+/*
+ * `--model` names a tier by its release id, `openrouter/<slug>`, and the catalogue lists the
+ * model under the slug alone - the cut the request itself is sent with. Looked up under the
+ * release id, the documented command prints tokens and no price.
+ */
+const byReleaseId = await ratesFor(
+  ['openrouter/a/b'],
+  (async () =>
+    new Response(
+      JSON.stringify({
+        data: [{ id: 'a/b', pricing: { prompt: '0.0000004', completion: '0.0000016' } }]
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } }
+    )) as unknown as typeof fetch
+);
+expect(
+  byReleaseId.rates.length === 1 &&
+    byReleaseId.rates[0]?.model === 'openrouter/a/b' &&
+    byReleaseId.rates[0]?.inPerMillion === 0.4 &&
+    byReleaseId.missing.length === 0,
+  'a tier named by its release id is priced under the slug the route bills, and the row keeps the release id it was named by'
 );
 
 /*

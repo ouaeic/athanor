@@ -49,9 +49,15 @@
  * measured anywhere in athanor and is not measured here. This bounds the cost of each failure; it
  * does not weight them.
  */
-import { applyEdit } from '../../apps/worker/src/edit/apply.js';
+import { applyEdit, NO_ANCHOR_NOTE } from '../../apps/worker/src/edit/apply.js';
 import { normaliseLine, toLines } from '../../apps/worker/src/edit/format.js';
-import { forgetReads, readsOf, recordRead } from '../../apps/worker/src/edit/snapshots.js';
+import { boundRepeatedRefusal, forgetRefusals } from '../../apps/worker/src/edit/refusals.js';
+import {
+  forgetReads,
+  readsOf,
+  recordRead,
+  recordWrite
+} from '../../apps/worker/src/edit/snapshots.js';
 import { fileText } from './corpus.js';
 
 /* ------------------------------------------------------------------------------- the currency */
@@ -110,6 +116,7 @@ export const namesAShape = (message: string): boolean =>
 
 export type Group =
   | 'anchor'
+  | 'anchored'
   | 'header'
   | 'body'
   | 'whitespace'
@@ -135,13 +142,25 @@ export interface ConformanceCase {
   /** Exactly what the model emitted, byte for byte. */
   readonly edit: string;
   /**
+   * A second patch, sent after the first one landed and was recorded, addressed in the numbers the
+   * first one left. `want.after` describes the file after BOTH.
+   */
+  readonly then?: string;
+  /**
+   * The same emission sent again after its refusal, byte for byte, through the repeated-patch
+   * bound the arm applies. The row scores the SECOND refusal, which must differ from the first
+   * and match this pattern - the fix, or the whole-file way out - or it costs a read.
+   */
+  readonly retry?: RegExp;
+  /**
    * What a forgiving harness must do, declared before the run.
    *
-   * `apply` carries the file the model asked for, computed here and never by the applier. `refuse`
-   * carries which of the two message tests the refusal has to pass.
+   * `apply` carries the file the model asked for, computed here and never by the applier, and may
+   * name a note the result has to carry. `refuse` carries which of the two message tests the
+   * refusal has to pass.
    */
   readonly want:
-    | { readonly kind: 'apply'; readonly after: (live: string) => string }
+    | { readonly kind: 'apply'; readonly after: (live: string) => string; readonly note?: RegExp }
     | { readonly kind: 'refuse'; readonly fixableFrom: 'content' | 'shape' };
   /** Where this lane disagrees with what the applier does. Printed beside the row. */
   readonly finding?: string;
@@ -159,7 +178,7 @@ export interface ConformanceRow {
    * refused an emission it had the evidence to recover, so the round trip is real and avoidable.
    * A cost of 1 on an over-refusal is still a cost of 1 that nobody had to pay.
    */
-  readonly verdict: 'landed' | 'refused' | 'over-refused' | 'landed-wrong';
+  readonly verdict: 'landed' | 'landed-silent' | 'refused' | 'over-refused' | 'landed-wrong';
   /** The refusal kind, or the notes the applier reported on a landing. */
   readonly detail: string;
   readonly finding?: string;
@@ -287,7 +306,7 @@ export const CASES: readonly ConformanceCase[] = [
     edit: 'PUT 10.=12:\n+    return undefined;\nPUT 12.=13:\n+  if (job.expiresAt < Date.now()) {',
     want: { kind: 'refuse', fixableFrom: 'shape' },
     finding:
-      'the right refusal, priced at 2 by the corpus because the message names no legal spelling and quotes no file text: "write one operation covering both" is advice a person acts on and a mechanical test cannot separate from "read the file again". Adding `PUT N.=M:` to that sentence costs eight characters and moves the row to 1'
+      'the right refusal, and it names the merged spelling `PUT a.=b:` for the two ranges it saw, so the retry is a re-emit: "write one operation covering both" on its own is advice a person acts on and a mechanical test cannot separate from "read the file again"'
   },
   {
     id: 'anchor-outside-the-window',
@@ -367,6 +386,422 @@ export const CASES: readonly ConformanceCase[] = [
     want: {
       kind: 'apply',
       after: (live) => splice(live, 15, 17, ['  if (job.expiresAt < Date.now()) {'])
+    }
+  },
+
+  /* --------------------------------------------------------------- the content anchor */
+  /*
+   * THE TAUGHT FORM. One `-` row first, quoting the start of the first addressed line; a prefix of
+   * eight non-space characters is enough. It closes the format's one hole - the off-by-one with
+   * nothing in the patch saying what the model believed was at the line - and every row here
+   * prices one way of writing it, or one way of attacking the recovery it enables. The attack rows
+   * are the ones that matter: each is a patch whose anchor could be made to land somewhere the
+   * patch did not name, and each must be refused with nothing written.
+   */
+  {
+    id: 'anchored-at-n',
+    group: 'anchored',
+    what: 'the anchor holds at the addressed line',
+    edit: "PUT 14:\n-    logger.warn('job expired'\n+    logger.error('job expired', { id: job.id });",
+    want: {
+      kind: 'apply',
+      after: (live) => splice(live, 14, 14, ["    logger.error('job expired', { id: job.id });"])
+    }
+  },
+  {
+    id: 'anchored-off-by-one',
+    group: 'anchored',
+    what: 'the anchor is one line from the number',
+    edit: "PUT 15:\n-    logger.warn('job expired'\n+    logger.error('job expired', { id: job.id });",
+    want: {
+      kind: 'apply',
+      after: (live) => splice(live, 14, 14, ["    logger.error('job expired', { id: job.id });"])
+    }
+  },
+  {
+    id: 'anchored-off-by-five',
+    group: 'anchored',
+    what: 'the anchor is five lines from the number - the outer ring',
+    edit: "PUT 19:\n-    logger.warn('job expired'\n+    logger.error('job expired', { id: job.id });",
+    want: {
+      kind: 'apply',
+      after: (live) => splice(live, 14, 14, ["    logger.error('job expired', { id: job.id });"])
+    }
+  },
+  {
+    id: 'anchored-prefix-eight-chars',
+    group: 'anchored',
+    what: 'an anchor of exactly eight non-space characters',
+    edit: "PUT 15:\n-    logger.w\n+    logger.error('job expired', { id: job.id });",
+    want: {
+      kind: 'apply',
+      after: (live) => splice(live, 14, 14, ["    logger.error('job expired', { id: job.id });"])
+    }
+  },
+  {
+    id: 'anchored-weak-brace-neighbour-resolves',
+    group: 'anchored',
+    what: 'a lone brace as anchor, one line out, whose neighbours read as recorded',
+    file: 'function a() {\n  x();\n}\n\n// a\n// b\n// c\nfunction b() {\n  y();\n}\n',
+    edit: 'PUT 4:\n-}\n+}  // end a',
+    want: { kind: 'apply', after: (live) => splice(live, 3, 3, ['}  // end a']) }
+  },
+  {
+    id: 'anchored-leaked-prefix-same-number',
+    group: 'anchored',
+    what: 'the anchor row copied with its display number, `-11:    return null;`',
+    edit: 'PUT 11:\n-11:    return null;\n+    return undefined;',
+    want: { kind: 'apply', after: (live) => splice(live, 11, 11, ['    return undefined;']) }
+  },
+  {
+    id: 'anchored-curly-quotes',
+    group: 'anchored',
+    what: 'the anchor came back through a surface that curled its quotes',
+    edit: "PUT 14:\n-    logger.warn(‘job expired’\n+    logger.error('job expired', { id: job.id });",
+    want: {
+      kind: 'apply',
+      after: (live) => splice(live, 14, 14, ["    logger.error('job expired', { id: job.id });"])
+    }
+  },
+  {
+    id: 'anchored-crlf-patch',
+    group: 'anchored',
+    what: 'every row of the patch ends CRLF',
+    edit: 'PUT 11:\r\n-    return null;\r\n+    return undefined;\r\n',
+    want: { kind: 'apply', after: (live) => splice(live, 11, 11, ['    return undefined;']) }
+  },
+  {
+    id: 'anchored-on-cut',
+    group: 'anchored',
+    what: 'a CUT with an anchor on its first line',
+    edit: 'CUT 13.=15\n-  if (job.expiresAt',
+    want: { kind: 'apply', after: (live) => splice(live, 13, 15, []) }
+  },
+  {
+    id: 'anchored-on-insert',
+    group: 'anchored',
+    what: 'an insert before line N, anchored on line N',
+    edit: 'PUT <13:\n-  if (job.expiresAt\n+  // expiry',
+    want: {
+      kind: 'apply',
+      after: (live) => {
+        const out = toLines(live);
+        out.splice(12, 0, '  // expiry');
+        return out.join('\n');
+      }
+    }
+  },
+  {
+    id: 'anchored-on-insert-after',
+    group: 'anchored',
+    what: 'an insert after line N, anchored on line N',
+    edit: 'PUT >13:\n-  if (job.expiresAt\n+    // expiry',
+    want: {
+      kind: 'apply',
+      after: (live) => {
+        const out = toLines(live);
+        out.splice(13, 0, '    // expiry');
+        return out.join('\n');
+      }
+    }
+  },
+  {
+    id: 'anchored-on-block',
+    group: 'anchored',
+    what: 'a block replacement anchored on its opening line',
+    edit: 'PUT 21*:\n-export const peek\n+export const peek = (queue: Job[]): Payload | null => queue[0]?.payload ?? null;',
+    want: {
+      kind: 'apply',
+      after: (live) =>
+        splice(live, 21, 30, [
+          'export const peek = (queue: Job[]): Payload | null => queue[0]?.payload ?? null;'
+        ])
+    }
+  },
+  {
+    /*
+     * The two-patch turn, which is where a line-addressed dialect is one edit deep unless the
+     * ledger moves with the file. The first patch adds two lines at the top of `drain`; the second
+     * addresses the `logger.warn` line at its NEW number, 16, with an anchor, and no read between.
+     * The ledger has moved by the same +2 the first result reported, so nothing is corrected.
+     */
+    id: 'anchored-renumbered-after-own-patch',
+    group: 'anchored',
+    what: 'a second patch addressed in the numbering the first one reported, with no read between',
+    edit: 'PUT <5:\n+// added\n+// added',
+    then: "PUT 16:\n-    logger.warn('job expired'\n+    logger.error('job expired', { id: job.id });",
+    want: {
+      kind: 'apply',
+      after: (live) => {
+        const out = toLines(live);
+        out[13] = "    logger.error('job expired', { id: job.id });";
+        out.splice(4, 0, '// added', '// added');
+        return out.join('\n');
+      }
+    }
+  },
+  {
+    id: 'anchored-body-identical-no-op',
+    group: 'anchored',
+    what: 'one operation whose body already reads that way, beside one that changes something',
+    edit: "PUT 11:\n-    return null;\n+    return null;\nPUT 14:\n-    logger.warn\n+    logger.error('job expired', { id: job.id });",
+    want: {
+      kind: 'apply',
+      after: (live) => splice(live, 14, 14, ["    logger.error('job expired', { id: job.id });"]),
+      note: /11 already read that way/
+    }
+  },
+  {
+    id: 'anchored-file-shifted-under-read',
+    group: 'anchored',
+    what: 'two lines prepended since the read; the anchor quotes exactly the line the model read at 13',
+    drift: (text) => `// added\n// by somebody else\n${text}`,
+    edit: 'PUT 13.=15:\n-  if (job.expiresAt\n+  if (job.expiresAt < Date.now()) {',
+    want: {
+      kind: 'apply',
+      after: (live) => splice(live, 15, 17, ['  if (job.expiresAt < Date.now()) {'])
+    }
+  },
+  {
+    id: 'anchored-insert-after-shifted-weak-anchor',
+    group: 'anchored',
+    what: 'one line prepended since the read; an insert after a lone `  }`, anchored on it',
+    drift: (text) => `// added\n${text}`,
+    edit: 'PUT >12:\n-  }\n+  // ready',
+    want: {
+      kind: 'apply',
+      after: (live) => {
+        const out = toLines(live);
+        out.splice(13, 0, '  // ready');
+        return out.join('\n');
+      }
+    }
+  },
+  {
+    id: 'anchored-same-prefix-line-inserted-above',
+    group: 'anchored',
+    what: 'a line starting the same way was inserted directly above the target since the read',
+    drift: (text) => {
+      const out = toLines(text);
+      out.splice(13, 0, "    logger.warn('job nearly expired', { id: job.id });");
+      return out.join('\n');
+    },
+    edit: "PUT 14:\n-    logger.warn('job expired'\n+    logger.error('job expired', { id: job.id });",
+    want: {
+      kind: 'apply',
+      after: (live) => splice(live, 15, 15, ["    logger.error('job expired', { id: job.id });"])
+    }
+  },
+  {
+    id: 'anchored-en-dash',
+    group: 'anchored',
+    what: 'the anchor came back with an en dash where the file has a hyphen; the body has one too, and it lands as sent',
+    file: 'export const run = () => {\n  const label = "a - b";\n  return label;\n};\n',
+    edit: 'PUT 2:\n-  const label = "a – b"\n+  const label = "a – b – c";',
+    want: { kind: 'apply', after: (live) => splice(live, 2, 2, ['  const label = "a – b – c";']) }
+  },
+  {
+    id: 'anchored-no-break-space',
+    group: 'anchored',
+    what: 'the anchor came back with a no-break space where the file has a space; the body keeps its own',
+    file: 'export const run = () => {\n  const label = "a - b";\n  return label;\n};\n',
+    edit: 'PUT 2:\n-  const\u00A0label = "a - b"\n+  const label = "a\u00A0-\u00A0b";',
+    want: {
+      kind: 'apply',
+      after: (live) => splice(live, 2, 2, ['  const label = "a\u00A0-\u00A0b";'])
+    }
+  },
+  {
+    id: 'body-row-leaked-prefix-same-number',
+    group: 'body',
+    what: 'body rows copied with their display numbers, each the number the row will stand at',
+    edit: 'PUT 10.=12:\n+10:  if (job.ready === false) {\n+11:    return null;\n+12:  }',
+    want: {
+      kind: 'apply',
+      after: (live) =>
+        splice(live, 10, 12, ['  if (job.ready === false) {', '    return null;', '  }'])
+    }
+  },
+  {
+    id: 'body-row-genuine-digit-colon-content',
+    group: 'body',
+    what: 'a schedule whose line 4 begins `4:` - the anchor and the body both begin `4:` and neither is a display prefix',
+    file: '1:00 open\n2:00 standup\n3:00 review\n4:00 lunch\n5:00 close\n',
+    edit: 'PUT 4:\n-4:00 lunch\n+4:15 lunch',
+    want: { kind: 'apply', after: (live) => splice(live, 4, 4, ['4:15 lunch']) }
+  },
+  {
+    id: 'body-row-genuine-digit-bar-grid',
+    group: 'body',
+    what: 'a grid whose rows begin `N|`, replaced with a row that begins the same way',
+    file: '1|a|b\n2|c|d\n3|e|f\n',
+    edit: 'PUT 2:\n+2|C|D',
+    want: { kind: 'apply', after: (live) => splice(live, 2, 2, ['2|C|D']) }
+  },
+  {
+    id: 'plain-range-carries-the-nudge',
+    group: 'anchored',
+    what: 'a plain range with no anchor: applied, and the result says what could not be checked',
+    edit: 'PUT 11:\n+    return undefined;',
+    want: {
+      kind: 'apply',
+      after: (live) => splice(live, 11, 11, ['    return undefined;']),
+      note: new RegExp(NO_ANCHOR_NOTE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    }
+  },
+  {
+    id: 'anchored-off-by-six-unique-elsewhere',
+    group: 'anchored',
+    what: 'the anchor is six lines from the number, past both rings, and unique in the file',
+    edit: "PUT 20:\n-    logger.warn('job expired'\n+    logger.error('job expired', { id: job.id });",
+    want: { kind: 'refuse', fixableFrom: 'content' }
+  },
+  {
+    id: 'anchored-two-candidates-in-window',
+    group: 'anchored',
+    what: 'the anchor starts two lines inside the ring, at distances one and two',
+    edit: 'PUT 26:\n-    return null;\n+    return undefined;',
+    want: { kind: 'refuse', fixableFrom: 'content' }
+  },
+  {
+    id: 'anchored-nowhere',
+    group: 'anchored',
+    what: 'an anchor that is nowhere in the file',
+    edit: "PUT 14:\n-    logger.info('never')\n+    logger.error('job expired', { id: job.id });",
+    want: { kind: 'refuse', fixableFrom: 'content' }
+  },
+  {
+    id: 'anchored-weak-brace-ambiguous',
+    group: 'anchored',
+    what: 'a lone brace as anchor with two candidates whose neighbours both read as recorded',
+    edit: 'PUT 13:\n-  }\n+  } // end',
+    want: { kind: 'refuse', fixableFrom: 'content' }
+  },
+  {
+    id: 'anchored-leaked-prefix-other-number',
+    group: 'anchored',
+    what: 'the anchor row carries a display number that is not the addressed line',
+    edit: 'PUT 11:\n-10:    return null;\n+    return undefined;',
+    want: { kind: 'refuse', fixableFrom: 'content' }
+  },
+  {
+    id: 'retry-identical-after-refusal',
+    group: 'anchored',
+    what: 'the same refused patch sent again, byte for byte',
+    edit: "PUT 14:\n-    logger.info('never')\n+    logger.error('job expired', { id: job.id });",
+    retry: /The one change that fixes it: drop the - row/,
+    want: { kind: 'refuse', fixableFrom: 'content' }
+  },
+  {
+    id: 'retry-identical-small-file-names-file_write',
+    group: 'anchored',
+    what: 'the same refused patch sent again, on a six-line file the model has seen all of',
+    file: SMALL,
+    edit: 'PUT 3:\n-nothing here at all\n+GAMMA',
+    retry: /send the whole 6-line file with file_write/,
+    want: { kind: 'refuse', fixableFrom: 'content' }
+  },
+
+  /* ------------------------------------------------------------------ the attack rows */
+  {
+    id: 'attack-anchor-matches-live-not-ledger',
+    group: 'anchored',
+    what: 'somebody wrote the anchor text onto line 13 after the read; PUT 14 with that anchor',
+    drift: (text) => splice(text, 13, 13, ["    logger.error('never here', { id: job.id });"]),
+    edit: "PUT 14:\n-    logger.error('never here'\n+    changed;",
+    want: { kind: 'refuse', fixableFrom: 'content' },
+    finding:
+      'THE INVARIANT. Line 13 carries the anchor in the live file and not in the ledger, so it is not a candidate whatever the file says now; the one line that starts that way is named as changed since the read, and nothing is written'
+  },
+  {
+    id: 'attack-anchor-hit-outside-shown-window',
+    group: 'anchored',
+    what: 'a window read of 10-30, and an anchor whose only match is line 5',
+    reads: [{ from: 10, to: 30 }],
+    edit: 'PUT 12:\n-export const drain\n+export const drain = () => undefined;',
+    want: { kind: 'refuse', fixableFrom: 'content' }
+  },
+  {
+    id: 'attack-two-hits-nearest-not-chosen',
+    group: 'anchored',
+    what: 'two candidates in the ring at distances one and two; the nearer one is not taken',
+    edit: 'PUT 10:\n-    return null;\n+    return undefined;',
+    want: { kind: 'refuse', fixableFrom: 'content' }
+  },
+  {
+    id: 'attack-weak-anchor-neighbour-mismatch',
+    group: 'anchored',
+    what: 'a lone brace as anchor, one candidate in the ring, and the line beside it changed since the read',
+    drift: (text) => splice(text, 15, 15, ['    return 0;']),
+    edit: 'PUT 17:\n-  }\n+  } // end',
+    want: { kind: 'refuse', fixableFrom: 'content' },
+    finding:
+      'the one brace within reach, 16, carries the anchor in both records, and the line above it does not read as the ledger recorded it - a row this short cannot say which brace it is, so it counts only where its neighbours vouch for it, and nothing is written'
+  },
+  {
+    id: 'attack-ledger-relocates-anchor-disagrees',
+    group: 'anchored',
+    what: 'three lines added at the top; the ledger follows 14 to 17, and the anchor quotes line 16',
+    drift: (text) => `// one\n// two\n// three\n${text}`,
+    edit: 'PUT 14:\n-  return job.payload;\n+  changed;',
+    want: { kind: 'refuse', fixableFrom: 'content' }
+  },
+  {
+    id: 'attack-prefix-strip-cannot-move',
+    group: 'anchored',
+    what: 'an anchor row `-13:  if (job.expiresAt` under PUT 14 - the number is not the addressed line',
+    edit: "PUT 14:\n-13:  if (job.expiresAt\n+    logger.error('job expired', { id: job.id });",
+    want: { kind: 'refuse', fixableFrom: 'content' },
+    finding:
+      'a prefix that disagrees with the addressed line is left byte for byte, so the row reads `13:  if (job.expiresAt` and is nowhere in the file; taken off, it would be the start of line 13 and would move the edit there'
+  },
+  {
+    id: 'attack-cut-relocation-past-shown-end',
+    group: 'anchored',
+    what: 'a window read of 1-20, and a CUT whose anchor would shift it onto line 21',
+    reads: [{ from: 1, to: 20 }],
+    edit: 'CUT 19.=20\n-/** The next job',
+    want: { kind: 'refuse', fixableFrom: 'content' }
+  },
+  {
+    id: 'attack-weak-anchor-stale-neighbour-is-ambiguity',
+    group: 'anchored',
+    what: 'a lone brace as anchor; the brace meant has a changed neighbour, and a further brace has intact ones',
+    file: 'function a() {\n  if (x) {\n    y();\n    z();\n  }\n  if (w) {\n    v();\n  }\n}\n',
+    drift: (text) => splice(text, 4, 4, ['    z(1);']),
+    edit: 'PUT 6:\n-  }\n+  } // end if x',
+    want: { kind: 'refuse', fixableFrom: 'content' },
+    finding:
+      'line 5 carries the brace in both records and its neighbour has changed; line 8 carries it with its neighbours intact and closes a different block. A row this short cannot tell them apart, so both are named and nothing is written - a stale neighbour is evidence the region moved, not evidence that the further brace is the one meant'
+  },
+  {
+    id: 'attack-whole-quote-past-shown-end',
+    group: 'anchored',
+    what: 'a window read of 1-20, and two `-` rows quoting lines 20 and 21 under PUT 19.=20',
+    reads: [{ from: 1, to: 20 }],
+    edit: 'PUT 19.=20:\n-/** The next job without taking it, or nothing if the queue is empty. */\n-export const peek = (queue: Job[]): Payload | null => {\n+REPLACED',
+    want: { kind: 'refuse', fixableFrom: 'content' },
+    finding:
+      'the whole-quote path corrects a miscount by one, and the corrected range would end on line 21, which no read has shown; the ledger cannot vouch for it, so the refusal names the read and nothing is written'
+  },
+  {
+    id: 'attack-whole-quote-matches-live-not-ledger',
+    group: 'anchored',
+    what: 'somebody rewrote line 17 after the read; two `-` rows quote lines 16-17 as they read NOW, under PUT 14.=15',
+    drift: (text) => splice(text, 17, 17, ['  return cached;']),
+    edit: 'PUT 14.=15:\n-  }\n-  return cached;\n+  return cached ?? job.payload;',
+    want: { kind: 'refuse', fixableFrom: 'content' },
+    finding:
+      'the quoted lines stand at 16-17 in the live file, two lines from the address, but the ledger recorded different text at 17 - the quote is of a line no read displayed, and a correction onto it would put bytes where nothing the model was shown had stood'
+  },
+  {
+    id: 'attack-body-never-folded',
+    group: 'anchored',
+    what: 'curly quotes in the anchor fold to find the line; curly quotes in the body land verbatim',
+    edit: 'PUT 14:\n-    logger.warn(‘job expired’\n+    logger.warn(“job expired”, { id: job.id });',
+    want: {
+      kind: 'apply',
+      after: (live) => splice(live, 14, 14, ['    logger.warn(“job expired”, { id: job.id });'])
     }
   },
 
@@ -486,6 +921,67 @@ export const CASES: readonly ConformanceCase[] = [
   },
   {
     /*
+     * Watched live, three times in one turn from a cheap model: a body row that lost its `+` in the
+     * MIDDLE of a body, with more `+` rows under it. It begins with none of `+ - space`, so it is
+     * not the space-row ambiguity above - a row like this followed by another `+` row has exactly
+     * one reading, a dropped marker, and taking it changes nothing about which lines are touched.
+     * Refusing it costs a round trip that the next two rows show is not needed.
+     */
+    id: 'body-dropped-plus-mid-body-more-plus-rows-follow',
+    group: 'body',
+    what: 'a body row whose `+` was dropped, in the middle of the body, with `+` rows after it',
+    edit: 'PUT >34:\n+\n+\ndef nth_prime(n):\n+    """Return the n-th prime."""',
+    want: {
+      kind: 'apply',
+      after: (live) => {
+        const out = toLines(live);
+        out.splice(34, 0, '', '', 'def nth_prime(n):', '    """Return the n-th prime."""');
+        return out.join('\n');
+      },
+      note: /dropped/
+    }
+  },
+  {
+    /*
+     * The same unmarked row at the END of a body has a second reading - prose the model wrote after
+     * the patch - and nothing in the patch chooses between them. Still refused, naming the row.
+     */
+    id: 'body-unmarked-trailing-prose',
+    group: 'body',
+    what: 'an unmarked row after the last `+` row - prose written after the patch',
+    edit: 'PUT 11:\n+    return undefined;\nThat replaces the null return with undefined.',
+    want: { kind: 'refuse', fixableFrom: 'shape' }
+  },
+  {
+    /*
+     * An unmarked row in the middle of a body that IS an operation is the next operation, not a
+     * body row: two PUTs written back to back with no blank row between them. The dropped-marker
+     * reading must never swallow it, or the second edit would land as text inside the first.
+     */
+    id: 'body-unmarked-mid-row-is-the-next-operation',
+    group: 'body',
+    what: 'a second PUT directly under the first body, with `+` rows after it',
+    edit: 'PUT 11:\n+    return undefined;\nPUT 15:\n+    return undefined;',
+    want: {
+      kind: 'apply',
+      after: (live) =>
+        splice(splice(live, 11, 11, ['    return undefined;']), 15, 15, ['    return undefined;'])
+    }
+  },
+  {
+    /*
+     * The row above with the second operation misspelt. `PUT line 15:` is an operation the model
+     * reached for and got wrong, and a body that swallowed it would land the words as text on
+     * line 12, leave line 15 untouched and report success. Refused by name at that row instead.
+     */
+    id: 'body-unmarked-mid-row-is-a-malformed-operation',
+    group: 'body',
+    what: 'a second PUT directly under the first body, written with a word where the number goes',
+    edit: 'PUT 11:\n+    return undefined;\nPUT line 15:\n+    return undefined;',
+    want: { kind: 'refuse', fixableFrom: 'shape' }
+  },
+  {
+    /*
      * Watched on the box, twice in one turn. The model put the body on the operation's own line -
      * `PUT 3:+from ivl.intervals import merge` - so the operation row did not parse and the next
      * real body row was then read as an operation. Two refusals from one habit, and neither of the
@@ -496,7 +992,9 @@ export const CASES: readonly ConformanceCase[] = [
     group: 'body',
     what: 'the body written after the colon on the operation row itself',
     edit: 'PUT 11:+    return undefined;',
-    want: { kind: 'refuse', fixableFrom: 'shape' }
+    want: { kind: 'apply', after: (live) => splice(live, 11, 11, ['    return undefined;']) },
+    finding:
+      'the text after the colon is read as the first body row, with a note saying where the body belongs. A refusal here is worse than one refusal: the next real body row is then read as an operation, so the one habit costs two in the same turn. Watched on the box twice in one turn'
   },
   {
     id: 'body-unmarked-content-that-reads-as-a-verb',
@@ -542,31 +1040,56 @@ export const CASES: readonly ConformanceCase[] = [
   {
     id: 'body-minus-rows-under-an-insert',
     group: 'body',
-    what: 'an insert with a `-` row under it, which describes a deletion nobody asked for',
+    what: 'an insert with one `-` row under it, quoting the line it hangs off',
     edit: 'PUT >11:\n-    return null;\n+    logger.debug({ id: job.id });',
-    want: { kind: 'refuse', fixableFrom: 'shape' }
+    want: {
+      kind: 'apply',
+      after: (live) => {
+        const out = toLines(live);
+        out.splice(11, 0, '    logger.debug({ id: job.id });');
+        return out.join('\n');
+      }
+    },
+    finding:
+      'one `-` row under an insert is the anchor for line N, which is what the spec now teaches, so this lands after line 11. Two or more `-` rows under an insert are still the deletion nobody asked for, and still refused by name'
   },
   {
     id: 'body-evidence-does-not-match',
     group: 'body',
-    what: 'a correct anchor whose `-` row the model typed from memory and got wrong',
+    what: 'a correct number whose `-` row the model typed from memory, without the semicolon',
     edit: 'PUT 11:\n-    return null\n+    return undefined;',
-    want: { kind: 'refuse', fixableFrom: 'content' },
+    want: { kind: 'apply', after: (live) => splice(live, 11, 11, ['    return undefined;']) },
     finding:
-      'the anchor was RIGHT. Volunteering evidence turned an edit that would have landed into a refusal, which is the price of checking evidence and is paid only by the model that writes more than the format asks for'
+      'the number was RIGHT and the row is a prefix of the line, which is all the spec asks of an anchor. Holding a `-` row to the whole line turns an edit that would have landed into a round trip, paid only by the model that volunteers evidence'
   },
 
   /* ---------------------------------------------------------------------------- whitespace */
   {
     id: 'ws-crlf-file',
     group: 'whitespace',
-    what: 'every line of the file ends CRLF; the read displayed LF',
+    what: 'every line of the file ends CRLF; the read displayed LF, and the new line must end CRLF too',
     drift: (text) => text.replace(/\n/g, '\r\n'),
     edit: 'PUT 11:\n+    return undefined;',
     want: {
       kind: 'apply',
-      after: (live) => splice(live, 11, 11, ['    return undefined;'])
+      after: (live) => splice(live, 11, 11, ['    return undefined;\r'])
     }
+  },
+  {
+    id: 'ws-crlf-file-anchored-two-rows',
+    group: 'whitespace',
+    what: 'a CRLF file, an anchored replacement of one line with two, and a file that does not end in a newline',
+    file: 'alpha\r\nbeta\r\ngamma\r\ndelta',
+    edit: 'PUT 2:\n-beta\n+BETA\n+beta and a half',
+    want: { kind: 'apply', after: () => 'alpha\r\nBETA\r\nbeta and a half\r\ngamma\r\ndelta' }
+  },
+  {
+    id: 'ws-crlf-file-edited-on-its-last-line',
+    group: 'whitespace',
+    what: 'a CRLF file with no trailing newline, replaced on its last line: the new last line gets no CR',
+    file: 'alpha\r\nbeta\r\ngamma',
+    edit: 'PUT 3:\n-gamma\n+GAMMA',
+    want: { kind: 'apply', after: () => 'alpha\r\nbeta\r\nGAMMA' }
   },
   {
     id: 'ws-trailing-spaces',
@@ -585,9 +1108,9 @@ export const CASES: readonly ConformanceCase[] = [
     what: 'the file is tab-indented and the `-` row was retyped with spaces',
     file: 'export const run = () => {\n\tconst value = 1;\n\treturn value;\n};\n',
     edit: 'PUT 2:\n-  const value = 1;\n+  const value = 2;',
-    want: { kind: 'refuse', fixableFrom: 'content' },
+    want: { kind: 'apply', after: (live) => splice(live, 2, 2, ['  const value = 2;']) },
     finding:
-      'leading whitespace is content and is not normalised, deliberately - a tab and two spaces are different indentation in Python. The refusal quotes the real line, so the retry is a re-emit, but the model cannot SEE the difference and its second attempt is likely to be the same one'
+      'the anchor is compared with its leading whitespace folded, so a `-` row retyped with spaces finds the tab-indented line; the body is written exactly as sent, spaces and all, because leading whitespace is content everywhere but in a row whose only job is to say which line is meant. The model cannot SEE the difference, so a refusal here is one whose retry is likely the same emission'
   },
   {
     id: 'ws-no-trailing-newline',
@@ -638,7 +1161,7 @@ export const CASES: readonly ConformanceCase[] = [
     edit: 'CUT 5.=18 @drain\nPUT >10 @drain',
     want: { kind: 'refuse', fixableFrom: 'shape' },
     finding:
-      'refused by the overlap check rather than by anything that knows about registers, so the message talks about ranges that must not overlap and never mentions @drain. Right answer, wrong sentence, and priced at 2 for the same reason the overlap row is'
+      'refused by the overlap check rather than by anything that knows about registers, so the message talks about ranges that must not overlap and never mentions @drain. It names the merged spelling `PUT 5.=18:` for the two ranges it saw, which is why the retry is a re-emit and the row is priced at 1 - but that spelling replaces the block and pastes nothing back, so the right answer is still carried by the wrong sentence'
   },
   {
     id: 'register-pasted-twice',
@@ -899,6 +1422,7 @@ export const sourceOf = (item: ConformanceCase): { read: string; live: string } 
  */
 export const runCase = (item: ConformanceCase): ConformanceRow => {
   forgetReads();
+  forgetRefusals();
   sequence += 1;
   const taskId = `conformance-${sequence}`;
   const path = item.path ?? QUEUE;
@@ -909,14 +1433,54 @@ export const runCase = (item: ConformanceCase): ConformanceRow => {
       recordRead(taskId, path, window.from, lines.slice(window.from - 1, window.to).join('\n'));
   if (item.drift && live === read)
     throw new Error(`${item.id}: drift() changed nothing, so the stale case is not being tested`);
+  const fullyShown = !item.noRead && !item.reads;
 
-  const outcome = applyEdit(path, item.edit, live, readsOf(taskId, path));
+  let outcome = applyEdit(path, item.edit, live, readsOf(taskId, path));
+  let notes: readonly string[] = outcome.ok ? outcome.notes : [];
+  /*
+   * A second patch rides on the record the first one left, exactly as `workspace.ts` leaves it:
+   * the new text and the spans it changed, so the ledger moves by what the result reported.
+   */
+  if (outcome.ok && item.then !== undefined) {
+    recordWrite(taskId, path, outcome.text, outcome.changed);
+    outcome = applyEdit(path, item.then, outcome.text, readsOf(taskId, path));
+    if (outcome.ok) notes = [...notes, ...outcome.notes];
+  }
   if (!outcome.ok) {
-    const message = outcome.refusal.message;
+    /*
+     * Through the repeated-patch bound the arm applies, both times, because the bound is part of
+     * what a refusal costs: the second identical patch has to get a different sentence that names
+     * the fix, or the loop the bound exists to stop is not stopped here either.
+     */
+    const first = boundRepeatedRefusal(
+      taskId,
+      path,
+      item.edit,
+      outcome.refusal,
+      toLines(live),
+      fullyShown
+    );
+    let message = first.message;
+    let retried = true;
+    if (item.retry) {
+      const again = applyEdit(path, item.edit, live, readsOf(taskId, path));
+      if (again.ok) throw new Error(`${item.id}: the retried patch applied the second time`);
+      const second = boundRepeatedRefusal(
+        taskId,
+        path,
+        item.edit,
+        again.refusal,
+        toLines(live),
+        fullyShown
+      );
+      message = second.message;
+      retried = second.message !== first.message && item.retry.test(second.message);
+    }
     const sufficient =
-      item.want.kind === 'refuse' && item.want.fixableFrom === 'content'
+      retried &&
+      (item.want.kind === 'refuse' && item.want.fixableFrom === 'content'
         ? carriesLiveText(message, toLines(live))
-        : carriesLiveText(message, toLines(live)) || namesAShape(message);
+        : carriesLiveText(message, toLines(live)) || namesAShape(message));
     return {
       id: item.id,
       group: item.group,
@@ -938,16 +1502,22 @@ export const runCase = (item: ConformanceCase): ConformanceRow => {
       ...(item.finding ? { finding: item.finding } : {})
     };
   const wanted = item.want.after(live);
-  if (outcome.text === wanted)
+  if (outcome.text === wanted) {
+    // A landing the case said must carry a note, and did not, is a landing the model was told
+    // nothing about: the bytes are right and the result is not, and the row says so by name.
+    const silent =
+      item.want.note !== undefined &&
+      !notes.some((note) => item.want.kind === 'apply' && item.want.note?.test(note));
     return {
       id: item.id,
       group: item.group,
       what: item.what,
       cost: 0,
-      verdict: 'landed',
-      detail: outcome.notes.length ? `${outcome.notes.length} note(s)` : 'no notes',
+      verdict: silent ? 'landed-silent' : 'landed',
+      detail: notes.length ? `${notes.length} note(s)` : 'no notes',
       ...(item.finding ? { finding: item.finding } : {})
     };
+  }
 
   /*
    * A wrong file, and the one question left is whether the model can SEE it.
