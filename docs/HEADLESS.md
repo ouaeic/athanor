@@ -79,7 +79,9 @@ sudo athanor task answer TASK_ID (--text TEXT | --text-file PATH)
 
 `run` also takes `--model ID`, `--privacy-route ROUTE`, `--credits N`, `--spend-usd N`,
 `--timeout SECONDS` and `--key IDEMPOTENCY-KEY`. `--prompt-file -` reads the prompt from standard
-input.
+input. Prefer it to `--prompt` for anything private: `sudo` writes the command line of every
+invocation to the system journal, so a prompt given as an argument is kept there in full, while a
+prompt read from a file or standard input never reaches it.
 
 `--spend-usd` is the ceiling that actually stops work, and `--credits` is not its twin.
 Compute credits are a runaway backstop rather than a budget: the server raises the number you pass

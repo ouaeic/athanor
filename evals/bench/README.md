@@ -577,18 +577,40 @@ nobody answering the same turn parks; a question is left parked.
 
 ### The arm ladder results
 
-<!-- PLACEHOLDER: paste the three assembled rows here after the runs. Keep the columns that carry
-     the argument: arm, n_runs, score_mean, score_std, cost_usd_mean, steps_mean, steps_p95,
-     approval_cards_fired_mean, approvals_auto_answered, security_mode, task_max_steps,
-     infra_failures_advisory, athanor_commit. -->
+Measured 4 September 2026: `openrouter/z-ai/glm-5.3-flash`, the 20-task stratified subset
+(task set sha `4cba057d3438a4bf`), step ceiling 50, one container per task, nine processes on
+disjoint (arm, run-index) pairs on the 16-vCPU box, 3 runs per arm. The rows are in `parity.csv`
+and were assembled from the records with `--assemble`; `score_std` is the sample standard
+deviation over the three runs.
 
-| arm          | n_runs | score_mean | score_std | cost_usd_mean | steps_mean | steps_p95 | cards_fired_mean | auto_answered | task_max_steps | athanor_commit |
-| ------------ | ------ | ---------- | --------- | ------------- | ---------- | --------- | ---------------- | ------------- | -------------- | -------------- |
-| `shipped`    | _tbd_  | _tbd_      | _tbd_     | _tbd_         | _tbd_      | _tbd_     | _tbd_            | 0             | 50             | _tbd_          |
-| `autonomous` | _tbd_  | _tbd_      | _tbd_     | _tbd_         | _tbd_      | _tbd_     | _tbd_            | 0             | 50             | _tbd_          |
-| `unattended` | _tbd_  | _tbd_      | _tbd_     | _tbd_         | _tbd_      | _tbd_     | _tbd_            | _tbd_         | 50             | _tbd_          |
+| arm          | n_runs | score_mean | score_std | cost_usd_mean | steps_mean | steps_p95 | wall_s_mean | cards_fired_mean | auto_answered | task_max_steps | athanor_commit |
+| ------------ | ------ | ---------- | --------- | ------------- | ---------- | --------- | ----------- | ---------------- | ------------- | -------------- | -------------- |
+| `shipped`    | 3      | **0.200**  | 0.050     | 0.356         | 15.7       | 51        | 280         | 0.68             | 0             | 50             | 9f842f1        |
+| `autonomous` | 3      | **0.317**  | 0.058     | 0.506         | 20.2       | 51        | 425         | 0.55             | 0             | 50             | bbc3a3e        |
+| `unattended` | 3      | **0.467**  | 0.076     | 0.742         | 32.2       | 51        | 694         | 2.58             | 154           | 50             | bbc3a3e        |
 
-The gap between the first and the last row is the price of the approval floor in benchmark points.
+**The gap between the first and the last row - 0.27 of a point - is the price of the approval
+floor in benchmark points.** It is the number this instrument exists to publish, and the third row
+is the only one comparable to a published leaderboard figure, because every published adapter runs
+with its approval prompts switched off. Tasks resolved in every one of the three runs: 2 under
+`shipped`, 4 under `autonomous`, 5 under `unattended`; nine tasks resolved in some runs and not
+others, which is what a sample deviation of 0.08 looks like at n=3. Two `unattended` task-runs
+ended on an infrastructure failure (an upstream timeout mid-response) and are scored 0, as
+discipline 2 requires; the advisory column says so.
+
+The whole ladder cost **$4.9** by the provider's own account - the first estimate of $6-10 above
+was right to within its own range, and the earlier "$17, call it $40" for a single run was wrong
+by an order of magnitude. Two of the nine (arm, run) pairs were first refused by the route-fidelity
+guard: a model polled `processes/bg-started`, a session id nobody minted, and a task that started a
+server had the loop ask `preview-check/8080`; both were shim gaps the runner would have answered,
+fixed in `bbc3a3e`, and only those two tasks were re-run - which is why two rows name that commit
+and one names its parent, and why the assembler accepts records from commits whose `apps`,
+`packages` and `services` are byte-identical.
+
+What the ladder also measured, from the events every record carries: the loop's repeated-failure
+bound on `file_patch` ("has failed 3 times the same way") fired 9 times across the 180 task-runs,
+on the editor as it stood before the anchored form shipped. The next ladder, on the build that
+carries it, is the measurement of that change.
 
 ### After the ladder
 
