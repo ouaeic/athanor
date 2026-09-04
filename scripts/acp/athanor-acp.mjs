@@ -1003,6 +1003,13 @@ const main = async () => {
             });
             if (!created?.id) throw new Error('the server accepted the task but returned no id');
             session.taskId = created.id;
+            // A cancel that arrived while the task was being created found no id to cancel and
+            // could only leave its mark. Honour it now, or the turn runs to its own end and the
+            // client that cancelled is answered with the task's verdict instead of `cancelled`.
+            if (session.cancelRequested)
+              await api
+                .cancelTask(session.taskId)
+                .catch((error) => note(`could not cancel ${session.taskId}: ${error.message}`));
           } else {
             // A second prompt in the same ACP session continues the same athanor task, so the
             // conversation the owner sees is the conversation the client is having.
