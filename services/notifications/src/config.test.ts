@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { loadConfig, masterKeyBytes } from './config.js';
+import { apiBaseUrl, loadConfig, masterKeyBytes } from './config.js';
 
 const base = {
   DATABASE_DRIVER: 'postgres',
@@ -35,5 +35,30 @@ describe('the workspace decryption key', () => {
   it('treats an empty or blank value as absent, which is how an unset line in control.env reads', () => {
     expect(loadConfig({ ...base, DATA_MASTER_KEY: '' }).DATA_MASTER_KEY).toBeUndefined();
     expect(loadConfig({ ...base, DATA_MASTER_KEY: '   ' }).DATA_MASTER_KEY).toBeUndefined();
+  });
+});
+
+describe('the phone transport settings', () => {
+  it('default to the real bot API and the longest long poll the service allows', () => {
+    const config = loadConfig(base);
+    // Absent means the real address, resolved where the client is built rather than here, so a
+    // record built by hand in a test need not name it. The API declares the key the same way.
+    expect(config.TELEGRAM_API_BASE_URL).toBeUndefined();
+    expect(config.NOTIFICATION_INBOUND_POLL_TIMEOUT_S).toBe(50);
+    // The two keys the API declares, read here with the same defaults, so the loopback address
+    // an answer is posted to is the one the API actually listens on.
+    expect(apiBaseUrl(config)).toBe('http://127.0.0.1:4100');
+    expect(apiBaseUrl(loadConfig({ ...base, API_HOST: '::1', API_PORT: '4111' }))).toBe(
+      'http://[::1]:4111'
+    );
+  });
+
+  it('can be pointed at a stub for a test, and refuses a poll longer than the service allows', () => {
+    expect(
+      loadConfig({ ...base, TELEGRAM_API_BASE_URL: 'http://127.0.0.1:9' }).TELEGRAM_API_BASE_URL
+    ).toBe('http://127.0.0.1:9');
+    expect(() => loadConfig({ ...base, TELEGRAM_API_BASE_URL: 'not a url' })).toThrow();
+    expect(() => loadConfig({ ...base, NOTIFICATION_INBOUND_POLL_TIMEOUT_S: '51' })).toThrow();
+    expect(() => loadConfig({ ...base, NOTIFICATION_INBOUND_POLL_TIMEOUT_S: '0' })).toThrow();
   });
 });

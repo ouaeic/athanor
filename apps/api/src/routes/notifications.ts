@@ -6,13 +6,32 @@
  * hostname on the list.
  */
 
+import { randomBytes, randomUUID } from 'node:crypto';
 import type { AgentNotification } from '@athanor/contracts';
-import { AthanorError, sha256 } from '@athanor/core';
+import { AthanorError, encryptJson, sha256 } from '@athanor/core';
+import { notificationDestinationAad, type NotificationDestinationRecord } from '@athanor/data';
 import { z } from 'zod';
 import { UNREADABLE_AGENT_MESSAGE, clockToMinutes, minutesToClock } from '../context.js';
 import { requireUser } from '../http/auth-hook.js';
 import type { RouteContext } from '../http/server-context.js';
+import { recordSecurityEvent } from '../security-events.js';
 import { sessionCookieName } from '../session.js';
+
+/** A bot token: the bot's numeric id, a colon, and a secret in the URL-safe alphabet. */
+const BOT_TOKEN = /^\d{5,12}:[A-Za-z0-9_-]{30,64}$/;
+
+/** The one real address of the bot API; the config key exists so a test can point at a stub. */
+const BOT_API_BASE_URL = 'https://api.telegram.org';
+
+/** How long a pairing link is good for. Long enough to find the phone, short enough to be one try. */
+const PAIRING_TTL_MS = 10 * 60_000;
+
+/**
+ * The loopback API token an answer typed on the phone is posted with. It outlives any session
+ * because the phone is paired once and answers for years; it is revoked the moment the phone is
+ * unpaired or the bot replaced, so its life is the pairing's and not the calendar's.
+ */
+const PHONE_TOKEN_LIFETIME_MS = 10 * 365 * 24 * 60 * 60_000;
 
 const pushSubscriptionSchema = z.object({
   endpoint: z.string().url().max(2048),
@@ -46,7 +65,16 @@ const validatePushEndpoint = (endpoint: string, suffixes: string[]): string => {
 };
 
 export const registerNotificationRoutes = (context: RouteContext): void => {
-  const { app, store, masterKey, secure, pushEndpointSuffixes, config, idempotent } = context;
+  const {
+    app,
+    store,
+    masterKey,
+    secure,
+    pushEndpointSuffixes,
+    config,
+    idempotent,
+    requireRecentStepUp
+  } = context;
   app.get('/v1/notifications/config', async () => ({
     enabled: Boolean(config.PUSH_VAPID_PUBLIC_KEY),
     publicKey: config.PUSH_VAPID_PUBLIC_KEY ?? null
@@ -215,5 +243,213 @@ export const registerNotificationRoutes = (context: RouteContext): void => {
         createdAt: row.createdAt
       })
     );
+  });
+
+  /*
+   * The phone transport: a bot on a messaging service, paired to exactly one sender.
+   *
+   * The token is checked against the bot API once, sealed under the master key with the row's own
+   * id in the context, and never served again by any route. Pairing is a one-time secret whose
+   * hash is stored for ten minutes; the phone that presents it becomes the one sender every
+   * inbound decision is checked against. The service in between is not end-to-end encrypted, so a
+   * card is sent as title and link only unless the owner says otherwise.
+   */
+  const botApi = async <T>(
+    method: string,
+    token: string,
+    body: Record<string, unknown>
+  ): Promise<T> => {
+    let response: Response;
+    try {
+      const base = config.TELEGRAM_API_BASE_URL ?? BOT_API_BASE_URL;
+      response = await fetch(`${base}/bot${token}/${method}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(10_000)
+      });
+    } catch {
+      // No detail from the failure itself: a fetch error quotes the URL, and the URL is the token.
+      throw new AthanorError(
+        'destination_unreachable',
+        'The bot API could not be reached from this box',
+        502
+      );
+    }
+    const envelope = (await response.json().catch(() => null)) as {
+      ok?: boolean;
+      result?: T;
+      error_code?: number;
+    } | null;
+    if (!response.ok || !envelope?.ok)
+      throw new AthanorError(
+        'destination_refused',
+        envelope?.error_code === 401 || envelope?.error_code === 404
+          ? 'That bot token was not accepted'
+          : 'The bot API refused the request',
+        400
+      );
+    return envelope.result as T;
+  };
+
+  const destinationResponse = (row: NotificationDestinationRecord) => ({
+    kind: row.kind,
+    botUsername: row.botUsername,
+    paired: row.verifiedAt !== null && row.senderId !== null,
+    verifiedAt: row.verifiedAt,
+    disabledAt: row.disabledAt,
+    redact: row.redact,
+    pairingPending: row.pairingPending,
+    pairingExpiresAt: row.pairingPending ? row.pairingExpiresAt : null
+  });
+
+  /**
+   * A fresh secret, its hash stored, the link served once and never again.
+   *
+   * "Never again" includes the idempotency ledger: the wrapper the other write routes use keeps a
+   * route's answer in `api_operations` for a day so a retried request can be served the same one,
+   * and this answer is the secret. So the two routes that mint one run outside it, as the routes
+   * that hand out an API token or a recovery code do, and a retry mints a fresh link that
+   * supersedes the first rather than reading the first back off the database.
+   */
+  const mintPairing = async (id: string, botUsername: string) => {
+    const secret = randomBytes(32).toString('base64url');
+    const expiresAt = new Date(Date.now() + PAIRING_TTL_MS);
+    await store.startDestinationPairing(id, sha256(secret), expiresAt);
+    return {
+      botUsername,
+      pairingUrl: `https://t.me/${botUsername}?start=${secret}`,
+      expiresAt: expiresAt.toISOString()
+    };
+  };
+
+  app.get('/v1/notifications/destinations', async (request) => {
+    const user = requireUser(request.user);
+    const row = await store.getNotificationDestination(user.id, 'telegram', masterKey);
+    return row ? [destinationResponse(row)] : [];
+  });
+
+  app.post('/v1/notifications/destinations/telegram', async (request, reply) => {
+    const user = requireUser(request.user);
+    await requireRecentStepUp(request, user);
+    const input = z.object({ botToken: z.string().regex(BOT_TOKEN) }).parse(request.body);
+    const me = await botApi<{ username?: string; is_bot?: boolean }>('getMe', input.botToken, {});
+    if (!me.username || me.is_bot === false)
+      throw new AthanorError('destination_refused', 'That token does not belong to a bot', 400);
+    const existing = await store.getNotificationDestination(user.id, 'telegram', masterKey);
+    // The row keeps its id on replacement and the envelope's context carries the id, so the
+    // existing id is what a replacement is sealed under.
+    const id = existing?.id ?? randomUUID();
+    if (existing?.config?.apiTokenId)
+      await store.revokeApiToken(user.id, existing.config.apiTokenId).catch(() => false);
+    const value = `oc_live_${randomBytes(32).toString('base64url')}`;
+    let apiTokenId: string;
+    try {
+      apiTokenId = (
+        await store.createApiToken({
+          userId: user.id,
+          label: 'Phone transport',
+          tokenHash: sha256(value),
+          prefix: value.slice(0, 16),
+          scopes: ['tasks:read', 'tasks:write'],
+          expiresAt: new Date(Date.now() + PHONE_TOKEN_LIFETIME_MS)
+        })
+      ).id;
+    } catch (cause) {
+      if (cause instanceof Error && cause.message === 'api_token_limit')
+        throw new AthanorError(
+          'api_token_limit',
+          'Revoke an existing API token before pairing a phone; answering from it needs one',
+          409
+        );
+      throw cause;
+    }
+    await store.upsertNotificationDestination({
+      id,
+      userId: user.id,
+      kind: 'telegram',
+      configCiphertext: encryptJson(
+        { botToken: input.botToken, botUsername: me.username, apiToken: value, apiTokenId },
+        masterKey,
+        notificationDestinationAad(user.id, id)
+      )
+    });
+    await recordSecurityEvent(store, {
+      userId: user.id,
+      kind: existing ? 'notification_destination_replaced' : 'notification_destination_created',
+      outcome: 'completed',
+      metadata: { destinationId: id, kind: 'telegram' }
+    });
+    reply.status(201);
+    return mintPairing(id, me.username);
+  });
+
+  app.post('/v1/notifications/destinations/telegram/pairing', async (request) => {
+    const user = requireUser(request.user);
+    await requireRecentStepUp(request, user);
+    const existing = await store.getNotificationDestination(user.id, 'telegram', masterKey);
+    if (!existing?.botUsername)
+      throw new AthanorError('destination_not_found', 'Add a bot token first', 404);
+    return mintPairing(existing.id, existing.botUsername);
+  });
+
+  app.patch('/v1/notifications/destinations/telegram', async (request, reply) => {
+    const user = requireUser(request.user);
+    const input = z
+      .object({ redact: z.boolean().optional(), disabled: z.boolean().optional() })
+      .parse(request.body);
+    // Switching redaction off is the one setting that widens what leaves this box for a service
+    // that can read it, so it wants the same recent passkey as binding the phone did. Narrowing
+    // it, and pausing or resuming sends, change nothing about the secrecy boundary and do not.
+    if (input.redact === false) await requireRecentStepUp(request, user);
+    return idempotent(request, reply, user, async () => {
+      if (input.redact !== undefined)
+        await store.setDestinationRedact(user.id, 'telegram', input.redact);
+      if (input.disabled !== undefined)
+        await store.setDestinationDisabled(user.id, 'telegram', input.disabled);
+      const row = await store.getNotificationDestination(user.id, 'telegram', masterKey);
+      if (!row) throw new AthanorError('destination_not_found', 'No phone is set up', 404);
+      return destinationResponse(row);
+    });
+  });
+
+  app.delete('/v1/notifications/destinations/telegram', async (request, reply) => {
+    const user = requireUser(request.user);
+    await requireRecentStepUp(request, user);
+    return idempotent(request, reply, user, async () => {
+      const existing = await store.getNotificationDestination(user.id, 'telegram', masterKey);
+      if (existing?.config?.apiTokenId)
+        await store.revokeApiToken(user.id, existing.config.apiTokenId).catch(() => false);
+      const removed = await store.deleteNotificationDestination(user.id, 'telegram');
+      if (removed)
+        await recordSecurityEvent(store, {
+          userId: user.id,
+          kind: 'notification_destination_removed',
+          outcome: 'completed',
+          metadata: { destinationId: existing?.id ?? null, kind: 'telegram' }
+        });
+      return { removed };
+    });
+  });
+
+  app.post('/v1/notifications/destinations/telegram/test', async (request, reply) => {
+    const user = requireUser(request.user);
+    return idempotent(request, reply, user, async () => {
+      const row = await store.getNotificationDestination(user.id, 'telegram', masterKey);
+      if (!row?.config) throw new AthanorError('destination_not_found', 'No phone is set up', 404);
+      if (!row.senderId || row.verifiedAt === null)
+        throw new AthanorError('destination_unpaired', 'Pair your phone first', 409);
+      await botApi('sendMessage', row.config.botToken, {
+        chat_id: row.senderId,
+        text: '<b>athanor</b>\nNotifications reach this phone. Approvals and questions will arrive here.',
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        protect_content: true,
+        reply_markup: {
+          inline_keyboard: [[{ text: 'Open in athanor', url: config.PUBLIC_APP_URL }]]
+        }
+      });
+      return { sent: true };
+    });
   });
 };

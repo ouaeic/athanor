@@ -102,3 +102,22 @@ describe('naming the push service in a log line', () => {
     expect(endpointHost('not a url')).toBe('the push service');
   });
 });
+
+describe('a far end that names its own wait', () => {
+  it('is tried again exactly when it asked, and no later than the ceiling', () => {
+    // A rate limit says "retry after 3" and means it. The minute the backoff would have chosen is
+    // twenty times too long for the first refusal and would hold every card behind it for nothing.
+    const health = new EndpointHealth();
+    health.failed('phone-1', 429, at(0), 3_000);
+    expect(health.waiting('phone-1', at(2_999))).toBe(true);
+    expect(health.waiting('phone-1', at(3_000))).toBe(false);
+    // An hour is asked for; the half-hour ceiling is what it gets.
+    health.failed('phone-2', 429, at(0), 60 * 60_000);
+    expect(health.waiting('phone-2', at(RETRY_CEILING_MS - 1))).toBe(true);
+    expect(health.waiting('phone-2', at(RETRY_CEILING_MS))).toBe(false);
+    // A nonsense wait is no wait at all: the backoff decides, as it does when none was named.
+    health.failed('phone-3', 500, at(0), Number.NaN);
+    expect(health.waiting('phone-3', at(RETRY_BASE_MS - 1))).toBe(true);
+    expect(health.waiting('phone-3', at(RETRY_BASE_MS))).toBe(false);
+  });
+});

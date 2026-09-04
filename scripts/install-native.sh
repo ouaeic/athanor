@@ -803,9 +803,17 @@ Cmnd_Alias ATHANOR_SANDBOX_CHECK = /usr/local/lib/athanor/athanor-sandbox check
 # These two flags are the whole vocabulary available here. Ubuntu 26.04 ships sudo-rs rather than
 # the original sudo, and it knows neither `syslog` nor `log_allowed` nor the `log_input`/`log_output`
 # pair - a file carrying any of them is rejected outright, which stops the install rather than
-# degrading it. So the command line does reach the local system log. That is a fair trade on a
-# single-owner box: the log is root-owned, never leaves the machine, and is the operator's only
-# record of what asked for privilege.
+# degrading it. So the command line of every invocation below reaches the local system journal,
+# and the journal is persistent. That is why the `run` arm takes no command on its command line:
+# the runner writes the command and its environment to a spec file only it and root can read, and
+# the helper reads and removes that file (scripts/athanor-sandbox, `spec_loader`). What the journal
+# then holds is the helper's path, the modes, the workspace root, the spec path and, as sudo's own
+# PWD, the workspace root again - the runner starts sudo there rather than in the directory the
+# agent chose, which the file carries instead - a record of what asked for privilege, and not of
+# what it ran or where inside the work. docs/PRIVACY.md says so under the "no logging" boundary.
+# The `run *` alias still matches, because the spec path is an argument like any other; the helper
+# accepts one path shape for it, under the runner's own state directory, since it removes the file
+# as root.
 Defaults!ATHANOR_SANDBOX_RUN !use_pty
 Defaults!ATHANOR_SANDBOX_SHELL use_pty
 athanor ALL=(root) NOPASSWD: /usr/local/sbin/athanor-system-packages *
@@ -1179,6 +1187,10 @@ set_env_value "$control_env" PUSH_VAPID_PRIVATE_KEY "$push_private_key"
 # The subject is the contact URL push services show when they reject deliveries; the server's
 # own public URL is used unless the operator records an address of their own.
 set_env_default "$control_env" PUSH_VAPID_SUBJECT "$public_url"
+# The phone transport reads its bot API address and its long-poll length from here; the bot token
+# itself is entered in Settings and sealed in the database, so nothing secret is written for it.
+set_env_default "$control_env" TELEGRAM_API_BASE_URL https://api.telegram.org
+set_env_default "$control_env" NOTIFICATION_INBOUND_POLL_TIMEOUT_S 50
 # Written by earlier releases, read by nothing now. A private service's health endpoint has one
 # correct bind address and one port on this box - `athanor doctor` probes them as literals and a
 # published preview is refused them as literals - so the notification service fixes both in code

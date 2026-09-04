@@ -90,9 +90,9 @@ asks for run as `athanor-agent`, a third account with less privilege than the ru
 install refuses to finish if that drop does not take effect, because a box that believes it confines
 agent commands and does not is worse than one that never claimed to. `athanor@api`, `@worker`,
 `@registry`, and `@notifications` run the private services as `athanor-control`, all bound to
-loopback and reached through Nginx. `athanor@notifications` delivers Web Push; its VAPID key pair
-is generated once at install into `/etc/athanor/control.env` and reused on every later run, because
-regenerating it would invalidate every browser subscription. Its health port is 4203, fixed in code
+loopback and reached through Nginx. `athanor@notifications` delivers Web Push and runs the phone
+transport; its VAPID key pair is generated once at install into `/etc/athanor/control.env` and
+reused on every later run, because regenerating it would invalidate every browser subscription. Its health port is 4203, fixed in code
 rather than configurable, and `doctor` fails if that port is missing or reachable from anywhere but
 loopback.
 
@@ -514,6 +514,102 @@ starts a turn on this box. `docs/HEADLESS.md` has the request shape. Operational
   `schedule.dispatch_recovered` to see that sweep doing it. Deliveries that arrived while the box was
   down are untouched and stay pending for the next occurrence.
 
+## Phone transport
+
+Beside Web Push, a notification can reach the owner's phone through a bot on the Telegram Bot API.
+It needs no app installed by athanor - the phone runs the service's own client - and it is two-way:
+an approval card arrives with Approve and Deny buttons, a question the agent asked arrives as a
+message to reply to, and both are acted on from the phone. Operationally:
+
+- **It is not end-to-end encrypted, and the owner is told so in Settings.** A bot's chat is a cloud
+  chat: what a card carries transits the service's servers and is readable there. By default a
+  card is therefore _redacted_ - the conversation's name and a link into athanor, nothing else -
+  and the buttons carry an id and a nonce, never content. With redaction switched off, a card also
+  carries the class of thing an approval asks for (never the command itself; the service never
+  holds the key to it) and the sentence an agent chose to send. That sentence is the agent's own
+  words and can quote what it read, so the default stays on unless the owner decides otherwise -
+  and switching it off asks for the passkey, as binding the phone did, because it is the one
+  switch that widens what leaves the box. Every send has forwarding protection on and link
+  previews off.
+- **Pairing binds one numeric sender.** The owner creates a bot with BotFather, pastes its token
+  into Settings, and opens the pairing link on the phone - a one-time secret of 32 random bytes,
+  stored only as a SHA-256 hash, good for ten minutes and for one use. The phone that presents it
+  is the sender every inbound decision is checked against: the numeric sender id, never a username
+  and never a chat id, and never from anything but a private chat - and checked against the row
+  as it stands at that moment, so minting a new pairing link in Settings shuts the previous phone
+  out at once. A tap from any other sender is refused and recorded in the owner's security events
+  as `destination_inbound_rejected`. The bot is findable by anyone on the service, so that record
+  has a ceiling: twenty refusals are written, then one more every five minutes, and a refusal
+  past the ceiling is still refused and is counted on the next event written
+  (`unrecordedBefore`). The pairing link is served once, in the response to the request that
+  minted it, and is not kept in the idempotency ledger the other write routes use.
+- **A decision from the phone is the same decision as one from the web client.** The tap runs the
+  approval route's three store calls in its order, so the first answer wins wherever it came from,
+  and the card is edited to show the outcome and lose its buttons - also when the decision was made
+  in the web client, from the command line, or by the deadline. An answer typed to a question is
+  posted to `/v1/tasks/:taskId/messages` over loopback with an API token minted at pairing, so
+  unparking the conversation and idempotency are that route's.
+- **The bot token and the paired sender are sealed under `DATA_MASTER_KEY`** with the row's own
+  id in the context, like the other secrets in this database, and neither is served again by any
+  route or written to any file - the sender is also the chat every message is addressed to, so a
+  copy of the table names neither the account nor the address. The API token minted for answering
+  is sealed beside them and revoked on unpair.
+- **A lost phone:** unpair in Settings, which deletes the destination, its ledger and the API
+  token; then `/revoke` the bot's token in BotFather, which is the one credential this box cannot
+  revoke for you. A new token and a new pairing link replace the phone; the old sender has no
+  standing with the new bot.
+- **Network:** long polling needs outbound HTTPS to the bot API and nothing inbound - no public
+  URL, no open port, no certificate. `TELEGRAM_API_BASE_URL` in `/etc/athanor/control.env` has one
+  real value and exists so a test can point the service at a stub. One poller runs per bot token;
+  running the service twice against one database would make the two steal each other's updates.
+- **Journal:** `journalctl -u athanor@notifications | grep notification.destination_` -
+  `_delivery_failing` when the bot API refuses a send (retried with a growing wait, capped at half
+  an hour, never retired), `_outcome_failed` when it refuses the edit that writes a decision onto
+  a card (the same wait, shared with sends, so a failing bot API never holds the push sweep
+  behind it) and `_outcome_unwritable` when the card itself is gone, `_poll_failed` and
+  `_poll_stalled` for the inbound side, `_inbound_flood` when refusals stop being recorded one by
+  one, `_unreadable` when the sealed configuration does not open under this box's key,
+  `_inbound_failed` when one update could not be handled, `_answer_failed` when the task route
+  refused a reply, and `_ignored` for a message that was neither a pairing nor a reply. No line
+  carries the token.
+- **Doctor:** `sudo athanor doctor` reads `destinations.telegram` off the health port and says
+  "phone notification transport" when a paired phone is being polled, or warns when it is paired
+  and not. `/metrics` on 4203 adds `athanor_notifications_destination_delivered_total`,
+  `_destination_failed_total`, `_inbound_total`, `_inbound_rejected_total` and
+  `_inbound_poll_age_seconds`.
+
+## Sharing
+
+An owner can hand out a read-only link to one conversation. Operationally:
+
+- The link is `/v1/shares/<22-character id>#1.<key>`. The server holds the SHA-256 of the id and a
+  snapshot encrypted under the key; the key is in the fragment, which a browser never sends, and it
+  is nowhere on the server. A database dump or a backup therefore carries share rows nobody can
+  open without the link that made them. There is nothing to rotate and nothing to leak from the
+  rows themselves.
+- `SHARING_ENABLED=false` in `control.env` turns the feature off: every public share route answers
+  the same 404 an unknown link gets, existing links included, and the owner's own routes refuse to
+  make one. Setting it back to `true` (or removing it - absent is on) restores the existing links.
+- Revocation is the owner's, from the conversation's share dialog: one link, or every link on the
+  conversation. An operator who needs every link on the box closed at once can run
+  `UPDATE task_shares SET revoked_at = NOW() WHERE revoked_at IS NULL;` against the database; the
+  public lookup refuses a revoked row in its own statement, so the effect is immediate.
+- Closed and expired rows are swept a month after they closed; the artifact bytes of a revoked
+  link go at once. Deleting a conversation deletes its links.
+- `journalctl -u athanor@api | grep 'share\.'` reports `share.created`, `share.revoked` and
+  `share.revoked_all` with row ids and sizes. It records no content, no link, and nothing about
+  readers; a read is a count and a time on the row, and that is all the server knows about it.
+- The viewer page is built with the web app (`apps/web/dist/share/`) and served by the API from
+  `/v1/shares/assets/`. `SHARE_VIEWER_DIR` points the API elsewhere if the two are deployed apart;
+  a link opened when the files are missing shows a page that says the viewer is not built. The
+  native nginx block proxies `/v1/` as a `^~` prefix so that `share.js` and `share.css` reach the
+  API rather than the static-asset location; a page that stays at "Opening…" on a hand-edited
+  server block is that prefix losing to the regex.
+- Two throttles, both answering 429: 120 requests a minute per address across the page, its
+  assets, the ciphertext and the artifacts together (one open of a link carrying the maximum fifty
+  files is fifty-four requests), and 600 ciphertext and artifact reads a minute box-wide, whichever
+  addresses they come from. Neither records the address past the minute it counts.
+
 ## Incident priorities
 
 1. Stop access with the firewall or `sudo athanor stop`.
@@ -533,7 +629,12 @@ starts a turn on this box. `docs/HEADLESS.md` has the request shape. Operational
 - **Preview unavailable:** verify the user process, loopback port, preview state, and path base.
 - **Passkey origin mismatch:** restore the original public origin; do not repeatedly rewrite it.
 - **Push notifications missing:** run `sudo athanor doctor`, which distinguishes a service that is
-  not answering from one that is running with no Web Push signing keys. A missing key pair does not
+  not answering from one that is running with no Web Push signing keys, and both from one that is
+  sending with nobody enrolled to receive: the health port reports `endpointsTotal` and
+  `destinationsPaired` beside `endpointsFailing`, and `doctor` warns "no device or phone is
+  enrolled for notifications" when both are zero, says `ok push notification delivery` only when
+  at least one exists and none is refusing, and reports a count the service could not make as
+  unknown rather than as zero. A missing key pair does not
   stop the unit — it disables delivery and says so, because a crash-looping unit hides its own
   reason. Confirm the `PUSH_VAPID_*` values in `/etc/athanor/control.env` and inspect
   `journalctl -u athanor@notifications`. This covers browsers and installed web apps only: the
@@ -547,17 +648,21 @@ starts a turn on this box. `docs/HEADLESS.md` has the request shape. Operational
   iOS 16.4 there is no Web Push even on the Home Screen, and there is no repair on that phone: the
   packaged client holds no push subscription either and raises its notices from a poll inside the
   page, which a suspended app does not run.
-- **Nothing reached the owner at all:** Web Push is the only transport this box has. Every
-  notification candidate is selected through a registered push subscription, so an owner with no
-  subscribed device is offered nothing, of any kind, however much is waiting for them. Three
-  ordinary situations produce that owner: an iPhone that was never added to the Home Screen, a
-  browser that refused a self-signed certificate and therefore runs no service worker, and a device
-  whose endpoint refused every notification for a day and was retired by the notifier, which
-  deletes the subscription. All three leave the standing record intact: what the agent raised is in
-  Settings and in each conversation, and `journalctl -u athanor@notifications` records a retirement
-  when one happens. None of them is reported to the owner by any channel that does not need the
-  device that has stopped working, and neither is a box that is down, because the notifier that
-  would say so is on it. A second transport is an open item, not a hidden claim.
+- **Nothing reached the owner at all:** two transports exist and each needs the owner's half.
+  Web Push needs a subscribed device, which an iPhone in a Safari tab, a browser that refused a
+  self-signed certificate, and a device whose endpoint was retired after a day of refusals all
+  lack. The phone transport needs a paired phone: Settings, "Your phone", and a bot token. An
+  owner with neither is offered nothing, of any kind, however much is waiting for them - the
+  candidate set selects on the owner's events and joins them to the owner's targets, and with no
+  target there is no candidate. All of it leaves the standing record intact: what the agent
+  raised is in Settings and in each conversation. A box that is down is reported by neither,
+  because the notifier that would say so is on it.
+- **A paired phone gone quiet:** `sudo athanor doctor` reports "a phone is paired for
+  notifications but the service is not reading from it" when the health port says `paired` and
+  not `polling`. The one cause is `DATA_MASTER_KEY`: the bot token is sealed under it, and a
+  service holding a different key - or none - can neither send with it nor poll for taps. Then
+  `journalctl -u athanor@notifications | grep notification.destination_` for the line that names
+  the destination and the refusal.
 - **Changed address:** inspect `/.well-known/athanor`, timer state, mDNS, provider DNS, and firewall.
 - **Dynamic DNS stale:** run `sudo athanor ddns status`, which prints the last recorded provider
   error, then `sudo athanor ddns test` to force a publish and see the provider's answer.

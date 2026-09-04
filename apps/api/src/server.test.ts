@@ -1486,7 +1486,8 @@ const isolatedConfig = (directory: string): ApiConfig => ({
   AI_FORCE_INHOUSE_WEB: false,
   ALLOW_INSECURE_PROVIDER_URLS: false,
   CONNECTOR_ALLOWED_HOST_SUFFIXES: '',
-  PUSH_ENDPOINT_HOST_SUFFIXES: 'fcm.googleapis.com'
+  PUSH_ENDPOINT_HOST_SUFFIXES: 'fcm.googleapis.com',
+  TELEGRAM_API_BASE_URL: 'https://bot-api.test'
 });
 
 const sessionCookie = (response: { headers: Record<string, unknown> }): string => {
@@ -9110,4 +9111,280 @@ describe('round trips before the first token', () => {
     );
     expect(sidebar.depth).toBeLessThanOrEqual(3);
   }, 40_000);
+});
+
+/**
+ * The phone transport's routes: the token is checked against the bot API and sealed, the pairing
+ * link is served once, nothing served afterwards names the token or the sender, and the write
+ * routes want a recent step-up.
+ */
+describe('the phone transport', () => {
+  const botToken = `1234567:${'A'.repeat(35)}`;
+
+  test('pairs one phone from Settings and serves the secret exactly once', async () => {
+    const botCalls: Array<{ method: string; body: Record<string, unknown> }> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const requestUrl = input instanceof Request ? input.url : input.toString();
+        const json = (body: unknown, status = 200) =>
+          new Response(JSON.stringify(body), {
+            status,
+            headers: { 'content-type': 'application/json' }
+          });
+        if (requestUrl.startsWith('https://bot-api.test/')) {
+          const method = requestUrl.slice(requestUrl.lastIndexOf('/') + 1);
+          botCalls.push({
+            method,
+            body:
+              typeof init?.body === 'string'
+                ? (JSON.parse(init.body) as Record<string, unknown>)
+                : {}
+          });
+          if (!requestUrl.includes(`/bot${botToken}/`))
+            return json({ ok: false, error_code: 401, description: 'Unauthorized' }, 401);
+          if (method === 'getMe')
+            return json({
+              ok: true,
+              result: { id: 1234567, is_bot: true, username: 'athanor_test_bot' }
+            });
+          if (method === 'sendMessage') return json({ ok: true, result: { message_id: 77 } });
+          return json({ ok: false, error_code: 400 }, 400);
+        }
+        return json({
+          storageBytes: 4_096,
+          hostStorageTotalBytes: 1_000_000_000,
+          hostStorageAvailableBytes: 900_000_000,
+          ok: true
+        });
+      })
+    );
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-phone-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, database, store } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+    const cookie = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'owner' } })
+    );
+    const destinations = '/v1/notifications/destinations';
+    const telegram = `${destinations}/telegram`;
+
+    const none = await app.inject({ method: 'GET', url: destinations, headers: { cookie } });
+    expect(none.statusCode, none.body).toBe(200);
+    expect(none.json()).toEqual([]);
+
+    // A token the bot API refuses is refused here, without echoing it, and nothing is stored.
+    const wrong = `7654321:${'B'.repeat(35)}`;
+    const refused = await app.inject({
+      method: 'POST',
+      url: telegram,
+      headers: { cookie, 'idempotency-key': 'phone-bad' },
+      payload: { botToken: wrong }
+    });
+    expect(refused.statusCode, refused.body).toBe(400);
+    expect(refused.json<{ error: { code: string } }>().error.code).toBe('destination_refused');
+    expect(refused.body).not.toContain(wrong);
+    expect(
+      (await app.inject({ method: 'GET', url: destinations, headers: { cookie } })).json()
+    ).toEqual([]);
+
+    const created = await app.inject({
+      method: 'POST',
+      url: telegram,
+      headers: { cookie, 'idempotency-key': 'phone-create' },
+      payload: { botToken }
+    });
+    expect(created.statusCode, created.body).toBe(201);
+    const offer = created.json<{ botUsername: string; pairingUrl: string; expiresAt: string }>();
+    expect(offer.botUsername).toBe('athanor_test_bot');
+    expect(offer.pairingUrl.startsWith('https://t.me/athanor_test_bot?start=')).toBe(true);
+    const secret = new URL(offer.pairingUrl).searchParams.get('start')!;
+    // 32 random bytes, base64url: 43 characters, all of them inside the deep link's alphabet.
+    expect(secret).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(Date.parse(offer.expiresAt)).toBeGreaterThan(Date.now());
+    expect(botCalls.map((call) => call.method)).toEqual(['getMe', 'getMe']);
+    // Served once means not kept: the idempotency ledger the other write routes keep their
+    // answers in for a day must not hold the link, or a database read inside the ten minutes
+    // would pair a phone. The same for a link minted again.
+    const ledgerText = async () =>
+      (await database.query('SELECT response_body::text AS body FROM api_operations')).rows
+        .map((row) => String(row.body))
+        .join('\n');
+    expect(await ledgerText()).not.toContain(secret);
+    const reminted = await app.inject({
+      method: 'POST',
+      url: `${telegram}/pairing`,
+      headers: { cookie, 'idempotency-key': 'phone-remint' }
+    });
+    expect(reminted.statusCode, reminted.body).toBe(200);
+    const again = new URL(reminted.json<{ pairingUrl: string }>().pairingUrl).searchParams.get(
+      'start'
+    )!;
+    expect(again).not.toBe(secret);
+    expect(await ledgerText()).not.toContain(again);
+    expect(await ledgerText()).not.toContain(secret);
+
+    // Listed without the token, without the secret, and never with a sender id.
+    const listed = await app.inject({ method: 'GET', url: destinations, headers: { cookie } });
+    expect(listed.json()).toEqual([
+      {
+        kind: 'telegram',
+        botUsername: 'athanor_test_bot',
+        paired: false,
+        verifiedAt: null,
+        disabledAt: null,
+        redact: true,
+        pairingPending: true,
+        pairingExpiresAt: expect.any(String) as string
+      }
+    ]);
+    expect(listed.body).not.toContain(botToken);
+    expect(listed.body).not.toContain(secret);
+    expect(listed.body).not.toContain(again);
+    // Sealed at rest: the row carries no token in the clear and only the newest secret's hash.
+    const rows = await database.query(
+      `SELECT id, config_ciphertext::text AS config, pairing_hash, sender_ciphertext::text AS sender
+       FROM notification_destinations`
+    );
+    expect(rows.rows).toHaveLength(1);
+    expect(String(rows.rows[0]!.config)).not.toContain(botToken);
+    expect(rows.rows[0]!.pairing_hash).toBe(sha256(again));
+    expect(rows.rows[0]!.sender).toBeNull();
+
+    // Not paired: a test message has nowhere to go.
+    const early = await app.inject({
+      method: 'POST',
+      url: `${telegram}/test`,
+      headers: { cookie, 'idempotency-key': 'phone-test-early' }
+    });
+    expect(early.statusCode, early.body).toBe(409);
+    expect(early.json<{ error: { code: string } }>().error.code).toBe('destination_unpaired');
+
+    // The phone presents the secret. The notification service does this from the bot API's
+    // inbound poll; the store call it makes is the same one, so it is made directly here. The
+    // first link was superseded by the second and binds nobody.
+    expect(
+      await store.completeDestinationPairing(
+        String(rows.rows[0]!.id),
+        sha256(secret),
+        '4242',
+        masterKey
+      )
+    ).toBe(0);
+    expect(
+      await store.completeDestinationPairing(
+        String(rows.rows[0]!.id),
+        sha256(again),
+        '4242',
+        masterKey
+      )
+    ).toBe(1);
+    // The sender is the chat every message goes to, and it is sealed like the token beside it:
+    // no column holds it in the clear, and the envelope that holds it does not contain the digits.
+    const sealedSender = await database.query(
+      'SELECT sender_ciphertext::text AS sender FROM notification_destinations'
+    );
+    expect(String(sealedSender.rows[0]!.sender)).not.toContain('4242');
+    const columns = await database.query(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_name='notification_destinations'`
+    );
+    expect(columns.rows.map((row) => row.column_name)).not.toContain('sender_id');
+    const sent = await app.inject({
+      method: 'POST',
+      url: `${telegram}/test`,
+      headers: { cookie, 'idempotency-key': 'phone-test' }
+    });
+    expect(sent.statusCode, sent.body).toBe(200);
+    expect(botCalls.at(-1)).toMatchObject({
+      method: 'sendMessage',
+      body: {
+        chat_id: '4242',
+        parse_mode: 'HTML',
+        protect_content: true,
+        link_preview_options: { is_disabled: true }
+      }
+    });
+
+    // Paired now, and still nothing served names the sender. Redaction is the owner's switch.
+    const paired = await app.inject({ method: 'GET', url: destinations, headers: { cookie } });
+    expect(paired.json()).toMatchObject([{ paired: true, pairingPending: false, redact: true }]);
+    expect(paired.body).not.toContain('4242');
+    const patched = await app.inject({
+      method: 'PATCH',
+      url: telegram,
+      headers: { cookie, 'idempotency-key': 'phone-redact' },
+      payload: { redact: false }
+    });
+    expect(patched.statusCode, patched.body).toBe(200);
+    expect(patched.json()).toMatchObject({ redact: false, paired: true });
+
+    // The routes that bind or unbind a phone want a recent step-up, and so does switching
+    // redaction off - the one setting that widens what leaves the box for a service that can read
+    // it. Switching it on, and pausing sends, do not.
+    await database.query("UPDATE sessions SET step_up_at=NOW()-INTERVAL '10 minutes'");
+    const widened = await app.inject({
+      method: 'PATCH',
+      url: telegram,
+      headers: { cookie, 'idempotency-key': 'phone-stepup-redact-off' },
+      payload: { redact: false }
+    });
+    expect(widened.statusCode, widened.body).toBe(403);
+    expect(widened.json<{ error: { code: string } }>().error.code).toBe('step_up_required');
+    const narrowed = await app.inject({
+      method: 'PATCH',
+      url: telegram,
+      headers: { cookie, 'idempotency-key': 'phone-stepup-redact-on' },
+      payload: { redact: true }
+    });
+    expect(narrowed.statusCode, narrowed.body).toBe(200);
+    expect(narrowed.json()).toMatchObject({ redact: true });
+    for (const [method, url, key] of [
+      ['POST', telegram, 'phone-stepup-create'],
+      ['POST', `${telegram}/pairing`, 'phone-stepup-pairing'],
+      ['DELETE', telegram, 'phone-stepup-delete']
+    ] as const) {
+      const blocked = await app.inject({
+        method,
+        url,
+        headers: { cookie, 'idempotency-key': key },
+        ...(method === 'DELETE' ? {} : { payload: { botToken } })
+      });
+      expect(blocked.statusCode, blocked.body).toBe(403);
+      expect(blocked.json<{ error: { code: string } }>().error.code).toBe('step_up_required');
+    }
+    expect(
+      (
+        await app.inject({
+          method: 'PATCH',
+          url: telegram,
+          headers: { cookie, 'idempotency-key': 'phone-off' },
+          payload: { disabled: true }
+        })
+      ).json()
+    ).toMatchObject({ disabledAt: expect.any(String) as string });
+    await app.inject({
+      method: 'POST',
+      url: '/v1/auth/step-up/options',
+      headers: { cookie },
+      payload: {}
+    });
+
+    // Unpairing takes the destination, its ledger and the token minted for answering with it.
+    const removed = await app.inject({
+      method: 'DELETE',
+      url: telegram,
+      headers: { cookie, 'idempotency-key': 'phone-delete' }
+    });
+    expect(removed.statusCode, removed.body).toBe(200);
+    expect(removed.json()).toEqual({ removed: true });
+    expect(
+      (await app.inject({ method: 'GET', url: destinations, headers: { cookie } })).json()
+    ).toEqual([]);
+    const tokens = await database.query(
+      "SELECT revoked_at FROM api_tokens WHERE label='Phone transport'"
+    );
+    expect(tokens.rows).toHaveLength(1);
+    expect(tokens.rows[0]!.revoked_at).not.toBeNull();
+  }, 30_000);
 });

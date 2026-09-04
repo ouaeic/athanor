@@ -142,5 +142,25 @@ export const sharedEnv = {
    * nothing else, so three budgets cost no more than one. Zero restores the old behaviour exactly,
    * and three is a hard bound on how far it can ever be turned up.
    */
-  TASK_MAX_SELF_CONTINUATIONS: z.coerce.number().int().min(0).max(3).default(2)
+  TASK_MAX_SELF_CONTINUATIONS: z.coerce.number().int().min(0).max(3).default(2),
+  /**
+   * Where this box's own API listens. The API binds it; the notifier posts an answer the owner
+   * types on the phone to the same task-message route the web client and the command line use, so
+   * the conversation is unparked by that route's checks and idempotency rather than by a second
+   * copy of them. One declaration, because two units reading one control.env must agree on where
+   * the API is.
+   */
+  API_HOST: z.string().default('127.0.0.1'),
+  API_PORT: z.coerce.number().int().positive().default(4100),
+  /**
+   * Where the phone transport's bot API answers. It has exactly one real value; the setting exists
+   * so a test can point the sender, the inbound poller and the API's own token check at a stub on
+   * loopback instead of at the internet. An operator has no reason to change it, which is why it is
+   * optional and absent means the real address: a test that builds a config record by hand should
+   * not have to name it.
+   */
+  TELEGRAM_API_BASE_URL: z.preprocess(
+    (value) => (value === '' ? undefined : value),
+    z.string().url().optional()
+  )
 };

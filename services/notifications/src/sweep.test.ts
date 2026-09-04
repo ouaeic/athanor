@@ -1,14 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import type { DataStore } from '@athanor/data';
 import type { PendingRow } from './context.js';
-import type { PushPayload } from './payload.js';
-import { EndpointHealth } from './retry.js';
+import { notificationPayload, type PushPayload } from './payload.js';
+import { EndpointHealth, RETRY_HORIZON_MS, backoffMs } from './retry.js';
 import { runSweep, type SweepInput } from './sweep.js';
+import { TransportError, type Delivered, type Transport } from './transport.js';
 
 const now = new Date('2026-07-31T12:00:00.000Z');
 
 const row = (overrides: Partial<PendingRow> = {}): PendingRow =>
   ({
+    transport: 'push',
     id: 'subscription-1',
     userId: 'owner',
     endpoint: 'https://push.example/1',
@@ -26,11 +28,37 @@ const row = (overrides: Partial<PendingRow> = {}): PendingRow =>
     ...overrides
   }) as PendingRow;
 
+/** A row for the phone transport: a paired destination whose configuration opened. */
+const destinationRow = (overrides: Partial<PendingRow> = {}): PendingRow =>
+  ({
+    transport: 'telegram',
+    id: 'destination-1',
+    userId: 'owner',
+    createdAt: '2026-07-01T00:00:00.000Z',
+    updatedAt: '2026-07-01T00:00:00.000Z',
+    senderId: '4242',
+    redact: true,
+    config: { botToken: '1000:bot-secret', botUsername: 'athanor_bot' },
+    kind: 'task_finished',
+    resourceId: 'task-1',
+    taskId: 'task-1',
+    taskStatus: 'completed',
+    eventAt: '2026-07-31T12:00:00.000Z',
+    taskTitle: null,
+    message: null,
+    ...overrides
+  }) as PendingRow;
+
 interface Recorded {
   /** Every argument list `listPendingNotifications` was called with, in order. */
   listed: unknown[][];
   settled: Array<[string, string, string]>;
+  /** The destination ledger, with what the far end handed back. */
+  destinationSettled: Array<[string, string, string, string | null, string | null]>;
   sessions: Array<{ lastSeenAt: string }>;
+  /** Every store method touched, in order, so a test can say what was never called. */
+  calls: string[];
+  securityEvents: Array<{ kind: string; metadata?: Record<string, unknown> }>;
 }
 
 const harness = (
@@ -38,8 +66,15 @@ const harness = (
   parts: Record<string, unknown> = {},
   sessions: Array<{ lastSeenAt: string }> = []
 ): { store: DataStore; recorded: Recorded } => {
-  const recorded: Recorded = { listed: [], settled: [], sessions };
-  const store = {
+  const recorded: Recorded = {
+    listed: [],
+    settled: [],
+    destinationSettled: [],
+    sessions,
+    calls: [],
+    securityEvents: []
+  };
+  const methods: Record<string, unknown> = {
     listPendingNotifications: async (...args: unknown[]) => {
       recorded.listed.push(args);
       return pending;
@@ -47,35 +82,74 @@ const harness = (
     recordNotificationDelivery: async (id: string, kind: string, resourceId: string) => {
       recorded.settled.push([id, kind, resourceId]);
     },
+    recordDestinationDelivery: async (
+      id: string,
+      kind: string,
+      resourceId: string,
+      externalRef: string | null,
+      nonce: string | null
+    ) => {
+      recorded.destinationSettled.push([id, kind, resourceId, externalRef, nonce]);
+    },
     effectiveSpendLimits: async () => ({ timeZone: 'UTC' }),
     notificationSettings: async () => null,
     listSessions: async () => recorded.sessions,
     listApprovals: async () => [],
     getTask: async () => null,
     deletePushSubscriptionById: async () => undefined,
-    recordSecurityEvent: async () => undefined,
+    deleteNotificationDestination: async () => undefined,
+    recordSecurityEvent: async (event: { kind: string; metadata?: Record<string, unknown> }) => {
+      recorded.securityEvents.push(event);
+    },
     ...parts
-  } as unknown as DataStore;
+  };
+  const store = new Proxy(methods, {
+    get: (target, property: string) => {
+      const value = target[property];
+      if (typeof value !== 'function') return value;
+      return (...args: unknown[]) => {
+        recorded.calls.push(property);
+        return (value as (...inner: unknown[]) => unknown)(...args);
+      };
+    }
+  }) as unknown as DataStore;
   return { store, recorded };
 };
 
+type Send = (row: PendingRow, payload: PushPayload) => Promise<Delivered | void>;
+
+/** Both transports, each handing the payload to one recording `send`. */
+const transportsFor = (send: Send): Record<'push' | 'telegram', Transport> => ({
+  push: {
+    kind: 'push',
+    send: async (item, subject) => (await send(item, notificationPayload(subject))) ?? {}
+  },
+  telegram: {
+    kind: 'telegram',
+    send: async (item, subject) => (await send(item, notificationPayload(subject))) ?? {}
+  }
+});
+
 const sweep = (
   store: DataStore,
-  overrides: Partial<SweepInput> = {}
-): { input: SweepInput; sent: PushPayload[] } => {
+  overrides: Partial<SweepInput> & { send?: Send } = {}
+): { input: SweepInput; sent: PushPayload[]; warned: string[] } => {
   const sent: PushPayload[] = [];
+  const warned: string[] = [];
+  const { send, ...rest } = overrides;
   return {
     sent,
+    warned,
     input: {
       store,
       masterKey: undefined,
       endpoints: new EndpointHealth(),
       batchSize: 100,
       deferredLastSweep: 0,
-      send: async (_row, payload) => void sent.push(payload),
+      transports: transportsFor(send ?? (async (_row, payload) => void sent.push(payload))),
       now: () => now,
-      warn: () => undefined,
-      ...overrides
+      warn: (line) => void warned.push(line),
+      ...rest
     }
   };
 };
@@ -266,5 +340,154 @@ describe('runSweep', () => {
     // delivery record and the next start considers them again - nothing is lost and nothing repeats.
     expect(recorded.settled).toEqual([['subscription-1', 'task_finished', 'task-1']]);
     expect(result).toMatchObject({ pending: 3, delivered: 1, failed: 0 });
+  });
+});
+
+/**
+ * The same sweep over a row for the phone transport. The decisions are the owner's and the
+ * event's, never the transport's, so every rule above applies unchanged; what differs is which
+ * ledger a settled row lands in, what the far end hands back, and what a refusal costs.
+ */
+describe('runSweep over a destination row', () => {
+  it('settles into the destination ledger with the message id and the nonce the far end was given', async () => {
+    const { store, recorded } = harness([destinationRow({ kind: 'approval_required' })]);
+    const { input } = sweep(store, {
+      send: async () => ({ externalRef: '512', nonce: 'abcdefgh' })
+    });
+    const result = await runSweep(input);
+    expect(recorded.settled).toEqual([]);
+    expect(recorded.destinationSettled).toEqual([
+      ['destination-1', 'approval_required', 'task-1', '512', 'abcdefgh']
+    ]);
+    expect(result).toMatchObject({ delivered: 1, destinationDelivered: 1, destinationFailed: 0 });
+  });
+
+  it('drops a kind the owner switched off, transport-blind, into the destination ledger', async () => {
+    const { store, recorded } = harness([destinationRow()], {
+      notificationSettings: async () => ({
+        kinds: { task_finished: false },
+        quietHours: null,
+        quietHoursAllowApprovals: true,
+        timeZone: 'UTC'
+      })
+    });
+    const { input, sent } = sweep(store);
+    const result = await runSweep(input);
+    expect(sent).toHaveLength(0);
+    // Settled with nothing on the far side: no message id, no nonce.
+    expect(recorded.destinationSettled).toEqual([
+      ['destination-1', 'task_finished', 'task-1', null, null]
+    ]);
+    expect(result).toMatchObject({ suppressed: 1, idle: false });
+  });
+
+  it('holds a notice inside quiet hours on the phone exactly as it would on a browser', async () => {
+    const { store, recorded } = harness(
+      [destinationRow({ kind: 'agent_message', resourceId: 'notification-1', taskStatus: null })],
+      {
+        notificationSettings: async () => ({
+          kinds: {},
+          // Noon UTC is inside a window that covers the whole day.
+          quietHours: { startMinute: 0, endMinute: 1439 },
+          quietHoursAllowApprovals: true,
+          timeZone: 'UTC'
+        })
+      }
+    );
+    const { input, sent } = sweep(store);
+    const result = await runSweep(input);
+    expect(sent).toHaveLength(0);
+    expect(recorded.destinationSettled).toEqual([]);
+    expect(result).toMatchObject({ held: 1, idle: true });
+  });
+
+  it('waits exactly as long as a rate limit asks, not the minute the backoff would have chosen', async () => {
+    const endpoints = new EndpointHealth();
+    const { store } = harness([destinationRow()]);
+    const { input } = sweep(store, {
+      endpoints,
+      send: async () => {
+        throw new TransportError('sendMessage answered 429', {
+          statusCode: 429,
+          retryAfterMs: 5_000
+        });
+      }
+    });
+    const result = await runSweep(input);
+    expect(result).toMatchObject({ failed: 1, destinationFailed: 1 });
+    expect(endpoints.waiting('destination-1', new Date(now.getTime() + 4_999))).toBe(true);
+    expect(endpoints.waiting('destination-1', new Date(now.getTime() + 5_001))).toBe(false);
+    expect(backoffMs(1)).toBeGreaterThan(5_000);
+  });
+
+  it('never retires a destination, however long it has been refusing', async () => {
+    // A device's subscription goes stale on its own and is retired after a day of refusals. A
+    // destination is the owner's one phone, paired on purpose; the bot API having a bad day is
+    // not a reason to unpair it, and the ceiling keeps the cost of waiting at two attempts an hour.
+    const endpoints = new EndpointHealth();
+    endpoints.failed('destination-1', 502, new Date(now.getTime() - RETRY_HORIZON_MS - 60_000));
+    const { store, recorded } = harness([destinationRow()]);
+    const { input, warned } = sweep(store, {
+      endpoints,
+      send: async () => {
+        throw new TransportError('sendMessage answered 502', { statusCode: 502 });
+      }
+    });
+    const result = await runSweep(input);
+    expect(result).toMatchObject({ failed: 1, retired: 0 });
+    expect(recorded.calls).not.toContain('deleteNotificationDestination');
+    expect(recorded.calls).not.toContain('deletePushSubscriptionById');
+    expect(recorded.destinationSettled).toEqual([]);
+    // Still waiting, at the ceiling, and still a candidate for the next pass after it.
+    expect(endpoints.waiting('destination-1', new Date(now.getTime() + 1))).toBe(true);
+    expect(warned.join('')).not.toContain('retired');
+  });
+
+  it("says once, in the journal and the owner's record, that a destination has started refusing", async () => {
+    const { store, recorded } = harness([destinationRow()]);
+    const { input, warned } = sweep(store, {
+      send: async () => {
+        throw new TransportError('sendMessage answered 500', { statusCode: 500 });
+      }
+    });
+    await runSweep(input);
+    expect(recorded.securityEvents).toEqual([
+      {
+        userId: 'owner',
+        kind: 'destination_delivery_failing',
+        outcome: 'failure',
+        metadata: { destinationId: 'destination-1', statusCode: 500 }
+      }
+    ]);
+    expect(warned).toHaveLength(1);
+    expect(warned[0]).toContain('notification.destination_delivery_failing');
+    expect(warned[0]).not.toContain('bot-secret');
+  });
+
+  it('leaves a row alone when this box has no transport for it, and counts it', async () => {
+    // A destination row on a box with no master key, or a device row on a box with no signing
+    // keys: nothing can send it, nothing settles it, and a box that can will.
+    const { store, recorded } = harness([destinationRow(), row()]);
+    const { input, sent } = sweep(store, { transports: {} });
+    const result = await runSweep(input);
+    expect(sent).toHaveLength(0);
+    expect(recorded.settled).toEqual([]);
+    expect(recorded.destinationSettled).toEqual([]);
+    expect(result).toMatchObject({ pending: 2, unsendable: 2, idle: true });
+  });
+
+  it('skips a destination whose configuration would not open, and says so once', async () => {
+    const { store, recorded } = harness([destinationRow({ config: null })]);
+    const warnedOnce = new Set<string>();
+    const first = sweep(store, { warnedOnce });
+    const result = await runSweep(first.input);
+    expect(first.sent).toHaveLength(0);
+    expect(recorded.destinationSettled).toEqual([]);
+    expect(result).toMatchObject({ unsendable: 1, failed: 0, idle: true });
+    expect(first.warned).toHaveLength(1);
+    expect(first.warned[0]).toContain('notification.destination_unreadable');
+    const second = sweep(store, { warnedOnce });
+    await runSweep(second.input);
+    expect(second.warned).toEqual([]);
   });
 });

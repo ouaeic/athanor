@@ -85,14 +85,29 @@ export class EndpointHealth {
     this.failing.delete(subscriptionId);
   }
 
-  failed(subscriptionId: string, statusCode: number, now: Date): FailureOutcome {
+  /**
+   * `retryAfterMs` is the far end naming its own wait, which a rate limit does. When it does, that
+   * is the wait - it is the one number the service is actually asking for, and doubling a minute
+   * against a "try again in three seconds" would hold every card behind it for nothing. The
+   * ceiling still applies: a far end asking for an hour gets the half hour.
+   */
+  failed(
+    subscriptionId: string,
+    statusCode: number,
+    now: Date,
+    retryAfterMs?: number
+  ): FailureOutcome {
     const previous = this.failing.get(subscriptionId);
     const attempts = (previous?.attempts ?? 0) + 1;
     const firstFailedAt = previous?.firstFailedAt ?? now.getTime();
+    const wait =
+      retryAfterMs !== undefined && Number.isFinite(retryAfterMs) && retryAfterMs > 0
+        ? Math.min(RETRY_CEILING_MS, retryAfterMs)
+        : backoffMs(attempts);
     const state: EndpointState = {
       attempts,
       firstFailedAt,
-      retryAt: now.getTime() + backoffMs(attempts),
+      retryAt: now.getTime() + wait,
       lastStatus: statusCode
     };
     this.failing.set(subscriptionId, state);

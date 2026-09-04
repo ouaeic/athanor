@@ -21,6 +21,8 @@ export interface NotifierTotals {
   deferred: number;
   /** Items the last pass decided to hold for the owner. Also a level, not a total. */
   held: number;
+  /** Items the last pass had no way to send. A level too, and a standing one is a misconfiguration. */
+  unsendable: number;
 }
 
 export interface NotifierInput {
@@ -28,7 +30,8 @@ export interface NotifierInput {
   sweep: (deferredLastSweep: number) => Promise<SweepResult>;
   pollMs: number;
   /**
-   * Whether this box has Web Push signing keys.
+   * Whether this box can send anything at all: Web Push signing keys for devices, or the master
+   * key that opens a paired destination's configuration.
    *
    * Read once, from configuration read once, and nothing in the process can change it - so when it
    * is false there is no sequence of events that ends in a delivery, and a loop is not a bounded
@@ -61,7 +64,8 @@ export const createNotifier = (input: NotifierInput) => {
     suppressed: 0,
     retired: 0,
     deferred: 0,
-    held: 0
+    held: 0,
+    unsendable: 0
   };
   /*
    * One pass, then the decision whether to wait.
@@ -84,6 +88,7 @@ export const createNotifier = (input: NotifierInput) => {
       totals.retired += result.retired;
       totals.deferred = result.deferred;
       totals.held = result.held;
+      totals.unsendable = result.unsendable;
       /*
        * Abortable, unlike the plain `delay` this replaced.
        *

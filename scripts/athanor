@@ -801,11 +801,63 @@ doctor() {
   # optional feature that crash-loops a unit hides its own reason. So "it answered" is not the same
   # as "notifications are being delivered", and the endpoint says which of the two this is.
   notifications_health=$(curl -fsS --max-time 5 http://127.0.0.1:4203/healthz 2>/dev/null || true)
+  # One number out of the payload: digits, `null` when the service could not count, and the empty
+  # string when the field is not there at all. Read with sed rather than jq because this arm has to
+  # speak on a box where jq is one of the things that is broken, and as two expressions rather
+  # than one alternation because alternation is not in the sed every box has.
+  notifications_count() {
+    printf '%s' "$notifications_health" |
+      sed -n -e "s/.*\"$1\":\([0-9][0-9]*\)[,}].*/\1/p" -e t \
+        -e "s/.*\"$1\":null[,}].*/null/p"
+  }
   case "$notifications_health" in
     *'"deliveryEnabled":false'*)
       check_warn "push notifications are switched off: no Web Push signing keys in /etc/athanor/control.env; re-run the installer to generate a pair"
       ;;
-    *'"endpointsFailing":0'*) check_ok "push notification delivery" ;;
+    *'"endpointsFailing":0'*)
+      # Zero refusing is trivially true of a box nobody has ever subscribed a device to, and that
+      # is the commonest real state: measured on a live box with no subscription, no paired phone
+      # and four cards parked waiting for a person, this line said `ok`. So "every device is
+      # healthy" and "there is no device" are told apart here, by the counts of what exists, and
+      # only the first is health. A count the service could not make is a third answer again.
+      endpoints_total=$(notifications_count endpointsTotal)
+      destinations_paired=$(notifications_count destinationsPaired)
+      case "$endpoints_total:$destinations_paired" in
+        0:0)
+          check_warn "no device or phone is enrolled for notifications, so nothing can tell you when a task stops to ask; on the device that should be told, open Settings and press \"Turn on notifications\", or pair a phone under Settings, \"Your phone\""
+          ;;
+        *null*|*:|:*)
+          check_note "push notification delivery: the service is sending but could not count the devices and phones enrolled to receive, so it is not known whether anything can be reached; run sudo athanor logs notifications"
+          ;;
+        *)
+          # What exists is a route only while the half of the service that reaches it is up. A
+          # paired phone is the owner's half; this box's half is reading from it, which stops
+          # without a DATA_MASTER_KEY to open the bot token with - and then the phone cannot be
+          # sent to either. Measured on a box with no key, no browser subscription and one paired
+          # phone: this line said `ok`, one line above the warning saying the phone could not be
+          # read from. A subscribed device with the signing keys removed since is the same shape.
+          notifications_reachable=""
+          if [ "$endpoints_total" != 0 ]; then
+            case "$notifications_health" in
+              *'"pushEnabled":false'*) ;;
+              *) notifications_reachable=yes ;;
+            esac
+          fi
+          if [ "$destinations_paired" != 0 ]; then
+            case "$notifications_health" in
+              *'"paired":true,"polling":true'*) notifications_reachable=yes ;;
+            esac
+          fi
+          if [ -n "$notifications_reachable" ]; then
+            check_ok "push notification delivery"
+          elif [ "$destinations_paired" != 0 ]; then
+            check_warn "the only notification route is a paired phone this box is not reading from, so nothing can tell you when a task stops to ask; check DATA_MASTER_KEY in /etc/athanor/control.env and run sudo athanor logs notifications"
+          else
+            check_warn "a device is subscribed for notifications but there are no Web Push signing keys to send to it with; re-run the installer to generate a pair"
+          fi
+          ;;
+      esac
+      ;;
     # Keys configured, the service sending, and a device not receiving. The one thing that cannot
     # report a broken push is a push, so this is where the owner finds out.
     *'"endpointsFailing"'*)
@@ -815,6 +867,14 @@ doctor() {
     # warning: keys are configured and it is sending, which is all the older build could report.
     *'"deliveryEnabled":true'*) check_ok "push notification delivery" ;;
     *) check_fail "the notification service is not answering; run sudo athanor logs" ;;
+  esac
+  # The phone transport's own line. Paired is the owner's half; polling is this box's, and the one
+  # reason it stops while paired is a DATA_MASTER_KEY the service cannot open the bot token with.
+  case "$notifications_health" in
+    *'"paired":true,"polling":false'*)
+      check_warn "a phone is paired for notifications but the service is not reading from it; check DATA_MASTER_KEY in /etc/athanor/control.env and run sudo athanor logs notifications"
+      ;;
+    *'"paired":true,"polling":true'*) check_ok "phone notification transport" ;;
   esac
   if pg_isready -q -h 127.0.0.1 -U athanor -d athanor; then
     check_ok "PostgreSQL"
@@ -3722,18 +3782,29 @@ task_emit() {
       | (($pending[0] // []) | map({ id, taskId, action, preview })) as $approvals
       | ($events | map(select(.kind == "question_asked")) | last) as $asked
       | (if ($outcome == "failed" or $outcome == "blocked")
-         then (($events
-                | map(select(((.kind == "error") or (.kind == "warning"))
-                             and ((.payload.owner // false) == true))
-                  )
+         then (((($events
+                  | map(select(((.kind == "error") or (.kind == "warning"))
+                               and ((.payload.owner // false) == true))))
+                 # A spend pause parks the task with a `status` carrying `blockedBy`, not an error -
+                 # so `blocked` came back with `reason: null` while the timeline held the sentence
+                 # "Paused at $0.0015 of the $0.01 limit for this task. Raise the limit to carry on."
+                 # The one channel a headless caller has said only "blocked".
+                 + ($events
+                    | map(select(.kind == "status" and ((.payload.blockedBy // "") != "")))))
+                # The latest of those by sequence, not the owner-marked one first. A provider wall
+                # the task was resumed past is still the last owner-marked warning on the timeline,
+                # and read first it was reported as the reason a ceiling had parked the task, with
+                # the ceiling itself invisible.
+                | sort_by(.sequence)
                 | last)
-               # A spend ceiling parks the task with a `status` carrying `blockedBy`, not an error -
-               # so `blocked` came back with `reason: null` while the timeline held the sentence
-               # "Paused at $0.0015 of the $0.01 limit for this task. Raise the limit to carry on."
-               # The one channel a headless caller has said only "blocked".
-               // ($events | map(select(.kind == "status" and (.payload.blockedBy != null))) | last)
                // ($events | map(select(.kind == "error")) | last))
          else null end) as $bad
+      # Which ceiling a spend pause names: "task", "daily" or "monthly". The worker writes one other
+      # word in the same field - `spend_guard_unavailable`, when the guard could not answer at all -
+      # and that is not a ceiling: nothing was crossed, and raising a limit changes nothing. So it
+      # is a reason code and not a ceiling, and only the three ceilings are `blockedBy`.
+      | ($bad.payload.blockedBy // "") as $stoppedBy
+      | ($stoppedBy == "task" or $stoppedBy == "daily" or $stoppedBy == "monthly") as $byCeiling
       | {
           contract: "athanor.task.outcome/1",
           outcome: $outcome,
@@ -3754,12 +3825,24 @@ task_emit() {
           verification: ($done.payload.verification // null),
           outstanding: ($done.payload.outstanding // []),
           reason: ($bad.summary // null),
-          reasonCode: ($bad.payload.code // null),
+          # The `status` event a spend ceiling writes carries `blockedBy` and no `code`, so the
+          # commonest blocked ending there is came back with `reason` filled and `reasonCode` null -
+          # the machine-readable half missing on exactly the ending a script branches on. The
+          # worker never names this one, so the name is given here, and only when nothing else is.
+          reasonCode: ($bad.payload.code
+                       // (if $byCeiling then "spend_ceiling"
+                           elif $stoppedBy != "" then $stoppedBy
+                           else null end)),
           # Which ceiling stopped it - "task", "daily" or "monthly" - rather than a code invented
           # here for the occasion. Null for every stop that is not a spend ceiling.
-          blockedBy: ($bad.payload.blockedBy // null),
+          blockedBy: (if $byCeiling then $stoppedBy else null end),
           pendingApprovals: $approvals,
-          question: (if ($approvals | length) > 0 or $asked == null then null else {
+          # A question is what the task is waiting on, so it is reported on the awaiting outcome
+          # and nowhere else. "Was a question ever asked" is true of every finished conversation
+          # that asked one, and reporting it beside `completed` invited a second answer to a task
+          # that has stopped listening.
+          question: (if $outcome != "awaiting_approval" or ($approvals | length) > 0 or $asked == null
+                     then null else {
               question: ($asked.payload.question // $asked.summary // null),
               why: ($asked.payload.why // null),
               options: ($asked.payload.options // [])

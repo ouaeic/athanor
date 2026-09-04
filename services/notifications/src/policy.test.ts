@@ -293,13 +293,14 @@ describe('pushLifetime', () => {
   });
 
   /**
-   * The lifetime is only worth anything if the send uses it, and `index.ts` is a process entry
-   * point - it opens a database and awaits a loop at the top level, so no test can import it. The
-   * source is read instead, which is what `log.test.ts` does for the same reason one directory
-   * over. The literal being asserted absent is the exact defect: `TTL: 600` on every send.
+   * The lifetime is only worth anything if the send uses it. The send lives in the push transport,
+   * which registers no VAPID details of its own - `index.ts` does that once at startup, and is a
+   * process entry point no test can import - so the source is read rather than the module run,
+   * which is what `log.test.ts` does for the same reason one directory over. The literal being
+   * asserted absent is the exact defect: `TTL: 600` on every send.
    */
   it('is what the service actually hands to web-push', async () => {
-    const source = await readFile(new URL('./index.ts', import.meta.url), 'utf8');
+    const source = await readFile(new URL('./push-transport.ts', import.meta.url), 'utf8');
     expect(source).toContain('pushLifetime(row.kind)');
     expect(source).not.toMatch(/TTL:\s*600/);
   });

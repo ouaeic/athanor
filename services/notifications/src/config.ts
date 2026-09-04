@@ -50,7 +50,41 @@ const Config = z.object({
       .optional()
   ),
   NOTIFICATION_POLL_MS: z.coerce.number().int().min(250).default(2000),
-  NOTIFICATION_BATCH_SIZE: z.coerce.number().int().min(1).max(500).default(100)
+  NOTIFICATION_BATCH_SIZE: z.coerce.number().int().min(1).max(500).default(100),
+  /*
+   * Where the phone transport's bot API answers. It has exactly one real value, and the setting
+   * exists so a test can point the sender and the inbound poller at a stub on loopback instead of
+   * at the internet; an operator has no reason to change it, and the API reads the same key for the
+   * two calls it makes itself. Absent means the real address, resolved where the client is built.
+   */
+  TELEGRAM_API_BASE_URL: z.preprocess(
+    (value) => (value === '' ? undefined : value),
+    z.string().url().optional()
+  ),
+  /*
+   * How many seconds one inbound long-poll request is allowed to hang open waiting for the owner to
+   * tap something. Fifty is the service's own ceiling and the right number on a box that is doing
+   * its job: a request that stays open costs nothing while it waits, and returns the instant
+   * something arrives. Shorter is only useful against a proxy that closes idle connections.
+   */
+  NOTIFICATION_INBOUND_POLL_TIMEOUT_S: z.coerce.number().int().min(1).max(50).default(50),
+  /*
+   * The address a card's "Open in athanor" button carries. Web Push needs no such thing - the
+   * service worker resolves a relative path against its own origin - but a message on a phone is
+   * opened by a browser that knows nothing about this box. Shared with every other service, and
+   * declared here rather than imported from the contracts package for the reason DATA_MASTER_KEY
+   * gives above.
+   */
+  PUBLIC_APP_URL: z.string().url().default('http://localhost:5173'),
+  /*
+   * Where this box's own API listens, for the one request this service makes to it: an answer the
+   * owner types on the phone to a question the agent asked is posted to the same route the web
+   * client and the command line use, so that the conversation is unparked by that route's checks
+   * and idempotency rather than by a second copy of them here. Same two keys the API declares, same
+   * defaults, from the same control.env.
+   */
+  API_HOST: z.string().default('127.0.0.1'),
+  API_PORT: z.coerce.number().int().positive().default(4100)
 });
 
 /**
@@ -90,3 +124,7 @@ export const pushConfigured = (
   Boolean(
     config.PUSH_VAPID_SUBJECT && config.PUSH_VAPID_PUBLIC_KEY && config.PUSH_VAPID_PRIVATE_KEY
   );
+
+/** The loopback address the API answers on, in the form a request needs it. */
+export const apiBaseUrl = (config: NotificationConfig): string =>
+  `http://${config.API_HOST.includes(':') ? `[${config.API_HOST}]` : config.API_HOST}:${config.API_PORT}`;

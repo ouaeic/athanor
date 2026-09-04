@@ -212,7 +212,12 @@ describe('optional Web Push configuration', () => {
     PGLITE_PATH: '.athanor/postgres',
     NOTIFICATION_POLL_MS: 2000,
     NOTIFICATION_BATCH_SIZE: 100,
-    NOTIFICATION_HEALTH_PORT: 4203
+    NOTIFICATION_HEALTH_PORT: 4203,
+    TELEGRAM_API_BASE_URL: 'https://api.telegram.org',
+    NOTIFICATION_INBOUND_POLL_TIMEOUT_S: 50,
+    PUBLIC_APP_URL: 'http://localhost:5173',
+    API_HOST: '127.0.0.1',
+    API_PORT: 4100
   };
 
   it('treats a fully configured key set as enabled', () => {

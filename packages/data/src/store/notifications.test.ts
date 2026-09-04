@@ -1,6 +1,9 @@
+import { randomUUID } from 'node:crypto';
+import { encryptJson, sha256 } from '@athanor/core';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createDatabase, migrateDatabase, type Database } from '../database.js';
 import { DataStore } from '../store.js';
+import { notificationDestinationAad } from './notifications.js';
 
 /**
  * The candidate set, asked the one question its four original branches could not answer: what
@@ -146,21 +149,16 @@ describe('a candidate for an approval that expired unanswered', () => {
 });
 
 /**
- * What this box can tell an owner who has never registered a device.
+ * What this box can tell an owner who has registered nothing: no device, no paired destination.
  *
- * Every branch of the candidate set starts `FROM push_subscriptions ps`, so the answer is nothing,
- * for every kind, for ever. That is not a bug in the query - it is what "content-free push" means,
- * and each branch is correctly bounded by the subscription's own age. It is the shape of the
- * product's only notification channel, and it is worth an executable statement of it, because the
- * owners it silences are the ones the feature exists for: an iPhone in a Safari tab has no
+ * The candidate set selects on the owner's events and joins them to the owner's targets, and an
+ * owner with no target of either kind is offered nothing, for every kind. That is the shape of the
+ * product rather than a defect in the query, and it is worth an executable statement of it because
+ * the owners it silences are the ones the feature exists for: an iPhone in a Safari tab has no
  * `PushManager` and so has no subscription to register, a browser that refused a self-signed
  * certificate runs no service worker, and a retired endpoint is deleted outright by the notifier
- * after a day of refusals - which removes the last subscription and, with it, every candidate.
- *
- * A second transport is what changes this answer. Whatever builds one must not extend the query
- * below, because the query cannot reach these rows: it has to select on the owner rather than on
- * the owner's devices, and carry its own delivery ledger, since `notification_deliveries` is keyed
- * by a subscription id that a mail transport does not have.
+ * after a day of refusals. The describe after this one is the other half: a paired destination is
+ * a target in its own right, and the same events reach it with no device registered at all.
  */
 describe('an owner with no subscribed device', () => {
   let database: Database;
@@ -267,5 +265,327 @@ describe('an owner with no subscribed device', () => {
     await expect(store.listPendingNotifications()).resolves.toHaveLength(2);
     await expect(store.deletePushSubscriptionById(subscription.id)).resolves.toBe(true);
     await expect(store.listPendingNotifications()).resolves.toEqual([]);
+  });
+});
+
+/**
+ * The second transport's half of the candidate set: a paired destination is a target with no
+ * device behind it, its ledger is its own, and the pairing link that binds it can be used once.
+ */
+describe('an owner with a paired destination and no device', () => {
+  let database: Database;
+  let store: DataStore;
+  const masterKey = new Uint8Array(32).fill(3);
+
+  beforeEach(async () => {
+    database = createDatabase({ driver: 'pglite', pglitePath: ':memory:' });
+    await migrateDatabase(database);
+    store = new DataStore(database);
+  });
+
+  afterEach(async () => database.close());
+
+  const sealed = (userId: string, id: string, key: Uint8Array = masterKey) =>
+    encryptJson(
+      { botToken: '123456:token-of-the-bot', botUsername: 'athanor_test_bot' },
+      key,
+      notificationDestinationAad(userId, id)
+    );
+
+  /** An owner, a conversation stopped on an approval, and one destination in the given state. */
+  const seeded = async (
+    state: 'verified' | 'unverified' | 'disabled',
+    key: Uint8Array = masterKey
+  ) => {
+    const user = await store.createUser({ username: 'ada', displayName: 'Ada' });
+    const workspace = await store.createWorkspace({
+      userId: user.id,
+      name: 'Cloud',
+      storageLimitBytes: 10 * 1024 ** 3,
+      imageRevision: 'dev',
+      region: 'auto',
+      wrappedKey: 'wrapped'
+    });
+    const id = randomUUID();
+    const destination = await store.upsertNotificationDestination({
+      id,
+      userId: user.id,
+      kind: 'telegram',
+      configCiphertext: sealed(user.id, id, key)
+    });
+    if (state !== 'unverified') {
+      const hash = sha256('one-time-secret');
+      await store.startDestinationPairing(destination.id, hash, new Date(Date.now() + 600_000));
+      expect(await store.completeDestinationPairing(destination.id, hash, '4242', key)).toBe(1);
+      // Paired before the approval was raised, which is what makes the approval its news.
+      await database.query(
+        "UPDATE notification_destinations SET verified_at = NOW() - INTERVAL '1 day'",
+        []
+      );
+    }
+    if (state === 'disabled') await store.setDestinationDisabled(user.id, 'telegram', true);
+    const task = await store.createTask({
+      userId: user.id,
+      workspaceId: workspace.id,
+      titleCiphertext: { v: 1, iv: 'a', tag: 'b', ciphertext: 'c' },
+      nameIndex: { nameTokens: '', openingTokens: '' },
+      modelId: 'qwen',
+      privacyRoute: 'provider_zdr',
+      maxComputeCredits: 1,
+      promptCiphertext: { v: 1, iv: 'a', tag: 'b', ciphertext: 'c' }
+    });
+    const approvalId = await store.createApproval({
+      userId: user.id,
+      taskId: task.id,
+      action: 'shell',
+      sideEffect: 'external_consequential',
+      previewCiphertext: { v: 1, iv: 'a', tag: 'b', ciphertext: 'c' },
+      previewHash: 'hash',
+      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000)
+    });
+    await store.setTaskStatusForUser(user.id, task.id, 'awaiting_user');
+    return { user, task, approvalId, destination };
+  };
+
+  it('is offered the approval with no push subscription at all', async () => {
+    // The whole point of the second transport, as one row: nothing in push_subscriptions, and the
+    // approval is still a candidate because the destination is a target in its own right.
+    const { approvalId, destination, user } = await seeded('verified');
+    const pending = await store.listPendingNotifications();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({
+      transport: 'telegram',
+      id: destination.id,
+      userId: user.id,
+      kind: 'approval_required',
+      resourceId: approvalId,
+      // No key was handed in, so the token and the sender stay sealed and the row says so.
+      senderId: null,
+      redact: true,
+      config: null
+    });
+    expect(JSON.stringify(pending)).not.toContain('token-of-the-bot');
+    expect(JSON.stringify(pending)).not.toContain('4242');
+  });
+
+  it('keeps the paired sender sealed at rest and opens it only for the caller holding the key', async () => {
+    const { user, destination } = await seeded('verified');
+    // Nothing in the table names the sender in the clear: the column that would have is gone and
+    // the envelope that replaces it does not contain the digits.
+    const columns = await database.query(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_name='notification_destinations' ORDER BY column_name`
+    );
+    expect(columns.rows.map((row) => row.column_name)).not.toContain('sender_id');
+    const rows = await database.query(
+      'SELECT sender_ciphertext::text AS sealed FROM notification_destinations'
+    );
+    expect(rows.rows).toHaveLength(1);
+    expect(String(rows.rows[0]!.sealed)).not.toContain('4242');
+    // Every read that hands the sender out takes the key and opens it; without the key, or with
+    // the wrong one, each says null rather than guessing.
+    const [row] = await store.listPendingNotifications(100, masterKey);
+    expect(row?.transport === 'telegram' ? row.senderId : 'not-telegram').toBe('4242');
+    expect((await store.getNotificationDestination(user.id, 'telegram', masterKey))?.senderId).toBe(
+      '4242'
+    );
+    expect((await store.getNotificationDestination(user.id, 'telegram'))?.senderId).toBeNull();
+    const wrongKey = new Uint8Array(32).fill(9);
+    expect(
+      (await store.getNotificationDestination(user.id, 'telegram', wrongKey))?.senderId
+    ).toBeNull();
+    const [active] = await store.listActiveNotificationDestinations(masterKey);
+    expect(active?.senderId).toBe('4242');
+    await store.recordDestinationDelivery(
+      destination.id,
+      'approval_required',
+      randomUUID(),
+      '5',
+      'n'
+    );
+    const ledger = await store.findDestinationDeliveryByExternalRef(destination.id, '5', masterKey);
+    expect(ledger?.senderId).toBe('4242');
+    expect(
+      (await store.findDestinationDeliveryByExternalRef(destination.id, '5'))?.senderId
+    ).toBeNull();
+    // And the envelope is bound to the row: moved onto another id it does not open. The ledger
+    // row goes first, because the id is what it is keyed to.
+    await database.query('DELETE FROM notification_destination_deliveries');
+    await database.query('UPDATE notification_destinations SET id=$1', [randomUUID()]);
+    const [moved] = await store.listActiveNotificationDestinations(masterKey);
+    expect(moved?.senderId).toBeNull();
+  });
+
+  it('unseals the bot token only for the caller holding the master key, and only under its own context', async () => {
+    const { destination } = await seeded('verified');
+    const [row] = await store.listPendingNotifications(100, masterKey);
+    expect(row?.transport === 'telegram' && row.config?.botToken).toBe('123456:token-of-the-bot');
+    expect(row?.transport === 'telegram' && row.config?.botUsername).toBe('athanor_test_bot');
+    // The wrong key opens nothing and sends nothing: config is null rather than an exception, so
+    // the rest of the batch is unaffected.
+    const [other] = await store.listPendingNotifications(100, new Uint8Array(32).fill(9));
+    expect(other?.transport === 'telegram' ? other.config : 'not-telegram').toBeNull();
+    // And the sealed configuration is bound to the row: moved onto another id it does not open.
+    const moved = await store.getNotificationDestinationById(destination.id, masterKey);
+    expect(moved?.config?.botToken).toBe('123456:token-of-the-bot');
+    await database.query('UPDATE notification_destinations SET id=$1', [randomUUID()]);
+    const [after] = await store.listActiveNotificationDestinations(masterKey);
+    expect(after?.config).toBeNull();
+  });
+
+  it('offers nothing to a destination that is not yet paired', async () => {
+    await seeded('unverified');
+    await expect(store.listPendingNotifications()).resolves.toEqual([]);
+  });
+
+  it('offers nothing to a destination the owner switched off, and everything again when it is on', async () => {
+    const { user } = await seeded('disabled');
+    await expect(store.listPendingNotifications()).resolves.toEqual([]);
+    await store.setDestinationDisabled(user.id, 'telegram', false);
+    await expect(store.listPendingNotifications()).resolves.toHaveLength(1);
+  });
+
+  it('is told each thing once: the ledger row stops a second candidate and a second row', async () => {
+    const { approvalId, destination } = await seeded('verified');
+    await store.recordDestinationDelivery(
+      destination.id,
+      'approval_required',
+      approvalId,
+      '77',
+      'nonce-one'
+    );
+    await store.recordDestinationDelivery(
+      destination.id,
+      'approval_required',
+      approvalId,
+      '78',
+      'nonce-two'
+    );
+    await expect(store.listPendingNotifications()).resolves.toEqual([]);
+    const rows = await database.query(
+      'SELECT external_ref, nonce FROM notification_destination_deliveries',
+      []
+    );
+    // The first write wins and the second changes nothing, so a card is never sent twice and the
+    // nonce the phone holds is the one the ledger holds.
+    expect(rows.rows).toEqual([{ external_ref: '77', nonce: 'nonce-one' }]);
+    const ledger = await store.getDestinationDelivery(
+      destination.id,
+      'approval_required',
+      approvalId
+    );
+    expect(ledger).toMatchObject({ nonce: 'nonce-one', externalRef: '77', outcomeAt: null });
+  });
+
+  it('refuses a pairing link that is wrong, that lapsed, or that was already used', async () => {
+    const { user, destination } = await seeded('unverified');
+    const hash = sha256('the-real-secret');
+    await store.startDestinationPairing(destination.id, hash, new Date(Date.now() + 600_000));
+    expect(
+      await store.completeDestinationPairing(destination.id, sha256('a-guess'), '1', masterKey)
+    ).toBe(0);
+    expect(await store.completeDestinationPairing(destination.id, hash, '4242', masterKey)).toBe(1);
+    // Replay: the same link tapped again, by anyone, binds nobody and changes nothing.
+    expect(await store.completeDestinationPairing(destination.id, hash, '9999', masterKey)).toBe(0);
+    expect((await store.getNotificationDestination(user.id, 'telegram', masterKey))?.senderId).toBe(
+      '4242'
+    );
+    // Lapsed: a fresh secret whose window has already closed.
+    const lapsed = sha256('too-late');
+    await store.startDestinationPairing(destination.id, lapsed, new Date(Date.now() - 1_000));
+    expect(await store.completeDestinationPairing(destination.id, lapsed, '5', masterKey)).toBe(0);
+    const state = await store.getNotificationDestination(user.id, 'telegram', masterKey);
+    expect(state).toMatchObject({ senderId: null, verifiedAt: null, pairingPending: false });
+  });
+
+  it('lists a sent card whose approval was decided elsewhere until its outcome is written back', async () => {
+    const { user, approvalId, destination } = await seeded('verified');
+    await store.recordDestinationDelivery(
+      destination.id,
+      'approval_required',
+      approvalId,
+      '5',
+      'n'
+    );
+    // Still pending: nothing to write back.
+    await expect(store.listDestinationDeliveriesAwaitingOutcome()).resolves.toEqual([]);
+    expect(await store.resolveApproval(user.id, approvalId, 'approved')).toBe(true);
+    const awaiting = await store.listDestinationDeliveriesAwaitingOutcome(100, masterKey);
+    expect(awaiting).toHaveLength(1);
+    expect(awaiting[0]).toMatchObject({
+      destinationId: destination.id,
+      resourceId: approvalId,
+      externalRef: '5',
+      approvalStatus: 'approved',
+      senderId: '4242',
+      userId: user.id
+    });
+    await store.markDestinationDeliveryOutcome(destination.id, 'approval_required', approvalId);
+    await expect(store.listDestinationDeliveriesAwaitingOutcome()).resolves.toEqual([]);
+  });
+
+  it('opens no outcome for a row settled without a message, so the sweep never edits a card that was not sent', async () => {
+    const { user, approvalId, destination } = await seeded('verified');
+    await store.recordDestinationDelivery(
+      destination.id,
+      'approval_required',
+      approvalId,
+      null,
+      null
+    );
+    expect(await store.resolveApproval(user.id, approvalId, 'denied')).toBe(true);
+    await expect(store.listDestinationDeliveriesAwaitingOutcome()).resolves.toEqual([]);
+  });
+
+  /*
+   * What the health port tells `doctor` exists. The service already reported how many endpoints
+   * were refusing, and zero refusing is trivially true of a box nobody has ever subscribed a
+   * device to - so `doctor` said push delivery was fine on a box where nothing could be delivered
+   * to. The count is of targets that could actually be sent to: a switched-off destination and one
+   * still waiting for its pairing link to be tapped are neither.
+   */
+  it('counts the devices and paired phones a notification could reach, and nothing that it cannot', async () => {
+    await expect(store.notificationTargetCounts()).resolves.toEqual({
+      pushSubscriptions: 0,
+      pairedDestinations: 0
+    });
+    const { user } = await seeded('disabled');
+    await expect(store.notificationTargetCounts()).resolves.toMatchObject({
+      pairedDestinations: 0
+    });
+    expect(await store.setDestinationDisabled(user.id, 'telegram', false)).toBe(true);
+    await expect(store.notificationTargetCounts()).resolves.toMatchObject({
+      pairedDestinations: 1
+    });
+    const subscription = await store.upsertPushSubscription({
+      userId: user.id,
+      sessionPublicId: await store.createSession(user.id, 'hash', new Date(Date.now() + 60_000)),
+      endpoint: 'https://push.example/opaque',
+      p256dh: 'public-key',
+      auth: 'auth-secret'
+    });
+    await expect(store.notificationTargetCounts()).resolves.toEqual({
+      pushSubscriptions: 1,
+      pairedDestinations: 1
+    });
+    expect(await store.deletePushSubscriptionById(subscription.id)).toBe(true);
+    await expect(store.notificationTargetCounts()).resolves.toMatchObject({
+      pushSubscriptions: 0
+    });
+  });
+
+  it('takes the ledger with the destination when the owner unpairs', async () => {
+    const { user, approvalId, destination } = await seeded('verified');
+    await store.recordDestinationDelivery(
+      destination.id,
+      'approval_required',
+      approvalId,
+      '5',
+      'n'
+    );
+    expect(await store.deleteNotificationDestination(user.id, 'telegram')).toBe(true);
+    const rows = await database.query('SELECT 1 FROM notification_destination_deliveries', []);
+    expect(rows.rows).toEqual([]);
+    await expect(store.getNotificationDestination(user.id, 'telegram')).resolves.toBeNull();
   });
 });

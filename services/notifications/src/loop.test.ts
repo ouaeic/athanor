@@ -10,6 +10,9 @@ const result = (overrides: Partial<SweepResult> = {}): SweepResult => ({
   retired: 0,
   deferred: 0,
   held: 0,
+  unsendable: 0,
+  destinationDelivered: 0,
+  destinationFailed: 0,
   idle: true,
   ...overrides
 });

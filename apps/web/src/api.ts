@@ -214,7 +214,11 @@ const REQUEST_TIMEOUT_MS = 45_000;
  */
 const webauthn = () => import('@simplewebauthn/browser');
 
-const request = async <T>(path: string, init?: RequestInit): Promise<T> => {
+/**
+ * Exported for the one caller outside this file: the phone transport's calls live in a module
+ * only the settings screen loads, so their weight stays out of the first paint.
+ */
+export const request = async <T>(path: string, init?: RequestInit): Promise<T> => {
   const response = await fetch(path, {
     credentials: 'include',
     ...init,
@@ -254,7 +258,7 @@ const request = async <T>(path: string, init?: RequestInit): Promise<T> => {
   ) as Promise<T>;
 };
 
-const mutation = (method: string, body: unknown): RequestInit => ({
+export const mutation = (method: string, body: unknown): RequestInit => ({
   method,
   body: JSON.stringify(body),
   headers: { 'idempotency-key': crypto.randomUUID() }

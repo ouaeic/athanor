@@ -22,6 +22,7 @@ import {
   ScrollText,
   Server,
   ShieldCheck,
+  Smartphone,
   Trash2,
   TriangleAlert,
   UserRoundPen,
@@ -85,6 +86,13 @@ import {
   type NotificationSettings,
   type NotificationSettingsDraft
 } from './notification-settings.js';
+import {
+  botTokenProblem,
+  phoneApi,
+  phoneStatusLine,
+  type NotificationDestination,
+  type PairingOffer
+} from './phone-transport.js';
 import type {
   ApiToken,
   Bootstrap,
@@ -977,6 +985,14 @@ export function SelfHostedSettings({
   const [pushDraft, setPushDraft] = useState<NotificationSettingsDraft>(
     notificationSettingsDraft(defaultNotificationSettings())
   );
+  /**
+   * The phone transport: undefined until asked, null on a server without it, so the block stays
+   * hidden on an older box rather than drawing buttons that would all fail.
+   */
+  const [phoneTransport, setPhoneTransport] = useState<NotificationDestination[] | null>();
+  const [botTokenDraft, setBotTokenDraft] = useState('');
+  /** The pairing link, shown once and never served again; cleared the moment a phone opens it. */
+  const [pairing, setPairing] = useState<(PairingOffer & { qr: string }) | null>(null);
   const [reissuedRecoveryCode, setReissuedRecoveryCode] = useState('');
   /**
    * Said inside the recovery card rather than in the page banner far above it.
@@ -1217,7 +1233,51 @@ export function SelfHostedSettings({
         if (settings) setPushDraft(notificationSettingsDraft(settings));
       })
       .catch(() => setPushSettings(null));
+    void phoneApi
+      .destinations()
+      .then(setPhoneTransport)
+      .catch(() => setPhoneTransport(null));
   }, []);
+
+  const phone = phoneTransport?.find((destination) => destination.kind === 'telegram') ?? null;
+  const phonePairingPending = phone?.pairingPending ?? false;
+  const phonePaired = phone?.paired ?? false;
+  /*
+   * While a link is out, ask every three seconds whether a phone has opened it. The pairing
+   * completes on the notification service's side, from the bot API's inbound poll, so this screen
+   * only ever learns of it by asking; and the link is dropped the moment the answer is yes, so a
+   * secret that has been used is not left on screen.
+   */
+  useEffect(() => {
+    if (!phonePairingPending) return undefined;
+    const timer = setInterval(() => {
+      void phoneApi
+        .destinations()
+        .then((list) => {
+          if (list) setPhoneTransport(list);
+        })
+        .catch(() => undefined);
+    }, 3_000);
+    return () => clearInterval(timer);
+  }, [phonePairingPending]);
+  useEffect(() => {
+    if (phonePaired) setPairing(null);
+  }, [phonePaired]);
+
+  /** The link as an image, loaded on demand: the encoder is only needed on this one screen. */
+  const showPairing = async (offer: PairingOffer) => {
+    const { toDataURL } = await import('qrcode');
+    setPairing({
+      ...offer,
+      qr: await toDataURL(offer.pairingUrl, {
+        errorCorrectionLevel: 'M',
+        margin: 2,
+        width: 240,
+        color: { dark: '#e7e9ea', light: '#0c0d0e' }
+      })
+    });
+    setPhoneTransport(await phoneApi.destinations());
+  };
 
   /*
    * Every write on this screen goes through here, which is why the step-up confirmation lives here
@@ -2749,6 +2809,175 @@ export function SelfHostedSettings({
             >
               <Save /> Save notification rules
             </button>
+          </>
+        )}
+
+        {/*
+          The second transport, under the device one it stands beside. A bot on a messaging
+          service reaches a phone with nothing installed by athanor, and is two-way: an approval
+          arrives with its buttons, a question arrives to be replied to. The messaging service can
+          read what it carries, which is why the redaction switch defaults on and says so.
+        */}
+        {phoneTransport && (
+          <>
+            <div className="section-heading">
+              <Smartphone />
+              <div>
+                <strong>Your phone</strong>
+                <span>
+                  Approvals, questions and news on your phone through a messaging bot, with nothing
+                  to install. You can approve, deny and answer from there. {phoneStatusLine(phone)}
+                </span>
+              </div>
+            </div>
+            {!phonePaired && !phonePairingPending && (
+              <>
+                <label>
+                  Bot token
+                  <input
+                    type="password"
+                    autoComplete="off"
+                    value={botTokenDraft}
+                    onChange={(event) => setBotTokenDraft(event.target.value)}
+                    placeholder="123456789:AA…"
+                  />
+                  <small>
+                    Message BotFather, send /newbot, and paste the token it gives you. It is sealed
+                    on this box and never shown again.
+                  </small>
+                </label>
+                <button
+                  disabled={busy}
+                  onClick={() =>
+                    void act(async () => {
+                      const problem = botTokenProblem(botTokenDraft);
+                      if (problem) throw new Error(problem);
+                      await api.stepUp();
+                      const offer = await phoneApi.create(botTokenDraft.trim());
+                      setBotTokenDraft('');
+                      await showPairing(offer);
+                    })
+                  }
+                >
+                  <Smartphone /> Pair your phone
+                </button>
+                {phone?.botUsername && (
+                  <button
+                    className="secondary"
+                    disabled={busy}
+                    onClick={() =>
+                      void act(async () => {
+                        await api.stepUp();
+                        await showPairing(await phoneApi.remintPairing());
+                      })
+                    }
+                  >
+                    <QrCode /> Make a new pairing link for @{phone.botUsername}
+                  </button>
+                )}
+              </>
+            )}
+            {pairing && !phonePaired && (
+              <div className="enrollment-card">
+                <img src={pairing.qr} alt="Phone pairing code" />
+                <span>
+                  Open this on your phone, then press Start in the chat with @{pairing.botUsername}.
+                  This page updates on its own once the phone is paired.
+                </span>
+                <code>{pairing.pairingUrl}</code>
+                <span>Expires {new Date(pairing.expiresAt).toLocaleTimeString()} · single use</span>
+                <div className="enrollment-actions">
+                  <CopyButton value={pairing.pairingUrl} label="Copy link" />
+                  <button
+                    className="secondary"
+                    disabled={busy}
+                    onClick={() =>
+                      void act(async () => {
+                        await api.stepUp();
+                        await showPairing(await phoneApi.remintPairing());
+                      })
+                    }
+                  >
+                    <RotateCcw /> Make a new link
+                  </button>
+                </div>
+              </div>
+            )}
+            {phone && phonePaired && (
+              <>
+                <label className="toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={phone.redact}
+                    disabled={busy}
+                    onChange={(event) => {
+                      const redact = event.target.checked;
+                      // Off widens what the messaging service can read, and the server asks for
+                      // the passkey before it does; on never does.
+                      void act(() =>
+                        withStepUp(async () => {
+                          const updated = await phoneApi.update({ redact });
+                          setPhoneTransport(updated ? [updated] : []);
+                        }, api.stepUp)
+                      );
+                    }}
+                  />
+                  <strong>Redacted cards</strong>
+                  <small>
+                    The messaging service is not end-to-end encrypted: what a card carries, its
+                    servers can read. On, a card is the conversation&apos;s name and a link and
+                    nothing else. Off, it also carries what athanor wants to do or say.
+                  </small>
+                </label>
+                <label className="toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={!phone.disabledAt}
+                    disabled={busy}
+                    onChange={(event) => {
+                      const disabled = !event.target.checked;
+                      void act(async () => {
+                        const updated = await phoneApi.update({ disabled });
+                        setPhoneTransport(updated ? [updated] : []);
+                      });
+                    }}
+                  />
+                  <strong>Send to this phone</strong>
+                  <small>
+                    Off keeps the pairing and sends nothing. The rules above decide what is sent
+                    when it is on.
+                  </small>
+                </label>
+                <button
+                  disabled={busy}
+                  onClick={() =>
+                    void act(async () => {
+                      await phoneApi.test();
+                      setNotice('Sent. If it did not arrive, check the chat with your bot.');
+                    })
+                  }
+                >
+                  <BellRing /> Send a test message
+                </button>
+                <button
+                  className="secondary"
+                  disabled={busy}
+                  onClick={() =>
+                    void act(async () => {
+                      await api.stepUp();
+                      await phoneApi.remove();
+                      setPhoneTransport([]);
+                      setPairing(null);
+                      setNotice(
+                        'Unpaired. Also revoke the bot token in BotFather if the phone was lost.'
+                      );
+                    })
+                  }
+                >
+                  <Trash2 /> Unpair
+                </button>
+              </>
+            )}
           </>
         )}
 
