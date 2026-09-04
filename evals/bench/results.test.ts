@@ -207,9 +207,10 @@ describe('assembling a row', () => {
       []
     );
     const { out } = quiet();
-    expect(assembleRow({ dir, arm: 'shipped', runs: 2, taskIds: ['alpha'], out }).refusal).toMatch(
-      /2 different athanor commits/
-    );
+    expect(
+      assembleRow({ dir, arm: 'shipped', runs: 2, taskIds: ['alpha'], out, sameBuild: () => false })
+        .refusal
+    ).toMatch(/2 different athanor commits/);
     const other = fresh();
     writeTaskRecord(other, 'shipped', 0, recordOf('shipped', 0, 'alpha', true), []);
     writeTaskRecord(
@@ -224,6 +225,44 @@ describe('assembling a row', () => {
     expect(
       assembleRow({ dir: other, arm: 'shipped', runs: 2, taskIds: ['alpha'], out }).refusal
     ).toMatch(/2 different models/);
+  });
+
+  it('shares a row across commits whose shipped code is identical, and names the newer one', () => {
+    /*
+     * The instrument changed, the loop did not: a shim fix landed between one task's re-run and
+     * the fifty-eight records beside it. What git says about apps, packages and services is the
+     * question; here it is answered by hand in both directions.
+     */
+    const dir = fresh();
+    writeTaskRecord(dir, 'shipped', 0, recordOf('shipped', 0, 'alpha', true), []);
+    writeTaskRecord(
+      dir,
+      'shipped',
+      1,
+      recordOf('shipped', 1, 'alpha', true, { athanor: { version: '0.1.1', commit: 'fff9999' } }),
+      []
+    );
+    const shared = quiet();
+    const assembled = assembleRow({
+      dir,
+      arm: 'shipped',
+      runs: 2,
+      taskIds: ['alpha'],
+      sameBuild: () => true,
+      out: shared.out
+    });
+    expect(assembled.refusal).toBeNull();
+    expect(assembled.row?.[COLUMNS.indexOf('athanor_commit')]).toBe('fff9999');
+    expect(shared.lines.some((line) => line.includes('byte-identical'))).toBe(true);
+    const refused = assembleRow({
+      dir,
+      arm: 'shipped',
+      runs: 2,
+      taskIds: ['alpha'],
+      sameBuild: () => false,
+      out: quiet().out
+    });
+    expect(refused.refusal).toMatch(/2 different athanor commits/);
   });
 
   it('passes rowFrom for unattended with cards auto-answered, and is refused for shipped', () => {

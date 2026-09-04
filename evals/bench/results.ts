@@ -34,6 +34,7 @@
  * failed to produce a verdict for, whatever the reason, and the row is the worse for it exactly as
  * it should be.
  */
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
@@ -216,7 +217,41 @@ export interface AssembleOptions {
    */
   readonly taskSet?: readonly TaskSetMember[] | undefined;
   readonly out: (line: string) => void;
+  /**
+   * Whether two commits ship the same loop.
+   *
+   * A row is one build, and the build is the code that RAN - `apps`, `packages` and `services` -
+   * not the label on the checkout. The first ladder had two of nine rows voided by a shim gap,
+   * the shim was fixed and the two tasks re-run, and the re-run records then carried the fixing
+   * commit while the other fifty-eight carried the one before it. Refusing that row would have
+   * said the loop changed when only the instrument had. So records from different commits share a
+   * row exactly when git says the shipped trees are byte-identical between every pair, and the
+   * row names the newest of them. Absent, the question is asked of git; a test hands in an answer.
+   */
+  readonly sameBuild?: ((a: string, b: string) => boolean) | undefined;
 }
+
+/** Asks git whether the code that runs is identical between two commits. Unknown commits are not. */
+export const shippedTreesAgree = (a: string, b: string): boolean => {
+  try {
+    execFileSync('git', ['diff', '--quiet', a, b, '--', 'apps', 'packages', 'services'], {
+      stdio: 'ignore'
+    });
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/** The later of two commits by ancestry, or `b` when git cannot say. */
+const laterCommit = (a: string, b: string): string => {
+  try {
+    execFileSync('git', ['merge-base', '--is-ancestor', a, b], { stdio: 'ignore' });
+    return b;
+  } catch {
+    return a;
+  }
+};
 
 export interface AssembledRow {
   readonly input: RowInput | null;
@@ -284,6 +319,20 @@ export const assembleRow = (options: AssembleOptions): AssembledRow => {
     values.length > 1
       ? `these records were produced on ${String(values.length)} different ${what}s (${values.join(', ')}), so no single ${what} column is true of the row: one box, one build, one model per row. No row.`
       : null;
+  const sameBuild = options.sameBuild ?? shippedTreesAgree;
+  let buildCommit: string | null = null;
+  const refuseMixedBuild = (commits: readonly string[]): string | null => {
+    if (commits.length <= 1) return null;
+    const pairs = commits.flatMap((a, i) => commits.slice(i + 1).map((b) => [a, b] as const));
+    if (!pairs.every(([a, b]) => sameBuild(a, b))) return refuseMixed('athanor commit', commits);
+    buildCommit = commits.reduce((newest, commit) =>
+      options.sameBuild ? commit : laterCommit(newest, commit)
+    );
+    options.out(
+      `  records carry ${String(commits.length)} commits (${commits.join(', ')}) whose apps, packages and services are byte-identical; the row names ${buildCommit}`
+    );
+    return null;
+  };
   const mixed =
     refuseMixed(
       'backend',
@@ -291,7 +340,7 @@ export const assembleRow = (options: AssembleOptions): AssembledRow => {
         records.map((one) => `${one.record.ranIn.name}/${String(one.record.ranIn.isolatesNetwork)}`)
       )
     ) ??
-    refuseMixed('athanor commit', distinct(records.map((one) => one.record.athanor.commit))) ??
+    refuseMixedBuild(distinct(records.map((one) => one.record.athanor.commit))) ??
     refuseMixed('model', distinct(records.map((one) => one.record.identity.model))) ??
     refuseMixed('benchmark', distinct(records.map((one) => one.record.benchmark))) ??
     refuseMixed('security mode', distinct(records.map((one) => one.record.securityMode)));
@@ -393,7 +442,7 @@ export const assembleRow = (options: AssembleOptions): AssembledRow => {
     modelRoute: first.identity.modelRoute,
     provider: first.identity.provider,
     harnessVersion: first.athanor.version,
-    harnessCommit: first.athanor.commit,
+    harnessCommit: buildCommit ?? first.athanor.commit,
     arm: options.arm,
     securityMode: first.securityMode,
     approvalsAutoAnswered: records.reduce((total, one) => total + one.record.autoAnswered, 0),
@@ -509,7 +558,7 @@ const KEY_COLUMNS = [
 const ARM_ORDER: readonly string[] = ['shipped', 'autonomous', 'unattended'];
 
 const keyOf = (row: readonly string[]): string =>
-  KEY_COLUMNS.map((column) => row[COLUMNS.indexOf(column)] ?? '').join(' ');
+  KEY_COLUMNS.map((column) => row[COLUMNS.indexOf(column)] ?? '').join('\u0000');
 
 /**
  * One row in, the rest kept.
