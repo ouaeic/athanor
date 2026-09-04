@@ -36,16 +36,16 @@
     "desktop:build": "pnpm --filter @athanor/desktop native:build"
   },
   "devDependencies": {
-    "@eslint/js": "9.39.5",
-    "@types/node": "24.13.3",
-    "eslint": "9.39.5",
+    "@eslint/js": "10.0.1",
+    "@types/node": "26.4.0",
+    "eslint": "10.9.1",
     "eslint-plugin-jsx-a11y": "6.10.2",
     "eslint-plugin-react-hooks": "7.1.1",
     "globals": "17.11.0",
-    "prettier": "3.8.5",
-    "tsx": "4.23.12",
-    "typescript": "5.9.3",
-    "typescript-eslint": "8.56.0",
-    "vitest": "4.1.10"
+    "prettier": "3.9.6",
+    "tsx": "4.23.13",
+    "typescript": "7.0.2",
+    "typescript-eslint": "8.69.0",
+    "vitest": "4.1.11"
   }
 }
