@@ -446,18 +446,23 @@ check('nine models, four of them going', Object.values(counts ?? {}), ['9|4']);
 const dependencies = (await database.query(read('dependencies'))).rows.map(
   (row) => Object.values(row)[0]
 );
-const today = (days) => {
-  const date = new Date();
-  date.setUTCDate(date.getUTCDate() + days);
-  return date.toISOString().slice(0, 10);
-};
+// Read off the same clock the rows were seeded from. The rows are `CURRENT_DATE + n` in the
+// database's own day; a date computed here from the process clock in UTC is a different day for
+// two hours out of every twenty-four on a box east of Greenwich, and this check failed for exactly
+// that reason at one in the morning.
+const today = async (days) =>
+  String(
+    Object.values(
+      (await database.query(`SELECT to_char(CURRENT_DATE + ${days}, 'YYYY-MM-DD') AS day`)).rows[0]
+    )[0]
+  );
 check(
   'only the pins and schedules with something wrong come back, in order',
   dependencies,
   [
-    `pin|pinner|m-soon-1|${today(6)}|Soon One`,
+    `pin|pinner|m-soon-1|${await today(6)}|Soon One`,
     'pin|stranded|m-vanished||',
-    `schedule|pinner|m-soon-3|${today(28)}|Soon Three`
+    `schedule|pinner|m-soon-3|${await today(28)}|Soon Three`
   ]
 );
 
