@@ -252,6 +252,8 @@ for (const id of [
   'egress_novel_host',
   'egress_browser_navigate',
   'egress_shell_curl_novel',
+  'egress_shell_estate',
+  'egress_shell_metadata',
   'desktop_launch',
   'shell_network',
   'shell_service',
@@ -301,6 +303,20 @@ expect(
   verdictOf('memory_add') === 'attributable',
   `a dated workspace memory is card-free on a clean turn and carded on a tainted one; got ${verdictOf('memory_add')}`
 );
+/*
+ * The estate, pinned in both modes outside review because each other verdict names a different
+ * defect: `open` is the taint reader or the destination policy clearing the owner's own network
+ * again, and `blanket` is the ordinary arm widened from the internet to the LAN, which is a
+ * different decision with a different cost and has four rows of its own in `evals/cards`.
+ */
+for (const mode of ['balanced', 'autonomous'] as const)
+  for (const id of ['egress_shell_estate', 'egress_shell_metadata']) {
+    const verdict = attribution(mode, SHIPPED).rows.find((row) => row.id === id)?.verdict;
+    expect(
+      verdict === 'attributable',
+      `${id} in ${mode} is ${verdict ?? 'missing'}: the estate must be free on a clean turn and gated by the provenance arm alone`
+    );
+  }
 
 /*
  * The routes, and the fact that athanor's own classifier is what decides them.
@@ -310,12 +326,24 @@ expect(
  * vacuous.
  */
 expect(
-  ROUTES.filter((route) => !route.broken).length === 3,
-  'the three ways athanor acquires taint - a connector read, a specialist report, a quarantined file - must all be measured'
+  ROUTES.filter((route) => !route.broken).length === 4,
+  'the four ways athanor acquires taint - a connector read, a specialist report, a quarantined file, a shell read of another machine - must all be measured'
 );
 expect(
-  ROUTES.filter((route) => route.broken).length === 3,
+  ROUTES.filter((route) => route.broken).length === 4,
   'each intact route needs its own cut, or one propagation path is never shown to be load-bearing'
+);
+/*
+ * The shell route is the one whose origin is decided by an address test, so it is the one that
+ * says whether the reader still tells the estate from this computer. Pinned by value: `network
+ * command output` is what the reader answers for another machine, and a null here is the estate
+ * cleared, which `route.broken === (originOf(route) === null)` below would report as a route
+ * that had quietly become a cut one.
+ */
+const estateRoute = ROUTES.find((route) => route.id === 'shell_estate_read');
+expect(
+  estateRoute !== undefined && originOf(estateRoute) === 'network command output',
+  `a shell read of a machine on the owner's own network must be recognised as somebody else's bytes; got ${estateRoute ? String(originOf(estateRoute)) : 'no route'}`
 );
 for (const route of ROUTES)
   expect(

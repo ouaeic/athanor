@@ -1593,11 +1593,20 @@ export const MEMORY_STANDING_ORDER_MAX_CHARS = 200;
  * rather than adequately" - and splitting there would cut a rule in half and call the second half
  * an exception. `and` is absent for the same reason in the other direction: it is the commonest
  * word in the corpus and it joins as often as it qualifies. `until`, `while` and `when` are
- * absent because they set a rule's scope rather than carving out of it.
+ * absent because they set a rule's scope rather than carving out of it - and dropping a scope
+ * makes a rule stricter, never looser, which is the safe direction for the one shape not read.
+ *
+ * Every phrasing a carve-out arrives in is a phrasing that has to be here, and that is the whole
+ * reason the set is as wide as it is. The split is what puts a qualified sighting on the same
+ * counter as the bare rule; a phrasing the split does not see keys under the whole sentence, and
+ * the day a bare sighting corroborates the rule it promotes without the exception - silently, on a
+ * path nothing reviews. So the set is not a corpus count of what this owner has typed but a list
+ * of how English carves out of an instruction, and it is attacked phrasing by phrasing in the
+ * tests rather than on the one connective the first fixture happened to use.
  *
  * Measured over the owner's 648 typed turns through the shipped `observedStandingOrders`: of the 40
  * observations it produces, 3 carry a clause these openers find - one `but remember,`, one
- * `but not`, one `although that`. The other nine alternatives never fire on this corpus and are
+ * `but not`, one `although that`. The other alternatives never fire on this corpus and are
  * kept anyway: a connective that is restrictive in English does not stop being restrictive because
  * this owner has not typed it yet, and an unused alternative in a regex costs nothing.
  *
@@ -1613,6 +1622,7 @@ export const MEMORY_STANDING_ORDER_MAX_CHARS = 200;
 const QUALIFICATION_OPENERS = [
   'but',
   'except',
+  'excepting',
   'unless',
   'other than',
   'apart from',
@@ -1622,15 +1632,193 @@ const QUALIFICATION_OPENERS = [
   'providing that',
   'as long as',
   'so long as',
-  'although'
+  'although',
+  'even though',
+  'with the exception of',
+  'excluding',
+  'barring'
 ] as const;
 
 /**
- * Preceded by whitespace, so an opener inside a word cannot fire and a sentence that OPENS on one
- * cannot split - a leading "Unless you are on a branch, ..." would leave no rule in front of the
- * carve-out, and a core of nothing is not an identity.
+ * Connectives that carve out only from behind a clause boundary - a comma, semicolon, colon or a
+ * dash - because inside a phrase each of them is something else. "Treat every warning as though it
+ * were an error" has no exception in it; nor does "however old they are", "files not tracked by
+ * git" or "push only when CI is green", where the clause is the body of the rule and not a carve
+ * from it. Behind the owner's own comma the same words are an exception, and are read as one.
+ *
+ * Bare `not` is narrower still: it has to open a scope - "not for", "not when", "not on main" -
+ * because behind a comma it is far more often a contrast than a carve-out. Measured over every
+ * turn on this machine, ", not" fires on "an app experience on desktop and mobile, not browser
+ * focused" and "skip loudly, not silently" and on no exception at all; the composed sentence would
+ * be the owner's either way, but a contrast is not a clause that rides a rule on one sighting.
  */
-const QUALIFICATION_OPENER = new RegExp(`(?<=\\s)(?:${QUALIFICATION_OPENERS.join('|')})\\b`, 'iu');
+const QUALIFICATION_BOUNDARY_OPENERS = [
+  'though',
+  'however',
+  'only if',
+  'only when',
+  'only where',
+  'outside of',
+  String.raw`not (?:for|when|if|where|while|whilst|on|in|under|during|after|before|until|inside|outside|within|against|once)`
+] as const;
+
+/**
+ * A sentence of its own that says it is an exception to the sentence in front of it.
+ *
+ * "Always ask before deleting files. This does not apply to /tmp." is one rule in two sentences,
+ * and the second is not a rule by any test this file has - no imperative head, no marker - so read
+ * alone it is nothing and the first sentence promotes bare. `observedStandingOrders` keeps such a
+ * sentence on the line of the one before it, and the split then reads the frame from behind the
+ * owner's own full stop. The frames are the ones that NAME the preceding sentence; a following
+ * sentence that merely happens to be about the same files is a sentence of its own.
+ */
+const QUALIFICATION_SENTENCE_FRAMES = [
+  String.raw`(?:this|that|it) (?:also )?(?:does not|doesn't|need not|needn't) apply`,
+  String.raw`the (?:only |one |sole )?exceptions? (?:is|are|being)`,
+  // "Exception: /tmp." and "The only exception: /tmp." - the frame written as a label.
+  String.raw`(?:the (?:only |one |sole )?)?exceptions?:`
+] as const;
+
+/**
+ * The seams an owner types between a rule and its carve-out: a comma, semicolon or colon; a dash
+ * in any of its spellings including the typed double hyphen; an ellipsis, typed or as the single
+ * character. Every one is the owner's own punctuation and is kept on the clause it opens.
+ */
+const QUALIFICATION_CLAUSE_BOUNDARY = String.raw`(?:[,;:]\s+|\s(?:-|--|–|—)\s+|[–—]\s*|(?:\.\.\.|…)\s*)`;
+
+/**
+ * Curly apostrophes, straightened for MATCHING only. macOS smart punctuation types "don’t" with
+ * U+2019 and every pattern here is written with the straight form; measured, "but you don’t need
+ * to ask" walked through the grant lexicon while "but you don't need to ask" was refused. Both
+ * are one code unit, so a match found on the straightened text can be sliced from the original
+ * and the owner's own character survives.
+ */
+const straightened = (text: string): string => text.replace(/[‘’]/gu, "'");
+
+/**
+ * Preceded by whitespace or a boundary, so an opener inside a word cannot fire and a sentence that
+ * OPENS on one cannot split - a leading "Unless you are on a branch, ..." would leave no rule in
+ * front of the carve-out, and a core of nothing is not an identity.
+ *
+ * Behind a full stop, the openers are read as well as the frames: "Always ask before deleting
+ * files. But not for files under /tmp." and ". Except for files under /tmp." carve out exactly
+ * as the comma spelling does, and `observedStandingOrders` is what decides whether a following
+ * sentence reaches here joined to the rule in front of it.
+ */
+const QUALIFICATION_OPENER = new RegExp(
+  [
+    `(?<=\\s)(?:${QUALIFICATION_OPENERS.join('|')})\\b`,
+    `(?<=${QUALIFICATION_CLAUSE_BOUNDARY}|[.!?]\\s+)(?:${QUALIFICATION_BOUNDARY_OPENERS.join('|')})\\b`,
+    `(?<=${QUALIFICATION_CLAUSE_BOUNDARY}|[.!?]\\s+)(?:${QUALIFICATION_SENTENCE_FRAMES.join('|')})(?:\\b|(?<=:))`
+  ].join('|'),
+  'iu'
+);
+
+/** A clause on its own - inside a bracket, or opening a sentence - that begins as a carve-out. */
+const QUALIFICATION_CLAUSE_HEAD = new RegExp(
+  `^(?:${[...QUALIFICATION_OPENERS, ...QUALIFICATION_BOUNDARY_OPENERS, ...QUALIFICATION_SENTENCE_FRAMES].join('|')})(?:\\b|(?<=:))`,
+  'iu'
+);
+
+/** A following sentence that opens by naming the one before it as the thing it carves out of. */
+const QUALIFICATION_SENTENCE_FRAME = new RegExp(
+  `^(?:${QUALIFICATION_SENTENCE_FRAMES.join('|')})(?:\\b|(?<=:))`,
+  'iu'
+);
+
+/**
+ * A bracket that closes the sentence: "Always ask before deleting files (not for /tmp)." A bracket
+ * that does not - "(not for /tmp) and before pushing anything" - is an aside inside the rule, and
+ * the words after it are the rule's own; cutting there would file "and before pushing anything"
+ * as an exception. Square brackets are the same aside in the other spelling.
+ */
+const QUALIFICATION_TRAILING_ASIDE = /^(.*?)(\s*[([])([^()[\]]+)([)\]])$/u;
+
+/**
+ * A clause that opens on a condition rather than a contrast: "unless", "until", "if", "when".
+ *
+ * The grant lexicon reads differently behind one. "Unless I allow it", "unless I say you may" and
+ * "unless the build may break" all carry a permission word, and all three are the owner's own
+ * future act or a plain condition - places the rule stops, not permissions handed out. Behind a
+ * condition only the clauses that hand this computer its own discretion are grants: "unless you
+ * think it is fine", "unless you decide otherwise", "if it is fine with you".
+ */
+const QUALIFICATION_CONDITIONAL_HEAD =
+  /^(?:unless|until|if|when|whenever|once|after|before|where|wherever|provided(?: that)?|providing(?: that)?|as long as|so long as|only (?:if|when|where)|except (?:when|if|where|while))\b/iu;
+
+/**
+ * A clause that grants, which is a second instruction and not a carve-out.
+ *
+ * The one-sighting allowance for an exception rests on `R except E` covering fewer situations than
+ * `R`, and that is true of a clause that names where the rule stops. It is not true of a clause
+ * that hands out a permission of its own: "but you may approve your own shell commands" is not a
+ * place the prohibition stops, it is a permission, and one sighting of it is one sighting of a
+ * permission. Read for the words a grant is made of - a modal of permission addressed to this
+ * computer, "without asking", "at your discretion", "fair game" - and refused as a carve-out when
+ * they are found, so that the whole sentence keys as one rule and earns its two sightings like any
+ * other. Passive "can be" is a grant except in the recovery idiom a condition is made of, "unless
+ * it can be undone", where the clause narrows and the modal is the owner's caution. The safe error
+ * is the one taken: a condition misread as a grant costs the owner a second telling, a grant
+ * misread as a condition costs a permission nobody corroborated.
+ */
+/**
+ * The half of the lexicon that hands this computer its own discretion, which is a grant behind any
+ * opener - a condition included.
+ */
+const DISCRETION_GRANT = [
+  String.raw`\b(?:you|athanor|the agent|agents?)(?:'re|\s+(?:are|is))\s+(?:free|allowed|permitted|welcome|cleared|authori[sz]ed|entitled)\b`,
+  String.raw`\bwithout\s+(?:asking|approval|confirmation|confirming|checking|permission|a card|prompting|waiting)\b`,
+  String.raw`\b(?:feel free|go ahead|freely|at (?:your|its) (?:own )?discretion|as you see fit|on your own(?: authority)?|approve (?:your|its) own|self-approv\p{L}*|auto-approv\p{L}*|blanket approval|standing approval|pre-?approved|fair game|free (?:rein|reign|hand)|carte blanche)\b`,
+  String.raw`\b(?:no need to|(?:don't|do not|needn't|need not|never)\s+(?:have to\s+|need to\s+|bother to\s+)?)(?:ask|confirm|check|wait|raise|prompt)\b`,
+  // "never skip the check" tightens; "skip the check" alone loosens.
+  String.raw`(?<!\b(?:never|not|don't|do not|shouldn't|should not|mustn't|must not)\s)\bskip\s+(?:the\s+)?(?:approval|card|asking|confirmation|prompt|check)\b`,
+  // A card, an approval or a sign-off said to be unnecessary, in any of its spellings.
+  String.raw`\bneeds?\s+no\s+(?:card|approval|permission|confirmation|sign-?off|check|prompt)\b`,
+  String.raw`\b(?:won't|will not|don't|do not|doesn't|does not|shouldn't|needn't|need not)\s+need\s+(?:a|an|any|the|my)?\s*(?:card|approval|permission|confirmation|sign-?off|prompt)\b`,
+  String.raw`\bno\s+(?:card|approval|permission|confirmation|sign-?off|prompt)\s+(?:is|are|will be|would be|being)?\s*(?:needed|required|necessary|expected)\b`,
+  String.raw`\bapproval\s+is\s+(?:automatic|implicit|implied|assumed|given|granted)\b|\bautomatic(?:ally)?\s+approv\p{L}*`,
+  // An imperative addressed to this computer that ends on "yourself": push it yourself, approve it
+  // yourself. A relative clause - "files you made yourself" - has no such verb and is not one.
+  String.raw`\b(?:push|approve|run|merge|delete|remove|deploy|ship|commit|decide|handle|proceed|go|do|sort|deal with)\b[^,;]*\byourse(?:lf|lves)\b`,
+  String.raw`\b(?:is|are|it's|they're|that's|which is|which are)\s+(?:fine|ok|okay|allowed|permitted|acceptable|exempt|fair game|free game|welcome|up to you|your call|yours|your own)(?:\s+with\s+you)?\b`,
+  String.raw`\bgo\s+(?:nuts|wild|crazy|for it|hog wild|straight\s+(?:ahead|in|up|on|through))\b|\bknock\s+yourself\s+out\b|\bhave\s+at\s+it\b`,
+  String.raw`\byou\s+(?:think|judge|decide|consider|deem|feel|believe|want|like|prefer|choose|see fit)\b`,
+  String.raw`\bjust\s+(?:go|do it|push|run|merge|delete|proceed|ship|commit|deploy)\b`
+] as const;
+
+/**
+ * The rest of the lexicon: a modal of permission, a passive "can be", the owner's own approving
+ * verb. Behind a contrast these are grants; behind a condition they are the condition's own words
+ * - "unless I allow it" is the owner's act, "unless it can be lost" is a caution.
+ *
+ * The modals refuse their own negation in every spelling: "you may not", "you may never", "you
+ * may no longer" and "you can't" all tighten, and a lookahead that named only "not" read "you may
+ * never touch /etc" as a permission.
+ */
+const CONTRAST_GRANT = [
+  String.raw`\b(?:you|athanor|the agent|agents?)\s+(?:may|might|can|could)\b(?!'t\b|\s+(?:not|never|no longer)\b)`,
+  String.raw`\bmay\b(?!\s+(?:not|never|no longer)\b)`,
+  String.raw`\b(?:can|could)\s+be\s+(?!(?:undone|restored|recovered|reverted|recreated|regenerated|rebuilt|reproduced|replayed|redone|reversed|rolled back|lost)\b)\p{L}+(?:ed|en|t)\b`,
+  String.raw`\b(?:have|has|with)\s+my\s+(?:permission|blessing|approval|consent)\b`,
+  String.raw`\bI\s+(?:hereby\s+)?(?:approve|authori[sz]e|permit|allow|consent)\b`
+] as const;
+
+const DISCRETION_GRANT_PATTERN = new RegExp(DISCRETION_GRANT.join('|'), 'iu');
+const QUALIFICATION_GRANT = new RegExp([...DISCRETION_GRANT, ...CONTRAST_GRANT].join('|'), 'iu');
+
+/**
+ * Whether a clause hands out a permission rather than naming where the rule stops.
+ *
+ * Read on the straightened text, and behind a conditional opener read for discretion alone - see
+ * `QUALIFICATION_CONDITIONAL_HEAD`. The seam the clause was cut on is stepped over first, so a
+ * clause that arrives with its own comma or full stop is judged by its words.
+ */
+export const qualificationGrants = (qualification: string): boolean => {
+  const clause = straightened(qualification).replace(/^[\s,;:.!?…([–—-]+/u, '');
+  return QUALIFICATION_CONDITIONAL_HEAD.test(clause)
+    ? DISCRETION_GRANT_PATTERN.test(clause)
+    : QUALIFICATION_GRANT.test(clause);
+};
 
 /** Shorter than this is a conjunction with nothing after it, not a carve-out. */
 export const MEMORY_QUALIFICATION_MIN_CHARS = 8;
@@ -1639,11 +1827,20 @@ export const MEMORY_QUALIFICATION_MIN_CHARS = 8;
 export interface QualifiedRule {
   /** What corroboration counts. Never empty. */
   readonly core: string;
-  /** Clauses, each opening on its own connective, in the order they were read. */
+  /**
+   * Clauses, in the order they were read, each carrying the seam the owner typed in front of it -
+   * `, but not for /tmp`, `. This does not apply to /tmp`, ` — not while a release is being cut`,
+   * ` (not for /tmp)` - so the sentence recomposes character for character. A clause with no seam
+   * on it is one the store kept before the seam was, and is joined with a comma.
+   */
   readonly qualifications: readonly string[];
   /** The owner's own full stop, kept so a rule with no carve-out recomposes to itself exactly. */
   readonly terminator: string;
 }
+
+/** The words of a clause, with the seam it was cut on and its closing bracket taken off. */
+const qualificationWords = (qualification: string): string =>
+  qualification.replace(/^[\s,;:.!?…([–—-]+/u, '').replace(/[\s)\].!?]+$/u, '');
 
 /**
  * One split per sentence, and everything after the first connective is the carve-out.
@@ -1654,35 +1851,61 @@ export interface QualifiedRule {
  *
  * A split is refused rather than taken when either side is too short to be what it claims: a core
  * under `MEMORY_STANDING_ORDER_MIN_CHARS` is not a rule, and a tail under
- * `MEMORY_QUALIFICATION_MIN_CHARS` is a dangling conjunction. A refused split is not a refused
- * sentence - the whole thing becomes the core, which is exactly what the store does today.
+ * `MEMORY_QUALIFICATION_MIN_CHARS` is a dangling conjunction. It is refused for a third reason
+ * that is not about size: a tail that grants (`qualificationGrants`) is a rule of its own, and a
+ * rule is counted on the whole sentence so that it earns two sightings. A refused split is not a
+ * refused sentence - the whole thing becomes the core, which is exactly what the store does for
+ * every sentence with no carve-out in it.
  */
 export const splitQualification = (sentence: string): QualifiedRule => {
   const trimmed = sentence.trim();
   const terminator = /[.!?]+$/u.exec(trimmed)?.[0] ?? '';
   const body = trimmed.slice(0, trimmed.length - terminator.length).trimEnd();
-  const opener = QUALIFICATION_OPENER.exec(body);
-  if (!opener || opener.index <= 0) return { core: body, qualifications: [], terminator };
-  const core = body.slice(0, opener.index).replace(/[\s,;:]+$/u, '');
-  const qualification = body
-    .slice(opener.index)
-    .trim()
-    .replace(/[\s,;:]+$/u, '');
+  const whole: QualifiedRule = { core: body, qualifications: [], terminator };
+  // Matched on the straightened text and sliced from the owner's own, which the two share
+  // character positions with.
+  const matchable = straightened(body);
+  const aside = QUALIFICATION_TRAILING_ASIDE.exec(matchable);
+  const cutAt =
+    aside && QUALIFICATION_CLAUSE_HEAD.test(aside[3] ?? '')
+      ? (aside[1] ?? '').length
+      : (() => {
+          const opener = QUALIFICATION_OPENER.exec(matchable);
+          return opener && opener.index > 0 ? opener.index : -1;
+        })();
+  if (cutAt <= 0) return whole;
+  /*
+   * The core is the rule with the seam taken off its end, because it has to key the same as the
+   * bare rule stated on another day - and that one arrives with its comma, its dash or its full
+   * stop taken off. The seam itself is NOT discarded: it goes onto the front of the clause, so
+   * the owner's comma stays a comma, their dash a dash and their full stop a full stop when the
+   * sentence is put back together. A composer that chose the seam for them turned ", But not
+   * for files under /tmp" into ". But not for files under /tmp" on the strength of a capital
+   * letter, and put a second full stop after a bracket that carried its own.
+   */
+  const rawCore = body.slice(0, cutAt);
+  const core = rawCore.replace(/[\s,;:.!?…–—-]+$/u, '');
+  const qualification = body.slice(core.length).replace(/[\s,;:]+$/u, '');
+  const words = qualificationWords(qualification);
   if (
     core.length < MEMORY_STANDING_ORDER_MIN_CHARS ||
-    qualification.length < MEMORY_QUALIFICATION_MIN_CHARS
+    words.length < MEMORY_QUALIFICATION_MIN_CHARS ||
+    qualificationGrants(words)
   )
-    return { core: body, qualifications: [], terminator };
+    return whole;
   return { core, qualifications: [qualification], terminator };
 };
 
 /**
  * The rule and every carve-out anybody has seen on it, as one sentence.
  *
- * **No word is added, replaced or reordered.** The only characters this function contributes are
- * the `, ` between clauses and the owner's own terminator - or a full stop when their sentence had
- * none. That is the whole of what separates a promoted standing order from a sentence the owner
- * wrote, and it is asserted over the corpus rather than claimed here.
+ * **No word is added, replaced or reordered, and no punctuation is either.** Each clause carries
+ * the seam the owner typed in front of it and is appended as it is; the only characters this
+ * function contributes are a `, ` in front of a clause that arrived with no seam - a row the
+ * store kept before seams were - and the owner's own terminator, or a full stop when their
+ * sentence had none and the last clause does not already end on one. That is the whole of what
+ * separates a promoted standing order from a sentence the owner wrote, and it is asserted over
+ * the corpus rather than claimed here.
  *
  * Null, never a shorter sentence, when the result will not fit. A composer that dropped the last
  * carve-out to make the length would be the defect with a bound in front of it: the row that
@@ -1696,7 +1919,13 @@ export const splitQualification = (sentence: string): QualifiedRule => {
  */
 export const composeQualifiedRule = (rule: QualifiedRule): string | null => {
   if (rule.core.length < MEMORY_STANDING_ORDER_MIN_CHARS) return null;
-  const composed = [rule.core, ...rule.qualifications].join(', ') + (rule.terminator || '.');
+  const body = rule.qualifications.reduce(
+    (sentence, clause) => `${sentence}${/^[\s,;:.!?…([–—-]/u.test(clause) ? '' : ', '}${clause}`,
+    rule.core
+  );
+  // A bracket that carried its own full stop - "(not for /tmp.)" - is not given a second one.
+  const end = rule.terminator || (/[.!?]["')\]]*$/u.test(body) ? '' : '.');
+  const composed = body + end;
   return composed.length > MEMORY_STANDING_ORDER_MAX_CHARS ? null : composed;
 };
 
@@ -1706,10 +1935,11 @@ export const composeQualifiedRule = (rule: QualifiedRule): string | null => {
  * `normalizeMemoryTerm` and not a second normalisation that happens to look like it - the same fold
  * `memoryObjectKey` already applies to the rule, and the identical failure if the two drift: two
  * spellings of one exception would be two accumulator rows, and the composed sentence would say the
- * same thing twice inside a 200-character bound that then refuses the rule outright.
+ * same thing twice inside a 200-character bound that then refuses the rule outright. The seam is
+ * taken off first, so the same clause behind a comma and behind a full stop is one clause.
  */
 export const qualificationIdentity = (qualification: string): string =>
-  normalizeMemoryTerm(qualification);
+  normalizeMemoryTerm(qualificationWords(qualification));
 
 /**
  * A rule split for the store: what corroboration will count, and what rides along.
@@ -1757,11 +1987,14 @@ export const factCandidateKeys = (
 /**
  * The sentence a promotion mints: the rule, and every carve-out the store has accumulated for it.
  *
- * Null is a refusal to promote, never a bare rule. Both ways it comes back null are ways the stored
- * sentence would otherwise be broader than what was said - a core too short to be a rule, or a
- * union past `MEMORY_STANDING_ORDER_MAX_CHARS`. `promoteMemoryFactCandidates` leaves a candidate
- * exactly where it is when `prepare` answers null, so refusing costs a rule the owner can state
- * again rather than costing the clauses.
+ * Null is a refusal to promote, never a bare rule. Every way it comes back null is a way the stored
+ * sentence would otherwise be broader than what was said - a core too short to be a rule, a union
+ * past `MEMORY_STANDING_ORDER_MAX_CHARS`, or an accumulated clause that grants. The last is a
+ * clause the split refuses at the write, so it can only be here from a row written before the
+ * split read polarity; composing it would mint a permission on the one sighting it had, and
+ * promoting without it would mint the bare rule, so neither happens. `promoteMemoryFactCandidates`
+ * leaves a candidate exactly where it is when `prepare` answers null, so refusing costs a rule the
+ * owner can state again rather than costing the clauses.
  *
  * The draft supplies the core and the owner's own full stop. The accumulator supplies the clauses,
  * and supplies ALL of them - the draft's own split is a fallback for an empty accumulator and never
@@ -1781,6 +2014,7 @@ export const promotedStandingOrder = (
   const seen = new Set<string>();
   const clauses: string[] = [];
   for (const qualification of qualifications.length > 0 ? qualifications : rule.qualifications) {
+    if (qualificationGrants(qualification)) return null;
     const identity = qualificationIdentity(qualification);
     if (!identity || seen.has(identity)) continue;
     seen.add(identity);
@@ -2105,11 +2339,97 @@ const STANDING_STOPWORDS = new Set([
  */
 export const flattenedForStandingOrders = (text: string): string => text.replaceAll('**', '');
 
+/**
+ * One sentence per line, except a sentence that says it is an exception to the one before it,
+ * which stays on that line with the owner's own gap in between. Read alone it is not a rule and
+ * names none, so the only place it can be kept is beside the rule it carves out of; the split
+ * reads it from behind the full stop.
+ */
+/**
+ * A sentence that carves out of the one before it, rather than standing on its own.
+ *
+ * Two shapes. A frame names the preceding sentence - "This does not apply to …", "The only
+ * exception is …", "Exception: …". An opener begins the sentence on a connective and goes on to
+ * something that is not a rule - "But not for files under /tmp.", "Except for /tmp.", "Unless
+ * they are under /tmp." - and the second half of that test is what keeps "But never push to
+ * main." a rule of its own: behind the opener it has an imperative head, so it is a sentence with
+ * a rule in it and not an exception to the one before.
+ */
+const QUALIFICATION_SENTENCE_OPENER = new RegExp(
+  `^(?:${[...QUALIFICATION_OPENERS, ...QUALIFICATION_BOUNDARY_OPENERS].join('|')})\\b`,
+  'iu'
+);
+const carvesOutOfThePrevious = (sentence: string): boolean => {
+  const straight = straightened(sentence);
+  if (QUALIFICATION_SENTENCE_FRAME.test(straight)) return true;
+  const opener = QUALIFICATION_SENTENCE_OPENER.exec(straight);
+  if (!opener) return false;
+  const rest = straight.slice(opener[0].length).replace(/^[\s,]+/u, '');
+  return !STANDING_HEAD.test(rest) && !/^(?:do not|don't|never|always)\b/iu.test(rest);
+};
+
+/** A rule sentence and the carve-out sentences that followed it, each with the gap in front of it. */
+interface StandingOrderLine {
+  readonly rule: string;
+  readonly carveOuts: readonly string[];
+}
+
+/**
+ * One sentence per line, except a sentence that carves out of the one before it, which is kept
+ * beside that sentence with the owner's own gap in front of it - see `carvesOutOfThePrevious`.
+ * Read alone such a sentence is not a rule and names none, so the only place it can be kept is
+ * beside the rule it carves out of; `observedStandingOrders` joins the two once each has passed
+ * its own refusals, and the split then reads the frame from behind the full stop.
+ *
+ * A carve-out on a line of its own, or on a bullet, is the same sentence laid out differently, and
+ * a bullet says how a sentence is laid out rather than what it says; it is joined with one space
+ * and the bullet taken off.
+ */
+const standingOrderLines = (text: string): StandingOrderLine[] => {
+  const lines: StandingOrderLine[] = [];
+  let current: { rule: string; carveOuts: string[] } | null = null;
+  for (const paragraph of text.split(/\n+/u)) {
+    const pieces = paragraph.split(/((?<=[.!?])\s+)/u);
+    for (let at = 0; at < pieces.length; at += 2) {
+      const sentence = pieces[at] ?? '';
+      const gap = at === 0 ? ' ' : (pieces[at - 1] ?? ' ');
+      const bare = at === 0 ? sentence.replace(STANDING_LEADING_MARKUP, '') : sentence;
+      if (current && bare.trim() && carvesOutOfThePrevious(bare.trim())) {
+        current.carveOuts.push(gap + bare.trim());
+        continue;
+      }
+      if (current) lines.push(current);
+      current = { rule: sentence, carveOuts: [] };
+    }
+  }
+  if (current) lines.push(current);
+  return lines;
+};
+
+/**
+ * Whether a carve-out sentence may ride on the rule in front of it: complete, not a question, not
+ * a quotation, not somebody else's words. The rule was measured against the same refusals on its
+ * own; measuring the joined line instead let the frame's defects cost the rule. `Always ask before
+ * deleting files. This does not apply to /tmp` - no final full stop, as chat is typed - was
+ * refused whole, and the rule that had been a candidate on its own was not even that.
+ */
+const carveOutStands = (carveOut: string): boolean => {
+  const sentence = carveOut.trim();
+  return (
+    STANDING_COMPLETE.test(sentence) &&
+    !STANDING_ASKED.test(sentence) &&
+    !STANDING_QUOTED.test(sentence) &&
+    !STANDING_REPORTED.test(sentence)
+  );
+};
+
 export const observedStandingOrders = (text: string): MemoryFactObservation[] => {
   if (!memoryPredicate('standing_order')) return [];
   const seen = new Set<string>();
   const found: MemoryFactObservation[] = [];
-  for (const raw of ownerWritten(flattenedForStandingOrders(text)).split(/\n+|(?<=[.!?])\s+/u)) {
+  for (const { rule: raw, carveOuts } of standingOrderLines(
+    ownerWritten(flattenedForStandingOrders(text))
+  )) {
     const line = raw
       .replace(STANDING_LEADING_MARKUP, '')
       .replace(STANDING_TRAILING_MARKUP, '')
@@ -2165,13 +2485,26 @@ export const observedStandingOrders = (text: string): MemoryFactObservation[] =>
     );
     if (words.length < 4) continue;
     if (words.filter((word) => !STANDING_STOPWORDS.has(word)).length < 3) continue;
-    const identity = line.toLowerCase().replace(/\s+/gu, ' ');
+    /*
+     * The carve-out sentences ride on the rule only once the rule has stood on its own, and only
+     * while the joined sentence fits the bound: one that pushes it past 200 characters is dropped
+     * and the rule is observed bare, which is what it was before the sentence after it was read
+     * at all. Dropped, never truncated - a carve-out cut short would be an exception the owner
+     * did not write.
+     */
+    const object = carveOuts.reduce((joined, carveOut) => {
+      const next = joined + carveOut;
+      return carveOutStands(carveOut) && next.length <= MEMORY_STANDING_ORDER_MAX_CHARS
+        ? next
+        : joined;
+    }, line);
+    const identity = object.toLowerCase().replace(/\s+/gu, ' ');
     if (seen.has(identity)) continue;
     seen.add(identity);
     // Addressed to this computer rather than about the owner, and that is not a nicety: the pack
     // caps facts at four per subject, so filing these under `owner` would mean a workspace with
     // four standing orders could never recall the owner's shell again.
-    found.push({ subject: 'athanor', predicate: 'standing_order', object: line });
+    found.push({ subject: 'athanor', predicate: 'standing_order', object });
   }
   return found.slice(0, MEMORY_MAX_FACT_OBSERVATIONS);
 };

@@ -1,11 +1,14 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { verifyCapabilityToken } from '@athanor/core';
 import type { ModelRelease } from '@athanor/contracts';
 import type { DataStore, TaskRecord } from '@athanor/data';
 import type { ModelResponse, ModelToolCall } from '@athanor/model-gateway';
 import type { AgentState } from './agent-state.js';
 import { executeDelegateTool } from './delegate.js';
-import type { AgentRunnerClient } from './runner-client.js';
+import { AgentRunnerClient } from './runner-client.js';
 import { executeToolCall, type ToolContext } from './tool-dispatch.js';
+import { displayedRanges, forgetReads, recordRead } from './edit/index.js';
+import { refuseShellReplacementOfUnread } from './tools/shell-writes.js';
 
 /**
  * The delegate arm's own file, which it did not have.
@@ -104,6 +107,12 @@ const runMission = async (
   options: {
     /** What the workspace runner answers, by the operation the arm asks for. */
     runner?: Partial<AgentRunnerClient>;
+    /**
+     * A real client, used as it is, for the one question a stub cannot answer: what the token on
+     * the wire says. Nothing recorded in `reads` when this is given, because the requests are
+     * observed at `fetch` instead.
+     */
+    client?: AgentRunnerClient;
     instruction?: string;
     /** The `context` field of the mission, which is the lead relaying its own window. */
     context?: string;
@@ -125,6 +134,8 @@ const runMission = async (
     leadMessages?: AgentState['messages'];
     /** The run's web route, which decides one line of the specialist's contract. */
     webPlan?: { mode: string };
+    /** What the lead's own reads had left outstanding before it called `delegate`. */
+    partialReads?: Record<string, number>;
   } = {}
 ): Promise<Harness> => {
   const seen: string[][] = [];
@@ -135,7 +146,8 @@ const runMission = async (
       { role: 'system', content: 'ATHANOR OPERATING CONTRACT\nlead contract' },
       { role: 'user', content: 'read the notes' }
     ],
-    ...(options.taint ? { taint: options.taint } : {})
+    ...(options.taint ? { taint: options.taint } : {}),
+    ...(options.partialReads ? { partialReads: options.partialReads } : {})
   } as unknown as AgentState;
   const reads: Array<{ path: string; urls: string[] }> = [];
   const answering = {
@@ -143,7 +155,7 @@ const runMission = async (
     readFile: async () => '',
     ...options.runner
   } as unknown as AgentRunnerClient;
-  const runner = {
+  const stub = {
     ...answering,
     call: async (
       workspaceId: string,
@@ -165,8 +177,12 @@ const runMission = async (
           body: unknown
         ) => Promise<unknown>
       )(workspaceId, id, op, path, body);
-    }
+    },
+    // A specialist is handed the runner signing for its own window; the stub has no wire to sign
+    // anything on, so its window is itself.
+    forWindow: () => stub
   } as unknown as AgentRunnerClient;
+  const runner = options.client ?? stub;
   const context = {
     store: {
       listModels: async () => [model],
@@ -919,5 +935,131 @@ describe('how much of a report the two spot checks stand for', () => {
 
     expect(result.reports[0]?.citations).toEqual({ checked: 2, cited: 2 });
     expect(result.reports[0]?.unverified).toBeUndefined();
+  });
+});
+
+/**
+ * A file read the specialist makes, as the runner reads it: the tool call `file_read` becomes at
+ * the wire.
+ */
+const fileRead = (path: string, id: string): ModelToolCall[] => [
+  { id, name: 'file_read', arguments: { path } } as unknown as ModelToolCall
+];
+
+describe('who the runner is told did the reading', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /*
+   * The runner's seen-line ledger is keyed by the `sub` on the capability token, because a record
+   * of what has been shown is a fact about one context window. A specialist has a window of its
+   * own - the catalogue promises the lead "a window it shares with nothing" - and its reads were
+   * signed with the lead's task id, so at the runner the two were one reader. Measured on a real
+   * workspace: the specialist read lines 1-400 of a file the lead had been shown 1-50 of, and the
+   * lead's whole-file write of five lines landed, destroying 395 lines no window of its own had
+   * ever held. The runner already tells two subjects apart; what this asserts is that the two
+   * windows arrive as two subjects.
+   */
+  it('signs a specialist’s reads for a window of its own, and the harness’s re-read for the lead', async () => {
+    const secret = 's'.repeat(48);
+    const signed: Array<{ path: string; sub: string }> = [];
+    vi.stubGlobal('fetch', async (input: string | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const bearer = (new Headers(init?.headers).get('authorization') ?? '').replace(
+        /^Bearer /,
+        ''
+      );
+      const claims = verifyCapabilityToken(bearer, secret, {
+        method: init?.method ?? 'GET',
+        path: url.pathname
+      });
+      signed.push({ path: `${url.pathname}${url.search}`, sub: claims.sub });
+      return new Response('the notes say three tiers\n', {
+        headers: {
+          'content-type': 'text/plain',
+          'x-content-sha256': 'a'.repeat(64),
+          'x-total-lines': '1',
+          'x-display-lines': '1',
+          'x-partial-line': 'false'
+        }
+      });
+    });
+
+    await runMission(
+      [
+        answer('', fileRead('workspace/notes.md', 'call-read-a')),
+        answer('', fileRead('workspace/more.md', 'call-read-b')),
+        answer(REPORT)
+      ],
+      { client: new AgentRunnerClient('http://runner.test', secret) }
+    );
+
+    // The specialist's own reads carry a display budget; the harness's re-read of the cited source
+    // does not. Both went out, which is what makes the next two assertions about two things.
+    const specialist = signed.filter((request) => request.path.includes('displayBytes='));
+    const verification = signed.filter((request) => !request.path.includes('displayBytes='));
+    expect(specialist).toHaveLength(2);
+    expect(verification.length).toBeGreaterThan(0);
+
+    for (const read of specialist) {
+      expect(read.sub).not.toBe(taskId);
+      // Still the task's: everything the runner scopes by task - what a process list shows, what a
+      // stop reaches - has to be able to see whose window this is.
+      expect(read.sub.startsWith(`${taskId}:`)).toBe(true);
+    }
+    // One mission is one window across all of its steps, so the second read is evidence for the
+    // same reader as the first.
+    expect(new Set(specialist.map((read) => read.sub)).size).toBe(1);
+    // And the harness reading a source on the lead's behalf is the lead.
+    for (const read of verification) expect(read.sub).toBe(taskId);
+  });
+});
+
+/**
+ * The worker's half of the same distinction. The runner's ledger told the two windows apart once
+ * the specialist signed for its own; the worker's record - `recordRead` keyed by task id, and the
+ * `partialReads` floor on the turn state - was still one record, so a specialist's read of the
+ * whole file lifted the lead's floor and the lead's `echo x > app.ts` ran over lines the lead had
+ * never been shown. Measured through the shipped arms with one task id and one state: the floor of
+ * 51 was gone after the specialist's read, and the redirect reached the runner.
+ */
+describe('whose evidence a specialist’s read is', () => {
+  it('leaves the lead’s own record of a partly-read file exactly as the lead left it', async () => {
+    forgetReads();
+    const lines = Array.from({ length: 400 }, (_, at) => `line ${at + 1}`);
+    recordRead(taskId, 'workspace/app.ts', 1, lines.slice(0, 50).join('\n'));
+    let displayed = 0;
+    const { state } = await runMission(
+      [answer('', fileRead('workspace/app.ts', 'call-read-a')), answer(REPORT)],
+      {
+        partialReads: { 'workspace/app.ts': 51 },
+        runner: {
+          readFileForDisplay: async () => {
+            displayed += 1;
+            return {
+              content: lines.join('\n'),
+              sha256: 'a'.repeat(64),
+              totalLines: 400,
+              displayedLines: 400,
+              partialLine: false
+            };
+          }
+        } as unknown as Partial<AgentRunnerClient>
+      }
+    );
+
+    // The specialist did read the whole file.
+    expect(displayed).toBe(1);
+    // And the lead has still been shown fifty lines of it, with the rest outstanding.
+    expect(state.partialReads).toEqual({ 'workspace/app.ts': 51 });
+    expect(displayedRanges(taskId, 'workspace/app.ts')).toEqual([{ start: 1, end: 50 }]);
+    // So the lead's whole-file replacement from the shell is refused, naming the unread lines.
+    expect(() =>
+      refuseShellReplacementOfUnread(taskId, state, {
+        executable: 'bash',
+        args: ['-lc', 'echo x > app.ts']
+      })
+    ).toThrow(/line 51 onwards has never been shown to you/);
   });
 });

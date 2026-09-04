@@ -10,6 +10,7 @@
  * report a number the eval suite structurally cannot: a card parks the turn, so a run can observe
  * one of them, while the function that decides them can be asked about all seven calls in a row.
  */
+import { untrustedOriginOfResult } from '../../apps/worker/src/provenance.js';
 import { approvalRequirement } from '../../apps/worker/src/tools.js';
 import {
   CONFINED,
@@ -22,13 +23,15 @@ import {
   READS,
   SINKS,
   STOPS_THE_COMPUTER,
+  TAINTS,
   WRITES,
   egressCall,
   noEgressUncovered,
   type ConfinedWrite,
   type Egress,
   type Guard,
-  type Sink
+  type Sink,
+  type Taint
 } from './guards.js';
 import { MODES, SCENARIOS, contextFor, type Call, type Mode, type Scenario } from './scenarios.js';
 
@@ -158,7 +161,8 @@ export interface GuardFailure {
     | 'destroys'
     | 'free-store'
     | 'free-workspace-deletes'
-    | 'stops-the-computer';
+    | 'stops-the-computer'
+    | 'taints';
   readonly id: string;
   readonly detail: string;
 }
@@ -215,8 +219,23 @@ export const guardFailures = (
   destroys: readonly Guard[] = DESTROYS,
   freeStore: readonly Guard[] = FREE_STORE_WORK,
   freeWorkspaceDeletes: readonly Guard[] = FREE_WORKSPACE_DELETES,
-  stopsTheComputer: readonly Guard[] = STOPS_THE_COMPUTER
+  stopsTheComputer: readonly Guard[] = STOPS_THE_COMPUTER,
+  taints: readonly Taint[] = TAINTS,
+  /*
+   * The taint reader, injectable for the reason the floor is in `declarationFailures`: the shipped
+   * table is written to pass against the shipped reader, so nothing in it can plant a failure, and
+   * `selftest.ts` hands this a reader with the estate cut out of it and requires the rows to say so.
+   * The result handed to it is the shape the runner answers a shell call with; `shell` is judged on
+   * its arguments, and a reader that started keying on the bytes instead would be a change these
+   * rows feel rather than one they step around.
+   */
+  reader: typeof untrustedOriginOfResult = untrustedOriginOfResult
 ): GuardFailure[] => {
+  const readOf = (call: { name: string; arguments: Record<string, unknown> }): string | null =>
+    reader(
+      { id: 'guard', name: call.name, arguments: call.arguments },
+      { stdout: '', exitCode: 0 }
+    );
   const failures: GuardFailure[] = [];
   for (const entry of publishes)
     for (const mode of modesOf(entry)) {
@@ -323,6 +342,20 @@ export const guardFailures = (
         id: entry.id,
         detail: `raises no card in ${entry.mode} mode after the turn read untrusted content, so the provenance floor is not there`
       });
+    /*
+     * The loop closed. A shell sink row is a fetch - a read of the estate, or of a host nobody
+     * named - and it is measured above on a turn whose taint is a literal. The product's turn has
+     * no literal: it is tainted by the classifier recognising a read, and the read it has to
+     * recognise is this one. Measured with `readsAnotherComputer` cut back to clearing the estate,
+     * the four estate rows above passed unchanged - each carded on a turn that, in the product,
+     * would never have become tainted by reaching it.
+     */
+    if (entry.call.name === 'shell' && readOf(entry.call) === null)
+      failures.push({
+        table: 'sinks',
+        id: entry.id,
+        detail: `is a read the taint reader does not recognise, so in the product the turn that reaches it never becomes the tainted turn this row is measured on, and the card above is measured on a turn that cannot occur`
+      });
   }
   /*
    * Both directions of the autonomous network arm, on a clean turn.
@@ -371,10 +404,35 @@ export const guardFailures = (
           table: 'egress',
           id: entry.id,
           detail: entry.cards
-            ? `raises no card in ${mode} mode ${spelling}, and it carries data to an address this computer can read`
+            ? `raises no card in ${mode} mode ${spelling}, and ${entry.why ?? 'it carries data to an address this computer can read'}`
             : `cards in ${mode} mode ${spelling} as "${requirement?.action}", on a clean turn, and nothing in it reaches anywhere the owner needs to decide about`
         });
       }
+  /*
+   * Where taint comes from, in both directions and with the limits written down.
+   *
+   * A table of reads that must taint is satisfied by a reader that taints everything, which would
+   * mark every build on this computer and gate every sink on every turn; a table of reads that
+   * must not is satisfied by deleting the reader. Held together, neither is reachable alone. The
+   * rows with a `why` are the stated limits, and a limit row that starts tainting fails here with
+   * the reason it was a limit - so coverage growing past a decision is a failure to re-make the
+   * decision rather than a count nobody reads.
+   */
+  for (const entry of taints) {
+    const origin = readOf(entry.call);
+    if (entry.taints && origin === null)
+      failures.push({
+        table: 'taints',
+        id: entry.id,
+        detail: `raises no taint, so a turn that ran it would go on reporting itself clean and every sink after it stays free${entry.why ? ` (${entry.why})` : ''}`
+      });
+    if (!entry.taints && origin !== null)
+      failures.push({
+        table: 'taints',
+        id: entry.id,
+        detail: `taints the turn as "${origin}", and ${entry.why ?? 'it reads nothing anybody else wrote'}`
+      });
+  }
   /*
    * And that the allowlist rows still cover the allowlist. A name added to `noEgressExecutables`
    * with no row beside a fetch is a name nothing here would notice going wrong, in a list where

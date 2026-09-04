@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AthanorError } from '@athanor/core';
+import { verifyCapabilityToken } from '@athanor/core';
 import { AgentRunnerClient, RUNNER_CONNECT_ATTEMPTS } from './runner-client.js';
 
 const client = new AgentRunnerClient('http://127.0.0.1:4300', 'r'.repeat(48));
@@ -272,5 +273,31 @@ describe('what the checkpoint response says about what it could not hold', () =>
     // whose runner has not been updated.
     await expect(checkpoint({})).resolves.toMatchObject({ uncovered: null });
     await expect(checkpoint({ uncoveredPaths: null })).resolves.toMatchObject({ uncovered: null });
+  });
+});
+
+describe('who a request is signed for', () => {
+  /** The subject on the bearer token a call put on the wire, read as the runner reads it. */
+  const subjectOf = async (through: AgentRunnerClient): Promise<string> => {
+    let bearer = '';
+    vi.stubGlobal('fetch', async (_input: string | URL, init?: RequestInit) => {
+      bearer = (new Headers(init?.headers).get('authorization') ?? '').replace(/^Bearer /, '');
+      return new Response('', { headers: { 'content-type': 'text/plain' } });
+    });
+    await through.readFile(workspaceId, taskId, 'workspace/notes.md');
+    return verifyCapabilityToken(bearer, 'r'.repeat(48), {
+      method: 'GET',
+      path: `/v1/workspaces/${workspaceId}/file`
+    }).sub;
+  };
+
+  it('is the task, unless the client was made for one window inside it', async () => {
+    expect(await subjectOf(client)).toBe(taskId);
+    // Composed onto the task id, so what the runner scopes by task still sees whose window it is.
+    expect(await subjectOf(client.forWindow('specialist-0123456789abcdef'))).toBe(
+      `${taskId}:specialist-0123456789abcdef`
+    );
+    // And the client that was asked is not changed by asking.
+    expect(await subjectOf(client)).toBe(taskId);
   });
 });

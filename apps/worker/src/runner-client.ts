@@ -184,8 +184,36 @@ const runnerFetch = async (
 export class AgentRunnerClient {
   constructor(
     private readonly baseUrl: string,
-    private readonly secret: string
+    private readonly secret: string,
+    /**
+     * The context window this client signs for, when it is not the task's own - see `forWindow`.
+     */
+    private readonly window?: string
   ) {}
+
+  /**
+   * The same runner, signing for one context window inside the task rather than for the task.
+   *
+   * `sub` is what the runner keys a reader by: its seen-line ledger records which lines were put in
+   * front of WHICH MODEL, and answers a write with whether that writer was shown the lines it
+   * changes. A delegated specialist has a window of its own - it is handed reads the lead never
+   * sees - and signed with the lead's task id it was the same reader as the lead, so a file the
+   * specialist had read whole was a file the lead could write whole with no read of its own.
+   * Measured: the specialist read 1-400 of a file the lead had been shown 1-50 of, and the lead's
+   * five-line write landed.
+   *
+   * Composed onto the task id rather than replacing it, because the runner also scopes other things
+   * by `sub` - a process list, a stop - and every one of those is about the task. A subject that
+   * starts with the task's own id keeps those readable by whoever asks about the task; a subject
+   * that is only a window would be a task the runner has never heard of.
+   */
+  forWindow(window: string): AgentRunnerClient {
+    return new AgentRunnerClient(this.baseUrl, this.secret, window);
+  }
+
+  private subjectFor(taskId: string): string {
+    return this.window === undefined ? taskId : `${taskId}:${this.window}`;
+  }
 
   async call<T>(
     workspaceId: string,
@@ -197,7 +225,7 @@ export class AgentRunnerClient {
     const method = body === undefined ? 'GET' : 'POST';
     const token = signCapabilityToken(
       {
-        sub: taskId,
+        sub: this.subjectFor(taskId),
         workspaceId,
         role: 'agent',
         scopes: Array.isArray(scope) ? scope : [scope],
@@ -264,7 +292,7 @@ export class AgentRunnerClient {
     const route = `/v1/workspaces/${workspaceId}/checkpoints`;
     const token = signCapabilityToken(
       {
-        sub: taskId,
+        sub: this.subjectFor(taskId),
         workspaceId,
         role: 'agent',
         scopes: ['workspace.manage'],
@@ -329,7 +357,7 @@ export class AgentRunnerClient {
   async readFile(workspaceId: string, taskId: string, requestedPath: string): Promise<string> {
     const token = signCapabilityToken(
       {
-        sub: taskId,
+        sub: this.subjectFor(taskId),
         workspaceId,
         role: 'agent',
         scopes: ['files.read'],
@@ -359,7 +387,7 @@ export class AgentRunnerClient {
   ): Promise<{ content: string; sha256: string | null }> {
     const token = signCapabilityToken(
       {
-        sub: taskId,
+        sub: this.subjectFor(taskId),
         workspaceId,
         role: 'agent',
         scopes: ['files.read'],
@@ -411,7 +439,7 @@ export class AgentRunnerClient {
   }> {
     const token = signCapabilityToken(
       {
-        sub: taskId,
+        sub: this.subjectFor(taskId),
         workspaceId,
         role: 'agent',
         scopes: ['files.read'],
@@ -481,7 +509,7 @@ export class AgentRunnerClient {
   }> {
     const token = signCapabilityToken(
       {
-        sub: taskId,
+        sub: this.subjectFor(taskId),
         workspaceId,
         role: 'agent',
         scopes: ['files.read'],
@@ -550,7 +578,7 @@ export class AgentRunnerClient {
   ): Promise<{ mimeType: string; base64: string; convertedFrom?: string }> {
     const token = signCapabilityToken(
       {
-        sub: taskId,
+        sub: this.subjectFor(taskId),
         workspaceId,
         role: 'agent',
         scopes: ['files.read'],
@@ -594,7 +622,7 @@ export class AgentRunnerClient {
   ): Promise<{ mimeType: string; bytes: Buffer }> {
     const token = signCapabilityToken(
       {
-        sub: taskId,
+        sub: this.subjectFor(taskId),
         workspaceId,
         role: 'agent',
         scopes: ['files.read'],
@@ -644,7 +672,7 @@ export class AgentRunnerClient {
   }> {
     const token = signCapabilityToken(
       {
-        sub: taskId,
+        sub: this.subjectFor(taskId),
         workspaceId,
         role: 'agent',
         scopes: ['files.read'],
@@ -695,7 +723,7 @@ export class AgentRunnerClient {
   ): Promise<unknown> {
     const token = signCapabilityToken(
       {
-        sub: taskId,
+        sub: this.subjectFor(taskId),
         workspaceId,
         role: 'agent',
         scopes: ['files.write'],
@@ -728,7 +756,7 @@ export class AgentRunnerClient {
   ): Promise<unknown> {
     const token = signCapabilityToken(
       {
-        sub: taskId,
+        sub: this.subjectFor(taskId),
         workspaceId,
         role: 'agent',
         scopes: ['files.write'],

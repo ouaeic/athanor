@@ -34,6 +34,33 @@ import { agentToolsFor, specialistToolNames } from './tool-catalogue.js';
 import type { ToolContext } from './tool-dispatch.js';
 
 /**
+ * The lead's turn state as one specialist window sees it: everything the turn shares - the
+ * novelty counter, the taint, the credit ceilings - read from and written to the lead's own
+ * object, and the two records that are facts about a window rather than a turn - which files this
+ * window has been shown part of, and the hash it read each at - kept apart.
+ *
+ * A proxy rather than a copy, because a copy would have to be merged back and the specialist's
+ * spending is charged to the turn as it happens: three missions run concurrently against one
+ * counter, and `runDelegatedMission` reads and writes that counter on the lead's object between
+ * two synchronous points. Only the two window-owned keys are shadowed.
+ */
+const WINDOW_OWNED_STATE = new Set<PropertyKey>(['partialReads', 'readFileHashes']);
+const readerWindowState = (lead: AgentState): AgentState => {
+  const own: Partial<AgentState> = { partialReads: {}, readFileHashes: {} };
+  return new Proxy(lead, {
+    get: (target, key, receiver): unknown =>
+      WINDOW_OWNED_STATE.has(key)
+        ? own[key as keyof AgentState]
+        : (Reflect.get(target, key, receiver) as unknown),
+    set: (target, key, value, receiver) => {
+      if (!WINDOW_OWNED_STATE.has(key)) return Reflect.set(target, key, value, receiver);
+      (own as Record<PropertyKey, unknown>)[key] = value;
+      return true;
+    }
+  });
+};
+
+/**
  * Re-reads two of a specialist's own citations and checks the quoted span is really there.
  *
  * This is the whole of what makes a parallel reader worth having rather than a second opinion of
@@ -493,6 +520,39 @@ ${clockLine(new Date(), timeZone)}
    */
   let toolOutputFloor: number | undefined;
   /*
+   * This mission as one context window, named once and used for both things a window is.
+   *
+   * The provider's session is keyed on it so the cached prefix is this mission's own, and the
+   * runner is handed a client signing for it so the reads it makes are evidence for THIS window
+   * and no other: the runner's seen-line ledger is keyed by the signed subject, and a specialist
+   * signed as the lead was, at the runner, the lead - a file it had read whole was a file the lead
+   * could then write whole, having read none of it. The catalogue promises "a window it shares
+   * with nothing", and the ledger is where that promise is either kept or not.
+   *
+   * Hashed rather than spelled out because `parentCallId` is text the provider chose, and the
+   * subject is a key at the runner; sixteen hex characters of it distinguish every mission a task
+   * can run.
+   */
+  const window = sha256(`athanor-task:${task.id}:delegate:${parentCallId}:${missionIndex}`).slice(
+    0,
+    64
+  );
+  const runner = context.runner.forWindow(`specialist-${window.slice(0, 16)}`);
+  /*
+   * The same window, named on the worker's side.
+   *
+   * Signing the specialist's reads for a window of its own made the runner's ledger tell the two
+   * readers apart, and left the worker's record - `recordRead` keyed by task id, and the
+   * `partialReads` floor on the turn state - still shared. So the runner refused the lead's
+   * `file_write` after a specialist had read the rest of the file, and nothing refused the lead's
+   * `echo x > app.ts`, because the shell floor consults the worker's record alone: measured, the
+   * lead's outstanding floor of 51 went to nothing the moment the specialist's read landed, and
+   * the redirect ran. The reader name is the runner's subject for this window, so both ledgers
+   * name one thing, and the state the specialist writes its reads into is its own.
+   */
+  const reader = `${task.id}:specialist-${window.slice(0, 16)}`;
+  const windowState = readerWindowState(state);
+  /*
    * The one correction the contract is worth, and the report it is holding for.
    *
    * #78's detail that most implementations miss is that the retry is *bounded* - exactly one, and
@@ -598,10 +658,7 @@ ${clockLine(new Date(), timeZone)}
         temperature: 0.1,
         maxTokens,
         reasoningEffort: 'high',
-        sessionId: sha256(`athanor-task:${task.id}:delegate:${parentCallId}:${missionIndex}`).slice(
-          0,
-          64
-        ),
+        sessionId: window,
         signal: AbortSignal.any([signal, stopWatch.signal])
       })
     ).finally(() => stopWatch.stop());
@@ -775,7 +832,16 @@ ${clockLine(new Date(), timeZone)}
         // Without it a mission on a box whose in-house route is bot-walled would spend its whole
         // budget being refused by a search engine while the lead beside it searched successfully.
         const result = await context.dispatch(
-          { ...context, task, key, consequentialApproved: false, webPlan, state },
+          {
+            ...context,
+            runner,
+            task,
+            key,
+            consequentialApproved: false,
+            webPlan,
+            state: windowState,
+            reader
+          },
           call
         );
         // The same classifier the lead's own reads go through, so a source is untrusted for the

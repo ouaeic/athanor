@@ -49,6 +49,11 @@ export type LineRange = { start: number; end: number };
  * guard whose identity can be forgotten by a caller is the same class of defect as one that is
  * keyed by the wrong thing; `sub` is signed, is already checked, and cannot be chosen by the code
  * running inside the task.
+ *
+ * AND ONE TASK CAN HOLD SEVERAL WINDOWS. A delegated specialist runs inside the lead's task with a
+ * context window of its own, and what it was shown is no evidence of what the lead has seen; the
+ * worker signs a specialist's calls with the task id and the specialist's window joined, so here
+ * they are two readers. `task` is therefore the name of a window, which for the lead is its task.
  */
 export type Reader = { readonly task: string };
 

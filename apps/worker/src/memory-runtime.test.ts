@@ -62,6 +62,9 @@ import {
   splitQualification,
   composeQualifiedRule,
   factCandidateKeys,
+  promotedStandingOrder,
+  qualificationGrants,
+  qualificationIdentity,
   MEMORY_STANDING_ORDER_MIN_CHARS,
   observedMemoryFacts,
   observedStandingOrders,
@@ -3528,6 +3531,165 @@ describe('against the real store', () => {
     });
 
     /*
+     * The carve-out stated in a phrasing that opens on no connective, and the bare rule two days
+     * later. The qualified sighting has to land on the bare rule's counter for the clause to be in
+     * the accumulator when the bare telling corroborates; keyed under its whole sentence it is a
+     * singleton nothing composes from, and the row that reaches `mem.item` is the bare rule with
+     * the exception gone and no trace of it anywhere.
+     */
+    it('keeps a carve-out however the owner phrased the seam', async () => {
+      const told = async (request: string, at: string) =>
+        recordTurnEpisode({
+          store,
+          userId: realUserId,
+          workspaceId: realWorkspaceId,
+          taskId: realTaskId,
+          dataKey,
+          request,
+          summary: 'Noted.',
+          outcome: 'ok',
+          occurredAt: new Date(at)
+        });
+      const first = await told(
+        `${RULE} — not while a release is being cut.`,
+        '2026-08-02T10:00:00.000Z'
+      );
+      expect(first?.factCandidates).toBe(1);
+      const second = await told(`${RULE}.`, '2026-08-04T10:00:00.000Z');
+      expect(second?.promotedFacts).toBe(1);
+      // The owner's own dash, and not a comma this tier chose for them: the sentence that reaches
+      // `mem.item` is the one they typed, character for character.
+      await expect(standingOrders()).resolves.toEqual([
+        `${RULE} — not while a release is being cut.`
+      ]);
+      await expect(standingOrders()).resolves.not.toContain(`${RULE}.`);
+    });
+
+    it('keeps a carve-out the owner put in a sentence of its own', async () => {
+      const told = async (request: string, at: string) =>
+        recordTurnEpisode({
+          store,
+          userId: realUserId,
+          workspaceId: realWorkspaceId,
+          taskId: realTaskId,
+          dataKey,
+          request,
+          summary: 'Noted.',
+          outcome: 'ok',
+          occurredAt: new Date(at)
+        });
+      const stated = `${RULE}. This does not apply to a branch nobody else has fetched.`;
+      const first = await told(`${RULE}.`, '2026-08-02T10:00:00.000Z');
+      expect(first?.factCandidates).toBe(1);
+      const second = await told(stated, '2026-08-04T10:00:00.000Z');
+      expect(second?.factCandidates).toBe(1);
+      expect(second?.promotedFacts).toBe(1);
+      // The owner's own two sentences, full stop and all, and not the bare first one.
+      await expect(standingOrders()).resolves.toEqual([stated]);
+    });
+
+    /*
+     * A clause that grants does not ride: the sentence keys whole, so the bare rule's two tellings
+     * promote the bare rule and the permission sits as a singleton of its own, exactly as a rule
+     * stated once does.
+     */
+    it('never lets one telling of a permission ride two tellings of the prohibition', async () => {
+      const told = async (request: string, at: string) =>
+        recordTurnEpisode({
+          store,
+          userId: realUserId,
+          workspaceId: realWorkspaceId,
+          taskId: realTaskId,
+          dataKey,
+          request,
+          summary: 'Noted.',
+          outcome: 'ok',
+          occurredAt: new Date(at)
+        });
+      const widened = `${RULE}, but you may push scratch branches without asking.`;
+      expect((await told(widened, '2026-08-01T10:00:00.000Z'))?.factCandidates).toBe(1);
+      expect((await told(`${RULE}.`, '2026-08-02T10:00:00.000Z'))?.factCandidates).toBe(1);
+      expect((await told(`${RULE}.`, '2026-08-04T10:00:00.000Z'))?.promotedFacts).toBe(1);
+      await expect(standingOrders()).resolves.toEqual([`${RULE}.`]);
+      const held = await store.listPromotableMemoryFactCandidates(realWorkspaceId, {
+        minEpisodes: 1,
+        minGapHours: 0
+      });
+      expect(held).toHaveLength(1);
+      expect(held[0]?.qualifications ?? []).toHaveLength(0);
+    });
+
+    /*
+     * The seam and the polarity read, driven through the store rather than the pure functions,
+     * because the store is where one sighting either rides or does not. Each case is the shape a
+     * verifier found walking past the pure-function tests: smart punctuation, a negated modal, a
+     * capitalised clause behind the owner's comma, a carve-out in a sentence of its own, and a
+     * frame sentence with a defect of its own.
+     */
+    describe('the shapes the store has to read the same way the pure functions do', () => {
+      const told = (request: string, at: string) =>
+        recordTurnEpisode({
+          store,
+          userId: realUserId,
+          workspaceId: realWorkspaceId,
+          taskId: realTaskId,
+          dataKey,
+          request,
+          summary: 'Noted.',
+          outcome: 'ok',
+          occurredAt: new Date(at)
+        });
+
+      it('never mints a permission typed with a curly apostrophe on one sighting', async () => {
+        const widened = `${RULE}, but you don’t need to ask for scratch branches.`;
+        expect((await told(widened, '2026-08-01T10:00:00.000Z'))?.factCandidates).toBe(1);
+        expect((await told(`${RULE}.`, '2026-08-02T10:00:00.000Z'))?.factCandidates).toBe(1);
+        expect((await told(`${RULE}.`, '2026-08-04T10:00:00.000Z'))?.promotedFacts).toBe(1);
+        await expect(standingOrders()).resolves.toEqual([`${RULE}.`]);
+        const held = await store.listPromotableMemoryFactCandidates(realWorkspaceId, {
+          minEpisodes: 1,
+          minGapHours: 0
+        });
+        expect(held).toHaveLength(1);
+        expect(held[0]?.qualifications ?? []).toHaveLength(0);
+      });
+
+      it('lets a clause that tightens with a negated modal ride the rule on one sighting', async () => {
+        const tightened = `${RULE}, but you may never force-push it.`;
+        expect((await told(tightened, '2026-08-02T10:00:00.000Z'))?.factCandidates).toBe(1);
+        expect((await told(`${RULE}.`, '2026-08-04T10:00:00.000Z'))?.promotedFacts).toBe(1);
+        await expect(standingOrders()).resolves.toEqual([tightened]);
+      });
+
+      it("keeps the owner's comma in front of a capitalised clause", async () => {
+        const stated = `${RULE}, But not while a release is being cut.`;
+        expect((await told(stated, '2026-08-02T10:00:00.000Z'))?.factCandidates).toBe(1);
+        expect((await told(`${RULE}.`, '2026-08-04T10:00:00.000Z'))?.promotedFacts).toBe(1);
+        await expect(standingOrders()).resolves.toEqual([stated]);
+      });
+
+      it.each([
+        `${RULE}. But not for a branch nobody else has fetched.`,
+        `${RULE}. Exception: a branch nobody else has fetched.`,
+        `${RULE} -- not for a branch nobody else has fetched.`
+      ])('keeps the carve-out however the following sentence opens: %s', async (stated) => {
+        expect((await told(stated, '2026-08-02T10:00:00.000Z'))?.factCandidates).toBe(1);
+        expect((await told(`${RULE}.`, '2026-08-04T10:00:00.000Z'))?.promotedFacts).toBe(1);
+        await expect(standingOrders()).resolves.toEqual([stated]);
+      });
+
+      it('never lets a frame sentence with a defect of its own cost the rule, or ride it', async () => {
+        // No final full stop, as chat is typed: the rule is still a candidate on its own.
+        const unfinished = `${RULE}. This does not apply to a branch nobody else has fetched`;
+        expect((await told(unfinished, '2026-08-02T10:00:00.000Z'))?.factCandidates).toBe(1);
+        // Somebody else's words after the rule: the rule promotes, the attribution never rides.
+        const reported = `${RULE}. This does not apply to scratch branches, my colleague says.`;
+        expect((await told(reported, '2026-08-04T10:00:00.000Z'))?.promotedFacts).toBe(1);
+        await expect(standingOrders()).resolves.toEqual([`${RULE}.`]);
+      });
+    });
+
+    /*
      * Whose sentence a promoted rule is, and the queue that no longer has a writer.
      *
      * `origin` decides two things: a promotion from `proposed` is minted at `derived` rather than
@@ -3613,9 +3775,11 @@ describe('the exception a rule was stated with', () => {
     const floor =
       'but always ask before purchases, credentials, public publishing, destructive actions and git pushes';
     const sentence = `${rule}, ${floor}.`;
+    // The clause carries the owner's own seam - here a comma and a space - so the sentence can be
+    // put back without this file choosing punctuation for them.
     expect(splitQualification(sentence)).toEqual({
       core: rule,
-      qualifications: [floor],
+      qualifications: [`, ${floor}`],
       terminator: '.'
     });
     // Character-identical, which is the invariant the whole tier rests on: the sentence a later
@@ -3651,7 +3815,7 @@ describe('the exception a rule was stated with', () => {
     );
     expect(
       splitQualification('Never leave the branch unpushed but not yet.').qualifications
-    ).toEqual(['but not yet']);
+    ).toEqual([' but not yet']);
   });
 
   it('refuses to compose a sentence past the bound rather than dropping the last carve-out', () => {
@@ -3713,6 +3877,371 @@ describe('the exception a rule was stated with', () => {
       objectKey: memoryObjectKey(observation.object, key),
       qualifications: []
     });
+  });
+});
+
+/**
+ * The phrasings a carve-out arrives in, and the two ways a clause is not one.
+ *
+ * Everything the split does not see promotes the rule bare once a bare sighting corroborates it:
+ * the qualified sighting keys under the whole sentence, the bare one under the rule, and the two
+ * never meet on one counter. So "does this phrasing split" is the same question as "does the owner's
+ * exception survive", and it is asked here on every phrasing rather than on the one the first
+ * fixture happened to use.
+ */
+describe('every phrasing a carve-out arrives in', () => {
+  const RULE = 'Always ask before deleting files';
+  const TAIL = 'not for files under /tmp';
+  const key = memoryIndexKey(dataKey);
+  const bareKey = factCandidateKeys(
+    { subject: 'athanor', predicate: 'standing_order', object: `${RULE}.` },
+    key,
+    dataKey,
+    workspaceId
+  ).objectKey;
+
+  const phrasings: readonly string[] = [
+    `${RULE}, but ${TAIL}.`,
+    `${RULE}, except ${TAIL}.`,
+    `${RULE}, unless they are under /tmp.`,
+    `${RULE}, other than files under /tmp.`,
+    `${RULE}, apart from files under /tmp.`,
+    `${RULE}, aside from files under /tmp.`,
+    `${RULE}, save for files under /tmp.`,
+    `${RULE}, provided that they are not under /tmp.`,
+    `${RULE}, providing that they are not under /tmp.`,
+    `${RULE}, as long as they are not under /tmp.`,
+    `${RULE}, so long as they are not under /tmp.`,
+    `${RULE}, although ${TAIL}.`,
+    `${RULE}, though ${TAIL}.`,
+    `${RULE}, even though ${TAIL}.`,
+    `${RULE}, however ${TAIL}.`,
+    `${RULE}, only if they are outside /tmp.`,
+    `${RULE}, only when they are outside /tmp.`,
+    `${RULE} — ${TAIL}.`,
+    `${RULE} - ${TAIL}.`,
+    `${RULE}; ${TAIL}.`,
+    `${RULE} (${TAIL}).`,
+    `${RULE}. This does not apply to files under /tmp.`,
+    `${RULE}. The only exception is files under /tmp.`,
+    `${RULE}, with the exception of files under /tmp.`,
+    `${RULE}, excluding files under /tmp.`,
+    `${RULE}, barring files under /tmp.`,
+    `${RULE}, outside of /tmp.`,
+    `${RULE}, ${TAIL}.`
+  ];
+
+  it('keys every phrasing of one rule to the identity of the bare rule', () => {
+    expect(phrasings.length).toBeGreaterThan(20);
+    for (const sentence of phrasings) {
+      const split = splitQualification(sentence);
+      expect(split, sentence).toMatchObject({ core: RULE, terminator: '.' });
+      expect(split.qualifications, sentence).toHaveLength(1);
+      expect(split.qualifications[0], sentence).toContain('/tmp');
+      // The carve-out survives to the sentence a later turn reads, and it rides the bare rule's
+      // counter rather than a counter of its own.
+      expect(composeQualifiedRule(split), sentence).toContain('/tmp');
+      expect(
+        factCandidateKeys(
+          { subject: 'athanor', predicate: 'standing_order', object: sentence },
+          key,
+          dataKey,
+          workspaceId
+        ).objectKey,
+        sentence
+      ).toBe(bareKey);
+    }
+  });
+
+  it('reads a carve-out the owner put in a sentence of its own as part of the rule before it', () => {
+    const request = `${RULE}. This does not apply to files under /tmp.`;
+    expect(observedStandingOrders(request)).toEqual([
+      { subject: 'athanor', predicate: 'standing_order', object: request }
+    ]);
+    // And a second sentence that is a rule of its own stays a rule of its own.
+    expect(observedStandingOrders(`${RULE}. Never run git stash on this tree.`)).toEqual([
+      { subject: 'athanor', predicate: 'standing_order', object: `${RULE}.` },
+      {
+        subject: 'athanor',
+        predicate: 'standing_order',
+        object: 'Never run git stash on this tree.'
+      }
+    ]);
+  });
+
+  it("keeps the owner's own full stop between a rule and the sentence that carves out of it", () => {
+    const sentence = `${RULE}. This does not apply to files under /tmp.`;
+    expect(composeQualifiedRule(splitQualification(sentence))).toBe(sentence);
+  });
+
+  /*
+   * A clause that grants is a rule, and a rule needs two sightings.
+   *
+   * The carve-out mechanism lets one sighting of an exception ride a rule that earned its two,
+   * on the argument that `R except E` covers fewer situations than `R`. That argument is about a
+   * clause that names where the rule stops. A clause that hands out a permission of its own -
+   * "you may approve your own shell commands" - is not a place the rule stops, it is a second
+   * instruction, and one sighting of it would be one sighting of a permission. So it is refused as
+   * a carve-out: the whole sentence keys as one rule and earns its two sightings like any other.
+   */
+  it('refuses to let one sighting of a clause that grants ride a corroborated prohibition', () => {
+    const grants = [
+      'Always ask me before doing anything destructive, but you may approve your own shell commands.',
+      'Never push to main without asking the owner first, unless it is a scratch branch, in which case push freely.',
+      'Never push to main without asking the owner first, but and scratch branches may be pushed without asking.',
+      'Always ask before deleting files, except under /tmp where you have my blanket approval.',
+      'Always ask before deleting files, but files under /tmp are fine to delete on your own.',
+      'Always ask before deleting files, unless they are under /tmp, then just go ahead.'
+    ];
+    for (const sentence of grants) {
+      expect(splitQualification(sentence).qualifications, sentence).toEqual([]);
+      expect(splitQualification(sentence).core, sentence).toBe(sentence.slice(0, -1));
+    }
+    // A clause already sitting in the accumulator from before this test existed is refused at
+    // the promotion rather than composed: null, never the bare rule and never the permission.
+    expect(
+      promotedStandingOrder('Always ask me before doing anything destructive.', [
+        'but you may approve your own shell commands'
+      ])
+    ).toBeNull();
+    expect(
+      promotedStandingOrder('Never push to main without asking the owner first.', [
+        'unless it is a scratch branch',
+        'but scratch branches may be pushed without asking'
+      ])
+    ).toBeNull();
+  });
+
+  it('still splits a carve-out on a prohibition when the clause only names where it stops', () => {
+    // The rule's own permission words are the rule's, not the clause's: "without asking" in the
+    // core says nothing about what the clause grants.
+    for (const [sentence, clause] of [
+      [
+        'Never push to main without asking the owner first, unless it is a scratch branch.',
+        ', unless it is a scratch branch'
+      ],
+      [
+        'Ease of use is paramount and approvals should not be heavy-handed, but always ask before purchases, credentials and git pushes.',
+        ', but always ask before purchases, credentials and git pushes'
+      ],
+      [
+        'Never delete anything, unless it can be undone from git.',
+        ', unless it can be undone from git'
+      ]
+    ] as const) {
+      expect(splitQualification(sentence).qualifications, sentence).toEqual([clause]);
+      expect(qualificationGrants(clause), clause).toBe(false);
+    }
+  });
+
+  /*
+   * What the split deliberately does not see, so that a widening of it is a decision and not a
+   * drift. Each of these stays one sentence under one key, and each says why.
+   */
+  it('states what it does not read as a carve-out, and why', () => {
+    for (const [sentence, why] of [
+      // Scope, not exception: dropping the clause makes the rule stricter, never looser, and the
+      // clause is often the body of the rule itself ("keep polling until the job finishes").
+      ['Always ask before deleting files, until I say otherwise.', 'until sets scope'],
+      ['Always ask before deleting files, while we are in the release freeze.', 'while sets scope'],
+      ['Always ask before deleting files when the tree is dirty.', 'when sets scope'],
+      // A comparative inside a clause; the second half is not an exception to the first.
+      [
+        'Always ask before deleting files, rather than deleting them silently.',
+        'rather than compares'
+      ],
+      // A conjunction joins as often as it qualifies, and it is the commonest word in the corpus.
+      ['Always ask before deleting files and before pushing anything.', 'and joins'],
+      // A connective that reads as a carve-out only after a clause boundary is not one mid-phrase.
+      ['Treat every warning as though it were an error in CI.', 'though inside a phrase'],
+      ['Always ask before deleting files however old they are.', 'however inside a phrase'],
+      ['Always ask before deleting files not tracked by git.', 'not inside a phrase'],
+      // A parenthesis that does not close the sentence is an aside inside the rule, not after it.
+      [
+        'Always ask before deleting files (not for /tmp) and before pushing anything.',
+        'aside mid-rule'
+      ]
+    ] as const) {
+      expect(splitQualification(sentence).qualifications, why).toEqual([]);
+      expect(composeQualifiedRule(splitQualification(sentence)), why).toBe(sentence);
+    }
+    // A following sentence that does not say it is an exception is a sentence of its own.
+    expect(
+      observedStandingOrders('Always ask before deleting files. Files under /tmp are fair game.')
+    ).toEqual([{ subject: 'athanor', predicate: 'standing_order', object: `${RULE}.` }]);
+  });
+
+  /*
+   * Smart punctuation. macOS types "don’t" with U+2019, and every pattern is written straight; the
+   * curly form walked through the grant lexicon and minted a permission on one sighting.
+   */
+  it('reads a grant typed with a curly apostrophe exactly as the straight one', () => {
+    for (const clause of [
+      'but you don’t need to ask for /tmp',
+      'but it’s fine to push scratch branches',
+      'but that’s ok for /tmp',
+      'but you needn’t ask about /tmp'
+    ]) {
+      expect(qualificationGrants(clause), clause).toBe(true);
+      expect(splitQualification(`${RULE}, ${clause}.`).qualifications, clause).toEqual([]);
+    }
+    expect(promotedStandingOrder(`${RULE}.`, ['but you don’t need to ask for /tmp'])).toBeNull();
+    // And the negated modal in the curly spelling tightens, as the straight one does.
+    expect(qualificationGrants('but you can’t touch /etc')).toBe(false);
+    expect(qualificationGrants("but you can't touch /etc")).toBe(false);
+  });
+
+  it('never refuses a clause that tightens as a grant', () => {
+    for (const clause of [
+      'but you may never touch /etc',
+      'but you may not touch /etc',
+      'but you may no longer touch /etc',
+      'but never skip the check on release branches',
+      'unless I allow it',
+      'unless I say you may',
+      'unless the build may break',
+      'unless it can be lost without harm',
+      'unless it can be undone from git'
+    ]) {
+      expect(qualificationGrants(clause), clause).toBe(false);
+      expect(splitQualification(`${RULE}, ${clause}.`).qualifications, clause).toEqual([
+        `, ${clause}`
+      ]);
+    }
+  });
+
+  it('reads a grant behind a condition only when it hands this computer its own discretion', () => {
+    for (const clause of [
+      'unless you think it is fine',
+      'unless it is fine with you',
+      'unless you decide otherwise',
+      'if you feel free to'
+    ])
+      expect(qualificationGrants(clause), clause).toBe(true);
+  });
+
+  it('reads the approval, card and asking family of grants in every spelling', () => {
+    for (const clause of [
+      'but scratch branches need no card',
+      "but you won't need a card for scratch branches",
+      'but for /tmp no approval is needed',
+      'but for /tmp approval is automatic',
+      'but you have free rein on scratch branches',
+      'but push scratch branches yourself',
+      'but approve deletions under /tmp yourself',
+      'except /tmp, which is yours',
+      'but go nuts in /tmp',
+      'but go straight ahead for /tmp',
+      "but you're free to push scratch branches",
+      "but you're allowed to push scratch branches",
+      'but scratch branches go straight up'
+    ]) {
+      expect(qualificationGrants(clause), clause).toBe(true);
+      expect(splitQualification(`${RULE}, ${clause}.`).qualifications, clause).toEqual([]);
+    }
+    // A relative clause that happens to end on "yourself" names where the rule stops.
+    expect(qualificationGrants('except files you made yourself')).toBe(false);
+  });
+
+  /*
+   * The carve-out in a sentence of its own, in every phrasing a following sentence opens on, and
+   * on its own line or bullet. Each is observed as one rule, keys to the bare rule's identity, and
+   * recomposes to the owner's own characters.
+   */
+  it('keys a carve-out in a following sentence, however it opens, to the bare rule', () => {
+    for (const sentence of [
+      `${RULE}. But not for files under /tmp.`,
+      `${RULE}. Exception: files under /tmp.`,
+      `${RULE}. The only exception: files under /tmp.`,
+      `${RULE}. Except for files under /tmp.`,
+      `${RULE}. Unless they are under /tmp.`,
+      `${RULE}. Not for files under /tmp.`,
+      `${RULE}. This doesn’t apply to files under /tmp.`,
+      `${RULE} -- not for files under /tmp.`,
+      `${RULE}… not for files under /tmp.`,
+      `${RULE}... not for files under /tmp.`,
+      `${RULE} [not for files under /tmp].`
+    ]) {
+      expect(observedStandingOrders(sentence), sentence).toEqual([
+        { subject: 'athanor', predicate: 'standing_order', object: sentence }
+      ]);
+      const split = splitQualification(sentence);
+      expect(split.core, sentence).toBe(RULE);
+      expect(split.qualifications, sentence).toHaveLength(1);
+      expect(composeQualifiedRule(split), sentence).toBe(sentence);
+      expect(
+        factCandidateKeys(
+          { subject: 'athanor', predicate: 'standing_order', object: sentence },
+          key,
+          dataKey,
+          workspaceId
+        ).objectKey,
+        sentence
+      ).toBe(bareKey);
+    }
+    // On a line of its own, and on a bullet: the layout is markup, the sentence is the same.
+    const joined = `${RULE}. This does not apply to files under /tmp.`;
+    for (const text of [
+      `${RULE}.\nThis does not apply to files under /tmp.`,
+      `${RULE}.\n- This does not apply to files under /tmp.`
+    ])
+      expect(observedStandingOrders(text), text).toEqual([
+        { subject: 'athanor', predicate: 'standing_order', object: joined }
+      ]);
+    // A following sentence that opens on a connective and goes on to a rule is a rule of its own.
+    expect(observedStandingOrders(`${RULE}. But never push to main.`)).toEqual([
+      { subject: 'athanor', predicate: 'standing_order', object: `${RULE}.` }
+    ]);
+  });
+
+  /*
+   * Character-identical, now on the seams that were being rewritten: a comma the composer had
+   * turned into a full stop on the strength of a capital letter, a bracket that carried its own
+   * full stop and got a second, and a dash that came back as a comma.
+   */
+  it('puts the sentence back with the owner’s own seam, whatever it was', () => {
+    for (const sentence of [
+      `${RULE}, But not for files under /tmp.`,
+      `${RULE}, Unless they are under /tmp.`,
+      `${RULE}; However not for files under /tmp.`,
+      `${RULE} (not for files under /tmp.)`,
+      `${RULE} — not while a release is being cut.`,
+      `${RULE}: except files under /tmp.`
+    ]) {
+      const split = splitQualification(sentence);
+      expect(split.qualifications, sentence).toHaveLength(1);
+      expect(composeQualifiedRule(split), sentence).toBe(sentence);
+    }
+    // The same clause behind a comma and behind a full stop is one clause at the store.
+    expect(qualificationIdentity(', but not for files under /tmp')).toBe(
+      qualificationIdentity('. But not for files under /tmp')
+    );
+    // A clause the store kept before seams were is joined with a comma, as it always was.
+    expect(
+      composeQualifiedRule({ core: RULE, qualifications: ['but not for /tmp'], terminator: '.' })
+    ).toBe(`${RULE}, but not for /tmp.`);
+  });
+
+  /*
+   * A frame sentence is measured on its own, so its defects cost the rule nothing and never ride.
+   * Joined first and measured second, the rule below was not even a candidate.
+   */
+  it('never lets a frame sentence’s own defect cost the rule in front of it', () => {
+    const bare = [{ subject: 'athanor', predicate: 'standing_order', object: `${RULE}.` }];
+    // No final full stop, as chat is typed.
+    expect(observedStandingOrders(`${RULE}. This does not apply to files under /tmp`)).toEqual(
+      bare
+    );
+    // A question.
+    expect(observedStandingOrders(`${RULE}. This does not apply to /tmp, does it?`)).toEqual(bare);
+    // Somebody else's words.
+    expect(
+      observedStandingOrders(`${RULE}. This does not apply to files under /tmp, my colleague says.`)
+    ).toEqual(bare);
+    // A frame that would push the joined sentence past the bound.
+    const long = `${RULE}. It does not apply to ${'/tmp, /var/tmp, '.repeat(12)}or /dev/shm.`;
+    expect(long.length).toBeGreaterThan(MEMORY_STANDING_ORDER_MAX_CHARS);
+    expect(observedStandingOrders(long)).toEqual(bare);
   });
 });
 

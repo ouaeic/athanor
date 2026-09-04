@@ -47,6 +47,19 @@ export interface ToolContext {
   readonly webPlan: WebToolPlan;
   /** The turn's state, for the tools that have to remember something across calls. */
   readonly state: AgentState;
+  /**
+   * The context window whose evidence this call's reads are, when it is not the task's own.
+   *
+   * The worker's read record - what has been shown, which lines, the outstanding remainder of a
+   * partly-read file - is a fact about one window, and it was keyed by task id alone. A delegated
+   * specialist reads through the same arms with the same task, so its `file_read` of a whole
+   * file landed on the lead's record and lifted the lead's own floor: a lead shown fifty lines of
+   * a four-hundred-line file could delegate "read it and summarise", then replace the file whole
+   * from the shell with nothing refusing. The runner's ledger already told the two windows apart
+   * by the signed subject; this is the worker's side of the same distinction. Absent for the
+   * lead, whose window is the task.
+   */
+  readonly reader?: string;
   /*
    * The four things an arm needs that are still the worker's: a provider credential, the
    * provider-side search route, the toolchain probe cache, and the run's destination corpus. Each

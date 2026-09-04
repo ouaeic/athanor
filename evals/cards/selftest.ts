@@ -24,9 +24,10 @@
  * the first run that finds anything, and it is on the every-change gate in verify.yml beside the
  * other three.
  */
+import { untrustedOriginOfResult } from '../../apps/worker/src/provenance.js';
 import { approvalRequirement } from '../../apps/worker/src/tools.js';
 import { agentToolsFor } from '../../apps/worker/src/tool-catalogue.js';
-import { EGRESS, READS, SINKS, WRITES, egressCall } from './guards.js';
+import { EGRESS, READS, SINKS, TAINTS, WRITES, egressCall } from './guards.js';
 import { declarationFailures, guardFailures, measureAll, provenanceFailures } from './measure.js';
 import { baselineFrom, check, rigIdentity, totals } from './report.js';
 import { MODES, SCENARIOS, type Scenario } from './scenarios.js';
@@ -98,6 +99,9 @@ const plant = (tables: {
   freeStore?: GuardTables[9];
   freeWorkspaceDeletes?: GuardTables[10];
   stopsTheComputer?: GuardTables[11];
+  taints?: GuardTables[12];
+  /** The taint reader. Omitted is the shipped one, which is what the taint rows are written for. */
+  reader?: GuardTables[13];
 }): ReturnType<typeof guardFailures> =>
   guardFailures(
     tables.writes ?? [],
@@ -111,7 +115,9 @@ const plant = (tables: {
     tables.destroys ?? [],
     tables.freeStore ?? [],
     tables.freeWorkspaceDeletes ?? [],
-    tables.stopsTheComputer ?? []
+    tables.stopsTheComputer ?? [],
+    tables.taints ?? [],
+    tables.reader
   );
 
 /*
@@ -287,6 +293,93 @@ expect(
 expect(
   EGRESS.every((entry) => egressCall(entry).name === 'shell'),
   'an egress row is not a shell call, so it is being judged by a rule the table is not about'
+);
+/*
+ * And balanced, whose own sentence the table holds now. A row naming balanced and a reason must be
+ * driven in balanced and must print the reason: with the whole balanced internet arm deleted, the
+ * shipped table reported zero failures and the baseline moved by two counts, which is a number to
+ * accept rather than a sentence that says why.
+ */
+const balancedPlant = plant({
+  egress: [
+    {
+      id: 'planted: ordinary work balanced must ask about',
+      script: 'npm test',
+      cards: true,
+      modes: ['balanced'] as const,
+      why: 'planted reason'
+    }
+  ]
+});
+expect(
+  balancedPlant.length === 2 &&
+    balancedPlant.every((failure) => failure.detail.includes('planted reason')),
+  'the egress guard does not drive a row in balanced with its own reason, so deleting the balanced internet arm would produce zero guard failures again'
+);
+expect(
+  EGRESS.some((entry) => entry.cards && entry.modes?.includes('balanced')),
+  'no egress row says balanced must card, so the arm that asks before the internet is held by the baseline count alone'
+);
+
+/*
+ * Where taint comes from, planted in both directions and then with the READER cut.
+ *
+ * The shipped rows are written to pass against the shipped reader, so no row in the table can plant
+ * a failure - which is exactly the state in which a table that had stopped being consulted would be
+ * silent. The reader is therefore injected, as the floor is in the declaration check, and the plant
+ * is the break this table exists for: the estate cleared, every private and estate-named address
+ * judged as this computer's own output.
+ */
+expect(
+  plant({
+    taints: [
+      {
+        id: 'planted: a read that must taint and does not',
+        call: { name: 'shell', arguments: { executable: 'npm', args: ['test'] }, step: 'planted' },
+        taints: true
+      }
+    ]
+  }).length === 1,
+  'the taints guard does not report a read the classifier fails to recognise, so the taint reader going quiet would be silent'
+);
+expect(
+  plant({
+    taints: [
+      {
+        id: 'planted: a stated limit the reader has grown past',
+        call: {
+          name: 'shell',
+          arguments: { executable: 'curl', args: ['-s', 'https://vendor.example/brief'] },
+          step: 'planted'
+        },
+        taints: false,
+        why: 'planted reason'
+      }
+    ]
+  }).some((failure) => failure.table === 'taints' && failure.detail.includes('planted reason')),
+  'the taints guard does not report a stated limit the reader has grown past, so coverage could grow past a decision without the decision being re-made'
+);
+const PRIVATE_ADDRESS =
+  /\b(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|169\.254\.)|\.(?:internal|local|home\.arpa)\b/;
+const clearsTheEstate: typeof untrustedOriginOfResult = (call, result) =>
+  PRIVATE_ADDRESS.test(JSON.stringify(call.arguments))
+    ? null
+    : untrustedOriginOfResult(call, result);
+const estateCut = plant({ sinks: SINKS, taints: TAINTS, reader: clearsTheEstate });
+expect(
+  estateCut.some((failure) => failure.table === 'taints') &&
+    estateCut.some((failure) => failure.table === 'sinks'),
+  'with the estate cleared out of the taint reader, neither the taint rows nor the estate sink rows report it - which is the break that was invisible to every rig'
+);
+expect(
+  plant({ sinks: SINKS, taints: TAINTS }).length === 0,
+  'the shipped taint reader fails a shipped taint or sink row, so a row is wrong or the reader is'
+);
+expect(
+  TAINTS.some((entry) => entry.taints) &&
+    TAINTS.some((entry) => !entry.taints && entry.why === undefined) &&
+    TAINTS.some((entry) => !entry.taints && entry.why !== undefined),
+  'the taint table has lost a direction: it needs reads that must taint, reads that must not, and stated limits with their reasons'
 );
 /*
  * And the coverage half. `noEgressExecutables` is the list that decides which segments of a script
@@ -560,6 +653,6 @@ for (const failure of failures) process.stderr.write(`SELFTEST: ${failure}\n`);
 process.stdout.write(
   failures.length
     ? `${failures.length} check(s) failed.\n`
-    : 'The cards rig measures something: every scenario names a shipped tool, all eleven guard tables report a planted failure in each direction they check - three of them for where a delete lands, which asks its rows again with the turn undo point taken away - the no-socket allowlist is covered name by name, the sink declaration cannot silence itself, the baseline comparison compares, and no column is a constant.\n'
+    : 'The cards rig measures something: every scenario names a shipped tool, all twelve guard tables report a planted failure in each direction they check - three of them for where a delete lands, which asks its rows again with the turn undo point taken away, and the taint rows again with the estate cut out of the reader - the no-socket allowlist is covered name by name, the sink declaration cannot silence itself, the baseline comparison compares, and no column is a constant.\n'
 );
 process.exit(failures.length ? 1 : 0);

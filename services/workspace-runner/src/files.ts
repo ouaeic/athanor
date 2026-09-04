@@ -137,6 +137,40 @@ export const assertUserDataPath = (root: string, requested = 'workspace'): strin
   throw new Error('Only workspace files and published artifacts are accessible');
 };
 
+/**
+ * Where a command's `cwd` means what the agent meant by it: the reading `assertUserDataPath` gives
+ * a file name, applied to the one field a command reads a directory from.
+ *
+ * The obvious resolution - against the container root, as every other path here - puts a bare
+ * `probe` one level above where `file_write('probe/x')` lands, so the two tools answer the same
+ * string with two places and the agent, which cannot see either, writes `workspace/probe` into a
+ * command that already runs in `workspace/` and creates `workspace/workspace/probe`. Measured on a
+ * live box across six of ten tasks and a shadow tree that had stood for weeks. A bare name is
+ * therefore read from `workspace/`, so `probe` and `workspace/probe` are one directory.
+ *
+ * Unlike the file fold this refuses nothing new and admits nothing new: `.athanor`, the guest's
+ * `.config` and the agent's home stay where they are, an absolute path resolves as written, and
+ * `resolveInside` still refuses anything that steps out of the container. A command may run in
+ * `.athanor/artifacts` or in `$HOME`, which a file tool may not write, and that difference is the
+ * runner's to keep - so this shares the container-only list and not the user-data check.
+ *
+ * And `.` is the container root, not a bare name. The document reader and the office converter
+ * are both run from `.` with a `workspace/…` path on their command line, and each resolves that
+ * path against its own working directory and refuses anything outside it - so a `.` read as
+ * `workspace/` makes every document read spelt the way the catalogue spells paths, and every
+ * document search that takes the default path, fail on a file that is there.
+ */
+export const resolveCommandDirectory = (root: string, requested = 'workspace'): string => {
+  const segments = requested.split(/[/\\]/).filter((segment) => segment && segment !== '.');
+  const bareName =
+    segments.length > 0 &&
+    !path.isAbsolute(requested) &&
+    !segments.includes('..') &&
+    segments[0] !== 'workspace' &&
+    !CONTAINER_ONLY.has(segments[0] ?? '');
+  return resolveInside(root, bareName ? path.join('workspace', requested) : requested);
+};
+
 const rejectSymlinkComponents = async (
   root: string,
   target: string,
