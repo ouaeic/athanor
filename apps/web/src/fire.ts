@@ -66,6 +66,16 @@ const publish = (next: number): void => {
  * and animate up to the truth. Returns the unregister, which every caller owes: three marks mount
  * on the sign-in screen alone, and a `Set` of detached nodes is a leak that writes to nothing.
  */
+/**
+ * The current draught, for anything that DRAWS the fire rather than styling one.
+ *
+ * The mark takes its height from a custom property because it is an SVG and that is how an SVG is
+ * animated. The room's fire is painted by a shader, which cannot read a custom property without a
+ * layout flush per frame - so it reads the number instead. Same signal, same source, and still the
+ * one that says a turn is running but nothing is coming out of it.
+ */
+export const readDraught = (): number => draught;
+
 export const registerFire = (node: SVGSVGElement | null): (() => void) | undefined => {
   if (!node) return undefined;
   nodes.add(node);

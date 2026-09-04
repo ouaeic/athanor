@@ -1,4 +1,4 @@
-const SHELL = 'athanor-shell-v4';
+const SHELL = 'athanor-shell-v6';
 const SHARE_CACHE = 'athanor-shares-v1';
 const SHARE_PREFIX = '/__athanor-share/';
 /** Written by the build: the entry chunk and everything it statically imports, by hashed name. */
@@ -7,7 +7,14 @@ const SHELL_URLS = [
   '/',
   '/index.html',
   '/brand/athanor-icon-512.png',
-  '/brand/athanor-icon-192.png'
+  '/brand/athanor-icon-192.png',
+  // The room's first frame. Small, and it is what the backdrop shows before the clip has loaded or
+  // if it never does - so an install that has never been online still opens onto the room rather
+  // than onto nothing.
+  '/room/room-poster.jpg',
+  // And the fire. It is the only thing in the picture that moves, so an install that has it is an
+  // install that is alive offline rather than a photograph of one.
+  '/room/fire.mp4'
 ];
 const MAX_SHARE_FILES = 20;
 const MAX_SHARE_FILE_BYTES = 49 * 1024 * 1024;
@@ -112,11 +119,40 @@ const cachedAsset = async (request) => {
   const hit = await caches.match(request);
   if (hit) return hit;
   const response = await fetch(request);
-  if (response.ok) {
+  /* Only a complete answer is worth keeping. A <video> asks for byte ranges, and a 206 is `ok` -
+     putting one in the cache throws, and a cached partial would be a corrupt file forever after. */
+  if (response.status === 200) {
     const cache = await caches.open(SHELL);
     await cache.put(request, response.clone());
   }
   return response;
+};
+
+/**
+ * The static files that are NOT hashed - the room, the mark - and therefore do change under their
+ * own names.
+ *
+ * `cachedAsset` is cache-first and never asks again, which is correct for a hashed chunk and wrong
+ * here: it pins the first copy a device ever saw for the life of the cache, so a redrawn backdrop
+ * or a re-cut clip never arrives and the app goes on compositing yesterday's picture against
+ * today's. Answer from the cache so it stays instant and works offline, but always ask in the
+ * background, so the next load is current.
+ */
+const revalidatingAsset = async (request, waitUntil) => {
+  const cache = await caches.open(SHELL);
+  const hit = await cache.match(request);
+  const fresh = fetch(request)
+    .then(async (response) => {
+      if (response.status === 200) await cache.put(request, response.clone());
+      return response;
+    })
+    .catch(() => undefined);
+  if (hit) {
+    waitUntil(fresh);
+    // Cloned, because a response body can be read once and the cached entry outlives this answer.
+    return hit.clone();
+  }
+  return (await fresh) ?? Response.error();
 };
 
 /**
@@ -265,8 +301,20 @@ self.addEventListener('fetch', (event) => {
     url.pathname.startsWith('/__athanor/preview/')
   )
     return;
+  // Hashed chunks: the name is the version, so the first copy is always the right one.
   if (url.origin === self.location.origin && url.pathname.startsWith('/assets/')) {
     event.respondWith(cachedAsset(event.request));
+    return;
+  }
+  /* The room it is drawn over and the mark it is drawn with. This is an installed app before it is
+     a page, so these belong to it rather than being things it fetches - without a route here they
+     fall through to the document handler, which offline answers a video request with index.html.
+     But their names never change, so they are revalidated rather than pinned. */
+  if (
+    url.origin === self.location.origin &&
+    (url.pathname.startsWith('/room/') || url.pathname.startsWith('/brand/'))
+  ) {
+    event.respondWith(revalidatingAsset(event.request, (work) => event.waitUntil(work)));
     return;
   }
   event.respondWith(

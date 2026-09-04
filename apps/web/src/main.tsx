@@ -75,6 +75,25 @@ const stopTrackingKeyboardInset = trackKeyboardInset();
 // and the same measurement is taken several times per frame.
 import.meta.hot?.dispose(stopTrackingKeyboardInset);
 
+/**
+ * The room behind the interface.
+ *
+ * Deferred rather than imported, for two reasons that pull the same way. It is decorative, so
+ * nothing on the first screen should wait on it - and it is reached through a dynamic import, which
+ * is what keeps it and its stylesheet out of the eager bundle the build gate measures. The module
+ * decides for itself whether to run at all; until it has drawn a frame the interface keeps its own
+ * fills, so every refusal path is simply the interface without a room.
+ */
+const room = new Promise<() => void>((resolve) => {
+  const start = (): void => {
+    void import('./glass/index.js').then(({ startGlass }) => resolve(startGlass()));
+  };
+  if (typeof window.requestIdleCallback === 'function')
+    window.requestIdleCallback(start, { timeout: 2000 });
+  else window.setTimeout(start, 400);
+});
+import.meta.hot?.dispose(() => void room.then((stop) => stop()));
+
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <App />

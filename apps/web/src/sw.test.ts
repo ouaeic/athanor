@@ -186,7 +186,7 @@ describe('offline shell', () => {
   /** A deployment that answers everything until the test cuts the network. */
   const deployment = () => {
     /** `stalled` is a box that accepted the connection and never answered - the worst real case. */
-    const state = { online: true, stalled: false };
+    const state = { online: true, stalled: false, poster: 'poster-v1' };
     const sw = worker({
       respond: async (url) => {
         if (state.stalled) return new Promise<Response>(() => undefined);
@@ -195,6 +195,11 @@ describe('offline shell', () => {
           return new Response(JSON.stringify(MANIFEST), {
             status: 200,
             headers: { 'content-type': 'application/json' }
+          });
+        if (url.endsWith('/room/room-poster.jpg'))
+          return new Response(state.poster, {
+            status: 200,
+            headers: { 'content-type': 'image/jpeg' }
           });
         if (url.endsWith('.js'))
           return new Response('export default 1', {
@@ -218,13 +223,50 @@ describe('offline shell', () => {
     ...extra
   });
 
+  it('re-fetches the room, whose name never changes, rather than pinning the first copy', async () => {
+    /* Cache-first is right for a hashed chunk and wrong for the backdrop: the room is redrawn under
+       the same path, so pinning it means an old picture is composited against a new clip for the
+       life of the cache - which looks like a rendering fault and is not one. The answer may come
+       from the cache, but the network must be asked every time so the next load is current. */
+    const { sw } = deployment();
+    await sw.dispatch('install', {});
+
+    const poster = 'https://box.example/room/room-poster.jpg';
+    // `fetch` is handed the request rather than a bare URL, so both shapes have to be counted.
+    const asks = (target: string) =>
+      sw.requests.filter((entry) => {
+        const seen = entry.url as unknown as string | { url?: string };
+        return (typeof seen === 'string' ? seen : seen?.url) === target;
+      }).length;
+    const before = asks(poster);
+    const answer = await sw.respond(get(poster));
+    await sw.drain();
+    expect(await (answer as Response).text()).toBe('poster-v1');
+    expect(asks(poster)).toBeGreaterThan(before);
+
+    // And again, from a warm cache: still asked for.
+    const warm = asks(poster);
+    await sw.respond(get(poster));
+    await sw.drain();
+    expect(asks(poster)).toBeGreaterThan(warm);
+
+    // A hashed chunk is the opposite: asked for once, then never again.
+    const chunk = 'https://box.example/assets/index-abc.js';
+    const asked = asks(chunk);
+    await sw.respond(get(chunk));
+    await sw.drain();
+    expect(asks(chunk)).toBe(asked);
+  });
+
   it('precaches the hashed module graph the build wrote down, not just the page', async () => {
     const { sw } = deployment();
     await sw.dispatch('install', {});
-    const shell = [...(sw.storage.stores.get('athanor-shell-v4')?.keys() ?? [])];
+    const shell = [...(sw.storage.stores.get('athanor-shell-v6')?.keys() ?? [])];
     expect(shell).toContain('https://box.example/index.html');
     expect(shell).toContain('https://box.example/assets/index-abc.js');
     expect(shell).toContain('https://box.example/assets/index-abc.css');
+    // The room is part of an installed app, not something it fetches when it happens to be online.
+    expect(shell).toContain('https://box.example/room/room-poster.jpg');
   });
 
   it('serves a module from the cache when the box is unreachable', async () => {

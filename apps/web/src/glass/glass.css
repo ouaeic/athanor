@@ -1,0 +1,55 @@
+/*
+  What changes once the room is actually on screen.
+
+  Every rule here is behind `html[data-glass='on']`, which the renderer sets only after it has drawn
+  a frame. That is the whole safety story: this stylesheet ships in the same lazy chunk as the
+  renderer, so it cannot arrive without it, and it cannot apply before the thing that justifies it
+  has proved it works. Without the attribute the interface keeps the fills it has always had.
+*/
+
+.glass-canvas {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+/*
+  The chain from the root down to the shell has to stop painting black over the room. `html` and
+  `body` deliberately keep theirs: Safari ignores `theme-color` and tints its own toolbar by
+  sampling the background of elements near the viewport edge, and a transparent root resolves to
+  white - which on a true-black phone-first tool is the worst available failure and does not
+  reproduce in a simulator.
+*/
+html[data-glass='on'] :is(#root, .app-shell, .workbench, .auth-page) {
+  position: relative;
+  z-index: 1;
+  background: transparent;
+}
+
+/*
+  The large fields open up. These were the darkest fills in the interface - close enough to the
+  ground that they bought little - and they are what stands between the reader and the room,
+  including the corner the fire is in.
+*/
+html[data-glass='on'] :is(.sidebar, .inspector, .computer-pane, .files-pane) {
+  background: transparent;
+}
+
+/*
+  The transcript fades into the ground at the bottom of the scrollport. Over a room rather than over
+  black, a fade to black is a smear, so it becomes a fade to nothing.
+*/
+html[data-glass='on'] .chat-canvas::after {
+  background: linear-gradient(transparent, #00000073);
+}
+
+/*
+  A scrim over a room has to be darker than a scrim over black, because it has something to hide.
+*/
+html[data-glass='on'] .modal-backdrop {
+  background: #000000d9;
+}

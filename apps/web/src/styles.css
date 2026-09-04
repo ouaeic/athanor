@@ -7,11 +7,11 @@
   box-shadow: none;
   font-size: 12px;
   text-decoration: underline;
-  text-decoration-color: #615952;
+  text-decoration-color: #5b5b5b;
   text-underline-offset: 3px;
 }
 .server-install-link:hover {
-  color: #fef0e3;
+  color: #f3f3f3;
   background: transparent;
   box-shadow: none;
 }
@@ -38,12 +38,12 @@
   width: 42px;
   height: 42px;
   place-items: center;
-  border: 1px solid #776e67;
+  border: 1px solid #707070;
   border-radius: 13px;
-  background: linear-gradient(145deg, #342e2a, #1d1815);
+  background: linear-gradient(145deg, #2f2f2f, #191919);
   box-shadow:
-    inset 0 1px 0 #8f867d55,
-    0 0 18px #e6d9cd18;
+    inset 0 1px 0 #88888855,
+    0 0 18px #dbdbdb18;
 }
 .server-install-icon svg {
   width: 20px;
@@ -51,7 +51,7 @@
 
 .server-install-footnote {
   margin: 9px 0 0;
-  color: #a69c92;
+  color: #9e9e9e;
   font-size: 12px;
   line-height: 1.5;
 }
@@ -60,7 +60,7 @@
   margin-top: 13px;
 }
 .server-install-modal .optional {
-  color: #91877f;
+  color: #898989;
   font-weight: 400;
 }
 
@@ -74,7 +74,7 @@
 .install-command code {
   min-width: 0;
   overflow-wrap: anywhere;
-  color: #e7dace;
+  color: #dcdcdc;
   font-size: 12px;
 }
 
@@ -155,14 +155,14 @@ select:focus-visible {
   width: 100%;
   height: 100%;
   overflow: hidden;
-  background: #fff0e4;
+  background: #f3f3f3;
 }
 .app-shell.inspector-closed {
   grid-template-columns: 272px minmax(460px, 1fr);
 }
 .sidebar {
-  background: #f4e7db;
-  border-right: 1px solid #e5d7cc;
+  background: #e9e9e9;
+  border-right: 1px solid #dadada;
   padding: 18px 14px 12px;
   min-width: 0;
   display: flex;
@@ -180,7 +180,7 @@ select:focus-visible {
   letter-spacing: -0.45px;
 }
 .brand.light {
-  color: #fff6ec;
+  color: #f7f7f7;
 }
 .brand-mark {
   display: grid;
@@ -188,13 +188,13 @@ select:focus-visible {
   width: 30px;
   height: 30px;
   border-radius: 10px;
-  color: #e4d6cb;
+  color: #d9d9d9;
   background:
-    radial-gradient(circle at 32% 18%, #36302c 0, transparent 42%),
-    linear-gradient(145deg, #221e1a, #0e0b09 72%);
-  border: 1px solid #fff6ec18;
+    radial-gradient(circle at 32% 18%, #313131 0, transparent 42%),
+    linear-gradient(145deg, #1f1f1f, #0c0c0c 72%);
+  border: 1px solid #f7f7f718;
   box-shadow:
-    inset 0 1px 0 #fff6ec12,
+    inset 0 1px 0 #f7f7f712,
     0 1px 2px #00000066;
 }
 .brand-mark svg {
@@ -314,7 +314,7 @@ select:focus-visible {
   color: var(--muted);
 }
 .icon-btn:hover {
-  background: #ede0d4;
+  background: #e2e2e2;
   color: var(--text);
 }
 .icon-btn svg {
@@ -323,8 +323,8 @@ select:focus-visible {
 }
 .queue-pill {
   cursor: default;
-  background: #f6f1d2;
-  color: #5d5e02;
+  background: #f0f0f0;
+  color: #595959;
 }
 .queued-user-message {
   opacity: 0.82;
@@ -347,8 +347,8 @@ select:focus-visible {
   gap: 10px;
   text-align: left;
   align-items: center;
-  border: 1px solid #e4d7cb;
-  background: #fff1e4;
+  border: 1px solid #d9d9d9;
+  background: #f4f4f4;
   padding: 8px;
   border-radius: 12px;
   margin: 14px 0 10px;
@@ -363,15 +363,15 @@ select:focus-visible {
   height: 15px;
 }
 .workspace-switcher:hover {
-  border-color: #c5b9af;
+  border-color: #bbbbbb;
 }
 .workspace-avatar {
   display: grid;
   place-items: center;
   width: 34px;
   height: 34px;
-  background: #eee0d5;
-  color: #4b443f;
+  background: #e3e3e3;
+  color: #454545;
   border-radius: 9px;
   font-weight: 700;
 }
@@ -398,16 +398,16 @@ select:focus-visible {
   width: 100%;
   border: 0;
   border-radius: 10px;
-  color: #fff6ec;
+  color: #f7f7f7;
   background: var(--text);
   padding: 10px 11px;
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
-  box-shadow: 0 3px 10px #211d1918;
+  box-shadow: 0 3px 10px #1e1e1e18;
 }
 .new-task:hover {
-  background: #38322d;
+  background: #333333;
 }
 .new-task kbd {
   margin-left: auto;
@@ -422,24 +422,24 @@ select:focus-visible {
   width: 100%;
   margin-top: 7px;
   padding: 8px 10px;
-  border: 1px solid #e3d6ca;
+  border: 1px solid #d8d8d8;
   border-radius: 10px;
-  background: #fff1e4;
-  color: #615a53;
+  background: #f4f4f4;
+  color: #5b5b5b;
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
 }
 .schedule-task:hover {
-  border-color: #bfb3a9;
-  background: #fceee1;
+  border-color: #b5b5b5;
+  background: #f1f1f1;
 }
 .schedule-task span {
   min-width: 20px;
   margin-left: auto;
   padding: 1px 6px;
   border-radius: 999px;
-  background: #efe1d5;
+  background: #e4e4e4;
   text-align: center;
   font-size: 12px;
 }
@@ -447,11 +447,11 @@ select:focus-visible {
   display: flex;
   align-items: center;
   gap: 7px;
-  background: #ecdfd3;
+  background: #e1e1e1;
   border-radius: 9px;
   margin: 12px 0 10px;
   padding: 0 9px;
-  color: #857b73;
+  color: #7d7d7d;
 }
 .search input {
   width: 100%;
@@ -484,11 +484,11 @@ select:focus-visible {
   cursor: pointer;
 }
 .task-row:hover {
-  background: #ecdfd3;
+  background: #e1e1e1;
 }
 .task-row.active {
-  background: #fff6ec;
-  box-shadow: 0 1px 5px #342f2a0c;
+  background: #f7f7f7;
+  box-shadow: 0 1px 5px #3030300c;
 }
 .task-copy {
   min-width: 0;
@@ -505,7 +505,7 @@ select:focus-visible {
   font-weight: 600;
 }
 .task-copy small {
-  color: #978c84;
+  color: #8e8e8e;
   font-size: 12px;
   margin-top: 3px;
   text-transform: capitalize;
@@ -514,37 +514,37 @@ select:focus-visible {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: #787068;
+  background: #717171;
 }
 .status-dot.running,
 .status-dot.planning,
 .status-dot.queued {
-  background: #a3988f;
-  box-shadow: 0 0 0 3px #a3988f1c;
+  background: #9a9a9a;
+  box-shadow: 0 0 0 3px #9a9a9a1c;
 }
 .status-dot.awaiting_user {
-  background: #e9a33c;
+  background: #b3b3b3;
 }
 .status-dot.failed {
   background: var(--danger-text);
 }
 .status-dot.completed {
-  background: #857c73;
+  background: #7e7e7e;
 }
 .empty-mini {
   display: flex;
   gap: 8px;
   padding: 18px 10px;
-  color: #958c83;
+  color: #8e8e8e;
   font-size: 13px;
   line-height: 1.5;
 }
 .empty-mini svg {
   flex: none;
-  color: #a2988e;
+  color: #9a9a9a;
 }
 .sidebar-bottom {
-  border-top: 1px solid #342e2a;
+  border-top: 1px solid #2f2f2f;
   padding-top: 8px;
 }
 .account-row {
@@ -561,7 +561,7 @@ select:focus-visible {
   cursor: pointer;
 }
 .account-row:hover {
-  background: #ecdfd3;
+  background: #e1e1e1;
 }
 .user-avatar {
   display: grid;
@@ -569,8 +569,8 @@ select:focus-visible {
   width: 30px;
   height: 30px;
   border-radius: 50%;
-  background: #4c453f;
-  color: #fffa9f;
+  background: #464646;
+  color: #f5f5f5;
   font-size: 12px;
   font-weight: 700;
 }
@@ -583,7 +583,7 @@ select:focus-visible {
 }
 .account-row small {
   font-size: 12px;
-  color: #978d84;
+  color: #8f8f8f;
   text-transform: capitalize;
   margin-top: 2px;
 }
@@ -601,8 +601,8 @@ select:focus-visible {
   display: flex;
   align-items: center;
   padding: 0 18px;
-  border-bottom: 1px solid #efe2d6;
-  background: #fff9edd9;
+  border-bottom: 1px solid #e4e4e4;
+  background: #f9f9f9d9;
   backdrop-filter: blur(12px);
   z-index: 4;
 }
@@ -623,7 +623,7 @@ select:focus-visible {
 }
 .task-title span {
   font-size: 12px;
-  color: #978c84;
+  color: #8e8e8e;
   margin-top: 3px;
   text-transform: capitalize;
 }
@@ -668,7 +668,7 @@ select:focus-visible {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: #a3988f;
+  background: #9a9a9a;
   margin-right: 5px;
 }
 .message-meta {
@@ -683,7 +683,7 @@ select:focus-visible {
   gap: 4px;
   border: 0;
   background: transparent;
-  color: #8c827a;
+  color: #848484;
   font-size: 11px;
   cursor: pointer;
   opacity: 0;
@@ -713,8 +713,8 @@ select:focus-visible {
   display: flex;
   align-items: center;
   gap: 5px;
-  border: 1px solid #ebded2;
-  background: #fff6ec;
+  border: 1px solid #e0e0e0;
+  background: #f7f7f7;
   border-radius: 9px;
   padding: 6px 9px;
   font-size: 12px;
@@ -768,20 +768,20 @@ select:focus-visible {
   align-items: center;
   gap: 6px;
   min-height: 32px;
-  border: 1px solid #ebded2;
-  background: #fff6ec;
+  border: 1px solid #e0e0e0;
+  background: #f7f7f7;
   border-radius: 9px;
   padding: 6px 9px;
-  color: #645c56;
+  color: #5e5e5e;
   font-weight: 600;
   font-size: 10px;
   cursor: pointer;
 }
 .workspace-tools-button:hover,
 .workspace-tools-button.active {
-  border-color: #4b453f;
-  background: #201c18;
-  color: #fceee1;
+  border-color: #464646;
+  background: #1d1d1d;
+  color: #f1f1f1;
 }
 .workspace-tools-button svg {
   width: 15px;
@@ -834,8 +834,8 @@ select:focus-visible {
 }
 .user-brief {
   margin: 0 0 27px auto;
-  background: #f6e9dd;
-  border: 1px solid #342e2a;
+  background: #ebebeb;
+  border: 1px solid #2f2f2f;
   border-radius: 16px 16px 5px 16px;
   width: fit-content;
   max-width: 80%;
@@ -849,17 +849,17 @@ select:focus-visible {
 }
 .user-brief span {
   display: block;
-  color: #998e86;
+  color: #909090;
   font-size: 12px;
   margin-top: 5px;
 }
 .task-plan-panel {
   margin: 0 0 24px;
   padding: 14px;
-  border: 1px solid #ecded2;
+  border: 1px solid #e1e1e1;
   border-radius: 14px;
-  background: #fffcef;
-  box-shadow: 0 5px 20px rgba(31, 49, 40, 0.04);
+  background: #fcfcfc;
+  box-shadow: 0 5px 20px rgba(0, 0, 0, 0.04);
 }
 .task-plan-panel > header,
 .task-plan-heading,
@@ -878,7 +878,7 @@ select:focus-visible {
 }
 .task-plan-heading > svg {
   width: 17px;
-  color: #a2988e;
+  color: #9a9a9a;
 }
 .task-plan-heading strong,
 .task-plan-heading span {
@@ -890,7 +890,7 @@ select:focus-visible {
 .task-plan-heading span {
   margin-top: 2px;
   font-size: 12px;
-  color: #958c83;
+  color: #8e8e8e;
 }
 .task-plan-actions {
   gap: 6px;
@@ -898,9 +898,9 @@ select:focus-visible {
 .task-plan-actions button,
 .task-plan-row-actions button,
 .task-plan-add {
-  border: 1px solid #342e2a;
-  background: #1b1612;
-  color: #a2988e;
+  border: 1px solid #2f2f2f;
+  background: #171717;
+  color: #9a9a9a;
   border-radius: 7px;
   cursor: pointer;
 }
@@ -921,30 +921,30 @@ select:focus-visible {
 .task-plan-actions .save {
   background: var(--text);
   border-color: var(--text);
-  color: #fff6ec;
+  color: #f7f7f7;
 }
 .task-plan-progress {
   height: 3px;
   margin: 12px 0;
   overflow: hidden;
   border-radius: 3px;
-  background: #f6e8dd;
+  background: #ebebeb;
 }
 .task-plan-progress span {
   display: block;
   height: 100%;
   border-radius: inherit;
-  background: #a49990;
+  background: #9b9b9b;
   transition: width 180ms var(--ease);
 }
 
 .task-plan-steps input,
 .task-plan-steps select {
   min-width: 0;
-  border: 1px solid #342e2a;
+  border: 1px solid #2f2f2f;
   border-radius: 7px;
-  background: #1b1612;
-  color: #efe1d6;
+  background: #171717;
+  color: #e4e4e4;
   font: inherit;
 }
 
@@ -992,8 +992,8 @@ select:focus-visible {
   margin: 10px 0;
   padding: 7px 9px;
   border-radius: 7px;
-  background: #241f1b;
-  color: #bfb989;
+  background: #202020;
+  color: #b7b7b7;
   font-size: 12px;
 }
 .task-plan-conflict button {
@@ -1006,19 +1006,19 @@ select:focus-visible {
 }
 .task-plan-error {
   margin: 9px 0 0;
-  color: #d8a8a5;
+  color: #b5b5b5;
   font-size: 12px;
 }
 .task-plan-history {
   margin-top: 10px;
   padding-top: 9px;
-  border-top: 1px solid #342e2a;
+  border-top: 1px solid #2f2f2f;
 }
 .task-plan-history-title {
   gap: 5px;
   margin-bottom: 5px;
   font-size: 12px;
-  color: #8e847c;
+  color: #868686;
   text-transform: uppercase;
   letter-spacing: 0.06em;
 }
@@ -1035,19 +1035,19 @@ select:focus-visible {
   border-radius: 6px;
   padding: 6px;
   background: transparent;
-  color: #a2988e;
+  color: #9a9a9a;
   text-align: left;
   cursor: pointer;
   font-size: 12px;
 }
 .task-plan-history > button:hover {
-  background: #feefe3;
+  background: #f2f2f2;
 }
 .task-plan-history > button svg {
   width: 12px;
 }
 .task-plan-history > button em {
-  color: #9b9088;
+  color: #929292;
   font-size: 11px;
   font-style: normal;
 }
@@ -1196,8 +1196,8 @@ select:focus-visible {
   align-items: flex-start;
   margin: 14px 40px;
   padding: 11px 13px;
-  border: 1px solid #eee0d5;
-  background: #fff6ea;
+  border: 1px solid #e3e3e3;
+  background: #f7f7f7;
   border-radius: 11px;
 }
 .system-event > svg,
@@ -1205,7 +1205,7 @@ select:focus-visible {
   display: grid;
   place-items: center;
   flex: none;
-  color: #a2988e;
+  color: #9a9a9a;
 }
 .system-event > svg,
 .completion-card > svg {
@@ -1225,13 +1225,13 @@ select:focus-visible {
 .system-event span,
 .completion-card span {
   font-size: 12px;
-  color: #8e857c;
+  color: #878787;
   margin-top: 3px;
   line-height: 1.4;
 }
 .completion-card .completion-summary {
   margin-top: 5px;
-  color: #8e857c;
+  color: #878787;
   font-size: 12px;
   line-height: 1.5;
 }
@@ -1254,12 +1254,12 @@ select:focus-visible {
 */
 .completion-card .completion-computer {
   margin-top: 8px;
-  color: #938a81;
+  color: #8c8c8c;
   font-variant-numeric: tabular-nums;
 }
 .system-event.approval {
-  background: #fdfadf;
-  border-color: #e5df88;
+  background: #f8f8f8;
+  border-color: #dadada;
 }
 /* The answer is quieter than the question. A request is a thing to act on and is coloured like one;
    a decision already taken is a record, and colouring it the same made a finished conversation look
@@ -1271,18 +1271,18 @@ select:focus-visible {
   color: var(--text);
 }
 .system-event.error {
-  background: #fff0e4;
-  border-color: #f3c9c6;
-  color: #99363b;
+  background: #f3f3f3;
+  border-color: #d4d4d4;
+  color: #5c5c5c;
 }
 .system-event.warning {
-  background: #fdf9e0;
-  border-color: #e1db92;
+  background: #f8f8f8;
+  border-color: #d7d7d7;
 }
 .tool-event {
   margin: 8px 40px;
-  border: 1px solid #efe1d5;
-  background: #fff9ed;
+  border: 1px solid #e4e4e4;
+  background: #f9f9f9;
   border-radius: 10px;
   overflow: hidden;
 }
@@ -1294,7 +1294,7 @@ select:focus-visible {
   padding: 9px 11px;
   cursor: pointer;
   font-size: 12px;
-  color: #a2988e;
+  color: #9a9a9a;
   list-style: none;
 }
 .tool-event summary::-webkit-details-marker {
@@ -1312,16 +1312,16 @@ select:focus-visible {
   transform: rotate(90deg);
 }
 .tool-event.success summary > svg:first-child {
-  color: #877e75;
+  color: #808080;
 }
 .tool-event pre {
   margin: 0;
-  border-top: 1px solid #342e2a;
+  border-top: 1px solid #2f2f2f;
   max-height: 240px;
   overflow: auto;
   padding: 10px 12px;
-  background: #1b1612;
-  color: #a2988e;
+  background: #171717;
+  color: #9a9a9a;
   font:
     9px/1.5 ui-monospace,
     SFMono-Regular,
@@ -1333,17 +1333,17 @@ select:focus-visible {
 .browser-capture-card {
   margin: 15px 40px 8px;
   overflow: hidden;
-  border: 1px solid #ecded3;
+  border: 1px solid #e1e1e1;
   border-radius: 13px;
-  background: #fff6ec;
-  box-shadow: 0 8px 24px rgba(31, 49, 40, 0.06);
+  background: #f7f7f7;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.06);
 }
 .browser-capture-card > img {
   display: block;
   width: 100%;
   max-height: 390px;
   object-fit: contain;
-  background: #181511;
+  background: #151515;
 }
 .browser-capture-card figcaption,
 .browser-capture-card figcaption > span {
@@ -1362,14 +1362,14 @@ select:focus-visible {
 }
 .browser-capture-card figcaption svg {
   width: 14px;
-  color: #a2988e;
+  color: #9a9a9a;
 }
 .browser-capture-card button,
 .artifact-actions button,
 .artifact-actions a {
-  border: 1px solid #342e2a;
-  background: #1b1612;
-  color: #efe1d6;
+  border: 1px solid #2f2f2f;
+  background: #171717;
+  color: #e4e4e4;
   text-decoration: none;
   border-radius: 7px;
   padding: 5px 8px;
@@ -1380,7 +1380,7 @@ select:focus-visible {
   display: flex;
   align-items: center;
   gap: 6px;
-  color: #a79c93;
+  color: #9e9e9e;
   font-size: 12px;
   margin: 7px 48px;
 }
@@ -1394,8 +1394,8 @@ select:focus-visible {
   align-items: center;
   margin: 12px 40px;
   padding: 11px;
-  border: 1px solid #ecded3;
-  background: #fff6ec;
+  border: 1px solid #e1e1e1;
+  background: #f7f7f7;
   border-radius: 11px;
 }
 .pdf-review-card {
@@ -1403,9 +1403,9 @@ select:focus-visible {
   min-height: 300px;
   overflow: hidden;
   margin: 12px 40px 0;
-  border: 1px solid #342e2a;
+  border: 1px solid #2f2f2f;
   border-radius: 11px;
-  background: #181511;
+  background: #151515;
 }
 .pdf-review-card iframe {
   width: 100%;
@@ -1437,7 +1437,7 @@ video.artifact-media {
   display: block;
   max-height: 390px;
   object-fit: contain;
-  background: #181511;
+  background: #151515;
 }
 .artifact-media img {
   width: 100%;
@@ -1467,10 +1467,10 @@ video.artifact-media {
   gap: 11px;
   margin: 14px 40px;
   padding: 13px;
-  border: 1px solid #e4d6cb;
+  border: 1px solid #d9d9d9;
   border-radius: 13px;
-  background: linear-gradient(135deg, #fffaed, #fff0e4);
-  box-shadow: 0 8px 24px rgba(42, 69, 51, 0.06);
+  background: linear-gradient(135deg, #fafafa, #f3f3f3);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.06);
 }
 .preview-chat-icon {
   display: grid;
@@ -1478,8 +1478,8 @@ video.artifact-media {
   width: 38px;
   height: 38px;
   border-radius: 11px;
-  color: #c9bdb3;
-  background: #2e2824;
+  color: #bfbfbf;
+  background: #292929;
 }
 .preview-chat-icon svg {
   width: 18px;
@@ -1496,7 +1496,7 @@ video.artifact-media {
 }
 .preview-chat-card > div > span {
   margin-top: 3px;
-  color: #897f77;
+  color: #818181;
   font-size: 12px;
 }
 /*
@@ -1513,20 +1513,20 @@ video.artifact-media {
   gap: 12px;
   margin: 14px 40px;
   padding: 14px;
-  border: 1px solid #5e5750;
+  border: 1px solid #585858;
   border-radius: 13px;
-  background: #1e1a16;
+  background: #1b1b1b;
 }
 .agent-note {
   grid-template-columns: 22px minmax(0, 1fr);
-  border-color: #59524b;
-  background: #1d1815;
+  border-color: #535353;
+  background: #191919;
 }
 .spend-pause-card > svg,
 .handoff-card > svg,
 .agent-note > svg {
   width: 20px;
-  color: #bcb680;
+  color: #b3b3b3;
 }
 .spend-pause-card .eyebrow {
   margin-bottom: 4px;
@@ -1543,7 +1543,7 @@ video.artifact-media {
   white-space: nowrap;
 }
 .agent-note > svg {
-  color: #bdb2a8;
+  color: #b4b4b4;
 }
 .handoff-card p,
 .agent-note p {
@@ -1565,13 +1565,13 @@ video.artifact-media {
 .handoff-card > div > span {
   margin-top: 3px;
   font-size: 12px;
-  color: #a89d94;
+  color: #9f9f9f;
 }
 .handoff-card > div > p {
   margin-top: 7px;
   font-size: 12px;
   line-height: 1.5;
-  color: #d2c6bb;
+  color: #c8c8c8;
 }
 .agent-note .markdown {
   margin-top: 4px;
@@ -1586,7 +1586,7 @@ video.artifact-media {
 
 .artifact-card > svg {
   width: 20px;
-  color: #a2988e;
+  color: #9a9a9a;
 }
 .artifact-card strong,
 .artifact-card span {
@@ -1597,13 +1597,13 @@ video.artifact-media {
 }
 .artifact-card span {
   font-size: 12px;
-  color: #978c84;
+  color: #8e8e8e;
   margin-top: 3px;
 }
 .artifact-card button,
 .artifact-card a {
-  border: 1px solid #e7d9ce;
-  background: #fff6ea;
+  border: 1px solid #dcdcdc;
+  background: #f7f7f7;
   color: inherit;
   text-decoration: none;
   border-radius: 7px;
@@ -1611,11 +1611,11 @@ video.artifact-media {
   font-size: 12px;
 }
 .completion-card {
-  background: #fff4e7;
-  border-color: #e6d9cd;
+  background: #f6f6f6;
+  border-color: #dbdbdb;
 }
 .completion-card > svg {
-  color: #726a62;
+  color: #6b6b6b;
 }
 .completion-card span {
   max-width: 560px;
@@ -1651,7 +1651,7 @@ video.artifact-media {
   height: 100%;
   min-height: 360px;
   padding: 40px 60px 40px;
-  color: #a2988e;
+  color: #9a9a9a;
 }
 .empty-canvas h1 {
   font-weight: 600;
@@ -1684,7 +1684,7 @@ video.artifact-media {
   letter-spacing: 0.12em;
   font-size: 12px;
   font-weight: 700;
-  color: #8f867d;
+  color: #888888;
 }
 
 /*
@@ -1707,17 +1707,17 @@ video.artifact-media {
   max-width: 820px;
   margin: 0 auto;
   background: white;
-  border: 1px solid #e7d9ce;
+  border: 1px solid #dcdcdc;
   border-radius: 16px;
   padding: 10px 10px 8px;
-  box-shadow: 0 13px 36px #3a342f18;
+  box-shadow: 0 13px 36px #35353518;
   pointer-events: auto;
 }
 .composer:focus-within {
-  border-color: #afa39a;
+  border-color: #a5a5a5;
   box-shadow:
-    0 13px 36px #3a342f18,
-    0 0 0 2px #cfc3b82b;
+    0 13px 36px #35353518,
+    0 0 0 2px #c5c5c52b;
 }
 .composer textarea {
   display: block;
@@ -1734,7 +1734,7 @@ video.artifact-media {
   line-height: 1.5;
 }
 .composer textarea::placeholder {
-  color: #aa9f96;
+  color: #a1a1a1;
 }
 .composer-bottom {
   display: flex;
@@ -1742,13 +1742,13 @@ video.artifact-media {
   gap: 8px;
 }
 .icon-btn.recording {
-  color: #fff6ec;
+  color: #f7f7f7;
   background: var(--danger);
   animation: recording-pulse 1.4s ease-in-out infinite;
 }
 @keyframes recording-pulse {
   50% {
-    box-shadow: 0 0 0 5px #b24c4e2b;
+    box-shadow: 0 0 0 5px #7171712b;
   }
 }
 .send-btn {
@@ -1764,7 +1764,7 @@ video.artifact-media {
   cursor: pointer;
 }
 .send-btn:hover {
-  background: #413a35;
+  background: #3b3b3b;
 }
 .send-btn svg {
   width: 15px;
@@ -1778,13 +1778,13 @@ video.artifact-media {
   max-width: 100%;
   margin: 0 auto 8px;
   pointer-events: auto;
-  border: 1px solid #efc2bf;
-  background: #fff0e4;
-  color: #9a363b;
+  border: 1px solid #cecece;
+  background: #f3f3f3;
+  color: #5d5d5d;
   border-radius: 9px;
   padding: 8px 10px;
   font-size: 12px;
-  box-shadow: 0 4px 15px #591f2114;
+  box-shadow: 0 4px 15px #35353514;
 }
 .inline-error button {
   border: 0;
@@ -1803,13 +1803,13 @@ video.artifact-media {
   max-width: 100%;
   margin: 0 auto 8px;
   pointer-events: auto;
-  border: 1px solid #dfd3c7;
-  background: #fff3e6;
-  color: #58514b;
+  border: 1px solid #d5d5d5;
+  background: #f5f5f5;
+  color: #525252;
   border-radius: 9px;
   padding: 8px 10px;
   font-size: 12px;
-  box-shadow: 0 4px 15px #413a3514;
+  box-shadow: 0 4px 15px #3b3b3b14;
 }
 .inline-notice button {
   display: grid;
@@ -1822,8 +1822,8 @@ video.artifact-media {
 }
 .inspector {
   min-width: 0;
-  background: #fdefe2;
-  border-left: 1px solid #342e2a;
+  background: #f2f2f2;
+  border-left: 1px solid #2f2f2f;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -1841,14 +1841,14 @@ video.artifact-media {
   align-items: end;
   gap: 11px;
   padding: 0 18px;
-  border-bottom: 1px solid #342e2a;
+  border-bottom: 1px solid #2f2f2f;
 }
 .inspector-tabs button {
   border: 0;
   background: transparent;
   height: 39px;
   padding: 0 1px;
-  color: #978c84;
+  color: #8e8e8e;
   font-size: 12px;
   cursor: pointer;
   border-bottom: 2px solid transparent;
@@ -1873,8 +1873,8 @@ video.artifact-media {
   align-items: center;
   gap: 5px;
   padding: 0 10px;
-  border-bottom: 1px solid #342e2a;
-  background: #1b1612;
+  border-bottom: 1px solid #2f2f2f;
+  background: #171717;
 }
 
 .computer-toolbar {
@@ -1921,7 +1921,7 @@ video.artifact-media {
   gap: 6px;
   min-width: 0;
   flex: 1;
-  color: #a2988e;
+  color: #9a9a9a;
   font-size: 12px;
 }
 .breadcrumbs span {
@@ -1957,19 +1957,19 @@ video.artifact-media {
   gap: 8px;
   align-items: end;
   padding: 10px 12px;
-  border-bottom: 1px solid #302b26;
+  border-bottom: 1px solid #2c2c2c;
 }
 .file-naming label {
   grid-column: 1 / -1;
-  color: #a49990;
+  color: #9b9b9b;
   font-size: 11px;
 }
 .file-naming input {
   min-width: 0;
-  border: 1px solid #37322d;
+  border: 1px solid #333333;
   border-radius: 9px;
-  background: #0f0d0a;
-  color: #f4e6db;
+  background: #0d0d0d;
+  color: #e9e9e9;
   padding: 8px 10px;
   font-size: 12px;
 }
@@ -1991,7 +1991,7 @@ video.artifact-media {
   cursor: pointer;
 }
 .file-list .file-open:hover {
-  background: #f2e5d9;
+  background: #e7e7e7;
 }
 .file-list .file-open > svg {
   width: 18px;
@@ -2006,7 +2006,7 @@ video.artifact-media {
 }
 .file-list small {
   font-size: 11px;
-  color: #a1968d;
+  color: #989898;
   margin-top: 2px;
 }
 .file-preview {
@@ -2030,7 +2030,7 @@ video.artifact-media {
   align-items: center;
   gap: 7px;
   padding: 0 10px;
-  border-bottom: 1px solid #342e2a;
+  border-bottom: 1px solid #2f2f2f;
   font-size: 12px;
 }
 .preview-header > strong {
@@ -2047,8 +2047,8 @@ video.artifact-media {
 .preview-disclosure {
   margin: 0;
   padding: 9px 13px;
-  border-bottom: 1px solid #342e2a;
-  background: #1b1612;
+  border-bottom: 1px solid #2f2f2f;
+  background: #171717;
   color: var(--muted);
   font-size: 11px;
   line-height: 1.5;
@@ -2058,8 +2058,8 @@ video.artifact-media {
   margin: 0;
   padding: 13px;
   overflow: auto;
-  background: #1b1612;
-  color: #efe1d6;
+  background: #171717;
+  color: #e4e4e4;
   font:
     10px/1.6 ui-monospace,
     SFMono-Regular,
@@ -2080,7 +2080,7 @@ video.artifact-media {
   align-items: center;
   gap: 7px;
   flex: 1;
-  color: #928880;
+  color: #8a8a8a;
   font-size: 12px;
 }
 .pane-loading svg {
@@ -2093,7 +2093,7 @@ video.artifact-media {
   justify-content: center;
   text-align: center;
   padding: 40px;
-  color: #9b9088;
+  color: #929292;
 }
 .empty-pane.grow {
   flex: 1;
@@ -2101,11 +2101,11 @@ video.artifact-media {
 .empty-pane svg {
   width: 28px;
   margin-bottom: 9px;
-  color: #978c84;
+  color: #8e8e8e;
 }
 .empty-pane strong {
   font-size: 13px;
-  color: #a2988e;
+  color: #9a9a9a;
 }
 .empty-pane span {
   font-size: 12px;
@@ -2118,8 +2118,8 @@ video.artifact-media {
   align-items: center;
   gap: 5px;
   flex: 1;
-  border: 1px solid #342e2a;
-  background: #1b1612;
+  border: 1px solid #2f2f2f;
+  background: #171717;
   border-radius: 7px;
   padding: 0 7px;
 }
@@ -2134,7 +2134,7 @@ video.artifact-media {
   outline: 0;
   background: transparent;
   font-size: 12px;
-  color: #a2988e;
+  color: #9a9a9a;
 }
 /*
  * Hugs the picture rather than stretching past it.
@@ -2147,7 +2147,7 @@ video.artifact-media {
   position: relative;
   min-height: 0;
   flex: 0 0 auto;
-  background: #ecded3;
+  background: #e1e1e1;
   overflow: auto;
 }
 .browser-viewport.loading,
@@ -2186,24 +2186,24 @@ video.artifact-media {
   gap: 6px;
   padding: 6px 8px;
   overflow-x: auto;
-  border-top: 1px solid #fff6ec14;
-  background: #130f0c;
+  border-top: 1px solid #f7f7f714;
+  background: #101010;
 }
 .terminal-keys > button {
   flex: 0 0 auto;
   min-width: 44px;
   min-height: 34px;
   padding: 0 10px;
-  border: 1px solid #fff6ec1f;
+  border: 1px solid #f7f7f71f;
   border-radius: 8px;
-  background: #1d1815;
-  color: #e5d8cd;
+  background: #191919;
+  color: #dadada;
   font-size: 0.82rem;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   cursor: pointer;
 }
 .terminal-keys > button:active {
-  background: #2b2722;
+  background: #282828;
 }
 .event-detail > summary {
   cursor: pointer;
@@ -2224,11 +2224,11 @@ video.artifact-media {
   position: fixed;
   inset: 0;
   z-index: 60;
-  background: #0f0c0a;
+  background: #0d0d0d;
 }
 .computer-pane:fullscreen,
 .computer-pane.expanded {
-  background: #0f0c0a;
+  background: #0d0d0d;
 }
 .computer-pane:fullscreen .browser-viewport,
 .computer-pane.expanded .browser-viewport {
@@ -2282,7 +2282,7 @@ video.artifact-media {
   height: auto;
   object-fit: contain;
   object-position: top;
-  background: #15110e;
+  background: #121212;
 }
 .remote-frame-button > .remote-frame-canvas[hidden] {
   display: none;
@@ -2323,12 +2323,12 @@ video.artifact-media {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  background: #241f1bea;
-  color: #f8eade;
+  background: #202020ea;
+  color: #ededed;
   border-radius: 9px;
   padding: 7px 9px;
   font-size: 12px;
-  box-shadow: 0 3px 14px #201c1833;
+  box-shadow: 0 3px 14px #1d1d1d33;
 }
 .browser-status span {
   display: flex;
@@ -2340,9 +2340,9 @@ video.artifact-media {
   color: var(--accent);
 }
 .browser-status button {
-  border: 1px solid #776f67;
-  background: #38322d;
-  color: #fff6ec;
+  border: 1px solid #707070;
+  background: #333333;
+  color: #f7f7f7;
   border-radius: 6px;
   padding: 4px 7px;
   font-size: 11px;
@@ -2353,8 +2353,8 @@ video.artifact-media {
   align-items: center;
   gap: 6px;
   padding: 7px 10px;
-  border-top: 1px solid #342e2a;
-  color: #8a8178;
+  border-top: 1px solid #2f2f2f;
+  color: #838383;
   font-size: 11px;
 }
 .browser-note svg {
@@ -2363,7 +2363,7 @@ video.artifact-media {
 .terminal-pane {
   flex: 1;
   min-height: 0;
-  background: #1a1611;
+  background: #171717;
   padding: 8px;
 }
 .terminal-pane .xterm {
@@ -2375,7 +2375,7 @@ video.artifact-media {
 }
 .meter-card {
   padding: 15px 0;
-  border-top: 1px solid #342e2a;
+  border-top: 1px solid #2f2f2f;
 }
 .meter-card > div:first-child {
   display: flex;
@@ -2391,22 +2391,22 @@ video.artifact-media {
 .meter-card .meter {
   height: 7px;
   border-radius: 10px;
-  background: #181511;
+  background: #151515;
   margin: 9px 0 7px;
   overflow: hidden;
 }
 .meter i {
   display: block;
   height: 100%;
-  background: #686059;
+  background: #616161;
   border-radius: inherit;
 }
 .meter.storage i {
-  background: #8b8279;
+  background: #848484;
 }
 .meter-card small {
   display: block;
-  color: #978c84;
+  color: #8e8e8e;
   font-size: 11px;
   line-height: 1.5;
 }
@@ -2421,13 +2421,13 @@ video.artifact-media {
   gap: 4px 10px;
   margin: 0 10px 8px;
   padding: 11px;
-  border: 1px solid #5e5750;
+  border: 1px solid #585858;
   border-radius: 10px;
-  background: #1e1a16;
+  background: #1b1b1b;
 }
 .wall-banner > svg {
   width: 18px;
-  color: #bcb680;
+  color: #b3b3b3;
 }
 .wall-banner strong,
 .wall-banner span,
@@ -2440,13 +2440,13 @@ video.artifact-media {
 .wall-banner span {
   margin-top: 3px;
   font-size: 11px;
-  color: #a89d94;
+  color: #9f9f9f;
 }
 .wall-banner small {
   margin-top: 6px;
   font-size: 11px;
   line-height: 1.5;
-  color: #d2c6bb;
+  color: #c8c8c8;
 }
 .wall-actions {
   grid-column: 2;
@@ -2468,10 +2468,10 @@ video.artifact-media {
   gap: 4px 10px;
   align-items: center;
   padding: 11px;
-  border: 1px solid #634745;
-  background: #1b1612;
+  border: 1px solid #4f4f4f;
+  background: #171717;
   border-radius: 9px;
-  box-shadow: 0 8px 25px #5427271f;
+  box-shadow: 0 8px 25px #3636361f;
 }
 .browser-error strong,
 .browser-error span {
@@ -2479,17 +2479,17 @@ video.artifact-media {
 }
 .browser-error strong {
   font-size: 12px;
-  color: #d8a8a5;
+  color: #b5b5b5;
 }
 .browser-error span {
   font-size: 11px;
-  color: #906c6b;
+  color: #767676;
 }
 .browser-error button {
   grid-column: 2;
   grid-row: 1/3;
-  border: 1px solid #634745;
-  background: #1b1612;
+  border: 1px solid #4f4f4f;
+  background: #171717;
   border-radius: 6px;
   padding: 5px 8px;
   font-size: 11px;
@@ -2511,17 +2511,17 @@ video.artifact-media {
   gap: 5px;
   align-items: center;
   padding: 7px 8px;
-  border-top: 1px solid #342e2a;
+  border-top: 1px solid #2f2f2f;
 }
 /* The agent has handed the field back so the owner can type a credential it must never see. That
    is a different mode, so it has to look like one. */
 .browser-input.secure {
-  background: #231f1a;
-  box-shadow: inset 0 0 0 1px #58504a;
+  background: #202020;
+  box-shadow: inset 0 0 0 1px #525252;
 }
 .browser-input > svg {
   width: 13px;
-  color: #a2988e;
+  color: #9a9a9a;
 }
 .browser-input input {
   min-width: 0;
@@ -2533,9 +2533,9 @@ video.artifact-media {
 }
 .browser-input button {
   height: 28px;
-  border: 1px solid #4b453f;
+  border: 1px solid #464646;
   border-radius: 6px;
-  background: #1b1612;
+  background: #171717;
   padding: 0 7px;
   font-size: 11px;
   cursor: pointer;
@@ -2552,10 +2552,10 @@ video.artifact-media {
   margin: 0 auto 8px;
   padding: 10px 12px;
   pointer-events: auto;
-  border: 1px solid #d9d280;
-  background: #fffbd0;
+  border: 1px solid #cecece;
+  background: #f8f8f8;
   border-radius: 9px;
-  color: #585800;
+  color: #545454;
   font-size: 12px;
 }
 .usage-warning > svg {
@@ -2569,23 +2569,23 @@ video.artifact-media {
   border: 0;
   border-radius: 6px;
   background: var(--caution-line);
-  color: #fff6ec;
+  color: #f7f7f7;
   padding: 6px 9px;
   font-size: 11px;
   cursor: pointer;
 }
 .usage-warning.critical {
-  border-color: #ebaaa8;
-  background: #fff0e4;
-  color: #872a30;
+  border-color: #bdbdbd;
+  background: #f3f3f3;
+  color: #4f4f4f;
 }
 .usage-warning.elevated {
-  border-color: #ccc786;
-  background: #fbf7e1;
-  color: #595a00;
+  border-color: #c3c3c3;
+  background: #f6f6f6;
+  color: #565656;
 }
 .usage-warning.critical button {
-  background: #96363b;
+  background: #5b5b5b;
 }
 .preview-pane {
   gap: 12px;
@@ -2597,13 +2597,13 @@ video.artifact-media {
   grid-template-columns: minmax(0, 1fr) 78px auto;
   gap: 7px;
   align-items: end;
-  border: 1px solid #ebded2;
+  border: 1px solid #e0e0e0;
   border-radius: 9px;
-  background: #fff6ea;
+  background: #f7f7f7;
   padding: 9px;
 }
 .preview-create label {
-  color: #a2988e;
+  color: #9a9a9a;
   font-size: 11px;
   font-weight: 600;
 }
@@ -2611,7 +2611,7 @@ video.artifact-media {
   width: 100%;
   height: 32px;
   margin-top: 4px;
-  border: 1px solid #e6d9cd;
+  border: 1px solid #dbdbdb;
   border-radius: 7px;
   background: white;
   padding: 0 7px;
@@ -2626,7 +2626,7 @@ video.artifact-media {
 .preview-boundary {
   display: flex;
   gap: 7px;
-  color: #847b72;
+  color: #7d7d7d;
   font-size: 11px;
   line-height: 1.45;
 }
@@ -2643,9 +2643,9 @@ video.artifact-media {
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 8px;
   align-items: center;
-  border: 1px solid #342e2a;
+  border: 1px solid #2f2f2f;
   border-radius: 8px;
-  background: #1b1612;
+  background: #171717;
   padding: 8px;
 }
 .preview-row.revoked,
@@ -2661,7 +2661,7 @@ video.artifact-media {
 }
 .preview-row small {
   margin-top: 2px;
-  color: #958c83;
+  color: #8e8e8e;
   font-size: 11px;
   line-height: 1.4;
 }
@@ -2675,13 +2675,13 @@ video.artifact-media {
   place-items: center;
   width: 27px;
   height: 27px;
-  border: 1px solid #342e2a;
+  border: 1px solid #2f2f2f;
   border-radius: 6px;
-  background: #1b1612;
-  color: #a2988e;
+  background: #171717;
+  color: #9a9a9a;
 }
 .preview-actions button:last-child {
-  color: #d8a8a5;
+  color: #b5b5b5;
 }
 .preview-actions svg,
 .preview-frame-wrap > div button svg {
@@ -2692,16 +2692,16 @@ video.artifact-media {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  border: 1px solid #342e2a;
+  border: 1px solid #2f2f2f;
   border-radius: 9px;
-  background: #1b1612;
+  background: #171717;
 }
 .preview-frame-wrap > div {
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 6px 8px;
-  border-bottom: 1px solid #342e2a;
+  border-bottom: 1px solid #2f2f2f;
   /* Was #748078 at 11px, about 4.4:1. */
   color: var(--muted);
   font-size: 11px;
@@ -2722,13 +2722,13 @@ video.artifact-media {
 .deliverable-library {
   display: grid;
   gap: 6px;
-  border-top: 1px solid #342e2a;
+  border-top: 1px solid #2f2f2f;
   margin-top: 18px;
   padding-top: 13px;
 }
 .deliverable-library > div:first-child small,
 .deliverable-library > small {
-  color: #8e857c;
+  color: #878787;
   font-size: 11px;
   line-height: 1.45;
 }
@@ -2738,7 +2738,7 @@ video.artifact-media {
   align-items: center;
   gap: 6px;
   padding: 7px 2px;
-  border-bottom: 1px solid #342e2a;
+  border-bottom: 1px solid #2f2f2f;
 }
 .deliverable-row > svg {
   width: 15px;
@@ -2750,14 +2750,14 @@ video.artifact-media {
 }
 .deliverable-row strong {
   overflow: hidden;
-  color: #efe1d6;
+  color: #e4e4e4;
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .deliverable-row small {
   margin-top: 2px;
-  color: #9a9087;
+  color: #929292;
   font-size: 11px;
 }
 /*
@@ -2781,13 +2781,13 @@ video.artifact-media {
   width: 27px;
   height: 27px;
   padding: 0;
-  border: 1px solid #342e2a;
+  border: 1px solid #2f2f2f;
   border-radius: 6px;
-  background: #1b1612;
-  color: #a2988e;
+  background: #171717;
+  color: #9a9a9a;
 }
 .deliverable-row button {
-  color: #d8a8a5;
+  color: #b5b5b5;
 }
 .deliverable-row a svg,
 .deliverable-row button svg {
@@ -2803,11 +2803,11 @@ video.artifact-media {
   grid-template-columns: 34px 1fr auto;
   gap: 12px;
   align-items: center;
-  background: #fffbee;
-  border: 1px solid #e3dd95;
+  background: #fbfbfb;
+  border: 1px solid #d9d9d9;
   border-radius: 13px;
   padding: 12px;
-  box-shadow: 0 14px 38px #42411a24;
+  box-shadow: 0 14px 38px #3f3f3f24;
   /* Bounded against the viewport rather than against the composer's height, and it scrolls its own
      overflow. A long command or a wide destination list used to push the request itself out of
      sight while Approve stayed put, which is the one shape this card must never take. */
@@ -2820,8 +2820,8 @@ video.artifact-media {
   width: 34px;
   height: 34px;
   border-radius: 10px;
-  background: #eae390;
-  color: #67660e;
+  background: #dfdfdf;
+  color: #626262;
 }
 .approval-symbol svg {
   width: 17px;
@@ -2831,7 +2831,7 @@ video.artifact-media {
 }
 .approval-copy .eyebrow {
   margin: 0 0 3px;
-  color: #7b7924;
+  color: #757575;
 }
 .approval-copy > strong {
   font-size: 13px;
@@ -2842,12 +2842,12 @@ video.artifact-media {
   margin: 4px 0;
   font-size: 12px;
   line-height: 1.5;
-  color: #6c6849;
+  color: #676767;
   white-space: pre-wrap;
 }
 .approval-copy small {
   font-size: 11px;
-  color: #928f73;
+  color: #8d8d8d;
 }
 
 /*
@@ -2872,14 +2872,14 @@ video.artifact-media {
   align-items: baseline;
 }
 .approval-facts dt {
-  color: #7b7924;
+  color: #757575;
   font-size: 11px;
   font-weight: 600;
   text-align: right;
 }
 .approval-facts dd {
   margin: 0;
-  color: #48452f;
+  color: #444444;
   font-size: 12px;
   line-height: 1.5;
   overflow-wrap: anywhere;
@@ -2890,13 +2890,13 @@ video.artifact-media {
   font-size: 12px;
 }
 .approval-facts .approval-destination dd span {
-  color: #767357;
+  color: #727272;
 }
 .approval-request {
   max-height: 132px;
   overflow: auto;
   margin: 5px 0 0;
-  color: #48452f;
+  color: #444444;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 11px;
   line-height: 1.5;
@@ -2923,26 +2923,26 @@ video.artifact-media {
   margin-top: 1px;
 }
 .approval-context.exposed {
-  color: #c4c09d;
+  color: #bebebe;
 }
 .approval-context.exposed > svg {
-  color: #d7d081;
+  color: #cccccc;
 }
 .approval-context.clean {
-  color: #8d847b;
+  color: #868686;
 }
 .approval-context.clean > svg {
-  color: #7f756e;
+  color: #777777;
 }
 
 .approval-agent-wording {
   margin: 7px 0 0;
   padding: 0 0 0 9px;
-  border-left: 2px solid #d7d081;
+  border-left: 2px solid #cccccc;
 }
 .approval-agent-wording > span {
   display: block;
-  color: #959066;
+  color: #8e8e8e;
   font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.04em;
@@ -2952,7 +2952,7 @@ video.artifact-media {
   max-height: 54px;
   overflow: auto;
   margin: 2px 0 0;
-  color: #6c6849;
+  color: #676767;
   font-size: 12px;
   font-style: italic;
   line-height: 1.5;
@@ -2979,22 +2979,22 @@ video.artifact-media {
 .primary {
   border: 1px solid var(--text);
   background: var(--text);
-  color: #fff6ec;
+  color: #f7f7f7;
 }
 .primary:hover {
-  background: #3d3731;
+  background: #383838;
 }
 .primary svg,
 .ghost svg {
   width: 14px;
 }
 .ghost {
-  border: 1px solid #e6d9cd;
-  background: #fff6ec;
-  color: #655d57;
+  border: 1px solid #dbdbdb;
+  background: #f7f7f7;
+  color: #5f5f5f;
 }
 .ghost:hover {
-  background: #fff1e5;
+  background: #f4f4f4;
 }
 /**
  * The quieter of two choices in a dialog - Cancel beside Save, Dismiss beside Try again.
@@ -3011,7 +3011,7 @@ video.artifact-media {
   color: var(--text);
 }
 .secondary:hover {
-  border-color: #968b83;
+  border-color: #8d8d8d;
 }
 .secondary svg {
   width: 14px;
@@ -3026,7 +3026,7 @@ video.artifact-media {
   z-index: 30;
   display: grid;
   place-items: center;
-  background: #24201c66;
+  background: #21212166;
   backdrop-filter: blur(5px);
   padding: 22px;
 }
@@ -3035,11 +3035,11 @@ video.artifact-media {
   width: min(620px, 100%);
   max-height: calc(100vh - 44px);
   overflow: auto;
-  background: #fff9ed;
-  border: 1px solid #ebded2;
+  background: #f9f9f9;
+  border: 1px solid #e0e0e0;
   border-radius: 18px;
   padding: 26px;
-  box-shadow: 0 25px 80px #211c1940;
+  box-shadow: 0 25px 80px #1d1d1d40;
 }
 
 .modal h2 {
@@ -3049,7 +3049,7 @@ video.artifact-media {
   margin: 4px 0 5px;
 }
 .subtle {
-  color: #8b8179;
+  color: #838383;
   font-size: 13px;
   line-height: 1.55;
 }
@@ -3063,7 +3063,7 @@ video.artifact-media {
   height: 30px;
   border: 0;
   border-radius: 8px;
-  background: #fbede0;
+  background: #f0f0f0;
   cursor: pointer;
 }
 .modal-close svg {
@@ -3072,7 +3072,7 @@ video.artifact-media {
 .modal label,
 .auth-form label {
   display: block;
-  color: #665e58;
+  color: #606060;
   font-size: 12px;
   font-weight: 600;
   margin: 16px 0 6px;
@@ -3083,9 +3083,9 @@ video.artifact-media {
   width: 100%;
   height: 39px;
   margin-top: 6px;
-  border: 1px solid #e6d9cd;
+  border: 1px solid #dbdbdb;
   border-radius: 9px;
-  background: #fff6ec;
+  background: #f7f7f7;
   padding: 0 10px;
   color: var(--text);
   outline: 0;
@@ -3095,12 +3095,12 @@ video.artifact-media {
 .modal input[type='radio'] {
   width: 15px;
   height: 15px;
-  accent-color: #564f48;
+  accent-color: #505050;
 }
 
 .modal input[type='range'] {
   width: 100%;
-  accent-color: #564f48;
+  accent-color: #505050;
   margin-top: 11px;
 }
 
@@ -3132,7 +3132,7 @@ video.artifact-media {
 */
 .recovery-create input {
   min-width: 0;
-  border: 1px solid #3c3731;
+  border: 1px solid #383838;
   border-radius: 9px;
 }
 
@@ -3199,9 +3199,9 @@ video.artifact-media {
   margin-top: 6px;
   padding: 11px 12px;
   resize: vertical;
-  border: 1px solid #342e2a;
+  border: 1px solid #2f2f2f;
   border-radius: 10px;
-  background: #1b1612;
+  background: #171717;
   color: var(--text);
   font: inherit;
   line-height: 1.55;
@@ -3212,10 +3212,10 @@ video.artifact-media {
   gap: 9px;
   margin-top: 16px;
   padding: 11px 12px;
-  border: 1px solid #e8dbcf;
+  border: 1px solid #dddddd;
   border-radius: 10px;
-  background: #fff4e8;
-  color: #6a615a;
+  background: #f6f6f6;
+  color: #636363;
   font-size: 12px;
   line-height: 1.55;
 }
@@ -3245,9 +3245,9 @@ video.artifact-media {
   height: 13px;
 }
 .form-error {
-  border: 1px solid #f0c5c3;
-  background: #fff0e4;
-  color: #a13d41;
+  border: 1px solid #d1d1d1;
+  background: #f3f3f3;
+  color: #636363;
   border-radius: 8px;
   padding: 8px 10px;
   font-size: 12px;
@@ -3263,9 +3263,9 @@ video.artifact-media {
   margin: 18px 0 2px;
   padding: 4px;
   overflow-x: auto;
-  border: 1px solid #eadcd1;
+  border: 1px solid #dfdfdf;
   border-radius: 11px;
-  background: #fcede1;
+  background: #f0f0f0;
 }
 .settings-nav button {
   flex: 1 0 auto;
@@ -3283,12 +3283,12 @@ video.artifact-media {
 }
 .settings-nav button:hover {
   color: var(--text);
-  background: #fff6e9;
+  background: #f7f7f7;
 }
 .settings-nav button.active {
   color: var(--text);
   background: white;
-  box-shadow: 0 1px 3px #2e292414;
+  box-shadow: 0 1px 3px #2a2a2a14;
 }
 .schedule-modal {
   width: min(1040px, calc(100vw - 32px));
@@ -3314,7 +3314,7 @@ video.artifact-media {
 }
 .schedule-existing > small {
   padding: 18px;
-  border: 1px dashed #342e2a;
+  border: 1px dashed #2f2f2f;
   border-radius: 11px;
   color: var(--muted);
   text-align: center;
@@ -3327,16 +3327,16 @@ video.artifact-media {
   align-items: center;
   gap: 7px;
   padding: 9px;
-  border: 1px solid #342e2a;
+  border: 1px solid #2f2f2f;
   border-radius: 11px;
-  background: #1b1612;
+  background: #171717;
 }
 .schedule-row.paused {
   opacity: 0.7;
 }
 .schedule-row > svg {
   width: 18px;
-  color: #a2988e;
+  color: #9a9a9a;
 }
 .schedule-row span,
 .schedule-row strong,
@@ -3358,16 +3358,16 @@ video.artifact-media {
 }
 .schedule-form {
   padding: 14px;
-  border: 1px solid #342e2a;
+  border: 1px solid #2f2f2f;
   border-radius: 13px;
-  background: #1b1612;
+  background: #171717;
 }
 .schedule-form textarea {
   width: 100%;
   resize: vertical;
-  border: 1px solid #342e2a;
+  border: 1px solid #2f2f2f;
   border-radius: 9px;
-  background: #1b1612;
+  background: #171717;
   padding: 9px;
 }
 .schedule-grid {
@@ -3389,16 +3389,16 @@ video.artifact-media {
 }
 .weekday-picker button {
   height: 31px;
-  border: 1px solid #342e2a;
+  border: 1px solid #2f2f2f;
   border-radius: 8px;
-  background: #1b1612;
+  background: #171717;
   cursor: pointer;
   font-size: 12px;
 }
 .weekday-picker button.active {
-  border-color: #5c544e;
-  background: #f1e4d8;
-  color: #49433d;
+  border-color: #565656;
+  background: #e6e6e6;
+  color: #444444;
   font-weight: 700;
 }
 .schedule-zone {
@@ -3406,7 +3406,7 @@ video.artifact-media {
   font-size: 12px;
 }
 .settings-section {
-  border-top: 1px solid #342e2a;
+  border-top: 1px solid #2f2f2f;
   padding: 18px 0;
 }
 .settings-section[hidden] {
@@ -3422,7 +3422,7 @@ video.artifact-media {
 }
 .section-heading > svg {
   width: 20px;
-  color: #a2988e;
+  color: #9a9a9a;
 }
 .section-heading strong,
 .section-heading span {
@@ -3433,7 +3433,7 @@ video.artifact-media {
 }
 .section-heading span {
   font-size: 12px;
-  color: #8e857c;
+  color: #878787;
   line-height: 1.5;
   margin-top: 3px;
 }
@@ -3442,7 +3442,7 @@ video.artifact-media {
   display: flex;
   gap: 7px;
   margin-top: 10px;
-  color: #8c827a;
+  color: #848484;
   font-size: 11px;
   line-height: 1.5;
 }
@@ -3464,7 +3464,7 @@ video.artifact-media {
   grid-template-columns: 1.05fr 0.95fr;
   width: 100%;
   height: 100%;
-  background: #fff5e8;
+  background: #f6f6f6;
 }
 .auth-story {
   position: relative;
@@ -3472,8 +3472,8 @@ video.artifact-media {
   flex-direction: column;
   padding: 36px 42px;
   background:
-    radial-gradient(circle at 70% 20%, #645d56 0, transparent 34%),
-    linear-gradient(145deg, #211d19, #342e2a 65%, #292420);
+    radial-gradient(circle at 70% 20%, #5e5e5e 0, transparent 34%),
+    linear-gradient(145deg, #1e1e1e, #2f2f2f 65%, #252525);
   overflow: hidden;
 }
 .auth-story:after {
@@ -3483,11 +3483,11 @@ video.artifact-media {
   height: 560px;
   right: -230px;
   bottom: -300px;
-  border: 1px solid #fbf39833;
+  border: 1px solid #efefef33;
   border-radius: 50%;
   box-shadow:
-    0 0 0 80px #fbf39808,
-    0 0 0 160px #fbf39805;
+    0 0 0 80px #efefef08,
+    0 0 0 160px #efefef05;
 }
 .auth-hero-copy {
   position: relative;
@@ -3501,12 +3501,12 @@ video.artifact-media {
   font-size: clamp(26px, 2.6vw, 38px);
   line-height: 1.1;
   letter-spacing: -0.04em;
-  color: #fff6ec;
+  color: #f7f7f7;
   margin: 10px 0 12px;
 }
 .auth-hero-copy > p:last-child {
   max-width: 510px;
-  color: #cfc2b8;
+  color: #c5c5c5;
   font-size: 14px;
   line-height: 1.7;
 }
@@ -3537,7 +3537,7 @@ video.artifact-media {
 }
 .switch-auth {
   text-align: center;
-  color: #988d85;
+  color: #8f8f8f;
   font-size: 12px;
   margin-top: 18px;
 }
@@ -3547,7 +3547,7 @@ video.artifact-media {
   border: 0;
   padding: 0;
   background: transparent;
-  color: #5d554f;
+  color: #575757;
   font-weight: 500;
   font-size: inherit;
   text-decoration: underline;
@@ -3563,12 +3563,12 @@ video.artifact-media {
   text-align: center;
   padding: 38px;
   background: white;
-  border: 1px solid #ecded2;
+  border: 1px solid #e1e1e1;
   border-radius: 18px;
-  box-shadow: 0 20px 60px #39342e17;
+  box-shadow: 0 20px 60px #35353517;
 }
 .recovery-card > p:not(.eyebrow) {
-  color: #857b73;
+  color: #7d7d7d;
   font-size: 13px;
   line-height: 1.6;
 }
@@ -3579,15 +3579,15 @@ video.artifact-media {
   height: 50px;
   margin: 0 auto 15px;
   border-radius: 50%;
-  background: #fcede1;
-  color: #726a62;
+  background: #f0f0f0;
+  color: #6b6b6b;
 }
 .recovery-code {
   display: block;
   margin: 20px 0;
   padding: 16px;
-  border: 1px dashed #4b453f;
-  background: #1b1612;
+  border: 1px dashed #464646;
+  background: #171717;
   border-radius: 10px;
   font:
     12px ui-monospace,
@@ -3604,9 +3604,9 @@ video.artifact-media {
   width: 100%;
   height: 100%;
   gap: 12px;
-  color: #a2988e;
+  color: #9a9a9a;
   font-size: 13px;
-  background: #0f0d0a;
+  background: #0d0d0d;
 }
 .mobile-sidebar,
 .mobile-scrim,
@@ -3687,7 +3687,7 @@ video.artifact-media {
     z-index: 24;
     inset: 0;
     border: 0;
-    background: #231e1a77;
+    background: #1f1f1f77;
   }
   /*
     A sheet the conversation stays behind, not a screen that replaces it.
@@ -3707,9 +3707,9 @@ video.artifact-media {
     inset: auto 0 var(--bottom-bar) 0;
     height: var(--sheet);
     border-left: 0;
-    border-top: 1px solid #37322d;
+    border-top: 1px solid #333333;
     border-radius: 16px 16px 0 0;
-    background: #110e0b;
+    background: #0f0f0f;
     box-shadow: 0 -18px 44px #000000a8;
   }
   .composer-wrap {
@@ -3730,8 +3730,8 @@ video.artifact-media {
     height: 52px;
     display: flex;
     justify-content: space-around;
-    background: #1b1612;
-    border-top: 1px solid #342e2a;
+    background: #171717;
+    border-top: 1px solid #2f2f2f;
     backdrop-filter: blur(15px);
     padding-bottom: env(safe-area-inset-bottom);
   }
@@ -3747,7 +3747,7 @@ video.artifact-media {
     min-width: 0;
     border: 0;
     background: transparent;
-    color: #9a9087;
+    color: #929292;
     font-size: 11px;
   }
   .mobile-tabs button svg {
@@ -3755,7 +3755,7 @@ video.artifact-media {
     height: 16px;
   }
   .mobile-tabs button.active {
-    color: #f4e6db;
+    color: #e9e9e9;
   }
   .approval-drawer {
     grid-template-columns: 30px 1fr;
@@ -3933,8 +3933,8 @@ video.artifact-media {
 */
 :root {
   color-scheme: dark;
-  color: #f4e6db;
-  background: #0f0d0a;
+  color: #e9e9e9;
+  background: #0d0d0d;
   font-family:
     ui-sans-serif,
     system-ui,
@@ -3966,11 +3966,11 @@ video.artifact-media {
     --line, --panel-* and --accent-soft are surfaces and hairlines, never type; they are stated as
     ratios against black for scale only (1.52, 1.17, 1.22, 1.39) and carry no text of their own.
   */
-  --text: #f4e6db;
-  --muted: #a2988e;
-  --line: #312c27;
-  --panel-soft: #1b1612;
-  --panel-strong: #1f1a16;
+  --text: #e9e9e9;
+  --muted: #9a9a9a;
+  --line: #2d2d2d;
+  --panel-soft: #171717;
+  --panel-strong: #1b1b1b;
 
   /*
     THE ACCENT, and the one thing it is not.
@@ -3999,9 +3999,9 @@ video.artifact-media {
     Focus is drawn in full ember, which is the same statement: a focused control is where the owner
     is about to act. That is why the outline rules reach for `--ember` and not for `--accent`.
   */
-  --accent: #d2ad8c;
-  --accent-muted: #b69678;
-  --accent-soft: #2f241b;
+  --accent: #b5b5b5;
+  --accent-muted: #9d9d9d;
+  --accent-soft: #262626;
 
   /*
     CAUTION AND DANGER, re-derived against warmth rather than against grey.
@@ -4029,14 +4029,22 @@ video.artifact-media {
     recording button and the Stop button - and it was darkened to L* 47 so that the warm white on
     top of it clears 4.66:1, which the old #bd7770 did not (3.48:1, a failure that predates this
     change). Use --danger-text for red type.
+
+    MONOCHROME, 2026-08: every hue in this sheet was mapped to the neutral of the same OKLab
+    lightness, so tonal structure survived and only colour left. That collapsed --danger-text and
+    --ok to within 0.024 L of each other, which would have made a diff's two polarities the same
+    grey. Luminance is the axis that replaces hue here, so the states are now spread along it on
+    purpose: danger is the BRIGHTEST thing on screen after the fire (attention is lightness when
+    there is no colour), caution sits mid, --ok is quiet and below body text. Polarity is still
+    carried redundantly by the +/- glyph, which is what makes this safe rather than merely legible.
   */
-  --caution: #c0bb6f;
-  --caution-line: #5b5938;
-  --caution-fill: #222115;
-  --danger: #b35152;
-  --danger-text: #e6a2a0;
-  --danger-line: #6a4442;
-  --danger-fill: #281918;
+  --caution: #9a9a9a;
+  --caution-line: #4a4a4a;
+  --caution-fill: #141414;
+  --danger: #8a8a8a;
+  --danger-text: #f2f2f2;
+  --danger-line: #8e8e8e;
+  --danger-fill: #101010;
 
   /*
     The one cool hue left, and it is data rather than chrome: an added line in a diff, a relay that
@@ -4044,7 +4052,7 @@ video.artifact-media {
     used for chrome, so it cannot be mistaken for a state of the product itself. 8.40:1 on
     --panel-soft.
   */
-  --ok: #8fbd8d;
+  --ok: #8d8d8d;
 }
 
 /*
@@ -4058,7 +4066,7 @@ video.artifact-media {
   moves.
 */
 ::selection {
-  background: #f2a13f4d;
+  background: #b5b5b54d;
   color: var(--text);
 }
 
@@ -4084,27 +4092,31 @@ body,
     system here. There is no third surface and there does not need to be one.
   */
   background: #000000;
-  color: #f4e6db;
+  color: #e9e9e9;
 }
 
 .sidebar,
 .inspector,
 .computer-pane,
 .files-pane {
-  background: #0d0b08;
+  background: #0d0d0d;
 }
 
 .workbench-header,
 .inspector-tabs,
 .computer-toolbar,
 .mobile-tabs {
-  background: #181511ef;
-  border-color: #302b26;
+  /*
+    Translucent, because these sit over scrolling content and the blur is what stops text
+    colliding with text.
+  */
+  background: #161616ef;
+  border-color: #2c2c2c;
   backdrop-filter: blur(16px);
 }
 
 .chat-canvas::after {
-  background: linear-gradient(transparent, #0f0d0a);
+  background: linear-gradient(transparent, #000000);
 }
 
 .composer,
@@ -4134,12 +4146,12 @@ body,
     lit pixel along the top of a surface reads unmistakably as something catching the light from
     above. The drop shadow underneath it is what stops the card and the page being coplanar.
   */
-  background: #191612;
-  border-color: #2d2823;
+  background: #161616;
+  border-color: #292929;
   border-radius: 12px;
-  color: #efe1d6;
+  color: #e4e4e4;
   box-shadow:
-    inset 0 1px 0 #fff6ec0d,
+    inset 0 1px 0 #f7f7f70d,
     0 1px 0 #00000080,
     0 14px 34px #000000a6;
 }
@@ -4161,9 +4173,9 @@ body,
 .notice-row,
 .enrollment-card {
   background: var(--panel-soft);
-  border: 1px solid #37322d;
+  border: 1px solid #333333;
   border-radius: 11px;
-  box-shadow: inset 0 1px 0 #fff6ec0d;
+  box-shadow: inset 0 1px 0 #f7f7f70d;
 }
 
 /*
@@ -4203,9 +4215,9 @@ body,
   shared hover's (0,3,1).
 */
 .self-hosted-settings :is(.modal-actions, .settings-list) button.danger:hover {
-  border-color: #9c6a68;
-  background: #241c19;
-  box-shadow: inset 0 1px 0 #fff6ec12;
+  border-color: #797979;
+  background: #1e1e1e;
+  box-shadow: inset 0 1px 0 #f7f7f712;
 }
 
 /*
@@ -4250,23 +4262,23 @@ body,
 .ghost:hover,
 .settings-nav button:hover,
 .task-plan-history > button:hover {
-  background: #201c18;
-  border-color: #4b453f;
-  color: #fceee1;
+  background: #1d1d1d;
+  border-color: #464646;
+  color: #f1f1f1;
 }
 
 .schedule-task span {
-  background: #312c27;
-  color: #ede0d4;
-  box-shadow: inset 0 0 0 1px #443d38;
+  background: #2d2d2d;
+  color: #e2e2e2;
+  box-shadow: inset 0 0 0 1px #3e3e3e;
 }
 
 .task-row.active,
 .settings-nav button.active,
 .workspace-tools-button.active {
   background: var(--accent-soft);
-  border-color: #877e75;
-  color: #f9ebdf;
+  border-color: #808080;
+  color: #eeeeee;
 }
 
 input,
@@ -4285,9 +4297,9 @@ select,
 .artifact-card a,
 .workspace-tools-button,
 .header-pill {
-  background: #181511;
-  border-color: #38322d;
-  color: #efe1d6;
+  background: #151515;
+  border-color: #333333;
+  color: #e4e4e4;
 }
 
 /*
@@ -4300,23 +4312,23 @@ select,
   a model held back for review listed with its reason rather than dropped.
 */
 optgroup {
-  background: #181511;
+  background: #151515;
   color: var(--muted);
 }
 option {
-  background: #181511;
-  color: #efe1d6;
+  background: #151515;
+  color: #e4e4e4;
 }
 option:disabled {
   /* 5.04:1 on that field. A reason nobody can read is the same as not giving one. */
-  color: #8f857c;
+  color: #878787;
 }
 
 input::placeholder,
 textarea::placeholder {
   /* 4.99:1 on the card fill and 4.77:1 on `--panel-strong`. A placeholder is text, and the cold
      grey it replaced measured 3.4:1 - it never cleared, on either palette. */
-  color: #8f857c;
+  color: #878787;
 }
 
 /*
@@ -4332,50 +4344,50 @@ textarea::placeholder {
 .new-task,
 .send-btn,
 .task-plan-actions .save {
-  background: linear-gradient(135deg, #ba916f 0%, #f3c49e 48%, #c9a07d 100%);
+  background: linear-gradient(135deg, #9a9a9a 0%, #cecece 48%, #a9a9a9 100%);
   border-color: var(--accent);
-  color: #1c1814;
-  box-shadow: inset 0 1px 0 #fff6ec3b;
+  color: #191919;
+  box-shadow: inset 0 1px 0 #f7f7f73b;
 }
 
 .primary:hover,
 .new-task:hover,
 .send-btn:hover {
-  background: linear-gradient(135deg, #cb9d75 0%, #ffcfa6 48%, #d9aa81 100%);
+  background: linear-gradient(135deg, #a7a7a7 0%, #d9d9d9 48%, #b4b4b4 100%);
   border-color: var(--edge-hot);
-  color: #1b1612;
+  color: #171717;
 }
 
 .brand-mark,
 .completion-card > svg {
-  background: #2e2824;
-  color: #c9bdb3;
+  background: #292929;
+  color: #bfbfbf;
 }
 
 .user-brief {
-  background: #25211c;
-  color: #f6e9dd;
+  background: #222222;
+  color: #ebebeb;
 }
 
 .markdown code {
-  background: #25211c;
+  background: #222222;
 }
 
 .markdown pre,
 .terminal-pane {
-  background: #0f0d0a;
-  color: #e8dacf;
+  background: #0d0d0d;
+  color: #dddddd;
 }
 
 .task-plan-progress,
 .meter {
-  background: #2e2924;
+  background: #2a2a2a;
 }
 
 .queue-pill,
 .workspace-avatar {
-  background: #2e2924;
-  color: #c2b6ac;
+  background: #2a2a2a;
+  color: #b8b8b8;
 }
 
 /*
@@ -4408,18 +4420,22 @@ textarea::placeholder {
 }
 
 .completion-card {
-  background: #25211c;
-  border-color: #5f5751;
+  background: #222222;
+  border-color: #595959;
 }
 
 .browser-viewport {
-  background: #15110e;
+  background: #121212;
 }
 
 .auth-story {
-  background:
-    radial-gradient(circle at 14% 18%, #2a2621 0, transparent 34%),
-    radial-gradient(circle at 84% 76%, #201c18 0, transparent 38%), #130f0c;
+  /*
+    This used to be two radial washes over #101010 — a suggestion of depth painted in CSS. There is
+    a real sky behind it now, so the washes are gone and the panel gets out of its way. They are
+    kept as a faint veil rather than deleted outright because the sign-in copy sits on this half and
+    needs a little separation from the stars behind it.
+  */
+  background: radial-gradient(circle at 22% 30%, #ffffff0a 0, transparent 46%);
 }
 
 .modal-backdrop {
@@ -4430,7 +4446,7 @@ textarea::placeholder {
 small,
 .message-meta,
 .section-heading span {
-  color: #a2988e;
+  color: #9a9a9a;
 }
 
 /* A link is something the owner can act on, so it wears the accent rather than a lighter grey.
@@ -4448,10 +4464,10 @@ a {
    * float carry a backdrop blur this never had.
    */
   .mobile-tabs {
-    background: #15110ef5;
+    background: #121212f5;
   }
   .inspector {
-    background: #15110e;
+    background: #121212;
   }
 }
 
@@ -4459,31 +4475,31 @@ a {
    light-theme component styles above. These keep every interactive surface
    dark instead of leaving bright islands inside the OLED-first shell. */
 .search {
-  border-color: #38322d;
-  background: #1b1612;
-  color: #e7dace;
+  border-color: #333333;
+  background: #171717;
+  color: #dcdcdc;
 }
 
 .search {
-  border: 1px solid #312c27;
+  border: 1px solid #2d2d2d;
 }
 
 .modal-close {
-  border: 1px solid #3c3731;
-  background: #1d1916;
-  color: #e7dace;
+  border: 1px solid #383838;
+  background: #1a1a1a;
+  color: #dcdcdc;
 }
 
 .modal label,
 .auth-form label {
-  color: #ebddd2;
+  color: #e0e0e0;
 }
 
 .modal label > input:not([type='range']):not([type='checkbox']):not([type='radio']),
 .auth-form label input {
-  border-color: #3c3731;
-  background: #15110e;
-  color: #efe1d6;
+  border-color: #383838;
+  background: #121212;
+  color: #e4e4e4;
 }
 
 /* Nested controls that predate the dark surface, brought onto the warm ramp: a filled chip is a
@@ -4491,8 +4507,8 @@ a {
    it takes no colour at all. */
 .queue-pill,
 .workspace-avatar {
-  background: #312c27;
-  color: #c5baaf;
+  background: #2d2d2d;
+  color: #bcbcbc;
 }
 
 /* The hover state for these three was declared twice, identically, about a hundred and sixty lines
@@ -4519,7 +4535,7 @@ a {
 
 .status-dot.queued,
 .task-title i {
-  background: #7c736c;
+  background: #757575;
   box-shadow: none;
 }
 
@@ -4530,12 +4546,12 @@ a {
 }
 
 .status-dot.completed {
-  background: #948b82;
+  background: #8d8d8d;
 }
 
 .user-avatar {
-  background: #342e2a;
-  color: #cdc1b7;
+  background: #2f2f2f;
+  color: #c3c3c3;
 }
 
 /* A progress fill is the machine working, so it is ember - steady, not pulsing, because work in
@@ -4547,7 +4563,7 @@ a {
 }
 
 .markdown {
-  color: #e0d3c8;
+  color: #d5d5d5;
 }
 
 /*
@@ -4567,7 +4583,7 @@ a {
   #f2a13f is 9.95:1, and every value the ramp passes through lies between them.
 */
 .cooling .markdown {
-  background-image: linear-gradient(to bottom, #e0d3c8 0 calc(100% - 3.2em), var(--ember) 100%);
+  background-image: linear-gradient(to bottom, #d5d5d5 0 calc(100% - 3.2em), var(--ember) 100%);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
@@ -4602,7 +4618,7 @@ a {
   untouched.
 */
 .cooling .markdown :is(code, td, .katex) {
-  color: #e0d3c8;
+  color: #d5d5d5;
 }
 
 /*
@@ -4628,7 +4644,7 @@ a {
     flare travelling down the page in the colour reserved for now.
   */
   .cooling .markdown {
-    background-image: linear-gradient(to bottom, #e0d3c8 0 calc(100% - 1.4em), var(--accent) 100%);
+    background-image: linear-gradient(to bottom, #d5d5d5 0 calc(100% - 1.4em), var(--accent) 100%);
   }
 }
 
@@ -4673,33 +4689,33 @@ a {
 .markdown th,
 .markdown td {
   padding: 7px 11px;
-  border: 1px solid #2d2823;
+  border: 1px solid #292929;
   text-align: left;
   vertical-align: top;
 }
 
 .markdown th {
-  background: #1d1815;
+  background: #191919;
   color: var(--text);
   font-weight: 620;
   white-space: nowrap;
 }
 
 .markdown tbody tr:nth-child(even) td {
-  background: #14100d;
+  background: #111111;
 }
 
 /* Spacing for the block elements is set once, with the rest of the reading column, rather than a
    margin at a time next to whatever rule happened to need one. What is left here is the drawing:
    the rule, the marker and the quote's edge. */
 .markdown blockquote {
-  border-left: 2px solid #37322d;
+  border-left: 2px solid #333333;
   color: var(--muted);
 }
 
 .markdown hr {
   border: 0;
-  border-top: 1px solid #2a2621;
+  border-top: 1px solid #272727;
 }
 
 .markdown ul,
@@ -4708,7 +4724,7 @@ a {
 }
 
 .markdown li::marker {
-  color: #8c827a;
+  color: #848484;
 }
 
 .markdown li > ul,
@@ -4731,10 +4747,10 @@ a {
 
 .markdown kbd {
   padding: 1px 5px;
-  border: 1px solid #3c3731;
+  border: 1px solid #383838;
   border-bottom-width: 2px;
   border-radius: 5px;
-  background: #1d1815;
+  background: #191919;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 0.85em;
 }
@@ -4746,30 +4762,30 @@ a {
 }
 
 .tool-event.success summary > svg:first-child {
-  color: #c1b6ab;
+  color: #b8b8b8;
 }
 
 .completion-card,
 .inline-notice {
-  border-color: #605952;
-  background: #25211c;
-  color: #d3c7bc;
+  border-color: #5a5a5a;
+  background: #222222;
+  color: #c9c9c9;
 }
 
 .completion-card > svg {
-  background: #312c27;
-  color: #ccc0b6;
+  background: #2d2d2d;
+  color: #c2c2c2;
 }
 
 .browser-status {
-  background: #211d19ee;
-  color: #ede0d4;
-  box-shadow: 0 3px 14px #0b090655;
+  background: #1e1e1eee;
+  color: #e2e2e2;
+  box-shadow: 0 3px 14px #09090955;
 }
 
 .browser-status button {
-  border-color: #625a54;
-  background: #2e2824;
+  border-color: #5c5c5c;
+  background: #292929;
 }
 
 /* ==========================================================================
@@ -4899,7 +4915,7 @@ a {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: #8a8178;
+  color: #838383;
 }
 
 .ledger-subject b {
@@ -4925,7 +4941,7 @@ a {
 }
 
 .ledger .tool-event > summary:hover {
-  background: #0c0a08;
+  background: #0a0a0a;
   color: var(--text);
 }
 
@@ -4975,8 +4991,8 @@ a {
 .task-result {
   margin: 10px 0;
   padding: 14px;
-  border-color: #443e39;
-  background: #1e1a16;
+  border-color: #3f3f3f;
+  background: #1b1b1b;
 }
 
 .task-result > div {
@@ -4984,20 +5000,20 @@ a {
 }
 
 .task-result > svg {
-  color: #c9bdb2;
+  color: #bfbfbf;
 }
 
 .task-result p {
   max-width: 640px;
   margin: 5px 0 0;
-  color: #c4b9ae;
+  color: #bbbbbb;
   font-size: 13px;
   line-height: 1.55;
 }
 
 .result-details {
   margin-top: 9px;
-  color: #938a81;
+  color: #8c8c8c;
   font-size: 12px;
 }
 
@@ -5008,13 +5024,13 @@ a {
 
 .result-details .completion-summary {
   padding-top: 7px;
-  color: #b9ada4;
+  color: #afafaf;
 }
 
 .verification-receipt ul {
   margin: 8px 0 0;
   padding-left: 16px;
-  color: #b9ada4;
+  color: #afafaf;
 }
 
 /* The harness's own run. Each check is a tick or a warning, the label the model gave it, and the
@@ -5044,12 +5060,12 @@ a {
 }
 
 .verification-receipt .harness-checks .failed svg {
-  color: #e68d8b;
+  color: #a9a9a9;
 }
 
 .verification-receipt .harness-checks strong {
   display: block;
-  color: #dacdc2;
+  color: #cfcfcf;
   font-size: 12px;
   font-weight: 500;
 }
@@ -5058,7 +5074,7 @@ a {
   display: block;
   margin-top: 2px;
   overflow-x: auto;
-  color: #9e948b;
+  color: #969696;
   font:
     11px/1.5 ui-monospace,
     SFMono-Regular,
@@ -5076,7 +5092,7 @@ a {
 .completion-card .completion-harness-caveat {
   max-width: 560px;
   margin-top: 8px;
-  color: #bcb680;
+  color: #b3b3b3;
 }
 
 /* A turn that stopped at its step limit hands over what it did not reach; that list is the point
@@ -5086,22 +5102,22 @@ a {
   max-width: 560px;
   margin-top: 9px;
   font-size: 12px;
-  color: #bcb680;
+  color: #b3b3b3;
 }
 .completion-card .completion-outstanding {
   margin: 5px 0 0;
   padding-left: 16px;
-  color: #b9ada4;
+  color: #afafaf;
   font-size: 12px;
   line-height: 1.55;
 }
 .completion-card.interrupted {
-  border-color: #5e5750;
-  background: #1e1a16;
+  border-color: #585858;
+  background: #1b1b1b;
 }
 .completion-card.interrupted > svg {
   background: none;
-  color: #bcb680;
+  color: #b3b3b3;
 }
 
 .timeline > .artifact-card,
@@ -5113,9 +5129,9 @@ a {
 }
 
 .task-plan-panel {
-  border-color: #342e2a;
-  background: #1b1612;
-  color: #efe1d6;
+  border-color: #2f2f2f;
+  background: #171717;
+  color: #e4e4e4;
   box-shadow: none;
 }
 
@@ -5123,25 +5139,25 @@ a {
 .artifact-actions a,
 .artifact-card button,
 .artifact-card a {
-  border-color: #3c3731;
-  background: #221e1a;
-  color: #d6cabf;
+  border-color: #383838;
+  background: #1f1f1f;
+  color: #cccccc;
 }
 
 .artifact-actions button:hover,
 .artifact-actions a:hover,
 .artifact-card button:hover,
 .artifact-card a:hover {
-  border-color: #615953;
-  background: #2e2824;
-  color: #fceee1;
+  border-color: #5b5b5b;
+  background: #292929;
+  color: #f1f1f1;
 }
 
 .weekday-picker button.active,
 .mobile-tabs button.active {
-  border-color: #877e75;
-  background: #2e2824;
-  color: #d6cabf;
+  border-color: #808080;
+  background: #292929;
+  color: #cccccc;
 }
 
 .modal input[type='checkbox'],
@@ -5155,18 +5171,18 @@ a {
 }
 
 .auth-hero-copy > p:last-child {
-  color: #c0b5aa;
+  color: #b7b7b7;
 }
 
 .recovery-card {
-  border-color: #342e2a;
-  background: #1b1612;
+  border-color: #2f2f2f;
+  background: #171717;
   box-shadow: none;
 }
 
 .success-icon {
-  background: #312c27;
-  color: #ccc0b6;
+  background: #2d2d2d;
+  color: #c2c2c2;
 }
 
 .empty-mini,
@@ -5180,7 +5196,7 @@ a {
 }
 
 .account-row strong {
-  color: #ebddd2;
+  color: #e0e0e0;
 }
 
 /*
@@ -5193,10 +5209,10 @@ a {
   so it may carry the fire's hue at low alpha without ever reaching the fire's chroma on screen.
 */
 :root {
-  --edge: #d7af8b;
-  --edge-hot: #fff0e4;
-  --edge-glow: #f2a13f2b;
-  --edge-glow-soft: #f2a13f12;
+  --edge: #b7b7b7;
+  --edge-hot: #f3f3f3;
+  --edge-glow: #b5b5b52b;
+  --edge-glow-soft: #b5b5b512;
 
   /*
     The fire.
@@ -5221,9 +5237,9 @@ a {
     strength: a 3px progress bar, the edge of a running card. 4.80:1 on --panel-soft, which is above
     the 3:1 a non-text graphic wants with room to spare.
   */
-  --ember: #f2a13f;
-  --ember-deep: #b4772c;
-  --ember-glow: #f2a13f26;
+  --ember: #b5b5b5;
+  --ember-deep: #868686;
+  --ember-glow: #b5b5b526;
 }
 
 @property --neon-angle {
@@ -5236,19 +5252,19 @@ a {
    not glow and a header casts rather than shines; the edge is the whole of what either one needs to
    say, and the warmth they were spending belongs to whatever just happened. */
 .sidebar {
-  border-right-color: #504943;
+  border-right-color: #4a4a4a;
 }
 
 .workbench-header {
-  border-bottom-color: #3e3933;
+  border-bottom-color: #3a3a3a;
 }
 
 .composer {
-  border-color: #4d4640;
+  border-color: #474747;
   box-shadow:
-    inset 0 1px 0 #fff6ec0d,
-    0 0 0 1px #f0e2d708,
-    0 0 20px #f0e2d709;
+    inset 0 1px 0 #f7f7f70d,
+    0 0 0 1px #e5e5e508,
+    0 0 20px #e5e5e509;
   transition:
     border-color 180ms var(--ease),
     box-shadow 180ms var(--ease),
@@ -5258,29 +5274,29 @@ a {
 .composer:focus-within {
   border-color: var(--edge);
   box-shadow:
-    inset 0 1px 0 #fff6ec1a,
-    0 0 0 1px #fff0e42e,
+    inset 0 1px 0 #f7f7f71a,
+    0 0 0 1px #f3f3f32e,
     0 0 28px var(--edge-glow);
   transform: translateY(-1px);
 }
 
 .new-task {
-  border: 1px solid #877e76;
-  background: linear-gradient(145deg, #2d2823, #1d1815);
-  color: #fdeee2;
+  border: 1px solid #808080;
+  background: linear-gradient(145deg, #292929, #191919);
+  color: #f1f1f1;
   box-shadow:
-    inset 0 1px 0 #fff6ec1c,
-    0 0 0 1px #fff0e412,
+    inset 0 1px 0 #f7f7f71c,
+    0 0 0 1px #f3f3f312,
     0 0 15px var(--edge-glow-soft);
 }
 
 .new-task:hover {
   border-color: var(--edge-hot);
-  background: linear-gradient(145deg, #3a352f, #231f1a);
-  color: #fff6ec;
+  background: linear-gradient(145deg, #363636, #202020);
+  color: #f7f7f7;
   box-shadow:
-    inset 0 1px 0 #fff6ec2e,
-    0 0 0 1px #fff0e438,
+    inset 0 1px 0 #f7f7f72e,
+    0 0 0 1px #f3f3f338,
     0 0 22px var(--edge-glow);
 }
 
@@ -5288,9 +5304,9 @@ a {
 .send-btn,
 .task-plan-actions .save {
   box-shadow:
-    inset 0 1px 0 #fff6ec52,
-    0 0 0 1px #fff0e41c,
-    0 0 16px #f0e2d720;
+    inset 0 1px 0 #f7f7f752,
+    0 0 0 1px #f3f3f31c,
+    0 0 16px #e5e5e520;
   transition:
     border-color 160ms var(--ease),
     box-shadow 160ms var(--ease),
@@ -5301,9 +5317,9 @@ a {
 .send-btn:hover,
 .task-plan-actions .save:hover {
   box-shadow:
-    inset 0 1px 0 #fff6ec6b,
-    0 0 0 1px #fff6ec42,
-    0 0 24px #f0e2d73b;
+    inset 0 1px 0 #f7f7f76b,
+    0 0 0 1px #f7f7f742,
+    0 0 24px #e5e5e53b;
   filter: brightness(1.05);
 }
 
@@ -5344,7 +5360,7 @@ a {
      into accent chroma. The bloom is `--edge-glow-soft`, ember at 7%. */
   border-color: var(--accent-muted);
   box-shadow:
-    inset 0 0 0 1px #fff0e410,
+    inset 0 0 0 1px #f3f3f310,
     0 0 14px var(--edge-glow-soft);
 }
 
@@ -5355,17 +5371,17 @@ a {
 .workspace-tools-button.active {
   border-color: var(--accent);
   box-shadow:
-    inset 0 0 0 1px #fff0e422,
-    0 0 16px #f0e2d717;
+    inset 0 0 0 1px #f3f3f322,
+    0 0 16px #e5e5e517;
 }
 
 .brand-mark {
   /* The mark's housing carries the accent rim and an ember bloom, because the mark is the product
      signing its own name and the pilot flame drawn inside it is the same fire the rest of the
      interface uses. The rim stays at accent chroma: a logo is not a state. */
-  border: 1px solid #7a5f43;
+  border: 1px solid #656565;
   box-shadow:
-    inset 0 1px 0 #fff6ec12,
+    inset 0 1px 0 #f7f7f712,
     0 0 12px var(--ember-glow);
 }
 
@@ -5396,21 +5412,21 @@ a {
   background: conic-gradient(
     from var(--neon-angle),
     transparent 0deg 122deg,
-    #b0855e00 136deg,
-    #dbad84c4 155deg,
-    #fff3e2 174deg,
-    #f0c39ac2 190deg,
+    #8f8f8f00 136deg,
+    #b7b7b7c4 155deg,
+    #f5f5f5 174deg,
+    #cdcdcdc2 190deg,
     transparent 208deg 276deg,
-    #b0855e00 286deg,
-    #e9bb90ad 304deg,
-    #fff3e2 320deg,
-    #e7b88ea1 334deg,
+    #8f8f8f00 286deg,
+    #c5c5c5ad 304deg,
+    #f5f5f5 320deg,
+    #c2c2c2a1 334deg,
     transparent 348deg 360deg
   );
   content: '';
   opacity: 0.94;
   pointer-events: none;
-  filter: drop-shadow(0 0 6px #ffcf9aa8);
+  filter: drop-shadow(0 0 6px #d9d9d9a8);
   -webkit-mask:
     linear-gradient(#000000 0 0) content-box,
     linear-gradient(#000000 0 0);
@@ -5457,19 +5473,19 @@ a {
   background: conic-gradient(
     from var(--neon-angle),
     transparent 0deg 118deg,
-    #f2a13f00 132deg,
-    #b4772cc4 152deg,
-    #f2a13f 174deg,
-    #f2a13fc2 194deg,
+    #b5b5b500 132deg,
+    #868686c4 152deg,
+    #b5b5b5 174deg,
+    #b5b5b5c2 194deg,
     transparent 212deg 276deg,
-    #b4772c00 286deg,
-    #b4772cad 304deg,
-    #f6b767 320deg,
-    #b4772ca1 336deg,
+    #86868600 286deg,
+    #868686ad 304deg,
+    #c4c4c4 320deg,
+    #868686a1 336deg,
     transparent 350deg 360deg
   );
   opacity: 1;
-  filter: drop-shadow(0 0 7px #f2a13f9e);
+  filter: drop-shadow(0 0 7px #b5b5b59e);
   animation:
     neon-edge-orbit 3.6s linear infinite,
     neon-edge-pulse 2.2s ease-in-out infinite;
@@ -5480,11 +5496,11 @@ a {
    went on pulsing nothing for as long as it took someone to grep. */
 
 .modal {
-  border-color: #575049;
+  border-color: #515151;
   box-shadow:
     0 28px 80px #000000b8,
-    inset 0 0 0 1px #fff0e40c,
-    0 0 30px #f0e2d712;
+    inset 0 0 0 1px #f3f3f30c,
+    0 0 30px #e5e5e512;
 }
 
 /* The same ember ring as the base rule, plus the bloom the neon layer gives everything else. The
@@ -5499,8 +5515,8 @@ a:focus-visible {
   outline: 1px solid var(--ember);
   outline-offset: 3px;
   box-shadow:
-    0 0 0 1px #f2a13f4d,
-    0 0 18px #f2a13f52;
+    0 0 0 1px #b5b5b54d,
+    0 0 18px #b5b5b552;
 }
 
 .composer textarea:focus-visible {
@@ -5561,7 +5577,7 @@ a:focus-visible {
   display: grid;
   gap: 6px;
   min-width: 0;
-  color: #cdc0b6;
+  color: #c3c3c3;
   font-size: 12px;
   font-weight: 680;
 }
@@ -5570,11 +5586,11 @@ a:focus-visible {
   width: 100%;
   min-width: 0;
   min-height: 38px;
-  border: 1px solid #3c3731;
+  border: 1px solid #383838;
   border-radius: 9px;
-  background: #15110e;
+  background: #121212;
   padding: 0 10px;
-  color: #efe1d6;
+  color: #e4e4e4;
   outline: 0;
 }
 
@@ -5586,8 +5602,8 @@ a:focus-visible {
 }
 
 .form-grid :is(input, select, textarea):focus {
-  border-color: #8f867d;
-  box-shadow: 0 0 0 3px #f0e2d712;
+  border-color: #888888;
+  box-shadow: 0 0 0 3px #e5e5e512;
 }
 
 .self-hosted-settings .settings-section > label:not(.toggle-line) {
@@ -5595,7 +5611,7 @@ a:focus-visible {
   gap: 6px;
   min-width: 0;
   margin-top: 14px;
-  color: #cdc0b6;
+  color: #c3c3c3;
   font-size: 12px;
   font-weight: 680;
 }
@@ -5604,11 +5620,11 @@ a:focus-visible {
   width: 100%;
   min-width: 0;
   min-height: 38px;
-  border: 1px solid #3c3731;
+  border: 1px solid #383838;
   border-radius: 9px;
-  background: #15110e;
+  background: #121212;
   padding: 0 10px;
-  color: #efe1d6;
+  color: #e4e4e4;
   outline: 0;
 }
 
@@ -5623,8 +5639,8 @@ a:focus-visible {
   .settings-section
   > label:not(.toggle-line)
   :is(input, select, textarea):focus {
-  border-color: #8f867d;
-  box-shadow: 0 0 0 3px #f0e2d712;
+  border-color: #888888;
+  box-shadow: 0 0 0 3px #e5e5e512;
 }
 
 .toggle-line {
@@ -5634,9 +5650,9 @@ a:focus-visible {
   align-items: start;
   margin-top: 14px;
   padding: 11px 12px;
-  border: 1px solid #37322d;
+  border: 1px solid #333333;
   border-radius: 10px;
-  background: #181511;
+  background: #151515;
   cursor: pointer;
 }
 
@@ -5655,13 +5671,13 @@ a:focus-visible {
 }
 
 .toggle-line strong {
-  color: #ebddd2;
+  color: #e0e0e0;
   font-size: 12px;
 }
 
 .toggle-line small {
   margin-top: 4px;
-  color: #a49990;
+  color: #9b9b9b;
   font-size: 11px;
   font-weight: 450;
   line-height: 1.5;
@@ -5676,19 +5692,19 @@ a:focus-visible {
 }
 
 .web-search-route strong {
-  color: #ebddd2;
+  color: #e0e0e0;
   font-size: 12px;
 }
 
 .web-search-route span {
-  color: #c4b9ae;
+  color: #bbbbbb;
   font-size: 12px;
   line-height: 1.5;
 }
 
 .web-search-route small {
   margin-top: 2px;
-  color: #a49990;
+  color: #9b9b9b;
   font-size: 11px;
   line-height: 1.5;
 }
@@ -5733,19 +5749,19 @@ a:focus-visible {
   cursor: pointer;
 }
 .settings-list-open:hover strong {
-  color: #fff0e4;
+  color: #f3f3f3;
   text-decoration: underline;
   text-underline-offset: 3px;
 }
 
 .settings-list strong {
-  color: #ebddd2;
+  color: #e0e0e0;
   font-size: 12px;
 }
 
 .settings-list small {
   margin-top: 4px;
-  color: #a49990;
+  color: #9b9b9b;
   font-size: 11px;
   line-height: 1.55;
 }
@@ -5766,7 +5782,7 @@ a:focus-visible {
 }
 
 .settings-list code {
-  color: #e4d7cc;
+  color: #d9d9d9;
   font-size: 0.96em;
 }
 
@@ -5785,12 +5801,12 @@ a:focus-visible {
   justify-content: center;
   gap: 7px;
   min-height: 34px;
-  border: 1px solid #665e58;
+  border: 1px solid #606060;
   border-radius: 9px;
   padding: 0 12px;
-  background: linear-gradient(180deg, #2f2925 0%, #221e1a 100%);
-  color: #f5e7dc;
-  box-shadow: inset 0 1px 0 #fff6ec12;
+  background: linear-gradient(180deg, #2a2a2a 0%, #1f1f1f 100%);
+  color: #eaeaea;
+  box-shadow: inset 0 1px 0 #f7f7f712;
   cursor: pointer;
   font-size: 12px;
   font-weight: 680;
@@ -5806,11 +5822,11 @@ a:focus-visible {
 .self-hosted-settings .recovery-create button:hover,
 .self-hosted-settings .restore-confirmation button:hover,
 .self-hosted-settings .settings-section > button:hover {
-  border-color: #b8aca3;
-  background: linear-gradient(180deg, #39342e 0%, #28231f 100%);
+  border-color: #aeaeae;
+  background: linear-gradient(180deg, #353535 0%, #242424 100%);
   box-shadow:
-    inset 0 1px 0 #fff6ec1c,
-    0 0 16px #f0e2d71d;
+    inset 0 1px 0 #f7f7f71c,
+    0 0 16px #e5e5e51d;
 }
 
 /* The scoped rule that used to live here is gone: `.secondary` is defined once, globally, beside
@@ -5828,10 +5844,10 @@ a:focus-visible {
   min-height: 34px;
   align-items: center;
   justify-content: center;
-  border: 1px solid #665e58;
+  border: 1px solid #606060;
   border-radius: 9px;
-  background: #221e1a;
-  color: #f5e7dc;
+  background: #1f1f1f;
+  color: #eaeaea;
   cursor: pointer;
 }
 
@@ -5844,18 +5860,18 @@ a:focus-visible {
   min-height: 32px;
   align-items: center;
   justify-content: center;
-  border: 1px solid #4d4741;
+  border: 1px solid #484848;
   border-radius: 8px;
   padding: 0 10px;
-  color: #e7dacf;
+  color: #dcdcdc;
   font-size: 12px;
   font-weight: 680;
   text-decoration: none;
 }
 
 .self-hosted-settings .settings-list a:hover {
-  border-color: #998e86;
-  background: #26221d;
+  border-color: #909090;
+  background: #232323;
 }
 
 .self-hosted-settings
@@ -5869,9 +5885,9 @@ a:focus-visible {
 }
 
 .self-hosted-settings button.danger {
-  border-color: #6d4645;
-  background: #1f1a16;
-  color: #dda7a5;
+  border-color: #525252;
+  background: #1b1b1b;
+  color: #b7b7b7;
 }
 
 /* `not-allowed` was the one cursor in the product that said it; the shadow still has to go, because
@@ -5940,21 +5956,21 @@ a:focus-visible {
   min-height: 76px;
   margin: 0 0 12px;
   padding: 8px 9px 8px 7px;
-  border-color: #5c544e;
+  border-color: #565656;
   border-radius: 13px;
-  background: linear-gradient(145deg, #211d19, #191612 72%);
+  background: linear-gradient(145deg, #1e1e1e, #161616 72%);
   box-shadow:
-    inset 0 1px 0 #fff6ec12,
-    0 0 18px #f0e2d70d;
+    inset 0 1px 0 #f7f7f712,
+    0 0 18px #e5e5e50d;
 }
 
 .sidebar > .computer-summary:hover {
-  border-color: #c0b4aa;
-  background: linear-gradient(145deg, #2a2621, #1e1a16 72%);
+  border-color: #b6b6b6;
+  background: linear-gradient(145deg, #272727, #1b1b1b 72%);
   box-shadow:
-    inset 0 1px 0 #fff6ec22,
-    0 0 0 1px #fff0e41a,
-    0 0 22px #f0e2d72b;
+    inset 0 1px 0 #f7f7f722,
+    0 0 0 1px #f3f3f31a,
+    0 0 22px #e5e5e52b;
 }
 
 .sidebar > .computer-summary .agent-brand-avatar {
@@ -6107,7 +6123,7 @@ a:focus-visible {
   margin: 13px 0;
   border: 1px solid var(--line);
   border-radius: 11px;
-  background: #0f0d0a;
+  background: #0d0d0d;
   overflow: hidden;
 }
 .code-block figcaption {
@@ -6196,7 +6212,7 @@ a:focus-visible {
 
 .composer-wrap.dropping .composer {
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px #bdb2a833;
+  box-shadow: 0 0 0 3px #b4b4b433;
 }
 .composer-wrap.dropping .composer::after {
   content: 'Drop files to attach them';
@@ -6205,7 +6221,7 @@ a:focus-visible {
   display: grid;
   place-items: center;
   border-radius: inherit;
-  background: #0f0d0acc;
+  background: #0d0d0dcc;
   color: var(--text);
   font-size: 13px;
   pointer-events: none;
@@ -6216,7 +6232,7 @@ a:focus-visible {
 
 .send-btn.stopping {
   background: var(--danger);
-  color: #fff6ec;
+  color: #f7f7f7;
 }
 
 /* Distinct from Send without competing with Stop: this one redirects work rather than ending it.
@@ -6244,7 +6260,7 @@ a:focus-visible {
   align-items: start;
   justify-items: center;
   padding: max(9vh, 48px) 16px 16px;
-  background: #07050499;
+  background: #05050599;
   backdrop-filter: blur(2px);
 }
 .palette {
@@ -6377,7 +6393,7 @@ a:focus-visible {
   cursor: pointer;
 }
 .fork-bar button:disabled {
-  color: #574f49;
+  color: #515151;
   cursor: default;
 }
 .fork-bar button:not(:disabled):hover {
@@ -6700,11 +6716,11 @@ body,
 }
 .composer-block button {
   flex: none;
-  border: 1px solid #676449;
+  border: 1px solid #636363;
   border-radius: 8px;
   padding: 6px 10px;
-  background: #2d2723;
-  color: #dbd6b6;
+  background: #282828;
+  color: #d5d5d5;
   font-size: 12px;
   cursor: pointer;
 }
@@ -6730,9 +6746,9 @@ body,
   gap: 9px;
   align-items: center;
   padding: 10px 12px;
-  border: 1px solid #605952;
-  background: #25211c;
-  color: #d3c7bc;
+  border: 1px solid #5a5a5a;
+  background: #222222;
+  color: #c9c9c9;
   font-size: 12px;
   line-height: 1.5;
 }
@@ -6767,7 +6783,7 @@ body,
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 5px 7px;
-  background: #17130f;
+  background: #141414;
   color: var(--text);
   font: inherit;
   text-align: right;
@@ -6781,8 +6797,8 @@ body,
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 6px 10px;
-  background: #2d2723;
-  color: #d3c7bc;
+  background: #282828;
+  color: #c9c9c9;
   font-size: 12px;
   cursor: pointer;
 }
@@ -6860,11 +6876,11 @@ body,
   gap: 10px;
   align-items: center;
   padding: 9px 10px 9px 14px;
-  border: 1px solid #3c3731;
+  border: 1px solid #383838;
   border-radius: 12px;
-  background: #211d19;
+  background: #1e1e1e;
   box-shadow: 0 16px 40px #00000059;
-  color: #f4e6db;
+  color: #e9e9e9;
   font-size: 12px;
 }
 .undo-toast > span {
@@ -6879,16 +6895,16 @@ body,
   gap: 6px;
   align-items: center;
   flex: none;
-  border: 1px solid #554e47;
+  border: 1px solid #4f4f4f;
   border-radius: 8px;
   padding: 5px 10px;
-  background: #292420;
-  color: #fceee1;
+  background: #252525;
+  color: #f1f1f1;
   font-size: 12px;
   cursor: pointer;
 }
 .undo-action:hover {
-  background: #342f2a;
+  background: #303030;
 }
 .undo-action svg {
   width: 14px;
@@ -6898,9 +6914,9 @@ body,
 /* A file change is shown as the change, not as a sentence describing it. */
 .file-diff {
   margin: 8px 0;
-  border: 1px solid #342e2a;
+  border: 1px solid #2f2f2f;
   border-radius: 10px;
-  background: #171410;
+  background: #141414;
   overflow: hidden;
 }
 .file-diff > summary {
@@ -6908,7 +6924,7 @@ body,
   gap: 8px;
   align-items: center;
   padding: 8px 10px;
-  color: #ddd1c5;
+  color: #d3d3d3;
   font-size: 12px;
   cursor: pointer;
 }
@@ -6934,7 +6950,7 @@ body,
 .diff-body {
   max-height: 340px;
   overflow: auto;
-  border-top: 1px solid #342e2a;
+  border-top: 1px solid #2f2f2f;
 }
 .diff-empty {
   margin: 0;
@@ -6951,7 +6967,7 @@ body,
 }
 .diff-hunk-header td {
   padding: 4px 10px;
-  background: #1c1814;
+  background: #191919;
   /* Was #7f878b on #16191b - the worst in the file at ~2.6:1. */
   color: var(--muted);
 }
@@ -6961,7 +6977,7 @@ body,
   /* Binds on the added row, which is the lightest of the three backgrounds this sits on: 5.22:1
      on the plain row, 4.74:1 on `.diff-line.add`, 4.93:1 on `.diff-line.remove`. Not `--muted`,
      because a line number should not compete with the line. */
-  color: #948a81;
+  color: #8c8c8c;
   text-align: right;
   user-select: none;
   white-space: nowrap;
@@ -6975,15 +6991,15 @@ body,
   display: inline-block;
   width: 1ch;
   margin-right: 6px;
-  color: #7c746c;
+  color: #757575;
 }
 .diff-line.add {
-  background: #1a2419;
-  color: #d5e7d3;
+  background: #212121;
+  color: #e1e1e1;
 }
 .diff-line.remove {
-  background: #2c1919;
-  color: #f0d0cf;
+  background: #1f1f1f;
+  color: #d9d9d9;
 }
 .diff-line.add .diff-sign {
   color: var(--ok);
@@ -7000,9 +7016,9 @@ body,
 .overwrite-choice {
   margin: 10px;
   padding: 12px;
-  border: 1px solid #48452e;
+  border: 1px solid #444444;
   border-radius: 12px;
-  background: #1d1916;
+  background: #1a1a1a;
   font-size: 12px;
 }
 .overwrite-choice > strong {
@@ -7021,7 +7037,7 @@ body,
   gap: 9px;
   align-items: center;
   margin: 6px 0 12px;
-  color: #e2d4c9;
+  color: #d7d7d7;
   font-size: 12px;
   text-align: left;
   cursor: pointer;
@@ -7047,9 +7063,9 @@ body,
   column-gap: 11px;
   row-gap: 4px;
   align-items: start;
-  border: 1px solid #37322d;
+  border: 1px solid #333333;
   border-radius: 11px;
-  background: #181511;
+  background: #151515;
   padding: 12px;
   margin-top: 8px;
   cursor: pointer;
@@ -7069,18 +7085,18 @@ body,
   display: block;
 }
 .toggle-row strong {
-  color: #ebddd2;
+  color: #e0e0e0;
   font-size: 12px;
 }
 .toggle-row small {
-  color: #a49990;
+  color: #9b9b9b;
   font-size: 11px;
   line-height: 1.55;
 }
 /* What the switches above add up to, in one sentence, so the rule is legible before it is saved. */
 .settings-summary {
   margin: 12px 0 0;
-  color: #c7bab0;
+  color: #bdbdbd;
   font-size: 11px;
   line-height: 1.6;
 }
@@ -7097,17 +7113,17 @@ body,
 
 /* The first screen's chips run the example instead of merely describing it. */
 .starter-capabilities button {
-  border: 1px solid #38322d;
+  border: 1px solid #333333;
   border-radius: 999px;
   padding: 7px 12px;
-  background: #1b1612;
-  color: #e7dace;
+  background: #171717;
+  color: #dcdcdc;
   font-size: 12px;
   cursor: pointer;
 }
 .starter-capabilities button:hover {
-  border-color: #5c554e;
-  background: #25211c;
+  border-color: #565656;
+  background: #222222;
 }
 
 /*
@@ -7116,23 +7132,23 @@ body,
  * on the one card where reading it is the whole point. Same amber signal, dark surface.
  */
 .approval-drawer {
-  background: #1b1712;
-  border-color: #464426;
+  background: #181818;
+  border-color: #424242;
   box-shadow: 0 14px 38px #00000059;
-  color: #f5e8dc;
+  color: #eaeaea;
 }
 .approval-symbol {
-  background: #353415;
-  color: #d4cf75;
+  background: #323232;
+  color: #cacaca;
 }
 .approval-copy .eyebrow {
-  color: #c1bc64;
+  color: #b7b7b7;
 }
 .approval-copy > p:not(.eyebrow) {
-  color: #cdcab1;
+  color: #c9c9c9;
 }
 .approval-copy small {
-  color: #a09c82;
+  color: #9b9b9b;
 }
 
 /*
@@ -7146,23 +7162,23 @@ body,
  * the part to trust, so the facts lead now.
  */
 .approval-facts dt {
-  color: #c1bc64;
+  color: #b7b7b7;
 }
 .approval-facts dd,
 .approval-request {
-  color: #d7d4bf;
+  color: #d3d3d3;
 }
 .approval-facts .approval-destination dd span {
-  color: #a09c82;
+  color: #9b9b9b;
 }
 .approval-agent-wording {
-  border-left-color: #5a573e;
+  border-left-color: #565656;
 }
 .approval-agent-wording > span {
-  color: #a09c82;
+  color: #9b9b9b;
 }
 .approval-agent-wording > p {
-  color: #b1ae91;
+  color: #acacac;
 }
 
 /*
@@ -7171,13 +7187,13 @@ body,
  * critical variant was already covered; this is its missing twin.
  */
 .usage-warning.elevated {
-  background: #241f1b;
-  border-color: #5a573e;
-  color: #c4bf89;
+  background: #202020;
+  border-color: #565656;
+  color: #bcbcbc;
 }
 .usage-warning.elevated button {
-  background: #494621;
-  color: #ede9c7;
+  background: #444444;
+  color: #e7e7e7;
 }
 
 /* ---------------------------------------------------------------------------
@@ -7191,16 +7207,16 @@ body,
   padding: 4px 0 14px;
 }
 .spend-card {
-  border: 1px solid #302b26;
+  border: 1px solid #2c2c2c;
   border-radius: 11px;
-  background: #1b1612;
+  background: #171717;
   padding: 11px 12px 12px;
   min-width: 0;
 }
 .spend-card-label {
   display: block;
   font-size: 11px;
-  color: #9a8f86;
+  color: #919191;
   letter-spacing: 0.02em;
 }
 .spend-card strong {
@@ -7209,14 +7225,14 @@ body,
   font-size: 22px;
   font-weight: 600;
   letter-spacing: -0.03em;
-  color: #f4e6db;
+  color: #e9e9e9;
 }
 .spend-card small {
   display: block;
   margin-top: 6px;
   font-size: 11px;
   line-height: 1.45;
-  color: #8a8178;
+  color: #838383;
 }
 .spend-card .meter.spend {
   height: 5px;
@@ -7226,16 +7242,16 @@ body,
 }
 /* The window's own state drives the colour, so a breach is legible without reading the caption. */
 .spend-card.warning {
-  border-color: #5a573e;
+  border-color: #565656;
 }
 .spend-card.warning .meter i {
-  background: linear-gradient(90deg, #6f6d22, var(--caution));
+  background: linear-gradient(90deg, #696969, var(--caution));
 }
 .spend-card.exceeded {
-  border-color: #714746;
+  border-color: #545454;
 }
 .spend-card.exceeded strong {
-  color: #f3b1ae;
+  color: #c4c4c4;
 }
 .spend-card.exceeded .meter i {
   background: linear-gradient(90deg, var(--danger), var(--danger-text));
@@ -7244,7 +7260,7 @@ body,
   margin: 0 0 6px;
   font-size: 11px;
   line-height: 1.5;
-  color: #8a8178;
+  color: #838383;
 }
 .spend-bars {
   display: flex;
@@ -7269,12 +7285,12 @@ button.spend-bar {
   cursor: pointer;
 }
 button.spend-bar:hover .spend-bar-name {
-  color: #f4e6db;
+  color: #e9e9e9;
   text-decoration: underline;
 }
 .spend-bar-name {
   font-size: 12px;
-  color: #d6cabf;
+  color: #cccccc;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -7293,7 +7309,7 @@ button.spend-bar:hover .spend-bar-name {
 .spend-bar-value {
   font-size: 12px;
   font-variant-numeric: tabular-nums;
-  color: #f4e6db;
+  color: #e9e9e9;
 }
 .spend-bar i {
   grid-column: 1 / -1;
@@ -7311,7 +7327,7 @@ button.spend-bar:hover .spend-bar-name {
 .task-spend {
   font-style: normal;
   font-variant-numeric: tabular-nums;
-  color: #a3988f;
+  color: #9a9a9a;
 }
 .task-spend::before {
   content: ' · ';
@@ -7323,17 +7339,17 @@ button.spend-bar:hover .spend-bar-name {
  * so both live at the bottom of the Server page, marked but not hidden.
  */
 .danger-heading > svg {
-  color: #d89c9a;
+  color: #aeaeae;
 }
 .danger-confirmation {
-  border-color: #6d4645;
-  background: #1a1612;
+  border-color: #525252;
+  background: #171717;
 }
 .danger-confirmation > strong {
-  color: #f3ccca;
+  color: #d7d7d7;
 }
 .danger-confirmation code {
-  color: #f3ccca;
+  color: #d7d7d7;
 }
 
 /* Standing instructions are a file on the agent computer, so they are edited as one. */
@@ -7343,7 +7359,7 @@ button.spend-bar:hover .spend-bar-name {
     SFMono-Regular,
     Menlo,
     monospace;
-  color: #8a8178;
+  color: #838383;
   font-weight: 500;
 }
 .self-hosted-settings .brief-editor textarea {
@@ -7377,13 +7393,13 @@ button.spend-bar:hover .spend-bar-name {
   align-items: center;
   max-width: 260px;
   padding: 6px 7px;
-  border: 1px solid #312c27;
+  border: 1px solid #2d2d2d;
   border-radius: 11px;
-  background: #1b1612;
+  background: #171717;
 }
 .attachment-chip.failed {
-  border-color: #6d4645;
-  background: #1a1612;
+  border-color: #525252;
+  background: #171717;
 }
 .attachment-thumb {
   width: 32px;
@@ -7391,12 +7407,12 @@ button.spend-bar:hover .spend-bar-name {
   flex: none;
   border-radius: 7px;
   object-fit: cover;
-  background: #231f1a;
+  background: #202020;
 }
 .attachment-thumb.glyph {
   display: grid;
   place-items: center;
-  color: #9c9188;
+  color: #939393;
 }
 .attachment-thumb.glyph svg {
   width: 15px;
@@ -7404,7 +7420,7 @@ button.spend-bar:hover .spend-bar-name {
 }
 .attachment-thumb.loading {
   display: block;
-  background: linear-gradient(100deg, #231f1a, #2d2823, #231f1a);
+  background: linear-gradient(100deg, #202020, #292929, #202020);
 }
 .attachment-copy {
   display: grid;
@@ -7420,7 +7436,7 @@ button.spend-bar:hover .spend-bar-name {
 }
 .attachment-copy small,
 .attachment-copy a {
-  color: #9c9188;
+  color: #939393;
   font-size: 11px;
 }
 .attachment-copy a {
@@ -7429,7 +7445,7 @@ button.spend-bar:hover .spend-bar-name {
   text-underline-offset: 2px;
 }
 .attachment-chip.failed .attachment-copy small {
-  color: #f3ccca;
+  color: #d7d7d7;
 }
 .attachment-progress {
   display: block;
@@ -7437,7 +7453,7 @@ button.spend-bar:hover .spend-bar-name {
   margin-top: 2px;
   overflow: hidden;
   border-radius: 2px;
-  background: #2a2621;
+  background: #272727;
 }
 .attachment-progress i {
   display: block;
@@ -7455,12 +7471,12 @@ button.spend-bar:hover .spend-bar-name {
   border: 0;
   border-radius: 7px;
   background: transparent;
-  color: #9c9188;
+  color: #939393;
   cursor: pointer;
 }
 .attachment-remove:hover {
-  background: #2a2621;
-  color: #f4e6db;
+  background: #272727;
+  color: #e9e9e9;
 }
 .attachment-remove svg {
   width: 13px;
@@ -7508,15 +7524,15 @@ button.spend-bar:hover .spend-bar-name {
   align-items: center;
   max-width: 250px;
   padding: 5px 9px 5px 6px;
-  border: 1px solid #312c27;
+  border: 1px solid #2d2d2d;
   border-radius: 999px;
-  background: #1b1612;
+  background: #171717;
   color: inherit;
   text-decoration: none;
 }
 .answer-sources a:hover {
-  border-color: #453f39;
-  background: #201c18;
+  border-color: #404040;
+  background: #1d1d1d;
 }
 .source-index {
   display: grid;
@@ -7524,8 +7540,8 @@ button.spend-bar:hover .spend-bar-name {
   height: 18px;
   place-items: center;
   border-radius: 999px;
-  background: #2a2621;
-  color: #c5baaf;
+  background: #272727;
+  color: #bcbcbc;
   font-size: 10px;
   font-weight: 700;
 }
@@ -7541,7 +7557,7 @@ button.spend-bar:hover .spend-bar-name {
   white-space: nowrap;
 }
 .source-copy small {
-  color: #8a8178;
+  color: #838383;
   font-size: 10px;
 }
 
@@ -7550,16 +7566,16 @@ button.spend-bar:hover .spend-bar-name {
   align-self: center;
   margin: 4px auto 14px;
   padding: 6px 14px;
-  border: 1px solid #312c27;
+  border: 1px solid #2d2d2d;
   border-radius: 999px;
-  background: #1b1612;
-  color: #c5baaf;
+  background: #171717;
+  color: #bcbcbc;
   font-size: 12px;
   cursor: pointer;
 }
 .earlier-in-conversation:hover {
-  border-color: #453f39;
-  color: #f4e6db;
+  border-color: #404040;
+  color: #e9e9e9;
 }
 
 /* The same control for the list of conversations, which is a list with the same shape of end. */
@@ -7567,18 +7583,18 @@ button.spend-bar:hover .spend-bar-name {
   width: 100%;
   margin: 6px 0 10px;
   padding: 7px 10px;
-  border: 1px solid #2a2621;
+  border: 1px solid #272727;
   border-radius: 9px;
   background: none;
-  color: #9a8f87;
+  color: #919191;
   font-size: 12px;
   text-align: left;
   cursor: pointer;
 }
 
 .earlier-conversations:hover:not(:disabled) {
-  border-color: #3c3731;
-  color: #e5d7cc;
+  border-color: #383838;
+  color: #dadada;
 }
 
 .earlier-conversations:disabled {
@@ -7587,9 +7603,9 @@ button.spend-bar:hover .spend-bar-name {
 
 /* The connection is down; the box is not. This says so without unmounting the workbench. */
 .offline-strip {
-  border-color: #45432a;
-  background: #1b1712;
-  color: #dfdbb5;
+  border-color: #424242;
+  background: #181818;
+  color: #d9d9d9;
 }
 .offline-strip svg {
   width: 15px;
@@ -7625,15 +7641,15 @@ button.spend-bar:hover .spend-bar-name {
   margin-top: 0;
 }
 .search-result.active-result .task-row {
-  background: #221e1a;
-  box-shadow: inset 0 0 0 1px #453f39;
+  background: #1f1f1f;
+  box-shadow: inset 0 0 0 1px #404040;
 }
 .task-elsewhere {
   display: inline-flex;
   gap: 3px;
   align-items: center;
   margin-right: 6px;
-  color: #9c9188;
+  color: #939393;
   font-style: normal;
 }
 .search-scope {
@@ -7641,7 +7657,7 @@ button.spend-bar:hover .spend-bar-name {
   gap: 7px;
   align-items: center;
   padding: 4px 8px 0;
-  color: #9c9188;
+  color: #939393;
   font-size: 12px;
 }
 
@@ -7660,23 +7676,23 @@ button.spend-bar:hover .spend-bar-name {
   gap: 12px;
   align-items: center;
   padding: 7px 0;
-  border-bottom: 1px solid #24201b;
+  border-bottom: 1px solid #212121;
 }
 .shortcut-list dt,
 .shortcut-list dd {
   margin: 0;
 }
 .shortcut-list dd {
-  color: #c5baaf;
+  color: #bcbcbc;
   font-size: 13px;
 }
 .shortcut-list kbd {
   display: inline-block;
   padding: 3px 8px;
-  border: 1px solid #37322d;
+  border: 1px solid #333333;
   border-radius: 7px;
-  background: #1d1815;
-  color: #ded2c6;
+  background: #191919;
+  color: #d4d4d4;
   font-family: inherit;
   font-size: 12px;
 }
@@ -7692,9 +7708,9 @@ button.spend-bar:hover .spend-bar-name {
   align-items: center;
   margin: 12px 0 0;
   padding: 12px 14px;
-  border: 1px solid #312c27;
+  border: 1px solid #2d2d2d;
   border-radius: 13px;
-  background: #191612;
+  background: #161616;
 }
 .relay-status > span:nth-child(2) {
   display: grid;
@@ -7706,14 +7722,14 @@ button.spend-bar:hover .spend-bar-name {
   font-weight: 600;
 }
 .relay-status small {
-  color: #9c9188;
+  color: #939393;
   font-size: 12px;
 }
 .relay-dot {
   width: 9px;
   height: 9px;
   border-radius: 999px;
-  background: #554e47;
+  background: #4f4f4f;
 }
 /* Three dots, three families, and no two of them share a hue: answered is the one cool thing in
    the room, working is caution's straw, needs-you is danger's red. None of them is ember, because
@@ -7733,14 +7749,14 @@ button.spend-bar:hover .spend-bar-name {
   align-items: center;
   margin-top: 8px;
   padding: 9px 12px;
-  border: 1px solid #312c27;
+  border: 1px solid #2d2d2d;
   border-radius: 11px;
-  background: #16130f;
+  background: #131313;
 }
 .relay-address code {
   overflow: hidden;
   flex: 1;
-  color: #ded2c6;
+  color: #d4d4d4;
   font:
     12px/1.5 ui-monospace,
     SFMono-Regular,
@@ -7757,7 +7773,7 @@ button.spend-bar:hover .spend-bar-name {
 .relay-enroll label {
   display: grid;
   gap: 4px;
-  color: #9c9188;
+  color: #939393;
   font-size: 12px;
 }
 .relay-enroll button {
@@ -7842,12 +7858,12 @@ button.spend-bar:hover .spend-bar-name {
   border-radius: 10px;
   background: var(--panel-soft);
   list-style: none;
-  color: #d6cabf;
+  color: #cccccc;
   font-size: 12px;
   line-height: 1.45;
 }
 .rewind-effects .rewind-caveat {
-  color: #bfb989;
+  color: #b7b7b7;
 }
 
 /*
@@ -7891,8 +7907,8 @@ button.spend-bar:hover .spend-bar-name {
   cursor: pointer;
 }
 .notice-row:hover {
-  border-color: #4b453f;
-  background: #201c18;
+  border-color: #464646;
+  background: #1d1d1d;
 }
 .notice-row > svg {
   width: 17px;
@@ -7935,7 +7951,7 @@ button.spend-bar:hover .spend-bar-name {
 }
 .token-scopes legend {
   padding: 0 0 6px;
-  color: #a49990;
+  color: #9b9b9b;
   font-size: 11px;
   letter-spacing: 0.04em;
   text-transform: uppercase;
@@ -7947,9 +7963,9 @@ button.spend-bar:hover .spend-bar-name {
   gap: 10px;
   margin: 0;
   padding: 9px 11px;
-  border: 1px solid #37322d;
+  border: 1px solid #333333;
   border-radius: 10px;
-  background: #181511;
+  background: #151515;
   cursor: pointer;
 }
 .token-scopes input {
@@ -7958,14 +7974,14 @@ button.spend-bar:hover .spend-bar-name {
 }
 .token-scopes strong {
   display: block;
-  color: #ebddd2;
+  color: #e0e0e0;
   font-size: 12px;
 }
 .token-scopes small {
   display: block;
   grid-column: 2;
   margin-top: 3px;
-  color: #a49990;
+  color: #9b9b9b;
   font-size: 11px;
   line-height: 1.5;
 }
@@ -7981,13 +7997,13 @@ button.spend-bar:hover .spend-bar-name {
   gap: 12px;
   margin: 14px 40px;
   padding: 14px;
-  border: 1px solid #59524b;
+  border: 1px solid #535353;
   border-radius: 13px;
-  background: #1d1815;
+  background: #191919;
 }
 .computer-rewound > svg {
   width: 20px;
-  color: #bdb2a8;
+  color: #b4b4b4;
 }
 .computer-rewound strong {
   display: block;
@@ -7996,7 +8012,7 @@ button.spend-bar:hover .spend-bar-name {
 .computer-rewound > div > span {
   display: block;
   margin-top: 3px;
-  color: #a89d94;
+  color: #9f9f9f;
   font-size: 12px;
   line-height: 1.5;
 }
@@ -8028,10 +8044,10 @@ button.spend-bar:hover .spend-bar-name {
   align-items: baseline;
   max-width: 100%;
   padding: 3px 9px;
-  border: 1px dashed #453f39;
+  border: 1px dashed #404040;
   border-radius: 999px;
-  background: #1b1612;
-  color: #a89d94;
+  background: #171717;
+  color: #9f9f9f;
   font-size: 12px;
   line-height: 1.5;
   text-decoration: none;
@@ -8039,12 +8055,12 @@ button.spend-bar:hover .spend-bar-name {
 }
 .blocked-resource::before {
   content: '⃠';
-  color: #8b8279;
+  color: #848484;
 }
 a.blocked-resource:hover {
-  border-color: #605952;
-  background: #201c18;
-  color: #d3c7bc;
+  border-color: #5a5a5a;
+  background: #1d1d1d;
+  color: #c9c9c9;
 }
 
 /*
@@ -8057,18 +8073,18 @@ a.blocked-resource:hover {
 .markdown .blocked-resource-summary {
   margin: 14px 0 0;
   padding: 8px 0 8px 12px;
-  border-left: 2px solid #45432a;
+  border-left: 2px solid #424242;
 }
 .markdown .blocked-resource-summary strong {
   display: block;
   font-size: 12px;
   font-weight: 600;
-  color: #c4c09d;
+  color: #bebebe;
 }
 .markdown .blocked-resource-summary span {
   display: block;
   margin-top: 2px;
-  color: #9c9289;
+  color: #949494;
   font-size: 11px;
   line-height: 1.5;
   overflow-wrap: anywhere;
@@ -8088,25 +8104,25 @@ a.blocked-resource:hover {
   align-items: start;
   margin: 16px 40px;
   padding: 9px 0;
-  border-top: 1px solid #312c27;
-  border-bottom: 1px solid #312c27;
+  border-top: 1px solid #2d2d2d;
+  border-bottom: 1px solid #2d2d2d;
 }
 .external-content-mark > svg {
   width: 16px;
   height: 16px;
   margin-top: 1px;
-  color: #9c9289;
+  color: #949494;
 }
 .external-content-mark strong {
   display: block;
   font-size: 12px;
   font-weight: 600;
-  color: #d3c7bc;
+  color: #c9c9c9;
 }
 .external-content-mark span {
   display: block;
   margin-top: 2px;
-  color: #9c9289;
+  color: #949494;
   font-size: 11px;
   line-height: 1.5;
 }
@@ -8114,9 +8130,9 @@ a.blocked-resource:hover {
 /* The same fact, gathered, for a conversation the owner was not watching while it ran. */
 .provenance-summary {
   margin: 14px 40px;
-  border: 1px solid #312c27;
+  border: 1px solid #2d2d2d;
   border-radius: 11px;
-  background: #1b1612;
+  background: #171717;
 }
 .provenance-summary > summary {
   display: grid;
@@ -8124,7 +8140,7 @@ a.blocked-resource:hover {
   gap: 9px;
   align-items: center;
   padding: 9px 12px;
-  color: #b8ada3;
+  color: #afafaf;
   font-size: 12px;
   cursor: pointer;
   list-style: none;
@@ -8135,7 +8151,7 @@ a.blocked-resource:hover {
 .provenance-summary > summary svg {
   width: 14px;
   height: 14px;
-  color: #8b8279;
+  color: #848484;
 }
 .provenance-summary[open] > summary svg:last-child {
   transform: rotate(90deg);
@@ -8145,7 +8161,7 @@ a.blocked-resource:hover {
 }
 .provenance-summary .eyebrow {
   margin: 6px 0 3px;
-  color: #8b8279;
+  color: #848484;
   font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.04em;
@@ -8154,13 +8170,13 @@ a.blocked-resource:hover {
 .provenance-summary ul {
   margin: 0;
   padding-left: 16px;
-  color: #c5baaf;
+  color: #bcbcbc;
   font-size: 12px;
   line-height: 1.6;
 }
 .provenance-summary p:not(.eyebrow) {
   margin: 0;
-  color: #9c9289;
+  color: #949494;
   font-size: 12px;
   line-height: 1.5;
 }
@@ -8214,7 +8230,7 @@ a.blocked-resource:hover {
 /* A load that failed, said plainly, so it is never mistaken for an empty workspace. */
 .connector-unavailable {
   margin: 0 0 10px;
-  color: #afaa53;
+  color: #a6a6a6;
   font-size: 0.9rem;
 }
 
@@ -8250,7 +8266,7 @@ a.blocked-resource:hover {
 /* A security list that could not be read is not an empty security list. */
 .settings-unavailable {
   margin: 0 0 10px;
-  color: #afaa53;
+  color: #a6a6a6;
   font-size: 0.9rem;
 }
 
@@ -8350,7 +8366,7 @@ a.blocked-resource:hover {
   color: var(--muted);
   font-size: 12px;
   cursor: pointer;
-  box-shadow: inset 0 1px 0 #fff6ec0d;
+  box-shadow: inset 0 1px 0 #f7f7f70d;
   transition:
     border-color 150ms var(--ease),
     color 150ms var(--ease);
@@ -8437,7 +8453,7 @@ a.blocked-resource:hover {
   font-size: 11px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: #8c827a;
+  color: #848484;
 }
 
 /*
@@ -8456,7 +8472,7 @@ a.blocked-resource:hover {
   border: 0;
   border-radius: 10px;
   background: transparent;
-  color: #ecded3;
+  color: #e1e1e1;
   cursor: pointer;
   text-align: left;
   transition: background-color 140ms var(--ease);
@@ -8465,7 +8481,7 @@ a.blocked-resource:hover {
 .composer-sheet-row > svg {
   flex: none;
   width: 16px;
-  color: #9c9188;
+  color: #939393;
 }
 
 .composer-sheet-label {
@@ -8476,18 +8492,18 @@ a.blocked-resource:hover {
   flex: 1 0 100%;
   font-size: 12px;
   line-height: 1.45;
-  color: #9a8f87;
+  color: #919191;
 }
 
 .composer-sheet-row:hover:enabled {
-  background: #211c19;
+  background: #1d1d1d;
 }
 
 /* Warm white, not ember: a mode that is already chosen is neither alive nor the owner's move, so
    it is allowed the brightness but not the saturation. */
 .composer-sheet-row.chosen {
-  background: #26221d;
-  box-shadow: inset 0 1px 0 #fff6ec12;
+  background: #232323;
+  box-shadow: inset 0 1px 0 #f7f7f712;
 }
 
 .composer-sheet-row.chosen .composer-sheet-label {
@@ -8502,16 +8518,16 @@ a.blocked-resource:hover {
   width: 100%;
   height: 40px;
   margin: 2px 0 9px;
-  border: 1px solid #877e76;
+  border: 1px solid #808080;
   border-radius: 10px;
-  background: linear-gradient(145deg, #2d2823, #1d1815);
-  color: #fdeee2;
+  background: linear-gradient(145deg, #292929, #191919);
+  color: #f1f1f1;
   cursor: pointer;
   font-size: 13px;
   font-weight: 600;
   box-shadow:
-    inset 0 1px 0 #fff6ec1c,
-    0 0 0 1px #fff0e412;
+    inset 0 1px 0 #f7f7f71c,
+    0 0 0 1px #f3f3f312;
 }
 
 .composer-sheet-connect:hover {
@@ -8535,10 +8551,10 @@ a.blocked-resource:hover {
   margin-top: 2px;
   padding: 11px 10px 2px;
   border: 0;
-  border-top: 1px solid #2b2622;
+  border-top: 1px solid #272727;
   border-radius: 0;
   background: transparent;
-  color: #9a8f87;
+  color: #919191;
   cursor: pointer;
   font-size: 12px;
   text-align: left;
@@ -8550,11 +8566,11 @@ a.blocked-resource:hover {
 }
 
 .composer-sheet-privacy:hover {
-  color: #e9dbd0;
+  color: #dedede;
 }
 
 .composer-sheet-privacy.provider-policy {
-  color: #d0a09e;
+  color: #aeaeae;
 }
 
 /* ---------------------------------------------------------------------------
@@ -8667,8 +8683,8 @@ a.blocked-resource:hover {
   align-items: center;
   justify-content: space-between;
   padding: 9px 11px;
-  border-top: 1px solid #fff6ec14;
-  background: #15120e;
+  border-top: 1px solid #f7f7f714;
+  background: #121212;
 }
 
 .terminal-closed > div {
@@ -8680,7 +8696,7 @@ a.blocked-resource:hover {
 .terminal-closed strong {
   font-size: 12px;
   font-weight: 600;
-  color: #d7cbc0;
+  color: #cdcdcd;
 }
 
 .terminal-closed span {
@@ -8694,12 +8710,12 @@ a.blocked-resource:hover {
  * needs no explanation.
  */
 .terminal-closed.faulted {
-  border-top-color: #634745;
-  background: #1b1612;
+  border-top-color: #4f4f4f;
+  background: #171717;
 }
 
 .terminal-closed.faulted strong {
-  color: #d8a8a5;
+  color: #b5b5b5;
 }
 
 .terminal-closed.faulted span {
@@ -8709,11 +8725,11 @@ a.blocked-resource:hover {
 /* Accent bronze: an interactive edge, not a live machine. */
 .terminal-new-session {
   flex: none;
-  border: 1px solid #564f48;
+  border: 1px solid #505050;
   border-radius: 7px;
   padding: 6px 11px;
-  background: #1d1815;
-  color: #efe1d5;
+  background: #191919;
+  color: #e4e4e4;
   font: inherit;
   font-size: 12px;
   font-weight: 600;
@@ -8725,7 +8741,7 @@ a.blocked-resource:hover {
 
 .terminal-new-session:hover {
   border-color: var(--edge);
-  background: #2a2621;
+  background: #272727;
 }
 
 /* ---------------------------------------------------------------------------
@@ -8798,7 +8814,7 @@ a.blocked-resource:hover {
 */
 .tool-command-line code {
   min-width: 0;
-  color: #ebddd2;
+  color: #e0e0e0;
   font:
     11px/1.5 ui-monospace,
     SFMono-Regular,
@@ -8811,10 +8827,10 @@ a.blocked-resource:hover {
    a command that failed is caution, and caution is dim and static. */
 .tool-command-status {
   flex: none;
-  border: 1px solid #464426;
+  border: 1px solid #424242;
   border-radius: 5px;
   padding: 1px 6px;
-  color: #c1bc64;
+  color: #b7b7b7;
   font-size: 10px;
   white-space: nowrap;
 }
@@ -8829,7 +8845,7 @@ a.blocked-resource:hover {
 */
 .tool-event .tool-output {
   margin: 0;
-  border: 1px solid #342e2a;
+  border: 1px solid #2f2f2f;
   border-radius: 8px;
   max-height: 260px;
   overflow: auto;
@@ -8855,10 +8871,10 @@ a.blocked-resource:hover {
   display: flex;
   align-items: center;
   gap: 8px;
-  border: 1px solid #342e2a;
+  border: 1px solid #2f2f2f;
   border-radius: 8px;
   padding: 7px 9px;
-  background: #181511;
+  background: #151515;
   color: inherit;
   text-decoration: none;
   transition: border-color 160ms var(--ease);
@@ -8897,20 +8913,20 @@ a.blocked-resource:hover {
 }
 
 .tool-pages strong {
-  color: #ebddd2;
+  color: #e0e0e0;
   font-size: 12px;
   font-weight: 600;
 }
 
 .tool-pages small {
-  color: #a2988e;
+  color: #9a9a9a;
   font-size: 11px;
 }
 
 /* --- the payload, one disclosure further down ---------------------------- */
 
 .tool-raw {
-  border: 1px solid #342e2a;
+  border: 1px solid #2f2f2f;
   border-radius: 8px;
   overflow: hidden;
 }
@@ -8928,12 +8944,12 @@ a.blocked-resource:hover {
 }
 
 .tool-event .tool-raw > summary:hover {
-  color: #a2988e;
+  color: #9a9a9a;
 }
 
 /* The dump already scrolls and wraps from `.tool-event pre`; only its edges change in here. */
 .tool-event .tool-raw pre {
-  border-top: 1px solid #342e2a;
+  border-top: 1px solid #2f2f2f;
   border-radius: 0;
 }
 
@@ -8945,7 +8961,7 @@ a.blocked-resource:hover {
   missing. This is the row a reader goes looking for after a bad run, so it is not dimmed away.
 */
 .tool-event.unfinished summary > svg:first-child {
-  color: #948b82;
+  color: #8d8d8d;
 }
 
 /* ==========================================================================
@@ -8975,7 +8991,7 @@ a.blocked-resource:hover {
 
 .running-row.live {
   opacity: 1;
-  border-color: #443e39;
+  border-color: #3f3f3f;
 }
 
 /*
@@ -8989,7 +9005,7 @@ a.blocked-resource:hover {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: #787068;
+  background: #717171;
 }
 
 .running-row.live .running-mark {
@@ -9023,7 +9039,7 @@ a.blocked-resource:hover {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: #ebddd2;
+  color: #e0e0e0;
   font:
     12px/1.4 ui-monospace,
     SFMono-Regular,
@@ -9033,7 +9049,7 @@ a.blocked-resource:hover {
 }
 
 .running-row small {
-  color: #a2988e;
+  color: #9a9a9a;
   font-size: 11px;
 }
 
@@ -9103,12 +9119,12 @@ a.blocked-resource:hover {
   display: grid;
   gap: 7px;
   margin-top: 4px;
-  border-top: 1px solid #2b2622;
+  border-top: 1px solid #272727;
   padding-top: 12px;
 }
 
 .running-publish > span {
-  color: #a2988e;
+  color: #9a9a9a;
   font-size: 11px;
   letter-spacing: 0.04em;
   text-transform: uppercase;
@@ -9133,7 +9149,7 @@ a.blocked-resource:hover {
 
 .security-modes legend {
   padding: 0 0 6px;
-  color: #a49990;
+  color: #9b9b9b;
   font-size: 11px;
   letter-spacing: 0.04em;
   text-transform: uppercase;
@@ -9165,7 +9181,7 @@ a.blocked-resource:hover {
 */
 .self-hosted-settings .security-modes label.chosen {
   border-color: var(--edge);
-  background: #201b18;
+  background: #1c1c1c;
 }
 
 /* FUNCTIONAL. The whole label is the hit area, so the disabled state has to read on all of it —
@@ -9192,7 +9208,7 @@ a.blocked-resource:hover {
 
 .security-modes strong {
   display: block;
-  color: #ebddd2;
+  color: #e0e0e0;
   font-size: 12px;
 }
 
@@ -9200,7 +9216,7 @@ a.blocked-resource:hover {
   display: block;
   grid-column: 2;
   margin-top: 3px;
-  color: #a49990;
+  color: #9b9b9b;
   font-size: 11px;
   line-height: 1.5;
 }

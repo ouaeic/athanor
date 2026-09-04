@@ -20,7 +20,10 @@ export const inertOutside = (element: Element): (() => void) => {
       if (sibling === node || sibling.hasAttribute('inert')) continue;
       // The undo layer is deliberately exempt, exactly as in `Dialog`: it belongs to whatever is on
       // top, and a delete that cannot be undone because a pane is open is the worst of both.
-      if (sibling.getAttribute('data-layer') === 'undo') continue;
+      // The room is behind everything, has no focusable content and is already `aria-hidden`;
+      // marking it inert on every dialog would be attribute churn for no reader benefit.
+      const layer = sibling.getAttribute('data-layer');
+      if (layer === 'undo' || layer === 'glass') continue;
       sibling.setAttribute('inert', '');
       made.push(sibling);
     }
