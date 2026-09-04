@@ -103,6 +103,10 @@ describe('what asks whatever the mode says', () => {
     // whole reason for this table: "High-impact actions always need approval" is not a fact anybody
     // can act on.
     for (const mode of securityModes) expect(modeFloors[mode]).not.toContain('High-impact');
+    // Balanced asks about a COMMAND reaching the internet. The built-in web tools read without a
+    // card in every mode, so a sentence that dropped the word would promise a card the floor never
+    // raises - which is the sentence an owner reads while choosing the mode.
+    expect(modeFloors.balanced).toMatch(/\bcommand\b/i);
   });
 
   /*

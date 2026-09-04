@@ -333,7 +333,8 @@ describe('the shipped built-in library', () => {
         'media-creation',
         'background-jobs',
         'render-proof',
-        'skill-authoring'
+        'skill-authoring',
+        'screen-capture'
       ])
     );
   });

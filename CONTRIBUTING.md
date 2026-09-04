@@ -88,6 +88,7 @@ sh scripts/test-update.sh           # transactional update, its rollback, and wh
 sh scripts/test-native-provisioning.sh  # the browser revision, the update record, the spending cap
 sh scripts/test-system-packages.sh  # which package manager an approved install actually reaches
 sh scripts/test-doctor-retirement.sh # what doctor says about a model the provider is withdrawing
+sh scripts/test-doctor-notifications.sh # what doctor says when nothing is enrolled to be notified
 ```
 
 Two of the server's shell commands are contracts rather than conveniences, because something outside
@@ -105,8 +106,9 @@ this repository did not write - ACP clients are somebody else's editors - so it 
 floor from four directions as well as the protocol: see docs/ACP.md.
 
 Three of the shell drills - `test-sandbox.sh`, `test-certificate.sh` and `test-relay-endpoint.sh` - also run in
-CI's `native-units` job; `test-update.sh` and `test-doctor-retirement.sh` run in the `application`
-job, at `.github/workflows/verify.yml`, after that job's `pnpm install`; and
+CI's `native-units` job; `test-update.sh`, `test-doctor-retirement.sh` and
+`test-doctor-notifications.sh` run in the `application` job, at `.github/workflows/verify.yml`,
+after that job's `pnpm install`; and
 `test-system-packages.sh` already runs inside `pnpm check` by way of
 `scripts/check-repository.mjs`. They are listed here because running one directly is how you read
 its output; `test-native-provisioning.sh` is the one with nothing but this list standing behind it. A new drill that this

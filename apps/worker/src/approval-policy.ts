@@ -810,7 +810,17 @@ export const SECURITY_MODE_FLOOR: Record<
   {
     /** Review only: a card in front of every command, file write and browser or desktop action. */
     readonly asksBeforeEveryChange: boolean;
-    /** Whether a command that reaches an address outside this computer is asked about at all. */
+    /**
+     * Whether a command that reaches an address out on the internet is asked about at all.
+     *
+     * A COMMAND, and the sentence below says so in as many words: this field is read by the shell
+     * arm of `ordinaryRequirement` and by nothing else. The built-in web tools - `web_search`,
+     * `parallel_web_read` and a browser navigation - never consult it, in any mode, which is the
+     * design the cards baseline records (`evals/cards/baseline.json`, the research scenario at zero
+     * balanced cards): a turn that reads forty pages and writes a report is not forty cards. What
+     * leaves on a turn that has read untrusted content is the provenance arm's question, not this
+     * one's.
+     */
     readonly asksBeforeReachingTheInternet: boolean;
     /** Whether adding software to this computer is asked about. Removing it always is. */
     readonly asksBeforeInstallingSoftware: boolean;
@@ -830,7 +840,7 @@ export const SECURITY_MODE_FLOOR: Record<
     asksBeforeReachingTheInternet: true,
     asksBeforeInstallingSoftware: true,
     sentence:
-      'Reaching an address out on the internet, and installing software onto it, on top of everything Autonomous asks about.'
+      'A command reaching an address out on the internet, and installing software onto it, on top of everything Autonomous asks about; the built-in web tools read without asking.'
   },
   autonomous: {
     asksBeforeEveryChange: false,
@@ -1430,9 +1440,12 @@ const ordinaryRequirement = (
         action: `Move data out of reach with ${executable}`,
         preview: `Run ${[executable, ...commandArgs].join(' ')}. This empties the place it moves from, and that place is outside the turn's undo point - which covers workspace/ and .athanor/artifacts and nothing else - so rewinding this turn does not put it back. Nothing has to be deleted for this computer to lose the agent's own keys or its shell configuration this way.`
       };
+    // Its own paragraph for the command, because a `bash -lc` pipeline ends on whatever its last
+    // word is and an explanation that follows on the same line fuses with it: "&& ls in the
+    // workspace" is a sentence the command does not contain, read on a phone 340 characters in.
     return {
       action: `Run ${executable}`,
-      preview: `Run ${[executable, ...commandArgs].join(' ')} in the workspace. This can remove or overwrite data.`
+      preview: `Run ${[executable, ...commandArgs].join(' ')}\n\nThis runs in the workspace and can remove or overwrite data.`
     };
   };
 

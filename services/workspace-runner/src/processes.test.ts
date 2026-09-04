@@ -1,9 +1,26 @@
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { agentHome } from './execution.js';
 import { ProcessManager } from './processes.js';
+
+/**
+ * Stands in for athanor-sandbox: consumes `run <network mode> <filesystem mode> <root> --spec
+ * <path>` the way the real helper does, reads the directory, the environment and the command out
+ * of the spec file - the header word, the directory, then NUL-terminated words - unlinks it,
+ * enters the directory, and execs as `env -i` does.
+ */
+const SANDBOX_STAND_IN = `#!/bin/sh
+shift 4
+[ "$1" = --spec ] || exit 125
+exec /usr/bin/python3 -I -S -c 'import os, sys
+data = open(sys.argv[1], "rb").read()
+os.unlink(sys.argv[1])
+words = data.split(b"\\0")[1:-1]
+os.chdir(words[0])
+os.execv("/usr/bin/env", [b"env", b"-i"] + words[1:])' "$2"
+`;
 
 const roots: string[] = [];
 
@@ -225,6 +242,52 @@ describe('background process manager', () => {
   );
 
   it(
+    'starts sudo from the container root for a background command, as the foreground path does',
+    async () => {
+      // The background path is the one that runs longest, and the directory sudo is started from
+      // is on its journal line beside the arguments. A session started in
+      // `workspace/acme-lawsuit-discovery` must not put that name there; the helper enters the
+      // directory from the spec instead, and the command still runs where it asked to.
+      const root = await mkdtemp(path.join(tmpdir(), 'athanor-process-'));
+      roots.push(root);
+      const chosen = path.join(root, 'workspace', 'acme-lawsuit-discovery');
+      await mkdir(chosen, { recursive: true });
+      const record = path.join(root, 'elevated');
+      const elevate = path.join(root, 'elevate');
+      await writeFile(
+        elevate,
+        `#!/bin/sh\nprintf '%s\\n' "$*" >"${record}"\nprintf '%s' "$PWD" >"${record}.pwd"\nshift\nexec "$@"\n`
+      );
+      await chmod(elevate, 0o700);
+      const helper = path.join(root, 'sandbox');
+      await writeFile(helper, SANDBOX_STAND_IN);
+      await chmod(helper, 0o700);
+      const manager = new ProcessManager();
+      const started = await manager.start(
+        root,
+        'workspace-1',
+        'task-1',
+        {
+          executable: '/bin/sh',
+          args: ['-c', 'pwd -P'],
+          cwd: 'acme-lawsuit-discovery',
+          timeoutSeconds: 5
+        },
+        5,
+        true,
+        { sandbox: { elevate, helper, specDirectory: path.join(root, 'specs') } }
+      );
+      const finished = await settledStatus(manager, started.sessionId);
+      expect(finished.status).toBe('completed');
+      expect(await realpath((finished.stdout ?? '').trim())).toBe(await realpath(chosen));
+      expect(await realpath(await readFile(`${record}.pwd`, 'utf8'))).toBe(await realpath(root));
+      expect(await readFile(record, 'utf8')).not.toContain('acme-lawsuit-discovery');
+      manager.close();
+    },
+    TEST_TIMEOUT_MS
+  );
+
+  it(
     'runs a background command through the agent sandbox, as a foreground one is',
     async () => {
       /*
@@ -249,7 +312,7 @@ describe('background process manager', () => {
       // consumes `run <network mode> <filesystem mode> <root>`, then applies the environment and
       // execs, as `env -i` does.
       const helper = path.join(root, 'sandbox');
-      await writeFile(helper, '#!/bin/sh\nshift 4\nexec /usr/bin/env -i "$@"\n');
+      await writeFile(helper, SANDBOX_STAND_IN);
       await chmod(helper, 0o700);
       const manager = new ProcessManager();
       const started = await manager.start(
@@ -259,7 +322,7 @@ describe('background process manager', () => {
         { executable: '/bin/sh', args: ['-c', 'printf "%s" "$HOME"'], timeoutSeconds: 5 },
         5,
         true,
-        { sandbox: { elevate, helper } }
+        { sandbox: { elevate, helper, specDirectory: path.join(root, 'specs') } }
       );
       const finished = await settledStatus(manager, started.sessionId);
       expect(finished.status).toBe('completed');
@@ -268,7 +331,10 @@ describe('background process manager', () => {
       expect(finished.stdout).toBe(agentHome(root));
       const elevated = await readFile(record, 'utf8');
       expect(elevated).toContain(`-n ${helper} run isolated`);
-      expect(elevated).toContain(`HOME=${agentHome(root)}`);
+      // And it reached the process through the spec file, not through sudo's argument list: the
+      // background path is the one that runs longest, and its command text belongs in the
+      // journal no more than a foreground command's does.
+      expect(elevated).not.toContain('HOME=');
       // WHERE that home is, spelled without `agentHome` on both sides. The two assertions above
       // compare the background path's answer against the same function the background path calls,
       // so they hold whatever that function returns: with `agentHome` reverted to the bare
@@ -636,7 +702,7 @@ describe('the host disk floor on the background path', () => {
     await writeFile(elevate, '#!/bin/sh\nshift\nexec "$@"\n');
     await chmod(elevate, 0o700);
     const helper = path.join(root, 'sandbox');
-    await writeFile(helper, '#!/bin/sh\nshift 4\nexec /usr/bin/env -i "$@"\n');
+    await writeFile(helper, SANDBOX_STAND_IN);
     await chmod(helper, 0o700);
     const manager = new ProcessManager();
     const started = await manager.start(
@@ -650,7 +716,7 @@ describe('the host disk floor on the background path', () => {
       },
       30,
       false,
-      { sandbox: { elevate, helper, confineFilesystem } }
+      { sandbox: { elevate, helper, specDirectory: path.join(root, 'specs'), confineFilesystem } }
     );
     const settled = await settledStatus(manager, started.sessionId);
     expect(settled.status).toBe('failed');

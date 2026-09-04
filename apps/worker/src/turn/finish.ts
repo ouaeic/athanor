@@ -47,6 +47,7 @@ import type { AgentState, AgentWorkerConfig } from '../agent-state.js';
 import {
   citableEvidence,
   completionVerification,
+  harnessEvidence,
   harnessVerificationStatus,
   observedCommands,
   type CompletionVerification
@@ -340,6 +341,12 @@ export const handleFinishCall = async (
       ];
     });
     acceptanceEvidence = acceptancePassedEvidence(results);
+    // And the same lines in the field a script reads first, under a source only the harness
+    // writes, so the label the model chose never travels there without the command beside it.
+    verification = {
+      ...verification,
+      evidence: [...verification.evidence, ...harnessEvidence(results)]
+    };
     const failed = results.filter((result) => !result.passed);
     if (failed.length) {
       const attempt = (state.acceptanceFailures ?? 0) + 1;

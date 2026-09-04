@@ -549,21 +549,28 @@ describe('the size of the catalogue the model is sent', () => {
      * format had to be argued against - it is resident in the cached prefix of every request of
      * every turn, whether or not the turn edits anything.
      *
-     *   model-facing spec, as written      1,020 bytes
-     *   new file_patch entry, on the wire  1,621 bytes
+     *   model-facing spec, as written      1,090 bytes
+     *   new file_patch entry, on the wire  1,694 bytes
      *   the quoted entry it replaces      -1,112 bytes
-     *   NET ON THE CATALOGUE                +509 bytes
+     *   NET ON THE CATALOGUE                +582 bytes
      *
-     * The catalogue measured 54,949 before and 55,458 after; the ceiling above moved by exactly
-     * that, for exactly the capability named there, and the bare-box ceiling below moved by the
-     * same 509 for the same reason. The previous costing of this same format put it at +1,306, and
-     * almost all of the difference is one decision - the dialect it was measured from makes the
-     * model copy a per-file version tag into every patch and spends three resident paragraphs on
-     * what to do when it does not match, and `apps/worker/src/edit/snapshots.ts` needs no tag
-     * because it remembers what each read displayed. A tag the model cannot miscopy is a tag
-     * nobody has to describe.
+     * The catalogue measured 54,949 before the format and 55,458 after it; the ceiling above moved
+     * by exactly that 509, for exactly the capability named there, and the bare-box ceiling below
+     * moved by the same 509 for the same reason. The previous costing of this same format put it
+     * at +1,306, and almost all of the difference is one decision - the dialect it was measured
+     * from makes the model copy a per-file version tag into every patch and spends three resident
+     * paragraphs on what to do when it does not match, and `apps/worker/src/edit/snapshots.ts`
+     * needs no tag because it remembers what each read displayed. A tag the model cannot miscopy
+     * is a tag nobody has to describe.
      *
-     * 1,100 is the 1,020 with room for one more operation and not for prose, which is the same
+     * The spec then went from 1,020 to 1,090 bytes for ONE sentence and one example row: the
+     * `-` row that anchors a line number to the text the model read at it. It is the one taught
+     * forgiveness, because it closes the format's one hole - an off-by-one with nothing in the
+     * patch saying what the model believed was at the line - and it was paid for out of the same
+     * paragraph: five tightenings of prose already there gave back 79 of the 149 bytes it cost.
+     * On the wire the entry measures 1,694, 73 more than without it.
+     *
+     * 1,100 is the spec with room for a few words and not for a paragraph, which is the same
      * distinction the ceiling above draws. The far side of the trade is measured offline over
      * fifteen tasks on this repository's own corpus: 4,086 characters of arguments become 1,589,
      * a 61% saving, winning fourteen of the fourteen rows where both formats do what was asked.
@@ -1724,6 +1731,7 @@ describe('declared action shapes', () => {
         'y',
         'response',
         'promptText',
+        'path',
         'tabId',
         'actions',
         'purpose'
@@ -1749,6 +1757,7 @@ describe('declared action shapes', () => {
       'inspect_tab',
       'click_at',
       'dialog',
+      'screenshot',
       'batch'
     ]);
     // The required set is the one thing that moved into prose, so it has to actually be there.
@@ -1762,6 +1771,7 @@ describe('declared action shapes', () => {
       ['scroll', 'deltaY'],
       ['click_at', 'x'],
       ['dialog', 'response'],
+      ['screenshot', 'path'],
       ['batch', 'actions']
     ])
       expect(
@@ -2145,5 +2155,34 @@ describe('the contract each answer is written to', () => {
     const memory = agentTools.find((tool) => tool.name === 'memory');
     expect(memory?.description).toMatch(/validUntil/);
     expect(memory?.description).toMatch(/never transient task state/);
+  });
+});
+
+/**
+ * The frame each path is read in, said on the two fields that had no description at all.
+ *
+ * The shell runs in `workspace/` and the file tools fold a bare name into `workspace/`, so a model
+ * shown `cwd: {default: 'workspace'}` and `path: {type: 'string'}` had no way to know that the
+ * string `workspace/probe/x` is a file to one tool and a directory that does not exist to the other.
+ * Measured live: six of ten tasks, a third of their tool calls. The runner now reads a bare cwd from
+ * `workspace/` and the shell result carries a note when a command trips on the prefix; these two
+ * clauses are the resident half, kept to one sentence each because they sit in every request.
+ */
+describe('which frame a path is read in', () => {
+  const properties = (name: string): Record<string, { description?: string }> =>
+    (agentTools.find((tool) => tool.name === name)?.parameters.properties ?? {}) as Record<
+      string,
+      { description?: string }
+    >;
+
+  it('tells the shell that the command already runs inside workspace/', () => {
+    const cwd = properties('shell').cwd?.description ?? '';
+    expect(cwd).toMatch(/already runs inside workspace\//);
+    expect(cwd).toMatch(/never workspace\/probe\/x/);
+  });
+
+  it('tells file_write that the bare name and the prefixed name are one file', () => {
+    const path = properties('file_write').path?.description ?? '';
+    expect(path).toMatch(/probe\/x and workspace\/probe\/x are the same file/);
   });
 });

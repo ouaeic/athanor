@@ -10,6 +10,7 @@ import {
   citableEvidence,
   completionVerification,
   evidenceFloor,
+  harnessEvidence,
   harnessVerificationStatus,
   normalisedSpan,
   observedCommands,
@@ -154,6 +155,50 @@ describe('completion verification', () => {
       }
     );
     expect(checked.ok).toBe(true);
+  });
+
+  it('writes the harness line, with the command beside the label, only for a command check that passed', () => {
+    expect(
+      harnessEvidence([
+        {
+          id: 'check-1',
+          label: 'the importer test passes',
+          passed: true,
+          detail: 'exit 0',
+          command: 'pytest -q'
+        },
+        { id: 'check-2', label: 'the report exists', passed: true, detail: '4213 bytes' },
+        {
+          id: 'check-3',
+          label: 'the linter passes',
+          passed: false,
+          detail: 'exit 1',
+          command: 'eslint .'
+        }
+      ])
+    ).toEqual([
+      {
+        claim: 'check-1: the importer test passes — ran pytest -q — exit 0',
+        source: 'acceptance_check'
+      }
+    ]);
+  });
+
+  it('never lets the model declare the harness as its source', () => {
+    const shell = state({ 'call-1': { name: 'shell', success: true } });
+    const cited = completionVerification(shell, {
+      status: 'verified',
+      evidence: [{ claim: 'The tests pass', source: 'acceptance_check', toolCallId: 'call-1' }]
+    });
+    expect(cited.ok).toBe(true);
+    expect(cited.ok && cited.verification.evidence[0]?.source).toBe('tool_result');
+    const bare = completionVerification(shell, {
+      status: 'verified',
+      evidence: [
+        { claim: 'check-1: the tests pass — ran pytest -q — exit 0', source: 'acceptance_check' }
+      ]
+    });
+    expect(bare.ok).toBe(false);
   });
 
   /**
@@ -900,7 +945,10 @@ describe('a command the harness answered instead of running', () => {
       id: 'check-1',
       label: 'the tests pass',
       passed: true,
-      detail: 'exit 0, from athanor running this same command after the last change'
+      detail: 'exit 0, from athanor running this same command after the last change',
+      // The command travels with the answer, so the record the owner reads says what was run and
+      // not only what the model called it.
+      command: 'pytest -q'
     });
   });
 });

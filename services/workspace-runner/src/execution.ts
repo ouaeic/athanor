@@ -9,7 +9,7 @@ import {
   privilegedHelperInvocation,
   resolveExecutable
 } from './command-policy.js';
-import { AGENT_HOME, resolveInside } from './files.js';
+import { AGENT_HOME, resolveCommandDirectory } from './files.js';
 import {
   belowHostStorageFloor,
   hostStorage as probeHostStorage,
@@ -738,7 +738,9 @@ export const prepareInvocation = async (
   const searchPath = agentSearchPath(workspaceRoot);
   // Asked first, so a policy the caller believes it is applying is refused before anything runs.
   const environment = agentEnvironment(workspaceRoot, searchPath, request.env);
-  const cwd = resolveInside(workspaceRoot, request.cwd);
+  // Read from workspace/ for a bare name, as a file path is, so the shell and the file tools cannot
+  // answer one spelling with two directories.
+  const cwd = resolveCommandDirectory(workspaceRoot, request.cwd);
   // Checked as the kernel will read it as well as as it was written, so a symbolic link or a
   // relative name cannot present a basename the checks below do not recognise.
   const resolved = await resolveExecutable(request.executable, searchPath, cwd);
@@ -824,7 +826,7 @@ export const prepareInvocation = async (
   // across exec, so setting them outermost applies them to everything underneath.
   const limited = limitedInvocation(
     sandbox
-      ? sandboxedInvocation(
+      ? await sandboxedInvocation(
           { executable, args },
           environment,
           sandbox,
@@ -833,7 +835,8 @@ export const prepareInvocation = async (
           // command may write in. Named here rather than derived inside the helper's caller
           // because this is the only place that knows it, and both execution paths - the
           // foreground command and the background session - arrive at this line.
-          workspaceRoot
+          workspaceRoot,
+          cwd
         )
       : { executable, args },
     policy.limits,
@@ -842,8 +845,14 @@ export const prepareInvocation = async (
   return {
     executable: limited.executable,
     args: limited.args,
-    cwd,
-    // The sandbox helper installs the environment itself, from arguments, because sudo resets it.
+    // Where the process is started matters as much as what it is handed when the process is
+    // sudo: its journal line records the directory it was started from, and started from the
+    // directory the agent chose it wrote `workspace/acme-lawsuit-discovery` - a name used inside
+    // the task - there for every command, beside the modes. So a sandboxed command starts sudo
+    // from the container root, which the line already names as the workspace, and the helper
+    // enters the directory it was asked for from the spec, after sudo has written its line.
+    cwd: sandbox ? workspaceRoot : cwd,
+    // The sandbox helper installs the environment itself, from the spec, because sudo resets it.
     env: sandbox ? {} : environment
   };
 };

@@ -8,8 +8,11 @@ set -eu
 # The helper only ever hands back *less* privilege than its caller already has: a different
 # unprivileged user, no route to a higher one, optionally no network, and optionally a Landlock
 # ruleset that admits one workspace and nothing else under /home. That is why it is safe for it to
-# accept an arbitrary command line - there is nothing a caller could gain by lying to it that it
-# did not already have.
+# run a command it did not write - there is nothing a caller could gain by lying to it that it did
+# not already have. The property has to be kept on every path the caller names, not only the
+# command: the file a `run` request arrives in is read and removed by this helper as root, so a
+# caller free to name that file could have root remove any file on the box. `spec_parent` below
+# and the reader's ownership checks are what keep the property true for the file too.
 
 agent_user="athanor-agent"
 
@@ -20,8 +23,34 @@ agent_user="athanor-agent"
 # disagree, `confine` refuses every command rather than confining the wrong tree.
 workspace_parent="/home/athanor"
 
+# Where a `run` request's spec file has to be, hard-coded for the same reason again. This helper
+# removes the file it is handed, as root, and it once did so for any path at all: measured with a
+# harness copy, `run network open - --spec /etc/sudoers.d/athanor-packages` was refused for its
+# header and the policy file was gone, and a refusal on the mode words removed whatever path stood
+# after `--spec` before anything was read - a root-level delete of any file on the box, for a
+# caller whose own account could not perform it. So a spec is `$spec_parent/<hex>.spec` and
+# nothing else: the directory the runner keeps its own private state in and creates owner-only
+# (sandbox.ts `sandboxSpecDirectory`), where removing a file removes what the caller could remove
+# anyway. `spec_path_shape` refuses every other path before a single byte is read or removed, and
+# the reader checks the file's owner against the account sudo says asked.
+spec_parent="$workspace_parent/.athanor/sandbox"
+
+# The file a `run` request's command and environment arrive in, once it has been named and its
+# path has passed `spec_path_shape` - nothing else is ever assigned here. Removed on every refusal
+# below that: the runner has handed the file over by the time it calls, and a refusal that left it
+# lying on disk would keep the command text around for exactly as long as nothing came to collect
+# it.
+spec=""
+
 fail() {
   printf 'athanor-sandbox: %s\n' "$1" >&2
+  # Only a path the shape check accepted, and only while no component the caller's account owns
+  # has become a link: `.athanor` and `sandbox` are the caller's directories, and either pointed
+  # elsewhere would make this a removal from wherever it pointed.
+  if [ -n "$spec" ] && [ ! -L "$workspace_parent/.athanor" ] && [ ! -L "$spec_parent" ] &&
+    [ ! -L "$spec" ]; then
+    rm -f -- "$spec"
+  fi
   # Distinct from the exit statuses a real command produces, so a sandbox failure is not read as
   # the command itself having failed.
   exit 125
@@ -93,6 +122,23 @@ workspace_id_shape() {
   case "$shape_d" in
     [89AaBb]*) ;;
     *) return 1 ;;
+  esac
+}
+
+# `$spec_parent/<hex>.spec` with no further slash, and nothing but hexadecimal digits before the
+# suffix: the name the runner gives a spec - twelve random bytes as twenty-four digits - and nothing
+# a caller could steer anywhere else. `case` globs match `/`, which is why the first pattern is
+# what refuses a subdirectory. Refused before the file is opened, read or removed.
+spec_path_shape() {
+  case "$1" in
+    "$spec_parent"/*/*) return 1 ;;
+    "$spec_parent"/*.spec) ;;
+    *) return 1 ;;
+  esac
+  spec_name="${1##*/}"
+  spec_name="${spec_name%.spec}"
+  case "$spec_name" in
+    "" | *[!0-9a-f]*) return 1 ;;
   esac
 }
 
@@ -202,6 +248,9 @@ confine_to() {
 # checked to be a workspace id, so there is no whitespace and no glob character in it for the split
 # to get wrong. It is carried in a variable rather than in "$@" because the command itself already
 # occupies the positional parameters, and /bin/sh has no second array.
+#
+# Reached by the owner's `shell` arm, whose command stands on the argument list. The `run` arm
+# builds the same chain inside its reader, from a file - see `spec_loader` below for why.
 run_as_agent() {
   # shellcheck disable=SC2086
   exec /usr/bin/setpriv \
@@ -209,6 +258,106 @@ run_as_agent() {
     $landlock_arguments \
     -- /usr/bin/env -i "$@"
 }
+
+# How a `run` request's command reaches the agent account, and why it is not simply "$@".
+#
+# This helper runs under sudo, and sudo writes every argument of every privileged invocation to the
+# system journal - persistent, root-owned, outside the workspace and outside every checkpoint. The
+# policy that admits this helper cannot say otherwise: the sudo the box ships knows no directive
+# that would keep the command line out of the log, and a sudoers file naming one is refused whole
+# (scripts/install-native.sh). With the command on the argument list, that journal held every
+# heredoc body, every filename and everything typed at a terminal, on a box whose privacy document
+# says its own logs hold none of those. So the argument list carries the modes, the root and a
+# path, and the command with its environment comes through a file the runner wrote for this one
+# invocation, readable by the runner and root and nobody else. The journal then records that a
+# command ran, in which modes and in which workspace, and not what it was.
+#
+# The file is read by /usr/bin/python3 rather than by this shell, because the shell cannot do it: a
+# variable cannot hold a NUL, `read` strips the newline it stops at, and command substitution strips
+# every trailing one - so an argument ending in a newline, which a heredoc body always does, would
+# arrive short. Python reads bytes and hands them to execv as bytes, and scripts/test-sandbox.sh
+# drives an argument that ends in two newlines through it and compares the far side byte for byte.
+# The reader unlinks the file before it execs, so the command itself can never find it.
+#
+# What the file holds: a header naming this format, then every word NUL-terminated - the directory
+# the command runs in first, then the environment's NAME=VALUE words, then the executable and its
+# arguments, which is exactly the list `env -i` was given when it stood on the argument list. The
+# header is what tells a runner and a helper that are out of step apart from a file that merely has
+# a command in it. The directory is in the file rather than being where sudo is started because
+# sudo writes the directory it was started from to the journal beside the arguments, and the
+# directory an agent chooses for a command is a name used inside the task; the runner starts sudo
+# from the container root and the reader enters the real directory here, after that line is
+# written. The directory persists across setpriv and unshare, so nothing else has to know it.
+#
+# WHAT THE READER CHECKS BEFORE IT REMOVES ANYTHING, because it removes as root. The path has
+# already passed `spec_path_shape`; the reader then walks the two components under
+# $workspace_parent without following a link, since both belong to the caller's account and either
+# could be pointed at a directory root must not remove from; opens the file itself without
+# following a link; and refuses one not owned by the account sudo says asked, or with a second
+# name, or without the header. Only then is it unlinked - by name in the directory it was opened
+# from - and only then read as a command. A file refused on any of those is left exactly where it
+# was, and the harness asserts that on each.
+#
+# The chain past the reader is the one `run_as_agent` builds for the owner's shell: setpriv drops
+# to the agent account with no route back and applies the ruleset, `env -i` installs exactly the
+# environment given. Network isolation wraps the same chain in a namespace, with loopback brought
+# up inside it: without it a command cannot even reach a port its own subprocess is listening on,
+# which breaks ordinary local tooling for no security benefit. The shell text is fixed and the
+# command arrives through "$@", so nothing from the caller is ever interpreted.
+spec_loader='
+import os, stat, sys
+network, spec, parent, asker, setpriv, unshare, uid, gid = sys.argv[1:9]
+landlock = sys.argv[9:]
+
+def fail(message):
+    sys.stderr.write("athanor-sandbox: %s\n" % message)
+    sys.exit(125)
+
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+if not spec.startswith(parent + "/"):
+    fail("the spec file is not under the workspace parent")
+components = spec[len(parent) + 1:].split("/")
+name = components.pop()
+try:
+    at = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    for component in components:
+        below = os.open(component, directory_flags, dir_fd=at)
+        os.close(at)
+        at = below
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=at)
+except OSError as error:
+    fail("the spec file could not be opened: %s" % error.strerror)
+info = os.fstat(fd)
+if not stat.S_ISREG(info.st_mode):
+    fail("the spec path is not a regular file")
+if info.st_uid != int(asker):
+    fail("the spec file is not owned by the account that asked for this command")
+if info.st_nlink != 1:
+    fail("the spec file has more than one name")
+with os.fdopen(fd, "rb") as handle:
+    data = handle.read()
+header = b"athanor-sandbox-spec 2\0"
+if not data.startswith(header) or not data.endswith(b"\0"):
+    fail("the spec file is not in the form this helper reads")
+os.unlink(name, dir_fd=at)
+os.close(at)
+words = data[len(header):-1].split(b"\0")
+cwd = words.pop(0)
+if not cwd.startswith(b"/"):
+    fail("the working directory must be an absolute path")
+if not words or all(b"=" in word for word in words):
+    fail("no command was given")
+try:
+    os.chdir(cwd)
+except OSError as error:
+    fail("the working directory could not be entered: %s" % error.strerror)
+chain = [setpriv, "--reuid", uid, "--regid", gid, "--clear-groups", "--no-new-privs"]
+chain += landlock + ["--", "/usr/bin/env", "-i"] + words
+if network == "isolated":
+    isolate = "ip link set lo up 2>/dev/null || true\nexec \"$@\""
+    chain = [unshare, "--net", "--", "/bin/sh", "-c", isolate, "athanor-sandbox"] + chain
+os.execv(chain[0], chain)
+'
 
 mode="${1:-}"
 shift || true
@@ -220,11 +369,32 @@ case "$mode" in
     confinement="${1:-}"
     shift || true
     # Present in the grammar even under `open`, where it is ignored, so that the word order is one
-    # fact rather than two: a caller that forgets the root is refused for a missing command instead
-    # of having its first environment assignment read as a mode.
+    # fact rather than two: a caller that forgets the root is refused for a missing spec instead of
+    # having its first environment assignment read as a mode.
     root="${1:-}"
     shift || true
-    [ "$#" -gt 0 ] || fail "no command was given"
+    # The spec path is the last word, and it is the only one after the root. Anything more is a
+    # caller spelling the command on the argument list, which is the one thing this arm must never
+    # run: refusing it is what keeps a stale caller from putting file contents back in the journal.
+    [ "${1:-}" = "--spec" ] ||
+      fail "the command is read from a spec file: run NETWORK FILESYSTEM ROOT --spec PATH"
+    spec_argument="${2:-}"
+    [ -n "$spec_argument" ] || fail "no spec path was given"
+    [ "$#" -eq 2 ] || fail "nothing may follow the spec path; the command and its environment belong in the file"
+    # Who is asking, before the file is looked at. sudo names the account in SUDO_UID, and the
+    # reader refuses a spec that account does not own - so a file root or anyone else left at the
+    # right path, under the right name, is neither read nor removed. A helper run by root directly
+    # has no asker to check against and is refused for it, with the file left where it is.
+    asker_uid="${SUDO_UID:-}"
+    case "$asker_uid" in
+      "" | *[!0-9]*) fail "SUDO_UID does not name the account that asked; this helper runs through the installed sudo policy" ;;
+    esac
+    # Then the shape, and `spec` assigned only past it, so that no refusal below can remove a file
+    # at a path the caller chose.
+    spec_path_shape "$spec_argument" ||
+      fail "the spec file must be $spec_parent/<hex>.spec, the one place the runner writes one"
+    spec="$spec_argument"
+    [ -f "$spec" ] || fail "the spec file $spec does not exist"
     case "$confinement" in
       confine)
         confinable_root "$root" ||
@@ -239,27 +409,16 @@ case "$mode" in
         ;;
     esac
     case "$network" in
-      network)
-        run_as_agent "$@"
-        ;;
-      isolated)
-        # Loopback comes up inside the new namespace: without it a command cannot even reach a
-        # port its own subprocess is listening on, which breaks ordinary local tooling for no
-        # security benefit. The shell text is fixed and the command arrives through "$@", so
-        # nothing from the caller is ever interpreted.
-        # shellcheck disable=SC2086
-        exec /usr/bin/unshare --net -- /bin/sh -c '
-          ip link set lo up 2>/dev/null || true
-          exec "$@"
-        ' athanor-sandbox /usr/bin/setpriv \
-          --reuid "$agent_uid" --regid "$agent_gid" --clear-groups --no-new-privs \
-          $landlock_arguments \
-          -- /usr/bin/env -i "$@"
-        ;;
-      *)
-        fail "the network mode must be network or isolated"
-        ;;
+      network | isolated) ;;
+      *) fail "the network mode must be network or isolated" ;;
     esac
+    [ -x /usr/bin/python3 ] || fail "/usr/bin/python3 is missing, and it is what reads the spec file"
+    # -I ignores every PYTHON* variable and the current directory, -S skips site-packages: the
+    # reader takes nothing from the environment sudo left it or from anything installed on the box.
+    # $landlock_arguments is split on whitespace on purpose, for the reason run_as_agent gives.
+    # shellcheck disable=SC2086
+    exec /usr/bin/python3 -I -S -c "$spec_loader" "$network" "$spec" "$workspace_parent" \
+      "$asker_uid" /usr/bin/setpriv /usr/bin/unshare "$agent_uid" "$agent_gid" $landlock_arguments
     ;;
   shell)
     # The owner's interactive terminal. Separated from `run` only so the sudoers policy can give
@@ -326,6 +485,6 @@ case "$mode" in
     fi
     ;;
   *)
-    fail "usage: athanor-sandbox {run network|isolated confine|open ROOT [VAR=VALUE...] COMMAND [ARG...]|shell [VAR=VALUE...] COMMAND [ARG...]|check}"
+    fail "usage: athanor-sandbox {run network|isolated confine|open ROOT --spec PATH|shell [VAR=VALUE...] COMMAND [ARG...]|check}"
     ;;
 esac

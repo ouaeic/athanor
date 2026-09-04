@@ -172,6 +172,53 @@ describe('what the harness ran', () => {
     ).toBeUndefined();
   });
 
+  it('carries the command beside the label for a command check, and nothing for an artifact', () => {
+    const run = harnessRun(
+      status('Acceptance checks: 2 of 2 passed', {
+        acceptance: [
+          {
+            id: 'check-1',
+            label: 'The suite passes',
+            passed: true,
+            detail: 'exit 0',
+            command: 'pytest -q'
+          },
+          { id: 'check-2', label: 'The report exists', passed: true, detail: '4213 bytes' }
+        ]
+      })
+    )!;
+    expect(run[0]).toEqual({
+      id: 'check-1',
+      label: 'The suite passes',
+      passed: true,
+      detail: 'exit 0',
+      command: 'pytest -q'
+    });
+    expect(run[1]).not.toHaveProperty('command');
+  });
+
+  it('keeps the harness’s own lines out of what the agent says it checked', () => {
+    const card = completionCard(
+      completed('Task completed', {
+        summary: 'Done.',
+        verification: {
+          status: 'verified',
+          evidence: [
+            { claim: 'Opened the report', source: 'tool_result' },
+            {
+              claim: 'check-1: The suite passes — ran pytest -q — exit 0',
+              source: 'acceptance_check'
+            }
+          ],
+          remainingRisks: []
+        }
+      }),
+      ranTwoChecks
+    );
+    expect(card.evidence).toEqual(['Opened the report']);
+    expect(card.verified).toBe(true);
+  });
+
   it('leads the receipt with the harness, because the agent did not write it', () => {
     const card = completionCard(
       completed('Task completed', {

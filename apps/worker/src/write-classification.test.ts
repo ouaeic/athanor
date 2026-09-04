@@ -158,3 +158,41 @@ describe('signalling is a change to the computer and not a card', () => {
     expect(isMutatingToolCall('shell', { executable: 'pgrep', args: ['-f', 'vite'] })).toBe(false);
   });
 });
+
+/*
+ * A screenshot is the one browser action that writes a file, and the durable-instruction and
+ * deferred-execution rules read `writtenPaths` to see writes at all. Unnamed here, a screenshot to
+ * `workspace/ATHANOR.md` on a tainted turn would raise nothing, and `.bashrc` would be judged as a
+ * shell's `.bashrc` rather than as a name the runner folds into `workspace/`.
+ */
+describe('the picture a browser action writes', () => {
+  it('names the screenshot path, on its own and inside a batch, and nothing for any other verb', () => {
+    expect(writtenPaths('browser_action', { action: 'screenshot', path: 'proofs/a.png' })).toEqual([
+      'proofs/a.png'
+    ]);
+    expect(
+      writtenPaths('browser_action', {
+        action: 'batch',
+        actions: [
+          { action: 'hover', selector: '#a' },
+          { action: 'screenshot', path: 'workspace/b.png' },
+          { type: 'screenshot', path: 'c.png' }
+        ]
+      })
+    ).toEqual(['workspace/b.png', 'c.png']);
+    expect(writtenPaths('browser_action', { action: 'hover', selector: '#a' })).toEqual([]);
+    expect(writtenPaths('browser_action', { action: 'screenshot' })).toEqual([]);
+  });
+
+  it('reads the path as workspace-confined, so a home-only name earns no deferred-execution card', () => {
+    expect(
+      deferredExecutionPaths('browser_action', { action: 'screenshot', path: '.bashrc' })
+    ).toEqual([]);
+    expect(
+      deferredExecutionPaths('browser_action', {
+        action: 'screenshot',
+        path: '.git/hooks/pre-commit'
+      })
+    ).toEqual(['.git/hooks/pre-commit']);
+  });
+});

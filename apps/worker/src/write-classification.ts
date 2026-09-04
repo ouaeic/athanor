@@ -352,8 +352,23 @@ export const isDeferredExecutionPath = (path: string, reachesHome = true): boole
   });
 };
 
+/**
+ * The one browser action that writes a file: a screenshot, on its own or as a step of a batch. Read
+ * off the flat bag the model writes - `action` - and off the nested `type` a turn replays out of
+ * its own history, for the reason surface-actions.ts gives for reading both.
+ */
+const screenshotPaths = (args: Record<string, unknown>): string[] => {
+  const verb = textValue(args.action) || textValue(args.type);
+  if (verb === 'screenshot') return [textValue(args.path)].filter(Boolean);
+  if (verb !== 'batch' || !Array.isArray(args.actions)) return [];
+  return args.actions.flatMap((step) =>
+    step && typeof step === 'object' ? screenshotPaths(step as Record<string, unknown>) : []
+  );
+};
+
 export const writtenPaths = (name: string, args: Record<string, unknown>): string[] => {
   if (name === 'file_write' || name === 'print_pdf') return [textValue(args.path)].filter(Boolean);
+  if (name === 'browser_action') return screenshotPaths(args);
   // A redirect writes the brief as surely as file_write does, and the whole point of the durable
   // rule is that the file is read back as a system message in every later task - so a rule that
   // only watched the two file tools was one `bash -lc 'echo ... >> workspace/ATHANOR.md'` away from
@@ -379,8 +394,12 @@ export const writtenPaths = (name: string, args: Record<string, unknown>): strin
     .filter(Boolean);
 };
 
-/** The tools whose every path the runner folds into `workspace/` or refuses. @see isDeferredExecutionPath */
-const PATH_CONFINED_TOOLS = new Set(['file_write', 'file_patch', 'print_pdf']);
+/**
+ * The tools whose every path the runner folds into `workspace/` or refuses. `browser_action` is
+ * here for the one path it ever writes, a screenshot's, which goes through the same boundary as a
+ * printed page's. @see isDeferredExecutionPath
+ */
+const PATH_CONFINED_TOOLS = new Set(['file_write', 'file_patch', 'print_pdf', 'browser_action']);
 
 /**
  * The paths this call leaves for a later, more privileged process to execute.

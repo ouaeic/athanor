@@ -85,15 +85,22 @@ input.
 Compute credits are a runaway backstop rather than a budget: the server raises the number you pass
 to at least what the chosen model's step limit would cost, so a value below that floor changes
 nothing and the outcome reports the floor it was raised to. Set the money limit; a task parked by
-one comes back `blocked`, exit 6, with `reason` carrying the sentence and `blockedBy` naming which
-ceiling it was - `task`, `daily` or `monthly`.
+one comes back `blocked`, exit 6, with `reason` carrying the sentence, `reasonCode` set to
+`spend_ceiling` and `blockedBy` naming which ceiling it was - `task`, `daily` or `monthly`. One
+other stop looks like it and is not: when the guard that checks the ceilings could not answer at
+all - its database did not - the task is parked the same way with `reasonCode` set to
+`spend_guard_unavailable` and `blockedBy` null. No limit was crossed, so raising one changes
+nothing; resume the task once the box is well.
 
 `answer` is the reply to a question the agent stopped to ask, and it is a different act from
 approving a card. `awaiting_user` covers both: when a card is waiting, `pendingApprovals` holds it
 and `question` is null; when the agent asked something, `pendingApprovals` is empty and `question`
 carries what was asked, why, and any options offered. A card in front of the owner takes precedence
-over a question already asked. `answer` keys itself on the words when you pass no `--key`, so a
-retried call cannot become a second message in the conversation.
+over a question already asked. `question` is only ever set on `awaiting_approval`: once the task
+has ended, a question it asked along the way is history in the transcript and the field is null, so
+a caller can key on it without answering a task that has stopped listening. `answer` keys itself on
+the words when you pass no `--key`, so a retried call cannot become a second message in the
+conversation.
 
 `--key` is the one worth understanding. Every write on this API needs an `Idempotency-Key`, and
 `run` generates a fresh one per invocation - so re-running the same command starts a **second**
@@ -132,9 +139,23 @@ to standard error, so `athanor task run ... > outcome.json` is a complete result
 `answer`, `verification` and `outstanding` are read out of the `completed` event's payload, which is
 where the worker writes the model's own account of the turn.
 
-`reason` and `reasonCode` come from the last event the worker addressed to the owner - the one whose
-payload carries `owner: true` - and they are filled only on an ending that has a reason, which is
-`failed` and `blocked`. Two things make that narrower and wider than "the last `error` event":
+`verification.evidence` holds two kinds of item, told apart by `source`. The model's own citations
+are `tool_result`, `published_artifact` or `user_visible_result`. Every command check the harness
+ran and saw pass is added by the harness itself as `acceptance_check`, and its `claim` carries the
+label and the command that was run, in the form `check-2: <label> — ran <command> — exit 0`. The
+label is the model's sentence; the command is what the computer tested, so read the one against the
+other. The model cannot write that source.
+
+`reason` and `reasonCode` come from the latest, by sequence, of the events that can end a run: an
+`error` or `warning` the worker addressed to the owner - the one whose payload carries
+`owner: true` - or the `status` a spend pause writes. Latest, because a task can be resumed past a
+stop: a provider wall at sequence 5 and a ceiling at sequence 11 is a task parked by the ceiling,
+and the wall is history. They are filled only on an ending that has a reason, which is `failed`
+and `blocked`. A spend pause is the one `blocked` ending the worker records without a code: it
+writes a `status` event carrying `blockedBy`, so on that ending `reasonCode` is given by the
+command - `spend_ceiling` when `blockedBy` is `task`, `daily` or `monthly`, and
+`spend_guard_unavailable`, with `blockedBy` null, when the guard itself could not answer. Two
+things make the rule narrower and wider than "the last `error` event":
 
 - a run that died of anything the provider did is recorded as a `warning`, not an `error`
   (`apps/worker/src/agent.ts`), and it still ends `failed` unless the code is one of the three
@@ -193,7 +214,9 @@ instead, so a result always carries the terms it was produced under.
 The three modes, and what each still stops for, are in `apps/worker/src/approval-policy.ts`:
 
 - **Review** asks before every command, every file written, and every browser or desktop action.
-- **Balanced** asks before reaching an address on the internet and before installing software.
+- **Balanced** asks whenever a command reaches an address on the internet, and before installing
+  software. The built-in web tools — search, page reads and the browser — read without asking;
+  what leaves on a turn that has read untrusted content is still carded, in every mode.
 - **Autonomous** asks only about what the computer cannot take back: publishing, sending, spending,
   destroying data, signing or accepting terms, anything it would go on running by itself, and a
   control on a screen that nothing could identify.

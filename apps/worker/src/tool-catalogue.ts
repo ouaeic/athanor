@@ -585,7 +585,16 @@ export const agentTools: ModelTool[] = [
       properties: {
         executable: { type: 'string' },
         args: { type: 'array', items: { type: 'string' } },
-        cwd: { type: 'string', default: 'workspace' },
+        cwd: {
+          type: 'string',
+          default: 'workspace',
+          // The one fact a model cannot get by trying, because trying answers with the kernel's
+          // ENOENT: the command already runs inside workspace/, so a path in it that repeats the
+          // prefix lands in workspace/workspace/. Measured live in six of ten tasks. The runner
+          // now reads a bare cwd from workspace/ too, so this clause is about the command text.
+          description:
+            'The command already runs inside workspace/, so a relative path in it is probe/x, never workspace/probe/x.'
+        },
         timeoutSeconds: {
           type: 'integer',
           minimum: 1,
@@ -860,7 +869,7 @@ export const agentTools: ModelTool[] = [
      *
      * The spec below is resident on every request and is therefore the number that had to be
      * argued. The reference dialect this was measured from spends 5,268 bytes describing itself;
-     * this spends 1,097, and the difference is not terseness. Three of the reference's paragraphs
+     * this spends 1,090, and the difference is not terseness. Three of the reference's paragraphs
      * describe a per-file version tag, what to do when it does not match, and how to recover from
      * that - and the harness here needs no tag at all, because `apps/worker/src/edit/snapshots.ts`
      * remembers what each read displayed and can therefore compare the file to what the model was
@@ -1319,7 +1328,12 @@ export const agentTools: ModelTool[] = [
       additionalProperties: false,
       required: ['path', 'content'],
       properties: {
-        path: { type: 'string' },
+        path: {
+          type: 'string',
+          // The other half of the shell's cwd clause: the file tools fold a bare name into
+          // workspace/, so the two spellings are one file here and the model need not choose.
+          description: 'Workspace-relative: probe/x and workspace/probe/x are the same file.'
+        },
         content: { type: 'string' }
       }
     }

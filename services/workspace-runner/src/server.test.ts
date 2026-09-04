@@ -900,6 +900,106 @@ describe('taking the machine over on one surface', () => {
     expect(acted.statusCode).toBeGreaterThanOrEqual(400);
     expect(JSON.stringify(acted.json())).toMatch(/held by user/);
   });
+
+  /*
+   * A screenshot is the one browser action that lands a file, and the action route is scoped for
+   * control alone. Held to the print route's terms: without the write scope the request ends at
+   * the scope check, before the browser or the disk is touched, on its own and inside a batch.
+   */
+  it('refuses a screenshot on the action route without the write scope', async () => {
+    const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'athanor-screenshot-scope-'));
+    disposers.push(() => rm(workspaceRoot, { recursive: true, force: true }));
+    const secret = 'runner-screenshot-scope-secret-at-least-32-chars';
+    const id = '00000000-0000-4000-8000-0000000000d8';
+    await ensureWorkspace(path.join(workspaceRoot, id));
+    class HeadlessDesktop extends DesktopManager {
+      constructor() {
+        super('/nonexistent/bridge.py', '/nonexistent/session.sh');
+      }
+    }
+    const config = {
+      RUNNER_HOST: '127.0.0.1',
+      RUNNER_PORT: 0,
+      RUNNER_SHARED_SECRET: secret,
+      WORKSPACE_ROOT: workspaceRoot,
+      TAR_EXECUTABLE: '/usr/bin/tar',
+      SNAPSHOT_EXECUTABLE: path.resolve('../../scripts/athanor-snapshot'),
+      BROWSER_USE_DESKTOP_DISPLAY: false,
+      MAX_EXECUTION_SECONDS: 30,
+      RESOURCE_LIMIT_EXECUTABLE: '/usr/bin/prlimit',
+      IMAGE_CONVERT_EXECUTABLE: 'magick',
+      MAX_BACKGROUND_SECONDS: 120,
+      COMMAND_PROCESS_LIMIT: 1024,
+      COMMAND_OPEN_FILE_LIMIT: 4096,
+      MAX_FILE_BYTES: 1024 * 1024,
+      RESERVED_PREVIEW_PORTS: [],
+      CHECKPOINT_BTRFS_EXECUTABLE: '/nonexistent/btrfs',
+      CHECKPOINT_ZFS_EXECUTABLE: '/nonexistent/zfs',
+      CHECKPOINT_PACKAGE_MANIFEST: '/nonexistent/status',
+      CHECKPOINT_INCLUDE_BROWSER_PROFILE: false,
+      CHECKPOINT_RETAIN_TURNS: 20,
+      CHECKPOINT_RETAIN_DAILY_DAYS: 14,
+      CHECKPOINT_MAX_FILES: 250_000,
+      CHECKPOINT_MAX_FILE_BYTES: 2 * 1024 ** 3,
+      ISOLATE_AGENT_NETWORK: false
+    } as RunnerConfig;
+    const app = await buildServer(config, {
+      desktop: new HeadlessDesktop(),
+      hostStorage: async () => ({
+        hostStorageTotalBytes: 100 * 1024 ** 3,
+        hostStorageAvailableBytes: 50 * 1024 ** 3
+      })
+    });
+    disposers.push(() => app.close());
+    const route = `/v1/workspaces/${id}/browser/action`;
+    const post = (scopes: string[], payload: Record<string, unknown>, nonce: string) =>
+      app.inject({
+        method: 'POST',
+        url: route,
+        headers: {
+          authorization: `Bearer ${signCapabilityToken(
+            {
+              sub: 'agent',
+              workspaceId: id,
+              role: 'agent',
+              scopes,
+              aud: capabilityAudience('POST', route),
+              nonce
+            },
+            secret,
+            120
+          )}`
+        },
+        payload
+      });
+
+    const alone = await post(
+      ['browser.control'],
+      { type: 'screenshot', path: 'proofs/page.png' },
+      'screenshot-scope-alone'
+    );
+    expect(alone.statusCode).toBeGreaterThanOrEqual(400);
+    expect(JSON.stringify(alone.json())).toMatch(/files\.write is required/);
+
+    const batched = await post(
+      ['browser.control'],
+      {
+        type: 'batch',
+        actions: [
+          { type: 'hover', selector: '#menu' },
+          { type: 'screenshot', path: 'proofs/menu.png' }
+        ]
+      },
+      'screenshot-scope-batched'
+    );
+    expect(batched.statusCode).toBeGreaterThanOrEqual(400);
+    expect(JSON.stringify(batched.json())).toMatch(/files\.write is required/);
+
+    // The control: an action that writes nothing is not asked for the write scope. It reaches the
+    // browser, which this box does not have, and is refused for that and not for a capability.
+    const reload = await post(['browser.control'], { type: 'reload' }, 'screenshot-scope-reload');
+    expect(JSON.stringify(reload.json())).not.toMatch(/is required/);
+  });
 });
 
 /**

@@ -322,7 +322,13 @@ describe('a turn the harness checked', () => {
     event(3, 'tool_started', 'Running file_patch', { tool: 'file_patch', toolCallId: 'c1' }),
     event(4, 'status', 'Acceptance checks: 2 of 2 passed', {
       acceptance: [
-        { id: 'check-1', label: 'The suite passes', passed: true, detail: 'exit 0' },
+        {
+          id: 'check-1',
+          label: 'The suite passes',
+          passed: true,
+          detail: 'exit 0',
+          command: 'pytest -q'
+        },
         { id: 'check-2', label: 'The report exists', passed: true, detail: '4213 bytes' }
       ]
     }),
@@ -338,6 +344,11 @@ describe('a turn the harness checked', () => {
     expect(markup).toContain('The harness ran 2 checks · all passed');
     expect(markup).toContain('The suite passes');
     expect(markup).toContain('exit 0');
+  });
+
+  it('prints the command it ran beside the label, so the label can be read against it', () => {
+    const markup = render(checkedTurn);
+    expect(markup).toContain('<code>pytest -q</code>');
   });
 
   it('reports the run that let the turn end, not the baseline taken before the work', () => {

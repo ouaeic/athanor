@@ -2818,6 +2818,8 @@ export class BrowserManager {
     framesOmitted?: number;
     text?: string;
     waited?: string;
+    /** Only for a screenshot: the workspace path the picture was written to. */
+    path?: string;
   }> {
     const page = resolveTab(session, 'tabId' in action ? action.tabId : undefined);
     let acted = page;
@@ -2984,6 +2986,22 @@ export class BrowserManager {
               .innerText({ timeout: 5_000 })
               .catch(() => '')
           ).slice(0, BROWSER_SNAPSHOT_TEXT_LIMIT)
+        };
+      }
+      case 'screenshot': {
+        // The picture the agent can keep, held to what a printed page is held to: the path goes
+        // through the file API's own boundary before anything is captured, and the bytes are
+        // written through it afterwards rather than a name being handed to the browser to open on
+        // its own, which would resolve it a second time after the check.
+        this.#assertReadablePage(page, session.control.holder === 'agent' ? 'agent' : 'user');
+        const relativePath = assertUserDataPath(root, action.path);
+        const image = await page.screenshot({ type: 'png' });
+        await writeWorkspaceFile(root, relativePath, image, this.options.maxFileBytes);
+        return {
+          url: page.url(),
+          title: await page.title().catch(() => ''),
+          tabId: tabIdFor(session, page),
+          path: relativePath
         };
       }
       case 'close_tab': {

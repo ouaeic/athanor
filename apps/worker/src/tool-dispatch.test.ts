@@ -734,6 +734,54 @@ describe('the workspace arms', () => {
     expect(executed.result).toMatchObject({ exitCode: 0, stdout: 'notes.md' });
   });
 
+  /*
+   * The one sentence the runner cannot say and the model cannot see: that its shell already runs in
+   * workspace/. A command naming `workspace/probe` from there reaches `workspace/workspace/probe`,
+   * and the only word it gets back is the kernel's ENOENT - which reads as "the file is not there"
+   * and sends the model into `find /`. Measured live in six of ten tasks. The note is appended only
+   * when the missing path the command's own stderr names begins with that prefix; an ENOENT for any
+   * other path says nothing, because nothing here knows why that one is missing.
+   */
+  it('says the shell is already in workspace/ when a workspace/ path comes back missing', async () => {
+    const executed = await dispatch(
+      {
+        name: 'shell',
+        arguments: {
+          executable: 'bash',
+          args: ['-lc', 'cd workspace/probe-2026-09-03 && python3 -m pytest -q']
+        }
+      },
+      {
+        route: (url) =>
+          url.endsWith(`${root}/exec`)
+            ? observation({
+                exitCode: 1,
+                stderr: 'bash: line 1: cd: workspace/probe-2026-09-03: No such file or directory\n'
+              })
+            : undefined
+      }
+    );
+    expect(executed.result).toMatchObject({ exitCode: 1 });
+    expect((executed.result as { note?: string }).note).toBe(
+      'The shell already runs inside workspace/, so write that path without the prefix: workspace/probe-2026-09-03 is probe-2026-09-03 here.'
+    );
+
+    const elsewhere = await dispatch(
+      { name: 'shell', arguments: { executable: 'cat', args: ['/etc/missing'] } },
+      {
+        route: (url) =>
+          url.endsWith(`${root}/exec`)
+            ? observation({
+                exitCode: 1,
+                stderr: 'cat: /etc/missing: No such file or directory\n'
+              })
+            : undefined
+      }
+    );
+    expect(elsewhere.result).toMatchObject({ exitCode: 1 });
+    expect(elsewhere.result).not.toHaveProperty('note');
+  });
+
   it('asks for the package-manager capability only when the command is one', async () => {
     const executed = await dispatch(
       { name: 'shell', arguments: { executable: '/usr/bin/apt-get', args: ['update'] } },
@@ -2522,6 +2570,49 @@ describe('the web arms', () => {
       maxCharactersPerPage: 12_000
     });
     expect(executed.result).toEqual({ sources: [], requested: 1, read: 0 });
+  });
+
+  it('carries the write scope on a screenshot, which is the one action that lands a file', async () => {
+    const executed = await dispatch(
+      {
+        name: 'browser_action',
+        arguments: { action: 'screenshot', path: 'workspace/proofs/checkout.png' }
+      },
+      {
+        route: (url) =>
+          url.endsWith(`${root}/browser/action`)
+            ? json({ path: 'workspace/proofs/checkout.png', url: 'https://example.com' })
+            : undefined
+      }
+    );
+    expect(executed.calls.at(-1)).toEqual({
+      method: 'POST',
+      path: `${root}/browser/action`,
+      scopes: ['browser.control', 'files.write'],
+      body: { type: 'screenshot', path: 'workspace/proofs/checkout.png' }
+    });
+    expect(executed.result).toMatchObject({ path: 'workspace/proofs/checkout.png' });
+
+    // Inside a batch as well, because a step is judged as the action it is.
+    const batched = await dispatch(
+      {
+        name: 'browser_action',
+        arguments: {
+          action: 'batch',
+          actions: [
+            { action: 'hover', selector: '#menu' },
+            { action: 'screenshot', path: 'menu.png' }
+          ]
+        }
+      },
+      {
+        route: (url) => (url.endsWith(`${root}/browser/action`) ? json({ steps: [] }) : undefined)
+      }
+    );
+    expect(batched.calls.at(-1)).toMatchObject({
+      path: `${root}/browser/action`,
+      scopes: ['browser.control', 'files.write']
+    });
   });
 
   it('drives the browser under control alone, with the purpose kept off the request', async () => {

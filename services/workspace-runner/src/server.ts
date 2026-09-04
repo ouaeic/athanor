@@ -44,7 +44,12 @@ import { machineReport, type CgroupReading } from './machine.js';
 import { runnerLogger } from './log.js';
 import { ProcessManager } from './processes.js';
 import { findRenderTools, proveRender, RENDER_SOURCE_MAX_BYTES } from './render-proof.js';
-import { resolveAgentSandbox, sandboxedInvocation, sandboxedShell } from './sandbox.js';
+import {
+  resolveAgentSandbox,
+  sandboxSpecDirectory,
+  sandboxedInvocation,
+  sandboxedShell
+} from './sandbox.js';
 import {
   assertUserDataPath,
   createWorkspaceFolder,
@@ -251,10 +256,17 @@ export interface RunnerServerOptions {
   desktop?: DesktopManager | undefined;
 }
 
+/** Whether a browser action, or any step of a batch, writes a file into the workspace. */
+const writesWorkspaceFile = (action: BrowserAction): boolean =>
+  action.type === 'batch'
+    ? action.actions.some((step) => step.type === 'screenshot')
+    : action.type === 'screenshot';
+
 export const buildServer = async (config: RunnerConfig, options: RunnerServerOptions = {}) => {
   const app = Fastify({ logger: false, bodyLimit: config.MAX_FILE_BYTES });
   const sandbox = await resolveAgentSandbox(
     config.AGENT_SANDBOX_HELPER,
+    sandboxSpecDirectory(config.WORKSPACE_ROOT),
     config.CONFINE_AGENT_FILESYSTEM
   );
   const privilegedHelpers = [config.SYSTEM_PACKAGE_HELPER, sandbox?.helper];
@@ -557,7 +569,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
    */
   const clearAgentOwnedFiles = async (root: string): Promise<void> => {
     if (!sandbox) return;
-    const invocation = sandboxedInvocation(
+    const invocation = await sandboxedInvocation(
       { executable: '/bin/rm', args: ['-rf', '--', root] },
       { PATH: '/usr/bin:/bin' },
       sandbox,
@@ -566,7 +578,10 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
       // the workspace, and a ruleset that admits `workspace/` and nothing above it would let it
       // empty the tree and then refuse to remove the tree - leaving the delete half done and the
       // runner's own `rm` below to report a failure with no cause a reader could see.
-      null
+      null,
+      // Run from the root of the filesystem: the tree it removes is named in full, and the one
+      // directory it must not be started in is the one that is going.
+      '/'
     );
     await new Promise<void>((resolve) => {
       const child = spawn(invocation.executable, invocation.args, {
@@ -1520,10 +1535,17 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
       requireScope(request, 'browser.control');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
       await ensureWorkspace(root);
+      const action = BrowserAction.parse(request.body);
+      // A screenshot is a workspace write wearing an action's name, so it is held to what the
+      // print route is held to: the write scope, and a host disk with room for the file.
+      if (writesWorkspaceFile(action)) {
+        requireScope(request, 'files.write');
+        await assertHostStorageWrite(root, 0, probeHostStorage);
+      }
       return browser.act(
         request.params.workspaceId,
         root,
-        BrowserAction.parse(request.body),
+        action,
         request.capability.role === 'user' ? 'user' : 'agent',
         request.capability.scopes.includes('browser.consequential')
       );

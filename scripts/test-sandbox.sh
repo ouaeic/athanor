@@ -15,6 +15,10 @@ fake_bin="$test_root/bin"
 records="$test_root/records"
 mkdir -p "$fake_bin" "$records"
 
+# The account that asks, as the helper learns it from SUDO_UID: sudo sets that on the box, and this
+# harness has to. Read before any recorder is on the PATH, because the `id` below answers as root.
+runner_uid=$(id -u)
+
 make_fake() {
   printf '#!/bin/sh\n%s\n' "$2" >"$fake_bin/$1"
   chmod 0755 "$fake_bin/$1"
@@ -104,9 +108,38 @@ chmod 0755 "$sandbox"
 grep -q "^workspace_parent=\"$workspaces\"$" "$sandbox" ||
   { printf 'the harness could not redirect workspace_parent; the assertions below would be vacuous\n' >&2; exit 1; }
 
+# The `run` arm reads its command from a spec file, so a request spelled out in full here is written
+# into one the way the runner writes it (services/workspace-runner/src/sandbox.ts): a header, then
+# every word NUL-terminated, the environment first and then the executable and its arguments. Both
+# `printf %s` and `"$@"` are byte-exact, so the file holds exactly what the request said and every
+# assertion below is about the helper's reading of it. A request with fewer than four words after
+# `run` is passed through untouched, which is how the malformed-request cases below reach the helper.
+#
+# The file is where the runner puts it - `<workspace parent>/.athanor/sandbox/<hex>.spec`, the one
+# path shape the helper reads - and the word after its header is the directory the command is to
+# run in, which is how that directory stays off sudo's own record of where it was started.
+spec_parent="$workspaces/.athanor/sandbox"
+mkdir -p "$spec_parent"
+chmod 0700 "$spec_parent"
+spec="$spec_parent/0123456789abcdef0123456789abcdef.spec"
+spec_cwd="$test_root"
+write_spec() {
+  {
+    printf 'athanor-sandbox-spec 2\0%s\0' "$spec_cwd"
+    [ "$#" -eq 0 ] || printf '%s\0' "$@"
+  } >"$spec"
+}
 run_sandbox() {
-  rm -f "$records/setpriv" "$records/unshare"
-  PATH="$fake_bin:$PATH" ATHANOR_TEST_RECORDS="$records" "$sandbox" "$@"
+  rm -f "$records/setpriv" "$records/unshare" "$spec"
+  if [ "${1:-}" = run ] && [ "$#" -ge 4 ]; then
+    run_network=$2
+    run_confinement=$3
+    run_root=$4
+    shift 4
+    write_spec "$@"
+    set -- run "$run_network" "$run_confinement" "$run_root" --spec "$spec"
+  fi
+  PATH="$fake_bin:$PATH" ATHANOR_TEST_RECORDS="$records" SUDO_UID="$runner_uid" "$sandbox" "$@"
 }
 
 # A command that was granted the network keeps the host's, and is still handed to the agent
@@ -126,6 +159,59 @@ output=$(ATHANOR_LEAK=must-not-arrive run_sandbox run network open - PATH=/usr/b
   /bin/sh -c 'printf "%s|%s" "$PATH" "${ATHANOR_LEAK-unset}"')
 test "$output" = '/usr/bin:/bin|unset'
 printf 'ok  the command gets exactly the environment it was given\n'
+
+# Why the command travels in a file at all, asserted at the byte. The words are read by a program
+# that can hold a NUL and does not strip anything, so an argument that ends in a newline - which a
+# heredoc body always does - has to arrive with it, and bytes that a shell would have quoted,
+# expanded or refused have to arrive untouched. The two trailing newlines are the case a shell
+# cannot pass through `$(...)`; they are kept here by the trailing-x idiom and checked on their own
+# at the end, so a reading that lost them fails by name rather than only in cmp's offset.
+tricky=$(printf 'line one\ttab "quoted" \\back $dollar `tick` \001\177\303\251 trailing\n\n'; printf x)
+tricky=${tricky%x}
+printf '%s' "$tricky" >"$test_root/expected"
+run_sandbox run network open - /bin/sh -c 'printf "%s" "$1" >"$2"' athanor-sandbox "$tricky" \
+  "$test_root/delivered"
+cmp "$test_root/expected" "$test_root/delivered" ||
+  { printf 'the command did not arrive byte for byte\n' >&2; exit 1; }
+test "$(tail -c 2 "$test_root/delivered" | tr '\n' N)" = NN ||
+  { printf 'the trailing newlines were lost on the way to the command\n' >&2; exit 1; }
+# The file is the one place the command text exists outside the runner, and it is gone before the
+# command starts: unlinked by the reader, so nothing that runs afterwards - the command itself
+# included - can find it on disk.
+if [ -e "$spec" ]; then
+  printf 'the spec file was left behind after the command ran\n' >&2
+  exit 1
+fi
+printf 'ok  the command arrives byte for byte, trailing newlines included, and the spec is unlinked\n'
+
+# And an empty argument, which is a word with nothing in it rather than no word: two terminators in
+# a row. A reader that split on runs of NUL would drop it and shift every argument after it left.
+output=$(run_sandbox run network open - /bin/sh -c 'printf "%s|%s|%s" "$#" "$1" "$2"' sh "" second)
+test "$output" = '2||second'
+printf 'ok  an empty argument arrives as an empty argument\n'
+
+# The directory the command runs in travels in the spec as well, because sudo records the
+# directory it was started from beside the command in its journal line, and the runner used to
+# start it from the directory the agent chose - a name used inside the task. The helper enters the
+# directory from the spec after sudo has written its line. A relative one would be resolved
+# against wherever sudo happened to start, so it is refused, and so is one that is not there.
+mkdir -p "$test_root/acme-lawsuit-discovery"
+spec_cwd="$test_root/acme-lawsuit-discovery"
+output=$(run_sandbox run network open - /bin/sh -c 'pwd -P')
+test "$output" = "$(cd "$test_root/acme-lawsuit-discovery" && pwd -P)"
+printf 'ok  the command runs in the directory the spec names\n'
+spec_cwd="acme-lawsuit-discovery"
+if run_sandbox run network open - /bin/sh -c : >/dev/null 2>&1; then
+  printf 'the sandbox ran a command in a directory named relative to nothing\n' >&2
+  exit 1
+fi
+spec_cwd="$test_root/absent"
+if run_sandbox run network open - /bin/sh -c : >/dev/null 2>&1; then
+  printf 'the sandbox ran a command in a directory that does not exist\n' >&2
+  exit 1
+fi
+spec_cwd="$test_root"
+printf 'ok  a working directory that is relative or absent is refused\n'
 
 output=$(run_sandbox run isolated open - /bin/sh -c 'printf isolated')
 test "$output" = isolated
@@ -288,6 +374,13 @@ do
   fi
 done
 printf 'ok  a root that is not a workspace under the workspace parent is refused\n'
+# A refused request leaves no spec behind either. The runner has handed the file over by then, and
+# the helper is the only thing left that knows to remove it.
+if [ -e "$spec" ]; then
+  printf 'a refused request left its spec file on disk\n' >&2
+  exit 1
+fi
+printf 'ok  a refused request takes its spec file with it\n'
 
 # `open` is the mode the workspace delete path and the owner's shell take, and it must reach the
 # exec line with no ruleset at all - a stray rule there would refuse the delete it exists to do.
@@ -381,6 +474,147 @@ do
   fi
 done
 printf 'ok  a malformed request is refused rather than guessed at\n'
+
+# The command on the argument list is the shape this helper exists to refuse: sudo writes every
+# argument of a privileged invocation to the system journal, and a helper that still ran a command
+# spelled there would let one stale caller put file contents back on disk outside every checkpoint.
+# Called directly rather than through `run_sandbox`, which would rewrite the request into a spec.
+raw_sandbox() {
+  PATH="$fake_bin:$PATH" ATHANOR_TEST_RECORDS="$records" SUDO_UID="$runner_uid" "$sandbox" "$@"
+}
+# The same, asking as an account other than the one that wrote the spec.
+raw_sandbox_as() {
+  asking_uid="$1"
+  shift
+  PATH="$fake_bin:$PATH" ATHANOR_TEST_RECORDS="$records" SUDO_UID="$asking_uid" "$sandbox" "$@"
+}
+if raw_sandbox run network open - /bin/sh -c : >/dev/null 2>&1; then
+  printf 'the sandbox ran a command spelled on its argument list\n' >&2
+  exit 1
+fi
+if raw_sandbox run network open - GREETING=hello /bin/sh -c : >/dev/null 2>&1; then
+  printf 'the sandbox ran a command whose environment was spelled on its argument list\n' >&2
+  exit 1
+fi
+write_spec /bin/sh -c :
+if raw_sandbox run network open - --spec "$spec" /bin/sh -c : >/dev/null 2>&1; then
+  printf 'the sandbox accepted words after the spec path\n' >&2
+  exit 1
+fi
+if raw_sandbox run network open - --spec >/dev/null 2>&1; then
+  printf 'the sandbox accepted --spec with no path\n' >&2
+  exit 1
+fi
+if raw_sandbox run network open - --spec "$test_root/absent" >/dev/null 2>&1; then
+  printf 'the sandbox accepted a spec path that does not exist\n' >&2
+  exit 1
+fi
+# A spec whose header is not this helper's is refused rather than read as a command: the header is
+# what tells a helper and a runner that are out of step apart from a file that simply has a shell
+# command in it.
+printf 'GREETING=hello\0/bin/sh\0-c\0:\0' >"$spec"
+if raw_sandbox run network open - --spec "$spec" >/dev/null 2>&1; then
+  printf 'the sandbox read a spec without the header\n' >&2
+  exit 1
+fi
+# And it is left where it was. The header is what says the file is this helper's to remove, and a
+# file without it is removed by nothing here; the runner sweeps its own directory at startup.
+if [ ! -e "$spec" ]; then
+  printf 'the sandbox removed a spec it could not vouch for\n' >&2
+  exit 1
+fi
+rm -f "$spec"
+# A spec that carries assignments and no command is `no command was given`, exactly as an
+# argument list ending in an assignment is.
+write_spec GREETING=hello
+if raw_sandbox run network open - --spec "$spec" >/dev/null 2>&1; then
+  printf 'the sandbox ran a spec holding an environment and no command\n' >&2
+  exit 1
+fi
+printf 'ok  a command on the argument list, or a spec the helper cannot vouch for, is refused\n'
+
+# ── Where the spec may be ─────────────────────────────────────────────────────────────────────
+#
+# The helper removes the file it is handed, as root. Accepting any path for it was a root-level
+# delete of any file on the box for the runner's account: name the sudoers policy or /etc/shadow,
+# be refused, and find it gone. So a spec is `<workspace parent>/.athanor/sandbox/<hex>.spec` and
+# nothing else, owned by the account that asked, with one name - and a file refused on any of
+# those is still there afterwards, on the reading path and on a refusal path alike.
+mkdir -p "$test_root/etc/sudoers.d"
+printf 'athanor-sandbox-spec 2\0%s\0/bin/sh\0-c\0:\0' "$test_root" \
+  >"$test_root/etc/sudoers.d/athanor-packages"
+printf 'root:x:0:0\n' >"$test_root/etc/shadow"
+if raw_sandbox run network open - --spec "$test_root/etc/sudoers.d/athanor-packages" \
+  >/dev/null 2>&1; then
+  printf 'the sandbox read a spec from outside its directory\n' >&2
+  exit 1
+fi
+if [ ! -e "$test_root/etc/sudoers.d/athanor-packages" ]; then
+  printf 'a refused spec outside the spec directory was removed\n' >&2
+  exit 1
+fi
+if raw_sandbox run network bogus - --spec "$test_root/etc/shadow" >/dev/null 2>&1; then
+  printf 'the sandbox accepted a spec outside its directory on a refusal path\n' >&2
+  exit 1
+fi
+if [ ! -e "$test_root/etc/shadow" ]; then
+  printf 'a refusal removed a file outside the spec directory\n' >&2
+  exit 1
+fi
+# Inside the directory but not the name the runner writes: a subdirectory, a name that is not
+# hexadecimal, and a name without the suffix. Each refused, each left alone.
+mkdir -p "$spec_parent/sub"
+for planted in \
+  "$spec_parent/sub/0123456789abcdef.spec" \
+  "$spec_parent/planted.spec" \
+  "$spec_parent/0123456789abcdef"
+do
+  printf 'athanor-sandbox-spec 2\0%s\0/bin/sh\0-c\0:\0' "$test_root" >"$planted"
+  if raw_sandbox run network open - --spec "$planted" >/dev/null 2>&1; then
+    printf 'the sandbox read a spec not named the way the runner names one: %s\n' "$planted" >&2
+    exit 1
+  fi
+  if [ ! -e "$planted" ]; then
+    printf 'a refused spec was removed: %s\n' "$planted" >&2
+    exit 1
+  fi
+done
+rm -rf "$spec_parent/sub" "$spec_parent/planted.spec" "$spec_parent/0123456789abcdef"
+printf 'ok  a spec anywhere but the spec directory, under the name the runner gives one, is refused and left alone\n'
+
+# Owned by someone else, or with a second name. sudo says who asked in SUDO_UID, and a file that
+# account does not own is not its file to have removed - and neither is a file it could not name
+# at all. A hard link is a second name for a file that may be root's. All refused before the
+# unlink, so the file is still there.
+write_spec /bin/sh -c :
+if raw_sandbox_as 99999 run network open - --spec "$spec" >/dev/null 2>&1; then
+  printf 'the sandbox read a spec owned by an account other than the one that asked\n' >&2
+  exit 1
+fi
+if [ ! -e "$spec" ]; then
+  printf 'a spec owned by another account was removed\n' >&2
+  exit 1
+fi
+if PATH="$fake_bin:$PATH" ATHANOR_TEST_RECORDS="$records" env -u SUDO_UID \
+  "$sandbox" run network open - --spec "$spec" >/dev/null 2>&1; then
+  printf 'the sandbox ran without knowing which account asked\n' >&2
+  exit 1
+fi
+if [ ! -e "$spec" ]; then
+  printf 'a spec was removed for an asker nothing named\n' >&2
+  exit 1
+fi
+ln "$spec" "$spec_parent/fedcba9876543210fedcba9876543210.spec"
+if raw_sandbox run network open - --spec "$spec" >/dev/null 2>&1; then
+  printf 'the sandbox read a spec with a second name\n' >&2
+  exit 1
+fi
+if [ ! -e "$spec" ]; then
+  printf 'a spec with a second name was removed\n' >&2
+  exit 1
+fi
+rm -f "$spec" "$spec_parent/fedcba9876543210fedcba9876543210.spec"
+printf 'ok  a spec the asking account does not own, or with a second name, is refused before it is removed\n'
 
 # Without root the helper cannot drop privilege at all, so it must not pretend to have.
 make_fake id 'case "$*" in "-u") printf "1000\n" ;; *) printf "4321\n" ;; esac'

@@ -29,7 +29,7 @@ import {
   refreshArtifactLedger,
   type ArtifactLedger
 } from './context.js';
-import { forgetReads, recordRead } from './edit/index.js';
+import { forgetReads, forgetRefusals, recordRead } from './edit/index.js';
 import { executeWorkspaceTool } from './tools/workspace.js';
 import type { AgentState } from './agent-state.js';
 import type { ToolContext } from './tool-dispatch.js';
@@ -94,6 +94,10 @@ const run = async (
   } = {}
 ): Promise<Ran> => {
   forgetReads();
+  // Every case here is `task-1`, and the repeated-patch bound remembers refusals per task and
+  // path across cases: without this a case that resends a patch an earlier case was refused gets
+  // the bounded sentence instead of the refusal it is asserting on.
+  forgetRefusals();
   const written = new Map<string, string>(Object.entries(options.files ?? {}));
   for (const path of options.seen ?? []) recordRead('task-1', path, 1, written.get(path) ?? '');
   for (const [path, text] of Object.entries(options.shown ?? {}))

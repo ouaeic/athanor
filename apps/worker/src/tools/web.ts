@@ -117,14 +117,28 @@ export async function executeSurfaceTool(
           }
         : read;
     }
-    case 'browser_action':
+    case 'browser_action': {
+      const request = surfaceActionRequest(call.arguments);
+      // A screenshot writes a workspace file, so it carries the write scope a printed PDF carries;
+      // the runner refuses the write without it, whether the step is on its own or in a batch.
+      const writes =
+        request.type === 'screenshot' ||
+        (Array.isArray(request.actions) &&
+          request.actions.some(
+            (step) => (step as { type?: unknown } | null)?.type === 'screenshot'
+          ));
       return context.runner.call(
         task.workspaceId,
         task.id,
-        consequentialApproved ? ['browser.control', 'browser.consequential'] : 'browser.control',
+        [
+          'browser.control',
+          ...(consequentialApproved ? ['browser.consequential'] : []),
+          ...(writes ? ['files.write'] : [])
+        ],
         `${root}/browser/action`,
-        surfaceActionRequest(call.arguments)
+        request
       );
+    }
     case 'desktop_observe':
       return context.runner.call(
         task.workspaceId,

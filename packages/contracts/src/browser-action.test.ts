@@ -65,6 +65,19 @@ describe('browser action contract', () => {
     });
   });
 
+  it('carries a screenshot path through as written, for the runner to place inside the workspace', () => {
+    // The same rule as upload paths: the shape must not normalise what the model asked for, because
+    // the runner judges the name against a concrete root and refuses what steps outside it.
+    expect(
+      BrowserAction.parse({ type: 'screenshot', path: 'workspace/proofs/checkout.png' })
+    ).toEqual({ type: 'screenshot', path: 'workspace/proofs/checkout.png' });
+    expect(
+      BrowserAction.parse({ type: 'screenshot', path: 'checkout.png', tabId: 'tab-2' })
+    ).toEqual({ type: 'screenshot', path: 'checkout.png', tabId: 'tab-2' });
+    expect(BrowserAction.safeParse({ type: 'screenshot' }).success).toBe(false);
+    expect(BrowserAction.safeParse({ type: 'screenshot', path: '' }).success).toBe(false);
+  });
+
   it('rejects an unknown action type', () => {
     expect(BrowserAction.safeParse({ type: 'drag', selector: '#a' }).success).toBe(false);
   });

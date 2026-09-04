@@ -187,6 +187,11 @@ jobs:
       # to replace.
       - name: Prove doctor still says a model is being withdrawn
         run: sh scripts/test-doctor-retirement.sh
+      # The same shape one check along: a health port faked, everything else refused, and the
+      # question of whether `doctor` tells a box with no enrolled device apart from one whose
+      # devices are all healthy. Needs nothing installed, and sits here because it is a doctor drill.
+      - name: Prove doctor says when nothing is enrolled to be notified
+        run: sh scripts/test-doctor-notifications.sh
 
   # The two harnesses that prove the privileged edges of a box still behave, and the drill that
   # measures the one property every confinement directive on the runner unit can silently take

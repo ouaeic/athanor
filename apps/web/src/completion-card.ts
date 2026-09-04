@@ -28,6 +28,13 @@ export interface HarnessCheck {
   label: string;
   passed: boolean;
   detail: string;
+  /**
+   * What was run, for a command check. The label is the agent's sentence and `passed` is the
+   * harness vouching for the command, so a reader can only tell which half of "54 rows (30 months
+   * x 3 products)" the computer checked when the command is printed beside it. Absent for an
+   * artifact check, which runs nothing.
+   */
+  command?: string;
 }
 
 export interface CompletionCard {
@@ -87,7 +94,8 @@ export const harnessRun = (event: TaskEvent): HarnessCheck[] | undefined => {
         id: typeof entry.id === 'string' ? entry.id : '',
         label: entry.label as string,
         passed: entry.passed === true,
-        detail: entry.detail as string
+        detail: entry.detail as string,
+        ...(typeof entry.command === 'string' && entry.command ? { command: entry.command } : {})
       })
     );
   return checks.length ? checks : undefined;
@@ -130,9 +138,17 @@ export const completionCard = (
   const harnessCaveats = strings(data.acceptance, 20).filter((line) =>
     remainingRisks.includes(line)
   );
+  /*
+   * The agent's claims only. The harness writes its own passed checks into the same array, under
+   * a source the agent cannot declare, and those lines are the run the card already shows above
+   * this list with the command beside each label; listed here too they would be read under the
+   * heading "What the agent says it checked", which is the one thing they are not.
+   */
   const evidence = Array.isArray(verification?.evidence)
     ? verification.evidence
-        .map((item) => record(item)?.claim)
+        .map((item) => record(item))
+        .filter((item) => item?.source !== 'acceptance_check')
+        .map((item) => item?.claim)
         .filter((claim): claim is string => typeof claim === 'string' && claim.trim() !== '')
         .slice(0, 20)
     : [];

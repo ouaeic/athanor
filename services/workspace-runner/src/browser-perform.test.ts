@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -346,6 +346,10 @@ const buildHarness = (): Harness => {
         return landed();
       },
       bringToFront: async () => say('bringToFront'),
+      screenshot: async (options: { type: string }) => {
+        say(`screenshot ${options.type}`);
+        return Buffer.from('png-bytes');
+      },
       close: async () => {
         say('close');
         closed = true;
@@ -883,6 +887,85 @@ describe('uploading a workspace file', () => {
         root
       )
     ).rejects.toThrow();
+    expect(harness.trace).toEqual([]);
+  });
+});
+
+/**
+ * A screenshot the agent can keep: the page as the browser is showing it, written as a PNG to a
+ * workspace path. Measured before this existed: 23 of 25 tool calls in one live task went on
+ * discovering that no browser tool wrote a picture to disk, two of them full-filesystem finds. The
+ * bytes travel through the file API's own boundary and size limit, as a printed PDF's do, so the
+ * browser is never handed a name to open for itself.
+ */
+describe('saving a screenshot to the workspace', () => {
+  const roots: string[] = [];
+  const workspace = async (): Promise<string> => {
+    const root = await mkdtemp(path.join(tmpdir(), 'athanor-screenshot-'));
+    roots.push(root);
+    await mkdir(path.join(root, 'workspace'), { recursive: true });
+    return root;
+  };
+  afterAll(async () => {
+    for (const root of roots) await rm(root, { recursive: true, force: true });
+  });
+
+  it('writes the page as a PNG at the path asked for, creating its folder', async () => {
+    const root = await workspace();
+    const harness = buildHarness();
+    const result = stepResult(
+      await act(
+        harness,
+        { type: 'screenshot', path: 'workspace/proofs/checkout.png' },
+        'agent',
+        false,
+        root
+      )
+    );
+    expect(harness.trace).toEqual(['tab-1 screenshot png']);
+    expect(result.path).toBe(path.join('workspace', 'proofs', 'checkout.png'));
+    expect(await readFile(path.join(root, 'workspace', 'proofs', 'checkout.png'), 'utf8')).toBe(
+      'png-bytes'
+    );
+  });
+
+  it('reads a bare name from workspace/, and a named tab in place', async () => {
+    const root = await workspace();
+    const harness = buildHarness();
+    const result = stepResult(
+      await act(
+        harness,
+        { type: 'screenshot', path: 'receipt.png', tabId: 'tab-2' },
+        'agent',
+        false,
+        root
+      )
+    );
+    expect(harness.trace).toEqual(['tab-2 screenshot png']);
+    expect(result.tabId).toBe('tab-2');
+    expect(result.url).toBe(OTHER_URL);
+    expect(await readFile(path.join(root, 'workspace', 'receipt.png'), 'utf8')).toBe('png-bytes');
+  });
+
+  it('refuses a path outside the user data boundary before the picture is taken', async () => {
+    const root = await workspace();
+    const harness = buildHarness();
+    await expect(
+      act(harness, { type: 'screenshot', path: '../../etc/cron.d/job.png' }, 'agent', false, root)
+    ).rejects.toThrow('escapes workspace');
+    await expect(
+      act(harness, { type: 'screenshot', path: '.athanor/browser/state.png' }, 'agent', false, root)
+    ).rejects.toThrow('Only workspace files');
+    expect(harness.trace).toEqual([]);
+  });
+
+  it('refuses the agent a picture of a page that is not on the public internet', async () => {
+    const root = await workspace();
+    const harness = buildHarness();
+    harness.session.page.url = () => LOOPBACK_URL;
+    await expect(
+      act(harness, { type: 'screenshot', path: 'admin.png' }, 'agent', false, root)
+    ).rejects.toThrow('not an address on the public internet');
     expect(harness.trace).toEqual([]);
   });
 });

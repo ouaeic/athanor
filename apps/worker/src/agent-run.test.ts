@@ -4325,8 +4325,15 @@ describe('what would prove the job is done', () => {
     expect(completed).toBeDefined();
     // What the harness itself ran, kept apart from what the model claimed.
     expect((completed?.payload as { acceptance?: string[] }).acceptance).toEqual([
-      'check-1: the importer test passes — exit 0'
+      'check-1: the importer test passes — ran pytest -q — exit 0'
     ]);
+    // And the same line in the field a script reads first, under the source only the harness writes.
+    const evidence = (completed?.payload as { verification?: { evidence?: unknown[] } })
+      .verification?.evidence;
+    expect(evidence).toContainEqual({
+      claim: 'check-1: the importer test passes — ran pytest -q — exit 0',
+      source: 'acceptance_check'
+    });
   });
 
   const importerCheck = {
@@ -4541,7 +4548,9 @@ describe('what would prove the job is done', () => {
       acceptance?: string[];
       verification?: { remainingRisks: string[] };
     };
-    expect(payload.acceptance).toEqual(['check-1: the importer test passes — exit 0']);
+    expect(payload.acceptance).toEqual([
+      'check-1: the importer test passes — ran pytest -q — exit 0'
+    ]);
     /*
      * What the owner is not told is when the checks were written relative to the work, because that
      * is a fact about how this box sequences its own steps and not about the job it just finished.

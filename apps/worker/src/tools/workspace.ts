@@ -2,8 +2,11 @@ import { sha256, AthanorError } from '@athanor/core';
 import { type ModelToolCall } from '@athanor/model-gateway';
 import {
   applyEdit,
+  boundRepeatedRefusal,
+  checkSyntax,
   displayedRanges,
   firstUnshownLine,
+  forgetRefusal,
   numberedWindow,
   readsOf,
   recordRead,
@@ -23,6 +26,8 @@ import {
   postEditDiagnostics
 } from './diagnostics.js';
 import { finiteNumber } from './numbers.js';
+import { withWorkspacePrefixNote } from './shell-frame.js';
+import { refuseShellReplacementOfUnread } from './shell-writes.js';
 
 /**
  * How much of what a patch just wrote comes back in the result.
@@ -693,12 +698,19 @@ export async function executeWorkspaceTool(
  */
 async function runWorkspaceTool(context: ToolContext, call: ModelToolCall): Promise<unknown> {
   const { task, state } = context;
+  // Whose evidence a read here is. The lead's window is the task; a specialist's is named on the
+  // context, and its reads must not vouch for lines the lead has never been shown.
+  const reader = context.reader ?? task.id;
   const root = `/v1/workspaces/${task.workspaceId}`;
   switch (call.name) {
     case 'shell': {
       const background = call.arguments.background === true;
       const execution = { ...call.arguments };
       delete execution.background;
+      // A redirect or a `tee` over a file this turn has read part of is the whole-file write the
+      // arm below refuses, spelled through the shell - and the runner's ledger cannot see a
+      // redirect. Asked here, of the same record, before anything is sent.
+      refuseShellReplacementOfUnread(reader, state, execution);
       const executable = textValue(execution.executable).split('/').pop()?.toLowerCase();
       /*
        * Whether this invocation is asking the computer to install software on itself.
@@ -750,7 +762,9 @@ async function runWorkspaceTool(context: ToolContext, call: ModelToolCall): Prom
         `${root}/usage`
       );
       await context.store.setWorkspaceStorage(task.userId, task.workspaceId, usage.storageBytes);
-      return result;
+      // The runner reports a missing file; only this side knows the command was written against
+      // the wrong frame. One sentence, appended only where it is true - @see shell-frame.ts.
+      return withWorkspacePrefixNote(execution, result);
     }
     case 'process': {
       const action = textValue(call.arguments.action, 'list');
@@ -836,7 +850,7 @@ async function runWorkspaceTool(context: ToolContext, call: ModelToolCall): Prom
          */
         const shownLines = toLines(read.content);
         const whole = read.partialLine ? shownLines.slice(0, -1) : shownLines;
-        if (whole.length) recordRead(task.id, path, read.startLine, whole.join('\n'));
+        if (whole.length) recordRead(reader, path, read.startLine, whole.join('\n'));
         /*
          * What this window leaves outstanding, so the whole-file write below can be asked about it.
          *
@@ -867,8 +881,7 @@ async function runWorkspaceTool(context: ToolContext, call: ModelToolCall): Prom
         state.partialReads = withPartialRead(
           state.partialReads,
           path,
-          read.totalLines !== undefined &&
-            firstUnshown(task.id, path, read.totalLines) === undefined
+          read.totalLines !== undefined && firstUnshown(reader, path, read.totalLines) === undefined
             ? undefined
             : reachTo
         );
@@ -936,7 +949,7 @@ async function runWorkspaceTool(context: ToolContext, call: ModelToolCall): Prom
       // Only what was displayed whole is recorded as displayed. This is the whole point of the
       // bound: `readsOf` is the evidence `file_patch` rests a line number on, and before this it
       // vouched for every line of the file after a read that had put a fraction of them on screen.
-      if (whole.length) recordRead(task.id, path, 1, whole.join('\n'));
+      if (whole.length) recordRead(reader, path, 1, whole.join('\n'));
       return {
         path,
         startLine: 1,
@@ -993,6 +1006,7 @@ async function runWorkspaceTool(context: ToolContext, call: ModelToolCall): Prom
         sha256: string;
         lines: number;
         wrote: string;
+        renumbered: readonly string[];
         notes: readonly string[];
       }> = [];
       const failures: Array<{ path: string; reason: string }> = [];
@@ -1032,11 +1046,26 @@ async function runWorkspaceTool(context: ToolContext, call: ModelToolCall): Prom
           });
           continue;
         }
-        const result = applyEdit(path, edit, before, readsOf(task.id, path));
+        const result = applyEdit(path, edit, before, readsOf(reader, path));
         if (!result.ok) {
-          failures.push({ path, reason: result.refusal.message });
+          /*
+           * The same bytes refused twice get the fix and not the reason a second time. The applier
+           * has said why once; a model that sent the identical patch back has read the reason and
+           * not acted on it, and `edit/refusals.ts` is the bound on how many times that is said.
+           */
+          const lines = toLines(before);
+          const bounded = boundRepeatedRefusal(
+            task.id,
+            path,
+            edit,
+            result.refusal,
+            lines,
+            firstUnshown(reader, path, lines.length) === undefined
+          );
+          failures.push({ path, reason: bounded.message });
           continue;
         }
+        forgetRefusal(task.id, path);
         const written = await context.runner.writeFile(
           task.workspaceId,
           task.id,
@@ -1074,7 +1103,7 @@ async function runWorkspaceTool(context: ToolContext, call: ModelToolCall): Prom
           path,
           after.length - toLines(before).length
         );
-        recordWrite(task.id, path, result.text, result.changed);
+        recordWrite(reader, path, result.text, result.changed);
         // The ledger row, written where the write landed rather than where it was asked for: a
         // patch that was refused above has already `continue`d into `failures` and never reaches
         // here, so a path in the block is a path the workspace confirmed. @see ARTIFACT_LEDGER_MARKER.
@@ -1084,6 +1113,19 @@ async function runWorkspaceTool(context: ToolContext, call: ModelToolCall): Prom
           bytes: landedBytes(written, result.text),
           step: state.step
         });
+        /*
+         * The fast syntax gate, on what is now on disk, as a note and never a refusal. The
+         * deferred checker armed below still runs and still lands on a later call; this is the
+         * one question it cannot answer on this turn - does the file still parse - and the
+         * numbered line beside the answer is what makes the fix one more edit rather than a read.
+         */
+        const fault = await checkSyntax(path, result.text);
+        const notes = fault
+          ? [
+              ...result.notes,
+              `syntax ${path} line ${fault.line}: ${fault.message}\n${numberedWindow(after, { from: fault.line, to: fault.line }, 1)}`
+            ]
+          : result.notes;
         applied.push({
           path,
           sha256: sha256(result.text),
@@ -1098,7 +1140,8 @@ async function runWorkspaceTool(context: ToolContext, call: ModelToolCall): Prom
             // A blank line between regions: two ranges of numbers run together read as one range
             // with a gap in it, which is the one thing this echo exists to make unambiguous.
             .join('\n\n'),
-          notes: result.notes
+          renumbered: result.renumbered,
+          notes
         });
       }
       if (!applied.length)
@@ -1139,6 +1182,15 @@ async function runWorkspaceTool(context: ToolContext, call: ModelToolCall): Prom
         patchCount: applied.length,
         // The numbers the file now has, so the next edit to it addresses this and not the read.
         wrote: applied.map(({ path, wrote }) => `${path}\n${wrote}`).join('\n\n'),
+        // And how the numbers of the read map onto them, so the rest of the file can be addressed
+        // without a read: the ledger has moved by exactly these amounts.
+        ...(applied.some(({ renumbered }) => renumbered.length)
+          ? {
+              renumbered: applied
+                .filter(({ renumbered }) => renumbered.length)
+                .map(({ path, renumbered }) => `${path}: ${renumbered.join('; ')}`)
+            }
+          : {}),
         ...(applied.some(({ notes }) => notes.length)
           ? { notes: applied.flatMap(({ notes }) => notes) }
           : {}),
@@ -1181,7 +1233,7 @@ async function runWorkspaceTool(context: ToolContext, call: ModelToolCall): Prom
        */
       const outstanding = state.partialReads?.[writePath];
       const unshownFrom =
-        outstanding === undefined ? undefined : firstUnshown(task.id, writePath, outstanding);
+        outstanding === undefined ? undefined : firstUnshown(reader, writePath, outstanding);
       if (unshownFrom !== undefined)
         throw new AthanorError(
           'write_unread',
@@ -1219,7 +1271,7 @@ async function runWorkspaceTool(context: ToolContext, call: ModelToolCall): Prom
       // where "text a caller authored is text it has been shown" is true of the whole file, and
       // saying so replaces a record whose line numbers describe a version that is now gone.
       state.partialReads = withPartialRead(state.partialReads, writePath, undefined);
-      recordWrite(task.id, writePath, textValue(call.arguments.content));
+      recordWrite(reader, writePath, textValue(call.arguments.content));
       // Behind the await, so a write the runner refused - a stale hash, an edit over lines nobody
       // has been shown, a file past the size limit - has thrown out of this arm with nothing
       // recorded. @see ARTIFACT_LEDGER_MARKER in context.ts for why that ordering is the whole

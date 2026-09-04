@@ -1,8 +1,19 @@
-import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  mkdtemp,
+  mkdir,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { resolveExecutable } from './command-policy.js';
+import { readWorkspaceFileLines } from './files.js';
+import { forgetDisplayedLines, readerFor } from './seen-lines.js';
 import {
   agentHome,
   agentSearchPath,
@@ -10,6 +21,23 @@ import {
   hostSearchPath,
   unclaimedStopNote
 } from './execution.js';
+
+/**
+ * Stands in for athanor-sandbox: consumes `run <network mode> <filesystem mode> <root> --spec
+ * <path>` the way the real helper does, reads the directory, the environment and the command out
+ * of the spec file - the header word, the directory, then NUL-terminated words - unlinks it,
+ * enters the directory, and execs as `env -i` does.
+ */
+const SANDBOX_STAND_IN = `#!/bin/sh
+shift 4
+[ "$1" = --spec ] || exit 125
+exec /usr/bin/python3 -I -S -c 'import os, sys
+data = open(sys.argv[1], "rb").read()
+os.unlink(sys.argv[1])
+words = data.split(b"\\0")[1:-1]
+os.chdir(words[0])
+os.execv("/usr/bin/env", [b"env", b"-i"] + words[1:])' "$2"
+`;
 
 const temporaryRoots: string[] = [];
 
@@ -355,10 +383,16 @@ describe("what the agent's own search path reaches", () => {
 });
 
 describe('agent sandbox', () => {
-  /** Stands in for sudo: records what it was asked to run, then runs it. */
+  /**
+   * Stands in for sudo: records what it was asked to run, and beside it the directory it was
+   * started from - the two things the real one writes to the journal - then runs it.
+   */
   const recordingElevator = async (root: string, record: string): Promise<string> => {
     const elevate = path.join(root, 'elevate');
-    await writeFile(elevate, `#!/bin/sh\nprintf '%s\\n' "$*" >"${record}"\nshift\nexec "$@"\n`);
+    await writeFile(
+      elevate,
+      `#!/bin/sh\nprintf '%s\\n' "$*" >"${record}"\nprintf '%s' "$PWD" >"${record}.pwd"\nshift\nexec "$@"\n`
+    );
     await chmod(elevate, 0o700);
     return elevate;
   };
@@ -371,13 +405,13 @@ describe('agent sandbox', () => {
     // Stands in for athanor-sandbox: drops its own four leading arguments the way the real helper
     // consumes `run <network mode> <filesystem mode> <root>`, then applies the environment and
     // execs, as `env -i` does.
-    await writeFile(helper, '#!/bin/sh\nshift 4\nexec /usr/bin/env -i "$@"\n');
+    await writeFile(helper, SANDBOX_STAND_IN);
     await chmod(helper, 0o700);
 
     const result = await execute(
       root,
       { executable: '/bin/sh', args: ['-c', 'printf "%s" "$HOME"'] },
-      { maximumSeconds: 30, sandbox: { elevate, helper } }
+      { maximumSeconds: 30, sandbox: { elevate, helper, specDirectory: path.join(root, 'specs') } }
     );
 
     expect(result.exitCode).toBe(0);
@@ -388,7 +422,38 @@ describe('agent sandbox', () => {
     expect(result.stdout).toBe(agentHome(root));
     const elevated = await readFile(record, 'utf8');
     expect(elevated).toContain(`-n ${helper} run network open -`);
-    expect(elevated).toContain(`HOME=${agentHome(root)}`);
+    // The home reached the command - the stdout assertion above is what says so - without ever
+    // standing on sudo's argument list, which is what the system journal records of every
+    // privileged invocation. sandbox.test.ts pins the whole absence; this is the production path.
+    expect(elevated).not.toContain('HOME=');
+    expect(elevated).not.toContain('/bin/sh');
+  });
+
+  it('starts sudo from the container root and enters the chosen directory inside the helper', async () => {
+    // sudo's journal line carries the directory it was started from, and the runner started it
+    // from the directory the agent chose - so a name used inside a task, which the privacy
+    // document says the box's logs hold none of, was written there for every command. The
+    // command still runs where it asked to: the helper enters that directory from the spec, after
+    // sudo has written its line.
+    const root = await workspaceRoot();
+    const chosen = path.join(root, 'workspace', 'acme-lawsuit-discovery');
+    await mkdir(chosen);
+    const record = path.join(root, 'elevated');
+    const elevate = await recordingElevator(root, record);
+    const helper = path.join(root, 'sandbox');
+    await writeFile(helper, SANDBOX_STAND_IN);
+    await chmod(helper, 0o700);
+
+    const result = await execute(
+      root,
+      { executable: '/bin/sh', args: ['-c', 'pwd -P'], cwd: 'acme-lawsuit-discovery' },
+      { maximumSeconds: 30, sandbox: { elevate, helper, specDirectory: path.join(root, 'specs') } }
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(await realpath(result.stdout.trim())).toBe(await realpath(chosen));
+    expect(await realpath(await readFile(`${record}.pwd`, 'utf8'))).toBe(await realpath(root));
+    expect(await readFile(record, 'utf8')).not.toContain('acme-lawsuit-discovery');
   });
 
   it('confines the command to its own workspace when the box says it can', async () => {
@@ -400,13 +465,21 @@ describe('agent sandbox', () => {
     const record = path.join(root, 'elevated');
     const elevate = await recordingElevator(root, record);
     const helper = path.join(root, 'sandbox');
-    await writeFile(helper, '#!/bin/sh\nshift 4\nexec /usr/bin/env -i "$@"\n');
+    await writeFile(helper, SANDBOX_STAND_IN);
     await chmod(helper, 0o700);
 
     const result = await execute(
       root,
       { executable: '/bin/sh', args: ['-c', 'true'] },
-      { maximumSeconds: 30, sandbox: { elevate, helper, confineFilesystem: true } }
+      {
+        maximumSeconds: 30,
+        sandbox: {
+          elevate,
+          helper,
+          specDirectory: path.join(root, 'specs'),
+          confineFilesystem: true
+        }
+      }
     );
 
     expect(result.exitCode).toBe(0);
@@ -421,13 +494,21 @@ describe('agent sandbox', () => {
     const record = path.join(root, 'elevated');
     const elevate = await recordingElevator(root, record);
     const helper = path.join(root, 'sandbox');
-    await writeFile(helper, '#!/bin/sh\nshift 4\nexec /usr/bin/env -i "$@"\n');
+    await writeFile(helper, SANDBOX_STAND_IN);
     await chmod(helper, 0o700);
 
     const result = await execute(
       root,
       { executable: '/bin/sh', args: ['-c', 'printf ran'] },
-      { maximumSeconds: 30, sandbox: { elevate, helper, confineFilesystem: false } }
+      {
+        maximumSeconds: 30,
+        sandbox: {
+          elevate,
+          helper,
+          specDirectory: path.join(root, 'specs'),
+          confineFilesystem: false
+        }
+      }
     );
 
     expect(result.stdout).toBe('ran');
@@ -458,11 +539,11 @@ describe('agent sandbox', () => {
     const record = path.join(root, 'elevated');
     const elevate = await recordingElevator(root, record);
     const helper = path.join(root, 'sandbox');
-    await writeFile(helper, '#!/bin/sh\nshift 4\nexec /usr/bin/env -i "$@"\n');
+    await writeFile(helper, SANDBOX_STAND_IN);
     await chmod(helper, 0o700);
     const result = await execute(root, denyingCommand(message), {
       maximumSeconds: 30,
-      sandbox: { elevate, helper, confineFilesystem }
+      sandbox: { elevate, helper, specDirectory: path.join(root, 'specs'), confineFilesystem }
     });
     expect(result.exitCode).toBe(1);
     return { root, stderr: result.stderr };
@@ -514,6 +595,7 @@ describe('agent sandbox', () => {
           sandbox: {
             elevate: path.join(inside.root, 'elevate'),
             helper: path.join(inside.root, 'sandbox'),
+            specDirectory: path.join(inside.root, 'specs'),
             confineFilesystem: true
           }
         }
@@ -556,14 +638,22 @@ describe('agent sandbox', () => {
     const record = path.join(interpreter, 'elevated');
     const elevate = await recordingElevator(interpreter, record);
     const helper = path.join(interpreter, 'sandbox');
-    await writeFile(helper, '#!/bin/sh\nshift 4\nexec /usr/bin/env -i "$@"\n');
+    await writeFile(helper, SANDBOX_STAND_IN);
     await chmod(helper, 0o700);
     const result = await execute(
       interpreter,
       denyingCommand(
         `/usr/bin/python3: can't open file ${path.join(interpreter, 'workspace', 'build.py')}: [Errno 13] Permission denied`
       ),
-      { maximumSeconds: 30, sandbox: { elevate, helper, confineFilesystem: true } }
+      {
+        maximumSeconds: 30,
+        sandbox: {
+          elevate,
+          helper,
+          specDirectory: path.join(interpreter, 'specs'),
+          confineFilesystem: true
+        }
+      }
     );
     expect(result.stderr).not.toContain('the sandbox on this computer');
   });
@@ -573,7 +663,7 @@ describe('agent sandbox', () => {
     const record = path.join(root, 'elevated');
     const elevate = await recordingElevator(root, record);
     const helper = path.join(root, 'sandbox');
-    await writeFile(helper, '#!/bin/sh\nshift 4\nexec /usr/bin/env -i "$@"\n');
+    await writeFile(helper, SANDBOX_STAND_IN);
     await chmod(helper, 0o700);
 
     await execute(
@@ -582,7 +672,12 @@ describe('agent sandbox', () => {
       {
         maximumSeconds: 30,
         isolateNetwork: true,
-        sandbox: { elevate, helper, confineFilesystem: true }
+        sandbox: {
+          elevate,
+          helper,
+          specDirectory: path.join(root, 'specs'),
+          confineFilesystem: true
+        }
       }
     );
     // Both boundaries on one exec line, which is the whole shape of this helper: the namespace and
@@ -607,7 +702,11 @@ describe('agent sandbox', () => {
         maximumSeconds: 30,
         allowSystemPackages: true,
         systemPackageHelper: packageHelper,
-        sandbox: { elevate, helper: path.join(root, 'sandbox') }
+        sandbox: {
+          elevate,
+          helper: path.join(root, 'sandbox'),
+          specDirectory: path.join(root, 'specs')
+        }
       }
     );
 
@@ -1030,5 +1129,136 @@ describe('the argument list', () => {
     await expect(
       execute(root, { executable: process.execPath, args }, { maximumSeconds: 30 })
     ).rejects.toThrow();
+  });
+});
+
+/**
+ * WHAT THIS ROUTE DELIBERATELY DOES NOT CONSULT, as a case that fails the day it starts to.
+ *
+ * The seen-line ledger holds an agent's whole-file write to what that agent has been shown, and a
+ * redirect reaches the disk without passing through the write route the ledger guards. This route
+ * has no shell parser and is not given one: the worker already reads every command through one
+ * (`effectiveCommands`), and a second reading of the same script in a second process is two things
+ * to keep in agreement, which is the defect shape this repository names most often. So the worker
+ * is where a shell command is held to the read record, before it is sent, and this route runs what
+ * it is sent. The case below is the measurement that says so; a runner that grows an opinion here
+ * turns it red, and the lane that does it then has to say why the worker's floor stopped being
+ * enough.
+ */
+describe('what execution does not consult', () => {
+  it('runs a redirect over a file the caller has been shown only part of', async () => {
+    forgetDisplayedLines();
+    const root = await workspaceRoot();
+    const target = path.join(root, 'workspace', 'app.ts');
+    await writeFile(
+      target,
+      `${Array.from({ length: 400 }, (_, at) => `line ${at + 1}`).join('\n')}\n`
+    );
+    const reader = readerFor({ role: 'agent', sub: 'task-shell' });
+    const window = await readWorkspaceFileLines(root, 'workspace/app.ts', {
+      startLine: 1,
+      endLine: 50,
+      maxBytes: 100_000,
+      shownTo: reader
+    });
+    expect(window.endLine).toBe(50);
+
+    const result = await execute(
+      root,
+      { executable: 'bash', args: ['-c', 'echo x > app.ts'], cwd: 'workspace' },
+      { maximumSeconds: 30 }
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe('');
+    expect(await readFile(target, 'utf8')).toBe('x\n');
+  });
+});
+
+/**
+ * WHERE A COMMAND'S `cwd` IS READ FROM, held to the same answer the file tools give.
+ *
+ * A bare file name means `workspace/<name>` to `file_write`, because commands run in `workspace/`
+ * and that is where an agent that has just listed its own directory means. Read against the
+ * container root - the obvious resolution, and the one every other path here gets - a bare `cwd`
+ * is one level up from that, where nothing of the agent's lives, so `probe` and `workspace/probe`
+ * would name one file to the file tools and two directories to the shell. Measured on a live box:
+ * six of ten tasks spent a third of their tool calls on exactly that, and a shadow
+ * `workspace/workspace/` tree had stood for weeks. So both spellings land in one directory, while
+ * `.athanor`, the agent's own home and every absolute path resolve as written and the escape
+ * refusal stands.
+ */
+describe('the directory a command runs in', () => {
+  const printCwd = { executable: process.execPath, args: ['-p', 'process.cwd()'] };
+
+  it('reads a bare cwd from workspace/, where the file tools read a bare name', async () => {
+    const root = await workspaceRoot();
+    await mkdir(path.join(root, 'workspace', 'probe'));
+    const bare = await execute(root, { ...printCwd, cwd: 'probe' }, { maximumSeconds: 30 });
+    const spelled = await execute(
+      root,
+      { ...printCwd, cwd: 'workspace/probe' },
+      { maximumSeconds: 30 }
+    );
+    expect(bare.exitCode).toBe(0);
+    expect(spelled.exitCode).toBe(0);
+    expect(bare.stdout.trim()).toBe(spelled.stdout.trim());
+    expect(await realpath(bare.stdout.trim())).toBe(
+      await realpath(path.join(root, 'workspace', 'probe'))
+    );
+  });
+
+  it('leaves the container-only directories and the default where they were', async () => {
+    const root = await workspaceRoot();
+    await mkdir(path.join(root, '.athanor', 'artifacts'), { recursive: true });
+    for (const [cwd, expected] of [
+      ['workspace', ['workspace']],
+      ['.', []],
+      ['./', []],
+      ['.athanor/artifacts', ['.athanor', 'artifacts']],
+      [path.join(root, 'workspace'), ['workspace']]
+    ] as const) {
+      const result = await execute(root, { ...printCwd, cwd }, { maximumSeconds: 30 });
+      expect(result.exitCode, cwd).toBe(0);
+      expect(await realpath(result.stdout.trim()), cwd).toBe(
+        await realpath(path.join(root, ...expected))
+      );
+    }
+  });
+
+  /*
+   * `.` is the container root and not a bare name. The document reader and the office converter
+   * are both run from `.` with a `workspace/…` path on their command line, and each resolves that
+   * path against its own working directory and refuses anything outside it - so a `.` read as
+   * `workspace/` makes `document_search` with its default path, and every `document_read` written
+   * the way the catalogue spells paths, fail with "not a regular file" on a file that is there.
+   */
+  it('keeps . at the container root, where the document reader resolves workspace/ paths', async () => {
+    const root = await workspaceRoot();
+    await writeFile(path.join(root, 'workspace', 'notes.txt'), 'hello\n');
+    const seen = await execute(
+      root,
+      {
+        executable: process.execPath,
+        args: [
+          '-p',
+          "require('node:fs').existsSync(require('node:path').resolve('workspace/notes.txt'))"
+        ],
+        cwd: '.'
+      },
+      { maximumSeconds: 30 }
+    );
+    expect(seen.exitCode).toBe(0);
+    expect(seen.stdout.trim()).toBe('true');
+  });
+
+  it('still refuses a cwd that steps out of the container', async () => {
+    const root = await workspaceRoot();
+    await expect(
+      execute(root, { ...printCwd, cwd: '../x' }, { maximumSeconds: 30 })
+    ).rejects.toThrow('escapes workspace');
+    await expect(
+      execute(root, { ...printCwd, cwd: 'workspace/../../x' }, { maximumSeconds: 30 })
+    ).rejects.toThrow('escapes workspace');
   });
 });

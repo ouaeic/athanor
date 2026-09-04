@@ -109,6 +109,13 @@ export interface AcceptanceResult {
   readonly passed: boolean;
   /** What the harness saw: an exit code, a size, or the reason the check could not run at all. */
   readonly detail: string;
+  /**
+   * The command that was run, for a command check, so the record says what was proved and not
+   * only what the model called it. A label is free text; `passed: true` beside it is the harness
+   * vouching for the command, and an owner reading "54 data rows (30 months x 3 products) passed"
+   * can only tell which half of that the computer checked if the command is printed beside it.
+   */
+  readonly command?: string;
 }
 
 /**
@@ -403,6 +410,96 @@ const normalisedCwd = (value: unknown): string => {
 
 const checkId = (index: number, kind: string): string => `${kind}-${index + 1}`;
 
+/** The command a check runs, in the spelling the owner reads it in everywhere it is shown. */
+export const acceptanceCommandText = (check: AcceptanceCommandCheck): string =>
+  [check.executable, ...check.args].join(' ');
+
+/** The field a result carries for a command check, and nothing for an artifact. */
+export const resultCommand = (check: AcceptanceCheck): Pick<AcceptanceResult, 'command'> =>
+  check.kind === 'command' ? { command: acceptanceCommandText(check) } : {};
+
+/**
+ * A number a label claims: a count, standing on its own.
+ *
+ * Read as one only when nothing touches it but whitespace, a bracket, a quote or the punctuation
+ * of a sentence. A digit run wearing anything else is not a count and is not read: a letter makes
+ * a name (`utf8`, `py3`, `sha256`), a second number joined by `-`, `/`, `:` or `.` makes a date, a
+ * fraction, a time or a version (`2026-09-03`, `3/4`, `12:30`, `v2.1`, `1.2.3`), and a symbol makes
+ * a measurement or an id (`100%`, `3x` and `3×` alike, `#3`, `$5`, `30°`). Each of those is the
+ * model describing the work, and none is the quantity a command compares a count against, which is
+ * the only claim this rule holds a label to. A leading minus is part of the number when nothing
+ * precedes it, so `check-2` claims nothing and `-5 degrees` claims minus five; a decimal is one
+ * token; a thousands separator is kept, so `1,000` is one claim and the misprint `1,0000` is none.
+ */
+const CLAIMED_NUMBER = /(?<=^|[\s("'[])-?\d+(?:,\d{3})*(?:\.\d+)?(?=$|[\s)"'\]]|[,;:.!?](?!\d))/g;
+
+/**
+ * A number the check text tests, read permissively: any digit run that is not the tail of a name.
+ *
+ * `python3`, `sha256sum`, `utf8` and `workspace/run3/` are names, and a name in the command is not
+ * the command testing anything, so a digit run glued to a word character on its left is passed
+ * over - except behind a short option, where `-n54` is how a tool is told 54. Everything else
+ * counts: `=54`, `$3`, `3s`, `3.0`. That includes a number the command only mentions - `grep -m 3`
+ * supplies a 3 without comparing one - because telling a mention from a comparison means parsing
+ * the shell, and this side is deliberately the one that is wrong towards acceptance.
+ */
+const TESTED_NUMBER =
+  /(?<![\w.])-?\d+(?:,\d{3})*(?:\.\d+)?(?![\d,]?\d)|(?<=(?:^|\s)-[A-Za-z])\d+(?:\.\d+)?/g;
+
+const numberValue = (spelling: string): number => Number(spelling.replace(/,/g, ''));
+
+/**
+ * The numbers a label claims that the command it is attached to never tests.
+ *
+ * A check is a label plus a command, and the label is what the owner reads: it is the line in
+ * "Acceptance checks: N of M passed" and the line in the completion's evidence, stamped by the
+ * harness. Nothing else holds the label to what the command proved, so a label that states a
+ * derived quantity beside the one the command counts - "54 rows (30 months x 3 products)" over a
+ * command that compares a row count with 54 - goes to the owner as verified with an untested claim
+ * in it, and did, in a PDF that carried the arithmetic refuting its own subtitle.
+ *
+ * The rule is deliberately the narrowest thing that catches that: every count the label claims
+ * must be a number the text the harness compares - the command, the expected output, and the
+ * expected exit code - also holds. Matched by value and not by digits, so `3` is not found inside
+ * `30` or `3.5` and is found in `3.0`, and `1,000` in `1000`. What is caught is the bare number
+ * nothing in the check so much as spells. What walks past, each on purpose and each a cost on
+ * honest work if it did not: a count written in words ("three products"); a number wearing a
+ * unit, a symbol, a date or a ratio (see `CLAIMED_NUMBER`); a number the command mentions without
+ * comparing (see `TESTED_NUMBER`); and every artifact check, where a path and a size are not a
+ * command and the label is held to nothing - `12 slides` beside a page count of 10 is not read.
+ * A false refusal is an outage on honest work; a false acceptance is only this bound not firing.
+ */
+export const untestedLabelNumbers = (label: string, tested: string): string[] => {
+  const claimed = [...new Set(label.match(CLAIMED_NUMBER) ?? [])];
+  if (!claimed.length) return [];
+  const held = new Set((tested.match(TESTED_NUMBER) ?? []).map(numberValue));
+  return claimed.filter((number) => !held.has(numberValue(number)));
+};
+
+/** The list the refusal names: `30`, `30 and 3`, `30, 3 and 90`. */
+const namedNumbers = (numbers: readonly string[]): string =>
+  numbers.length <= 1
+    ? (numbers[0] ?? '')
+    : `${numbers.slice(0, -1).join(', ')} and ${numbers[numbers.length - 1]}`;
+
+/**
+ * Why a command check's label cannot stand, or null when every number in it is one the command
+ * tests. Returned at declaration, where a correction costs a sentence, rather than at finish.
+ */
+export const acceptanceLabelRefusal = (
+  label: string,
+  check: Pick<AcceptanceCommandCheck, 'executable' | 'args' | 'expectExit' | 'expectStdoutContains'>
+): string | null => {
+  const tested = [
+    acceptanceCommandText(check as AcceptanceCommandCheck),
+    check.expectStdoutContains ?? '',
+    `exit ${check.expectExit}`
+  ].join('\n');
+  const untested = untestedLabelNumbers(label, tested);
+  if (!untested.length) return null;
+  return `the label claims ${namedNumbers(untested)} and the command never tests ${untested.length === 1 ? 'it' : 'them'}. Either make the command test the number - compare a count against it, or put it in expectStdoutContains - or drop it from the label. The label is what the user is shown as proved, so it may claim only what the command checks.`;
+};
+
 /** The largest page count worth naming; past it the number is a mistake rather than a document. */
 const MAX_EXPECTED_PAGES = 5_000;
 /** A margin wider than this is most of a slide, so it is a typo rather than a layout. */
@@ -485,6 +582,15 @@ export const parseAcceptanceChecks = (
         ? Math.trunc(Number(record.expectExit))
         : 0;
       const contains = textValue(record.expectStdoutContains).trim().slice(0, 400);
+      // Third question, asked last because it is about the label rather than the command: a
+      // number the label claims is a number the owner will read as proved.
+      const labelRefusal = acceptanceLabelRefusal(label, {
+        executable,
+        args,
+        expectExit,
+        ...(contains ? { expectStdoutContains: contains } : {})
+      });
+      if (labelRefusal) return { ok: false, reason: `Check ${index + 1}: ${labelRefusal}` };
       checks.push({
         id: checkId(index, 'check'),
         kind: 'command',
@@ -571,7 +677,8 @@ export const acceptanceAlreadyObserved = (
     id: check.id,
     label: check.label,
     passed: true,
-    detail: `exit ${exitCode}, from athanor running this same command after the last change`
+    detail: `exit ${exitCode}, from athanor running this same command after the last change`,
+    command: acceptanceCommandText(check)
   };
 };
 
@@ -630,8 +737,16 @@ export const acceptanceFailureMessage = (
   ].join('\n');
 };
 
+/**
+ * One line per check for the completion record, with the command in it where there was one: the
+ * owner reads what was run beside what it was called, so a label can no longer stand for more
+ * than its command proved.
+ */
 export const acceptancePassedEvidence = (results: readonly AcceptanceResult[]): string[] =>
-  results.map((result) => `${result.id}: ${result.label} — ${result.detail}`);
+  results.map(
+    (result) =>
+      `${result.id}: ${result.label} — ${result.command ? `ran ${result.command} — ` : ''}${result.detail}`
+  );
 
 /**
  * Whether a turn that has used its step budget may give itself another one instead of stopping.

@@ -62,6 +62,7 @@ const browserActionEnum = [
   'inspect_tab',
   'click_at',
   'dialog',
+  'screenshot',
   'batch'
 ];
 
@@ -100,7 +101,7 @@ export const browserActionProperties: Record<string, unknown> = {
      * went from 125 bytes to 120, measured, so the catalogue moved 55,673 -> 55,668.
      */
     description:
-      'Which action, and the fields it takes beyond the optional tabId every one of them accepts. navigate url. click, double_click, hover selector. type selector, text and mode - fill sets the value at once, keys sends real keystrokes, which is what wakes a typeahead or a keydown validator. select_option selector, values - every chosen value for a multiple-select. upload selector, paths. text_input text, into whatever has focus. press key, for example Enter, Tab or Escape. scroll deltaY, optional deltaX and selector. wait_for optional selector with state, or text, or urlIncludes, and timeoutMs; name one of those three, or it waits on the page alone, which a single-page application can satisfy while still empty. back. reload. new_tab optional url and activate. select_tab, close_tab and inspect_tab tabId - inspect_tab reads that tab in place and leaves the active one alone. click_at x, y - ambiguous, so it always needs confirmation; use a selector when the page exposes one. dialog response, optional promptText, to answer a native alert, confirm or prompt reported by browser_snapshot. batch actions.'
+      'Which action, and the fields it takes beyond the optional tabId every one of them accepts. navigate url. click, double_click, hover selector. type selector, text and mode - fill sets the value at once, keys sends real keystrokes, which is what wakes a typeahead or a keydown validator. select_option selector, values - every chosen value for a multiple-select. upload selector, paths. text_input text, into whatever has focus. press key, for example Enter, Tab or Escape. scroll deltaY, optional deltaX and selector. wait_for optional selector with state, or text, or urlIncludes, and timeoutMs; name one of those three, or it waits on the page alone, which a single-page application can satisfy while still empty. back. reload. new_tab optional url and activate. select_tab, close_tab and inspect_tab tabId - inspect_tab reads that tab in place and leaves the active one alone. click_at x, y - ambiguous, so it always needs confirmation; use a selector when the page exposes one. dialog response, optional promptText, to answer a native alert, confirm or prompt reported by browser_snapshot. screenshot path - writes a PNG of the page to that workspace path. batch actions.'
   },
   url: { type: 'string' },
   selector,
@@ -133,6 +134,7 @@ export const browserActionProperties: Record<string, unknown> = {
   y: { type: 'number', minimum: 0, maximum: 900 },
   response: { type: 'string', enum: ['accept', 'dismiss'] },
   promptText: { type: 'string', maxLength: 4_000 },
+  path: { type: 'string', maxLength: 1_024 },
   tabId,
   actions: {
     type: 'array',

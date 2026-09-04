@@ -18,6 +18,8 @@
 import type { DataStore, TaskRecord } from '@athanor/data';
 import {
   acceptanceAlreadyObserved,
+  acceptanceCommandText,
+  resultCommand,
   type AcceptanceRecord,
   type AcceptanceResult
 } from './acceptance.js';
@@ -230,7 +232,8 @@ export const acceptanceChecks = async (
           id: check.id,
           label: check.label,
           passed: false,
-          detail: `the check could not run: the acceptance suite ran out of time after ${ACCEPTANCE_SUITE_DEADLINE_SECONDS}s`
+          detail: `the check could not run: the acceptance suite ran out of time after ${ACCEPTANCE_SUITE_DEADLINE_SECONDS}s`,
+          ...resultCommand(check)
         });
         continue;
       }
@@ -260,6 +263,7 @@ export const acceptanceChecks = async (
         results.push({
           id: check.id,
           label: check.label,
+          command: acceptanceCommandText(check),
           passed: exitOk && containsOk && !observation.timedOut,
           detail: observation.timedOut
             ? `timed out after ${timeoutSeconds}s running ${check.executable}`
@@ -326,7 +330,8 @@ export const acceptanceChecks = async (
         id: check.id,
         label: check.label,
         passed: false,
-        detail: `the check could not run: ${error instanceof Error ? error.message : 'unknown error'}`
+        detail: `the check could not run: ${error instanceof Error ? error.message : 'unknown error'}`,
+        ...resultCommand(check)
       });
     }
   }

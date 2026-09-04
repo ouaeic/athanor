@@ -77,7 +77,16 @@ const completedEvent = (summary) => ({
   summary: 'Task completed',
   payload: {
     summary,
-    verification: { claim: 'the report exists', evidence: 'ls report.pdf' },
+    verification: {
+      claim: 'the report exists',
+      evidence: [
+        { claim: 'Opened the report', source: 'tool_result', toolCallId: 'call-3' },
+        {
+          claim: 'check-1: the report exists — ran test -s workspace/report.pdf — exit 0',
+          source: 'acceptance_check'
+        }
+      ]
+    },
     outstanding: ['the second half was not attempted']
   }
 });
@@ -252,6 +261,21 @@ check('the completion contract travels with the answer', () => {
   assert.equal(finished.outcome.verification.claim, 'the report exists');
   assert.deepEqual(finished.outcome.outstanding, ['the second half was not attempted']);
 });
+check(
+  'the harness line with the command beside the label travels in the evidence, untouched',
+  () => {
+    const harness = finished.outcome.verification.evidence.filter(
+      (item) => item.source === 'acceptance_check'
+    );
+    assert.deepEqual(harness, [
+      {
+        claim: 'check-1: the report exists — ran test -s workspace/report.pdf — exit 0',
+        source: 'acceptance_check'
+      }
+    ]);
+    assert.match(harness[0].claim, /ran test -s workspace\/report\.pdf/);
+  }
+);
 check('the terms the work ran under are in the result', () => {
   assert.equal(finished.outcome.securityMode, 'balanced');
   assert.equal(finished.outcome.modelId, 'a/model');
@@ -722,6 +746,146 @@ check('a task parked by a spend ceiling reports which ceiling and what it said',
   assert.match(pausedByCeiling.outcome.reason, /Raise the limit to carry on/);
   assert.equal(pausedByCeiling.outcome.blockedBy, 'task');
 });
+/*
+ * And the machine-readable half. The `status` event a ceiling writes carries `blockedBy` and no
+ * `code`, so an outcome that copied `payload.code` had `reasonCode: null` on the commonest blocked
+ * ending there is - while docs/HEADLESS.md promised the field on every `blocked`. A script that
+ * branches on `reasonCode` alone, as the documentation invites, saw nothing to branch on.
+ */
+check('a spend pause carries a reason code and not only a ceiling', () =>
+  assert.equal(pausedByCeiling.outcome.reasonCode, 'spend_ceiling')
+);
+
+/*
+ * And the one `blockedBy` the worker writes that is not a ceiling. When the spending guard itself
+ * cannot answer - its database query failed - `agent.ts` parks the task with
+ * `blockedBy: 'spend_guard_unavailable'`, and no limit was crossed: raising one, which is what
+ * `spend_ceiling` tells a script to do, changes nothing. Keyed on any non-null `blockedBy`, the
+ * outcome called this a ceiling and named the guard failure as the ceiling that was crossed.
+ */
+const guardDown = await drive(
+  runRoutes(
+    [[200, taskRecord({ status: 'paused' })]],
+    [
+      {
+        sequence: 11,
+        kind: 'status',
+        summary:
+          'Paused: athanor could not check this against your spending caps, so it stopped rather than spend past them.',
+        payload: {
+          blockedBy: 'spend_guard_unavailable',
+          reason: 'connection refused',
+          estimateUsd: 0.001
+        }
+      }
+    ]
+  ),
+  started
+);
+check('a spending guard that could not answer is not reported as a ceiling', () => {
+  assert.equal(guardDown.code, 6);
+  assert.equal(guardDown.outcome.outcome, 'blocked');
+  assert.match(guardDown.outcome.reason, /could not check this against your spending caps/);
+  assert.equal(guardDown.outcome.reasonCode, 'spend_guard_unavailable');
+  assert.equal(guardDown.outcome.blockedBy, null);
+});
+
+/*
+ * The stop that parked the task is the latest one, not the first kind looked for. A task that hit
+ * a provider wall, was resumed past it and was then parked by its own ceiling has both on its
+ * timeline; read owner-marked warnings first, the outcome reported the wall the task had already
+ * been resumed past, and the ceiling that actually paused it was invisible. The same in the other
+ * order: a ceiling the owner raised and a failure after it is a failure.
+ */
+const ceilingEvent = (sequence, blockedBy) => ({
+  id: `ev-${sequence}`,
+  sequence,
+  kind: 'status',
+  summary: 'Paused at $0.0100 of the $0.01 limit for this task. Raise the limit to carry on.',
+  payload: { blockedBy, windows: [{ name: blockedBy, capUsd: 0.01, state: 'exceeded' }] }
+});
+const walledThenParked = await drive(
+  runRoutes(
+    [[200, taskRecord({ status: 'paused' })]],
+    [
+      {
+        id: 'ev-5',
+        sequence: 5,
+        kind: 'warning',
+        summary: 'The provider is rate limiting requests.',
+        payload: { owner: true, code: 'provider_rate_limited' }
+      },
+      ceilingEvent(11, 'task')
+    ]
+  ),
+  started
+);
+check('the ceiling that parked a task is reported over a wall it was resumed past', () => {
+  assert.equal(walledThenParked.code, 6);
+  assert.match(walledThenParked.outcome.reason, /Raise the limit to carry on/);
+  assert.equal(walledThenParked.outcome.reasonCode, 'spend_ceiling');
+  assert.equal(walledThenParked.outcome.blockedBy, 'task');
+});
+const parkedThenFailed = await drive(
+  runRoutes(
+    [[200, taskRecord({ status: 'failed' })]],
+    [
+      ceilingEvent(5, 'daily'),
+      endingEvent('The provider stream could not be parsed.', 'provider_stream_unparsed', 'warning')
+    ]
+  ),
+  started
+);
+check('a failure after a ceiling the owner raised is reported as the failure', () => {
+  assert.equal(parkedThenFailed.code, 2);
+  assert.equal(parkedThenFailed.outcome.reason, 'The provider stream could not be parsed.');
+  assert.equal(parkedThenFailed.outcome.reasonCode, 'provider_stream_unparsed');
+  assert.equal(parkedThenFailed.outcome.blockedBy, null);
+});
+
+/*
+ * A question the task asked and the owner answered is not still being asked once the task has
+ * finished. The guard on `question` read "no card pending, and a question was asked at some point",
+ * never the outcome - so every terminal outcome of a conversation that ever asked anything carried
+ * a live-looking `question`, and a caller keying on that field alone (the natural reading of
+ * "`question` carries what was asked") sent a second answer to a finished task.
+ */
+const askedThenFinished = await drive(
+  {
+    ...runRoutes(
+      [[200, taskRecord({ status: 'completed' })]],
+      [
+        questionEvent('Which do you prefer: A or B?', 'Two options', ['A', 'B']),
+        completedEvent('Asked A or B; the answer (B) is recorded.')
+      ]
+    ),
+    'GET /v1/approvals': [200, []]
+  },
+  started
+);
+check('a completed task no longer carries the question it once asked', () => {
+  assert.equal(askedThenFinished.code, 0);
+  assert.equal(askedThenFinished.outcome.answer, 'Asked A or B; the answer (B) is recorded.');
+  assert.equal(askedThenFinished.outcome.question, null);
+});
+// The other terminal endings of the same conversation say the same. `failed` and `cancelled` are
+// each a state nothing answers into, so a question reported there is the identical trap.
+for (const [status, code] of [
+  ['failed', 2],
+  ['cancelled', 5]
+]) {
+  const ended = await drive(
+    {
+      ...runRoutes([[200, taskRecord({ status })]], [questionEvent('Still asking?', 'no')]),
+      'GET /v1/approvals': [200, []]
+    },
+    started
+  );
+  check(`a ${status} task reports no question either`, () => {
+    assert.equal(ended.code, code);
+    assert.equal(ended.outcome.question, null);
+  });
+}
 
 /*
  * The counter-direction: an ordinary completed run invents neither field, and a stop that is not a

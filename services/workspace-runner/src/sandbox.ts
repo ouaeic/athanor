@@ -1,5 +1,7 @@
+import { randomBytes } from 'node:crypto';
 import { constants } from 'node:fs';
-import { access } from 'node:fs/promises';
+import { access, mkdir, rm, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import type { Invocation } from './limits.js';
 
 /**
@@ -13,6 +15,15 @@ export interface AgentSandbox {
   elevate: string;
   /** Absolute path of the root-owned helper, outside every directory on the agent's PATH. */
   helper: string;
+  /**
+   * Where each command's spec file is written: the file that carries the command and its
+   * environment to the helper, so that neither stands on the argument list. See
+   * `sandboxedInvocation` for why the argument list is the wrong place for them.
+   *
+   * `sandboxSpecDirectory` says where this is on a box; it is a field rather than a call so that
+   * every test can point it at a directory of its own.
+   */
+  specDirectory: string;
   /**
    * Whether this box draws a filesystem boundary as well as an identity one.
    *
@@ -34,7 +45,35 @@ export interface AgentSandbox {
 const SUDO_EXECUTABLE = '/usr/bin/sudo';
 
 /**
- * The environment is handed over as arguments because sudo resets it, and reconstructing it
+ * The spec files live beside the workspaces, in the directory that already holds the runner's own
+ * private state - `services.json` is written there - rather than in any one workspace or in /tmp.
+ * Every caller has this directory, including the workspace delete, whose own container is the
+ * thing going away; it is created 0700 by the runner, so the agent account - which shares a group
+ * with the runner and would read a 0770 directory - cannot open it even on a box with no Landlock;
+ * and under Landlock its whole parent is granted nowhere. /tmp would have had to defend the file
+ * against the account that owns every other file there, and a workspace's `.athanor` is not there
+ * when the command is the one that deletes the workspace.
+ *
+ * The helper has this same path hard-coded beside its workspace parent and reads a spec from
+ * nowhere else: it removes the file as root, and a path the caller was free to choose would have
+ * been a root-level delete of any file on the box. The two have to agree, and the name has to be
+ * the shape the helper accepts - hexadecimal digits and `.spec`, no further path.
+ */
+export const sandboxSpecDirectory = (workspaceRoot: string): string =>
+  path.resolve(workspaceRoot, '.athanor', 'sandbox');
+
+const SPEC_DIRECTORY_MODE = 0o700;
+const SPEC_FILE_MODE = 0o600;
+
+/**
+ * The first word of every spec file, so the helper can tell a file it should read from a file
+ * that merely has a command in it - a runner and a helper out of step, or a stray file. The number
+ * is the layout: it moved when the working directory became the word after the header.
+ */
+const SPEC_HEADER = 'athanor-sandbox-spec 2';
+
+/**
+ * The environment is handed over in the spec file because sudo resets it, and reconstructing it
  * through sudoers `env_keep` would put the same values in a file the runner does not own. None
  * of them is secret: the runner sets PATH, HOME and LANG, and everything else has already been
  * filtered down to locale and terminal settings the agent asked for.
@@ -42,18 +81,42 @@ const SUDO_EXECUTABLE = '/usr/bin/sudo';
 const environmentArguments = (env: Record<string, string>): string[] =>
   Object.entries(env).map(([key, value]) => `${key}=${value}`);
 
-export const agentSandbox = (helper: string, confineFilesystem: boolean): AgentSandbox => ({
+/**
+ * What the helper reads: the header, then every word NUL-terminated - the directory to run in,
+ * the environment, then the executable and its arguments, the last three being exactly the list
+ * `env -i` receives. NUL is the delimiter, so the encoding is byte-exact in both directions for
+ * every word that holds none: an argument that ends in a newline, as every heredoc body does, ends
+ * in a newline on the far side. The helper's own harness, scripts/test-sandbox.sh, drives one
+ * through and compares the bytes. A word holding a NUL is refused by `assertSandboxableCommand`
+ * before this is reached, because the file cannot carry it and reshaping it is not an option.
+ */
+const specContents = (words: string[]): Buffer =>
+  Buffer.concat([SPEC_HEADER, ...words].map((word) => Buffer.from(`${word}\0`, 'utf8')));
+
+export const agentSandbox = (
+  helper: string,
+  confineFilesystem: boolean,
+  specDirectory: string
+): AgentSandbox => ({
   elevate: SUDO_EXECUTABLE,
   helper,
+  specDirectory,
   confineFilesystem
 });
 
 /**
  * Resolves the configured helper, refusing to start rather than silently running agent commands
  * as the runner's own account. A box that cannot sandbox has to say so.
+ *
+ * The spec directory is emptied and remade here. The helper unlinks every spec it reads and every
+ * spec it refuses once it has vouched for the file as the runner's own, so a file still there at
+ * startup is one the helper never saw or would not vouch for - sudo itself refused the
+ * invocation, the runner died between writing it and spawning, or the file was not in the form
+ * the helper reads. Nothing is in flight when the runner starts, so nothing there is still wanted.
  */
 export const resolveAgentSandbox = async (
   helper: string | undefined,
+  specDirectory: string,
   confineFilesystem = false
 ): Promise<AgentSandbox | undefined> => {
   if (!helper) return undefined;
@@ -64,25 +127,57 @@ export const resolveAgentSandbox = async (
       `AGENT_SANDBOX_HELPER points at ${helper}, which is not executable. Agent commands would run as the runner's own account, so the runner will not start.`
     );
   }
-  return agentSandbox(helper, confineFilesystem);
+  await rm(specDirectory, { recursive: true, force: true });
+  await mkdir(specDirectory, { recursive: true, mode: SPEC_DIRECTORY_MODE });
+  return agentSandbox(helper, confineFilesystem, specDirectory);
 };
 
 /**
+ * Two things the helper's input cannot hold, refused rather than reshaped.
+ *
  * `env -i` reads leading `NAME=VALUE` arguments as assignments and stops at the first argument
  * without an equals sign, so an executable path containing one would be swallowed as an
  * assignment. No real program path has one, and refusing is cheaper than a second delimiter.
+ *
+ * NUL is the spec file's word delimiter and the one byte no argument can hold. Written as-is, an
+ * argument holding one arrives as two arguments, and an environment value holding one arrives as
+ * a value and a second assignment nobody filtered - `TERM=xterm\0LD_PRELOAD=/x` installs a
+ * preload past the list of variables a command may be given. Measured: before the file existed,
+ * the kernel refused the same byte on the argument list, loudly, and the file must not be quieter
+ * than the argument list was. The request schema admits the byte from JSON, so it is checked here,
+ * on every word, before anything is written.
  */
-export const assertSandboxableCommand = (invocation: Invocation): void => {
+export const assertSandboxableCommand = (
+  invocation: Invocation,
+  env: Record<string, string>
+): void => {
   if (invocation.executable.includes('='))
     throw new Error('An executable path may not contain an equals sign');
+  const words = [invocation.executable, ...invocation.args, ...environmentArguments(env)];
+  if (words.some((word) => word.includes('\0')))
+    throw new Error('A command, its arguments and its environment may not contain a NUL byte');
 };
 
 /**
  * The word the helper reads where a root would go when there is no confinement to ask for. A word
  * rather than an omission because the helper's grammar is positional: were the root left out, the
- * first `NAME=VALUE` of the environment would land in its place and be read as one.
+ * `--spec` word would land in its place and be read as one.
  */
 const NO_CONFINEMENT_ROOT = '-';
+
+/**
+ * Writes one command's spec and returns its path. A fresh random name under an exclusive create,
+ * mode 0600, in a directory only the runner and root can open: the file exists for the few
+ * milliseconds between this write and the helper's read, and the helper unlinks it before the
+ * command starts. The directory is made here as well as at startup, because a startup that found
+ * no helper made none and a test hands over a directory of its own.
+ */
+const writeSpec = async (specDirectory: string, words: string[]): Promise<string> => {
+  await mkdir(specDirectory, { recursive: true, mode: SPEC_DIRECTORY_MODE });
+  const specPath = path.join(specDirectory, `${randomBytes(12).toString('hex')}.spec`);
+  await writeFile(specPath, specContents(words), { mode: SPEC_FILE_MODE, flag: 'wx' });
+  return specPath;
+};
 
 /**
  * `confinementRoot` is the workspace the command may write in, or `null` for a command that must
@@ -94,16 +189,45 @@ const NO_CONFINEMENT_ROOT = '-';
  * Passing a root is a request, not a guarantee. A box whose installer found no Landlock says so on
  * the sandbox, and the helper is then asked for `open` and the command runs exactly as it did
  * before - which is the difference between a ladder and an outage.
+ *
+ * THE COMMAND AND ITS ENVIRONMENT ARE NOT ON THE ARGUMENT LIST, and that is the point of the spec
+ * file. sudo writes every argument of every privileged invocation to the system journal -
+ * persistent, root-owned, outside the workspace and outside every checkpoint - and the sudo the box
+ * ships cannot be told not to (scripts/install-native.sh says which directives it lacks). With the
+ * command there, that journal held every heredoc body, every filename and everything typed at a
+ * terminal, on a box whose privacy document says its own logs hold none of those. So the argument
+ * list carries the helper, the modes, the root and a path, and the text goes through a file the
+ * helper reads and unlinks. What the journal records is that a command ran, in which modes and in
+ * which workspace, and not what it was. sandbox.test.ts asserts the absence directly.
+ *
+ * NEITHER IS THE DIRECTORY THE COMMAND RUNS IN, and `cwd` is required for the same reason the
+ * root is. The journal line records the directory sudo was started from beside its arguments, and
+ * the directory an agent chooses for a command - `workspace/acme-lawsuit-discovery` - is a name
+ * used inside the task. So the caller starts sudo from the container root, which the line already
+ * names as the workspace, and the helper enters the real directory from the spec after the line
+ * is written. It has to be absolute: the helper has no directory of its own to resolve against but
+ * wherever sudo started, which is exactly the fact this keeps out of the journal.
  */
-export const sandboxedInvocation = (
+export const sandboxedInvocation = async (
   invocation: Invocation,
   env: Record<string, string>,
   sandbox: AgentSandbox,
   isolateNetwork: boolean,
-  confinementRoot: string | null
-): Invocation => {
-  assertSandboxableCommand(invocation);
+  confinementRoot: string | null,
+  cwd: string
+): Promise<Invocation> => {
+  assertSandboxableCommand(invocation, env);
+  if (cwd.includes('\0'))
+    throw new Error('A command, its arguments and its environment may not contain a NUL byte');
+  if (!path.isAbsolute(cwd))
+    throw new Error('The directory a sandboxed command runs in must be an absolute path');
   const confined = sandbox.confineFilesystem === true && confinementRoot !== null;
+  const specPath = await writeSpec(sandbox.specDirectory, [
+    cwd,
+    ...environmentArguments(env),
+    invocation.executable,
+    ...invocation.args
+  ]);
   return {
     executable: sandbox.elevate,
     args: [
@@ -113,9 +237,8 @@ export const sandboxedInvocation = (
       isolateNetwork ? 'isolated' : 'network',
       confined ? 'confine' : 'open',
       confined ? confinementRoot : NO_CONFINEMENT_ROOT,
-      ...environmentArguments(env),
-      invocation.executable,
-      ...invocation.args
+      '--spec',
+      specPath
     ]
   };
 };
@@ -129,13 +252,18 @@ export const sandboxedInvocation = (
  * ruleset here would stop them reading their own files from their own terminal while the file
  * browser hands them the same files two clicks away - a boundary paid for in ease of use and
  * bought nothing with. The helper's `shell` mode has no confine word for the same reason.
+ *
+ * Its command stays on the argument list, and that is a different case from `sandboxedInvocation`:
+ * what stands there is the shell's own path and the terminal's TERM and locale words, none of
+ * which is content. What the owner then types goes down the pseudo-terminal, which sudo does not
+ * record.
  */
 export const sandboxedShell = (
   invocation: Invocation,
   env: Record<string, string>,
   sandbox: AgentSandbox
 ): Invocation => {
-  assertSandboxableCommand(invocation);
+  assertSandboxableCommand(invocation, env);
   return {
     executable: sandbox.elevate,
     args: [

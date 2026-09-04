@@ -1077,6 +1077,9 @@ function Event({
                       {check.passed ? <Check /> : <AlertTriangle />}
                       <span>
                         <strong>{check.label}</strong>
+                        {/* What was run, above what it returned: the label is the agent's
+                            sentence and the tick is for the command, so the command is shown. */}
+                        {check.command && <code>{check.command}</code>}
                         <code>{check.detail}</code>
                       </span>
                     </li>

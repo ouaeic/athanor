@@ -35,7 +35,7 @@ import {
   resolveExecutable
 } from './command-policy.js';
 import { hostSearchPath } from './execution.js';
-import { resolveInside } from './files.js';
+import { resolveCommandDirectory } from './files.js';
 import { DesktopControl } from './holder.js';
 import { failureCode, runnerLogger } from './log.js';
 import { awaitChildExit } from './subprocess.js';
@@ -1353,7 +1353,9 @@ export class DesktopManager {
     const session = await this.ensure(workspaceId, root);
     if (session.control.holder !== 'agent')
       throw new Error(`Desktop control is held by ${session.control.holder}`);
-    const cwd = resolveInside(root, request.cwd);
+    // The shell's reading of a bare cwd, so a program and a command started from `probe` open in
+    // the same directory.
+    const cwd = resolveCommandDirectory(root, request.cwd);
     // A desktop program is spawned directly, so without this the same command the shell refuses
     // runs unchecked simply by asking for a window. Resolved as well as literal, so a symbolic
     // link inside the workspace cannot present a harmless basename.
