@@ -62,11 +62,23 @@ export const canonicalRoute = (method: string, url: string): string => {
     }
   })();
   const segments = path.split('/').map((segment, index, all) => {
+    const before = all[index - 1];
+    /*
+     * Two places where the runner's own route takes WHATEVER segment arrives, so the fold has to
+     * as well, or a value the model made up voids a row for a route the runner would have
+     * answered. `/processes/:id` is a fastify parameter: a session id nobody minted gets a 404,
+     * which the loop reads as "no such process" and carries on. Measured on the box: a model that
+     * polled `processes/bg-started` produced a miss and no row for the whole arm, while the real
+     * runner would have said not found. `/preview-check/:port` is the same shape with a number.
+     */
+    if (before === 'processes' && segment !== 'start' && segment !== 'stop-owner' && segment !== '')
+      return ':id';
+    if (before === 'preview-check' && segment !== '') return ':port';
     if (!idLike(segment)) return segment;
     // The workspace id is the segment after `workspaces`; everything else id-shaped is whatever
     // the route before it named. Distinguished so the two do not collapse into one another and
     // hide a route with two ids in it.
-    return all[index - 1] === 'workspaces' ? ':workspaceId' : ':id';
+    return before === 'workspaces' ? ':workspaceId' : ':id';
   });
   return `${method.toUpperCase()} ${segments.join('/')}`;
 };
@@ -115,6 +127,10 @@ export const IMPLEMENTED_ROUTES: readonly string[] = [
   'GET /v1/workspaces/:workspaceId/processes',
   'POST /v1/workspaces/:workspaceId/processes/stop-owner',
   'POST /v1/workspaces/:workspaceId/processes/:id',
+  // Whether something answers on a port inside the box, which is what the loop asks after a
+  // task starts a server. Reached on the box by a task that started one; a miss here voided a
+  // resolved row.
+  'GET /v1/workspaces/:workspaceId/preview-check/:port',
   // Checkpoints. Answered as a real content checkpoint over the backend, because a turn that
   // cannot check point cannot roll back, and a stub answer here would make a rollback look done.
   'GET /v1/workspaces/:workspaceId/checkpoints',

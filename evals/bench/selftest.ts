@@ -154,6 +154,12 @@ const EXERCISE: ReadonlyArray<{
     body: { action: 'poll' }
   },
   {
+    route: 'GET /v1/workspaces/:workspaceId/preview-check/:port',
+    method: 'GET',
+    // A port nothing on a fresh box listens on, so the honest answer is `available: false`.
+    url: `/v1/workspaces/${WORKSPACE}/preview-check/48211`
+  },
+  {
     route: 'POST /v1/workspaces/:workspaceId/checkpoints',
     method: 'POST',
     url: `/v1/workspaces/${WORKSPACE}/checkpoints`,
@@ -251,6 +257,23 @@ export const selfTest = async (observation: RouteObservation | null): Promise<st
     'POST /v1/workspaces/:workspaceId/processes/:id'
   )
     problems.push('a runner-minted session id is not being recognised as an id');
+  if (
+    canonicalRoute('POST', `/v1/workspaces/${WORKSPACE}/processes/bg-started`) !==
+    'POST /v1/workspaces/:workspaceId/processes/:id'
+  )
+    // A session id the model made up. The runner's route takes any segment and answers not
+    // found; a fold that kept it literal turned that answer into a miss and voided a whole arm.
+    problems.push('a session id the model made up is not being read as the id the route takes');
+  if (
+    canonicalRoute('GET', `/v1/workspaces/${WORKSPACE}/preview-check/8080`) !==
+    'GET /v1/workspaces/:workspaceId/preview-check/:port'
+  )
+    problems.push('a preview port is not being read as the parameter the route takes');
+  if (
+    canonicalRoute('POST', `/v1/workspaces/${WORKSPACE}/processes/start`) !==
+    'POST /v1/workspaces/:workspaceId/processes/start'
+  )
+    problems.push('the literal `start` under processes is being folded into an id');
 
   /* ----------------------------------------------------------------- the shim, over a real box */
   if (IMPLEMENTED_ROUTES.length === 0) {

@@ -461,6 +461,33 @@ export const createShim = (options: ShimOptions): Shim => {
           stderr: session.stderr
         });
       }
+      case 'GET /v1/workspaces/:workspaceId/preview-check/:port': {
+        const port = Number(url.pathname.split('/').pop());
+        if (!Number.isInteger(port) || port < 1 || port > 65_535)
+          return json({ error: { code: 'invalid_port', message: 'A port is 1 to 65535' } }, 400);
+        /*
+         * The runner opens a socket to 127.0.0.1:port on its own host. This box is a container the
+         * runner is not inside, so the question is asked of the kernel's own table from within:
+         * a LISTEN entry (state 0A) on that port in /proc/net/tcp or tcp6. No binary is assumed
+         * beyond a shell and `cat`, which every image this rig has met carries.
+         */
+        const hex = port.toString(16).toUpperCase().padStart(4, '0');
+        const probe = await backend.exec({
+          executable: '/bin/sh',
+          args: ['-c', 'cat /proc/net/tcp /proc/net/tcp6 2>/dev/null'],
+          cwd: '.',
+          env: {},
+          timeoutSeconds: 5,
+          network: false,
+          maxOutputBytes: 1024 * 1024
+        });
+        const listening = probe.stdout
+          .split('\n')
+          .some((line) =>
+            new RegExp(`^\\s*\\d+: [0-9A-F]+:${hex} [0-9A-F]+:[0-9A-F]+ 0A `).test(line)
+          );
+        return json({ port, available: listening });
+      }
       case 'POST /v1/workspaces/:workspaceId/processes/stop-owner':
         // Nothing is killed, and it says so. This shim does not hold the child handles after
         // `exec` returns them to the promise above, so it cannot stop one. A benchmark task that
