@@ -6,6 +6,7 @@ import { api } from '../api.js';
 import type { SendBlock } from '../composer-state.js';
 import { describeFailure } from '../failure-text.js';
 import { paneId } from '../shortcuts.js';
+import { upsertTask } from '../task-list.js';
 import type { BotWall, Bootstrap, ConversationSearchResult, Task, Workspace } from '../types.js';
 import type { FireState } from '../fire.js';
 import type { useUndoQueue } from '../Undo.js';
@@ -203,6 +204,7 @@ export function Workbench(props: {
             onOpenTask={setTaskId}
             onReload={props.reloadForNewShell}
             onPause={props.pauseConversation}
+            onShare={() => overlays.setShare(true)}
             onToggleInspector={() => inspector.setOpen(!inspector.open)}
           />
           {/* A named region with `tabIndex={-1}`: the skip link, ⌘2 and F6 all put focus here, and
@@ -366,6 +368,18 @@ export function Workbench(props: {
           onOpenTask={setTaskId}
           onSettingsPage={overlays.setSettingsPage}
           onWorkspaceId={setWorkspaceId}
+          shareOpen={overlays.share}
+          onCloseShare={() => overlays.setShare(false)}
+          onShareNotice={status.setNotice}
+          onShareError={status.setError}
+          onShareCount={(count) => {
+            if (!task) return;
+            setData((current) =>
+              current
+                ? { ...current, tasks: upsertTask(current.tasks, { ...task, shareCount: count }) }
+                : current
+            );
+          }}
           onLogout={() =>
             void api
               .logout()

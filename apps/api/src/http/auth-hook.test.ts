@@ -40,6 +40,8 @@ interface Harness {
   store: DataStore;
   /** `${ip}:${path}` for every request the throttle table claimed. */
   throttled: string[];
+  /** The address of every request the share viewer's own per-address bucket counted. */
+  shareThrottled: string[];
   /** How many times a handler ran despite the hooks; the pre-handler's whole job is to keep it 0. */
   handlerRuns: () => number;
   cookieFor: (userId: string) => Promise<string>;
@@ -54,6 +56,7 @@ const buildHarness = async (): Promise<Harness> => {
   app.decorateRequest('user', null);
   app.decorateRequest('apiToken', null);
   const throttled: string[] = [];
+  const shareThrottled: string[] = [];
   let handlerRuns = 0;
 
   const context = {
@@ -64,6 +67,9 @@ const buildHarness = async (): Promise<Harness> => {
     requestStarted: new WeakMap<object, number>(),
     checkAuthRate: (key: string) => {
       throttled.push(key);
+    },
+    checkShareRate: (key: string) => {
+      shareThrottled.push(key);
     },
     config: { PUBLIC_APP_URL: 'https://athanor.test' } as ApiConfig
   } as unknown as ServerBase;
@@ -114,6 +120,30 @@ const buildHarness = async (): Promise<Harness> => {
     app.post(path, async () => ({ ok: true }));
   }
   app.get('/healthz', async () => ({ ok: true }));
+  /*
+   * The share viewer's four public routes, as probes: each records whether it ran and what
+   * `request.user` held when it did. The hook is the only thing between these and a session, so a
+   * route here that sees a user is the hook reading a cookie it must not read.
+   */
+  for (const path of [
+    '/v1/shares/:token',
+    '/v1/shares/:token/blob',
+    '/v1/shares/:token/artifacts/:n',
+    '/v1/shares/assets/:file'
+  ]) {
+    app.get(path, async (request) => {
+      handlerRuns += 1;
+      return { user: request.user?.id ?? null };
+    });
+  }
+  /** A route that fails the way a handler built from an upstream answer might: with a link in it. */
+  app.get('/v1/probe/leaky-error', async () => {
+    throw new AthanorError(
+      'upstream_refused',
+      'could not fetch https://box.example/v1/shares/AbCdEfGhIjKlMnOpQrStUv#1.' + 'k'.repeat(43),
+      502
+    );
+  });
 
   await app.ready();
   disposers.push(async () => {
@@ -125,6 +155,7 @@ const buildHarness = async (): Promise<Harness> => {
     app,
     store,
     throttled,
+    shareThrottled,
     handlerRuns: () => handlerRuns,
     cookieFor: async (userId: string) => {
       const token = randomBytes(32).toString('base64url');
@@ -263,5 +294,90 @@ describe('passkey ceremony throttle', () => {
     const harness = await buildHarness();
     await harness.app.inject({ method: 'GET', url: '/healthz' });
     expect(harness.throttled).toEqual([]);
+  });
+});
+
+describe('the share viewer, which is public in a stronger sense', () => {
+  const routes = [
+    '/v1/shares/AbCdEfGhIjKlMnOpQrStUv',
+    '/v1/shares/AbCdEfGhIjKlMnOpQrStUv/blob',
+    '/v1/shares/AbCdEfGhIjKlMnOpQrStUv/artifacts/0',
+    '/v1/shares/assets/share.js'
+  ];
+  const patterns = [
+    '/v1/shares/:token',
+    '/v1/shares/:token/blob',
+    '/v1/shares/:token/artifacts/:n',
+    '/v1/shares/assets/:file'
+  ];
+
+  /** On `publicPaths`: a caller with no session reaches the handler. Drop an entry and this is a 401. */
+  test('reaches every share route with no session at all', async () => {
+    const harness = await buildHarness();
+    for (const url of routes) {
+      const response = await harness.app.inject({ method: 'GET', url });
+      expect(response.statusCode, url).toBe(200);
+      expect(response.json(), url).toEqual({ user: null });
+    }
+    expect(harness.handlerRuns()).toBe(routes.length);
+  });
+
+  /**
+   * Throttled through the viewer's own per-address bucket, the four routes together, and not
+   * through the ceremony table: that one allows twenty a quarter-hour per route pattern, and one
+   * open of the largest link this product makes is a page, two assets, the ciphertext and up to
+   * fifty artifacts through those same four patterns - so a share route on the ceremony table is a
+   * link that cannot be opened.
+   */
+  test('throttles every share route through one per-address bucket, not the ceremony table', async () => {
+    const harness = await buildHarness();
+    for (const url of routes)
+      await harness.app.inject({ method: 'GET', url, remoteAddress: '203.0.113.9' });
+    expect(harness.throttled).toEqual([]);
+    expect(harness.shareThrottled).toEqual(routes.map(() => '203.0.113.9'));
+    expect(patterns).toHaveLength(routes.length);
+  });
+
+  /**
+   * The short-circuit before the session lookup. A valid cookie, on a session young enough that
+   * `sessionUser` would renew it and re-issue the cookie: the handler must still see no user, and
+   * the response must carry no `Set-Cookie`. Remove the early return in the hook and both go red.
+   */
+  test('neither resolves nor refreshes a session a share request happens to carry', async () => {
+    const harness = await buildHarness();
+    const owner = await seedOwnerWorkspace(harness.store, 'owner');
+    const cookie = await harness.cookieFor(owner.userId);
+    for (const url of routes) {
+      const response = await harness.app.inject({ method: 'GET', url, headers: { cookie } });
+      expect(response.statusCode, url).toBe(200);
+      expect(response.json(), url).toEqual({ user: null });
+      expect(response.headers['set-cookie'], url).toBeUndefined();
+    }
+    // The control: the same cookie on an ordinary route is a session, and is renewed.
+    const control = await harness.app.inject({
+      method: 'GET',
+      url: `/v1/workspaces/${owner.workspaceId}/scoped-probe`,
+      headers: { cookie }
+    });
+    expect(control.statusCode).toBe(200);
+    expect(control.headers['set-cookie']).toBeDefined();
+  });
+});
+
+describe('what an error carries onto the wire', () => {
+  /** A share link inside an AthanorError message is both halves of a secret; the net takes it whole. */
+  test('redacts a share link out of an error message', async () => {
+    const harness = await buildHarness();
+    const owner = await seedOwnerWorkspace(harness.store, 'owner');
+    const response = await harness.app.inject({
+      method: 'GET',
+      url: '/v1/probe/leaky-error',
+      headers: { cookie: await harness.cookieFor(owner.userId) }
+    });
+    expect(response.statusCode).toBe(502);
+    const message = response.json<{ error: { message: string } }>().error.message;
+    expect(message).toBe('could not fetch https://box.example[REDACTED]');
+    expect(response.body).not.toContain('AbCdEfGhIjKlMnOpQrStUv');
+    expect(response.body).not.toContain('kkkkkkkk');
   });
 });

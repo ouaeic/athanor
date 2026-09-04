@@ -65,6 +65,7 @@ import { registerRelayRoutes } from './routes/relay.js';
 import { registerRunnerProxyRoutes } from './routes/runner-proxy.js';
 import { registerScheduleRoutes } from './routes/schedules.js';
 import { registerSearchRoutes } from './routes/search.js';
+import { registerShareRoutes } from './routes/shares.js';
 import { registerSnapshotRoutes } from './routes/snapshots.js';
 import { createServerSupport } from './routes/support.js';
 import { registerTaskEventRoutes } from './routes/task-events.js';
@@ -245,6 +246,7 @@ export const buildServer = async (
   registerTaskRoutes(routes);
   registerTrajectoryRoutes(routes);
   registerTaskEventRoutes(routes);
+  registerShareRoutes(routes);
 
   /**
    * Started last, so nothing it might touch is still being built, and stopped first below.

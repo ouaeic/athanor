@@ -23,6 +23,7 @@ export function WorkbenchHeader(props: {
   onOpenTask: (id: string) => void;
   onReload: () => void;
   onPause: (task: Task) => void;
+  onShare: () => void;
   onToggleInspector: () => void;
 }) {
   const { task, workspace, computerHolder, taskIsActive, inspectorOpen } = props;
@@ -106,6 +107,16 @@ export function WorkbenchHeader(props: {
         */}
         {queuedFollowUpLabel(task) && (
           <span className="header-pill queue-pill">{queuedFollowUpLabel(task)}</span>
+        )}
+        {/*
+          A conversation with a live link says so where its other facts are said, and the word is
+          the door to the links: this is chrome, a fact about the machine with the one control that
+          belongs to it, and it is not on screen when nothing is shared.
+        */}
+        {task && task.shareCount > 0 && (
+          <button className="header-pill share-pill" onClick={props.onShare}>
+            Shared{task.shareCount > 1 ? ` · ${task.shareCount}` : ''}
+          </button>
         )}
         {taskIsActive && task && (
           <button className="header-pill" onClick={() => props.onPause(task)}>

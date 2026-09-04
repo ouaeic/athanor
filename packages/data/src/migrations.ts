@@ -3130,5 +3130,165 @@ export const migrations = [
         ON task_schedule_deliveries(schedule_id, created_at)
         WHERE delivered_at IS NULL;
     `
+  },
+  {
+    version: 80,
+    name: 'a_notification_can_reach_a_phone_with_no_subscription',
+    /*
+     * The second transport: one destination per owner per kind, and a ledger of its own.
+     *
+     * Every branch of the notification candidate set joined `push_subscriptions`, so an owner with
+     * no registered device was offered nothing of any kind, for ever - docs/OPERATIONS.md carried
+     * that as an open item. A destination is the owner-level target that query now selects on
+     * beside a device: a paired chat on a messaging service, reached by its bot API.
+     *
+     * `config_ciphertext` is the bot token and the loopback API token, sealed by the API under the
+     * master key with the row's own id in the context, so a row moved between accounts does not
+     * open. `sender_id` is the numeric sender the owner's phone presented at pairing; every inbound
+     * decision is checked against it and never against a chat id or a username, because a group's
+     * chat id is not a person and a username is renameable. `pairing_hash` is the SHA-256 of a
+     * one-time secret minted in Settings and never stored in the clear; `pairing_expires_at` bounds
+     * it. `last_update_id` is the inbound poller's cursor. `redact` defaults to true because the
+     * service in between is not end-to-end encrypted: the default sends a title and a link.
+     *
+     * A SECOND LEDGER RATHER THAN A WIDER `notification_deliveries`: that table's primary key carries
+     * a foreign key to `push_subscriptions`, and the tests that hold the push ledger to its shape
+     * assert on exactly that. `external_ref` is the message id the service answered with, which is
+     * what a later edit that clears the buttons is addressed to; `nonce` is bound into the button
+     * data so a callback from a stale or forged card is refused before any store call; `outcome_at`
+     * is set once the far side's card shows the decision and needs nothing more.
+     *
+     * Two new tables and no rewrite, so there is no entry in `REWRITING_MIGRATIONS`.
+     */
+    sql: `
+      CREATE TABLE IF NOT EXISTS notification_destinations (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('telegram')),
+        config_ciphertext JSONB NOT NULL,
+        sender_id TEXT,
+        pairing_hash TEXT,
+        pairing_expires_at TIMESTAMPTZ,
+        last_update_id BIGINT,
+        redact BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        verified_at TIMESTAMPTZ,
+        disabled_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(user_id, kind)
+      );
+
+      CREATE TABLE IF NOT EXISTS notification_destination_deliveries (
+        destination_id UUID NOT NULL REFERENCES notification_destinations(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('approval_required','task_finished','spend_paused',
+                                            'agent_message','takeover_needed')),
+        resource_id UUID NOT NULL,
+        external_ref TEXT,
+        nonce TEXT,
+        delivered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        outcome_at TIMESTAMPTZ,
+        PRIMARY KEY(destination_id, kind, resource_id)
+      );
+      CREATE INDEX IF NOT EXISTS notification_destination_deliveries_time_idx
+        ON notification_destination_deliveries(delivered_at);
+      CREATE INDEX IF NOT EXISTS notification_destination_deliveries_open_idx
+        ON notification_destination_deliveries(destination_id, resource_id)
+        WHERE kind='approval_required' AND outcome_at IS NULL;
+    `
+  },
+  {
+    version: 81,
+    name: 'a_share_is_ciphertext_nobody_on_this_box_can_open',
+    /*
+     * Share links: two tables, and the shape of both is the security argument.
+     *
+     * `task_shares` is one row per link the owner made. `lookup_hash` is the SHA-256 of the 22
+     * character segment in the link's path, so the table can find a row for a request and a copy
+     * of the table cannot produce a request. `envelope` is the snapshot - the owner's messages, the
+     * assistant's replies, one line per tool step, the artifact names - sealed with AES-256-GCM
+     * under a key that exists in exactly two places: the fragment of the link the owner was handed
+     * once, and the memory of the browser reading it. Not in this row, not in any row, not in the
+     * workspace key and not derivable from the master key. Every failure the public surface can
+     * have - a log line, a backup on the wrong disk, an enumeration, a bug in the handler, a
+     * link-preview bot - therefore yields bytes nobody can read. The AAD is `share:<lookup_hash>`,
+     * so an envelope moved onto another share's row fails its tag.
+     *
+     * `manifest` names how many artifacts the link carries and how large each is, and nothing else.
+     * Names and types live inside the encrypted snapshot; the public route addresses an artifact
+     * by its index in this list, so no artifact id, storage key or workspace path is ever public.
+     *
+     * `task_share_artifacts` holds the bytes, copied out of the workspace at share time - the agent
+     * can rewrite `.athanor/artifacts/*` afterwards, and a link is a promise about what it showed
+     * when it was made. BYTEA rather than a directory on disk, deliberately: the task cascade then
+     * removes them for free, a backup carries them as the ciphertext they are, and the embedded
+     * database the tests run on covers the same statement production runs. `envelope_meta` is the
+     * public half of the envelope - version, IV, tag and AAD - kept apart from the ciphertext so
+     * the blob route can list every artifact's envelope without reading a byte of any of them.
+     *
+     * `ON DELETE CASCADE` from `tasks`, `workspaces` and `users`, and `deleteTask` deletes the rows
+     * explicitly as well: a share must not outlive the conversation it was cut from, and that
+     * invariant should not rest on a constraint alone.
+     *
+     * `expires_at` NULL is the deliberate choice of never; `revoked_at` is immediate and final -
+     * the artifact rows go with it, the share row stays so the owner's list can say what happened.
+     * `view_count` and `last_viewed_at` are the whole of what is recorded about readers: no
+     * address, no agent string, no identity.
+     *
+     * Two new tables and their indexes. Nothing is rewritten, so there is no entry in
+     * `REWRITING_MIGRATIONS`.
+     */
+    sql: `
+      CREATE TABLE IF NOT EXISTS task_shares (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        lookup_hash TEXT NOT NULL UNIQUE,
+        envelope JSONB NOT NULL,
+        manifest JSONB NOT NULL DEFAULT '[]'::jsonb,
+        snapshot_bytes INTEGER NOT NULL DEFAULT 0 CHECK (snapshot_bytes >= 0),
+        version INTEGER NOT NULL DEFAULT 1,
+        expires_at TIMESTAMPTZ,
+        view_count INTEGER NOT NULL DEFAULT 0,
+        last_viewed_at TIMESTAMPTZ,
+        revoked_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS task_shares_task_idx ON task_shares(task_id);
+      CREATE INDEX IF NOT EXISTS task_shares_owner_idx ON task_shares(user_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS task_share_artifacts (
+        share_id UUID NOT NULL REFERENCES task_shares(id) ON DELETE CASCADE,
+        n INTEGER NOT NULL CHECK (n >= 0),
+        envelope_meta JSONB NOT NULL,
+        ciphertext BYTEA NOT NULL,
+        size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+        PRIMARY KEY (share_id, n)
+      );
+    `
+  },
+  {
+    version: 82,
+    name: 'the_paired_sender_is_sealed_like_the_token_beside_it',
+    /*
+     * The sender the owner's phone presented at pairing is also the private chat every outbound
+     * message is addressed to, and it was the one part of the destination row kept in the clear.
+     * A copy of the table therefore tied the owner to an account on the messaging service and,
+     * beside a recovered bot token, named the address to send to. `sender_ciphertext` is that id
+     * sealed under the master key with the owner's and the row's ids in the context, exactly as
+     * the token beside it is; the data layer opens it for the sender and the inbound poller and
+     * for nothing else. The API serves `paired`, never the id, so no route changes shape.
+     *
+     * The plaintext column goes rather than being carried over: a migration holds no master key,
+     * so it cannot seal what is there. A destination paired before this migration keeps its
+     * verification and loses its sender, which the notifier reports once as unreadable and the
+     * settings page shows as "no phone is paired to it" - one new pairing link puts it right. No
+     * row is written, so there is no entry in `REWRITING_MIGRATIONS`.
+     */
+    sql: `
+      ALTER TABLE notification_destinations ADD COLUMN IF NOT EXISTS sender_ciphertext JSONB;
+      ALTER TABLE notification_destinations DROP COLUMN IF EXISTS sender_id;
+    `
   }
 ] as const;

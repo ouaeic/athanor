@@ -158,6 +158,7 @@ export const mapTask = (row: Record<string, unknown>): TaskRecord => {
     maxSpendUsd: numericOrNull(row.max_spend_usd),
     spentUsd: Number(row.spent_usd ?? 0),
     queuedMessageCount: Number(row.queued_message_count ?? 0),
+    shareCount: Number(row.share_count ?? 0),
     promptCiphertext: json<EncryptedEnvelope>(row.prompt_ciphertext),
     agentStateCiphertext: row.agent_state_ciphertext
       ? json<EncryptedEnvelope>(row.agent_state_ciphertext)

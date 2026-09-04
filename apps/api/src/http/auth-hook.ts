@@ -25,7 +25,7 @@ import type { ApiTokenScope } from '@athanor/contracts';
 import { AthanorError, sha256 } from '@athanor/core';
 import type { ApiTokenRecord, UserRecord } from '@athanor/data';
 import type { FastifyRequest } from 'fastify';
-import { STEP_UP_WINDOW_SECONDS, sessionCookieName, sessionUser } from '../session.js';
+import { hasRecentStepUp, sessionCookieName, sessionUser } from '../session.js';
 import type { ServerBase } from './server-context.js';
 
 declare module 'fastify' {
@@ -35,6 +35,26 @@ declare module 'fastify' {
     rawBody?: Buffer;
   }
 }
+
+/**
+ * The share viewer, which is the one surface on this box built for a reader who is not the owner.
+ *
+ * Public in a stronger sense than the rest of `publicPaths`: those routes have no session yet and
+ * are about to make one, while these must never touch one. A session cookie arriving here - the
+ * owner opening their own link, a device that happens to be signed in - is deliberately not read,
+ * because reading it writes: `sessionUser` slides the expiry and re-issues the cookie, and a
+ * `Set-Cookie` on a response anyone can request is the kind of thing a public route must not do.
+ * The request hook short-circuits before the session lookup for these, so `request.user` is null
+ * on them whatever the caller carried.
+ *
+ * Listed by route pattern like the hook route above, because the segment is random and hashed.
+ */
+const publicShareRoutes = new Set([
+  '/v1/shares/:token',
+  '/v1/shares/:token/blob',
+  '/v1/shares/:token/artifacts/:n',
+  '/v1/shares/assets/:file'
+]);
 
 const publicPaths = new Set([
   '/healthz',
@@ -74,7 +94,8 @@ const publicPaths = new Set([
    * Listed by ROUTE pattern and not by URL, which is what this table is read with
    * (`request.routeOptions.url`), so the random segment does not have to be enumerated.
    */
-  '/v1/hooks/:token'
+  '/v1/hooks/:token',
+  ...publicShareRoutes
 ]);
 
 /**
@@ -103,6 +124,15 @@ const authRateLimitedPaths = new Set([
   // unauthenticated caller, which is the profile this throttle exists for.
   '/v1/auth/enroll/options',
   '/v1/auth/enroll/verify'
+  /*
+   * The share viewer is deliberately NOT on this table, although it has the profile: a capability
+   * presented by an unauthenticated caller, on a route that answers as often as it is asked. This
+   * table is keyed by route pattern and sized for a ceremony - twenty a quarter-hour - and one open
+   * of the largest link the product makes is a page, two assets, the ciphertext and up to fifty
+   * artifacts through the same four patterns, so a link on this table is a link that cannot be
+   * opened. The viewer has its own per-address bucket, one for all of its routes together, sized
+   * in `SHARE_REQUESTS_PER_MINUTE` and applied in the request hook below.
+   */
 ]);
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -219,11 +249,7 @@ export type StepUpGuard = (request: FastifyRequest, user: UserRecord) => Promise
 export const createStepUpGuard = (context: ServerBase): StepUpGuard => {
   const { store, secure } = context;
   const requireRecentStepUp = async (request: FastifyRequest, user: UserRecord): Promise<void> => {
-    const token = request.cookies[sessionCookieName(secure)];
-    if (
-      !token ||
-      !(await store.hasRecentSessionStepUp(user.id, sha256(token), STEP_UP_WINDOW_SECONDS))
-    ) {
+    if (!(await hasRecentStepUp(store, user.id, request.cookies[sessionCookieName(secure)]))) {
       throw new AthanorError(
         'step_up_required',
         'Confirm this sensitive action with your passkey',
@@ -237,11 +263,25 @@ export const createStepUpGuard = (context: ServerBase): StepUpGuard => {
 
 /** The gates above, hung on the app in the order a request meets them. */
 export const registerAuthHooks = (context: ServerBase): void => {
-  const { app, store, secure, requestStarted, checkAuthRate, config } = context;
+  const { app, store, secure, requestStarted, checkAuthRate, checkShareRate, config } = context;
   app.addHook('onRequest', async (request, reply) => {
     requestStarted.set(request, performance.now());
     const path = request.routeOptions.url ?? request.url.split('?')[0]!;
     if (authRateLimitedPaths.has(path)) checkAuthRate(`${request.ip}:${path}`);
+    /*
+     * Before the session is looked up, and that order is the whole point - see
+     * `publicShareRoutes`. Nothing below this line runs for a share route: no session read, no
+     * cookie re-issue, no bearer token resolved, no origin check, because there is no caller to
+     * identify and nothing on these routes that identifying one could change.
+     */
+    if (publicShareRoutes.has(path)) {
+      // One bucket per address for the viewer's routes together, the assets included, so that a
+      // flood aimed at the page cannot route round the count by fetching its script.
+      checkShareRate(request.ip);
+      request.user = null;
+      request.apiToken = null;
+      return;
+    }
     const authorization = request.headers.authorization;
     if (authorization?.startsWith('Bearer ')) {
       const value = authorization.slice('Bearer '.length);

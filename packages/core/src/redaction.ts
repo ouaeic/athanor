@@ -45,7 +45,15 @@ const SECRET_PATTERNS: RegExp[] = [
   // Any JSON web token, whichever provider issued it.
   /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
   // A private key block, which is worth catching whole rather than by its base64 body.
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+  /*
+   * A share link, whole. The path segment is a capability - anyone holding it can read the
+   * snapshot - and the fragment after it is the key that opens the snapshot, so a pasted link in
+   * an error message or a log line is both halves of a secret at once. The fixed 22-character
+   * segment is the recognisable prefix; the lookahead keeps an owner-side route naming a UUID
+   * (`/v1/shares/<36 characters>`) from being cut in half and half-leaked.
+   */
+  /\/v1\/shares\/[A-Za-z0-9_-]{22}(?![A-Za-z0-9_-])(?:#\S*)?/g
 ];
 
 /**

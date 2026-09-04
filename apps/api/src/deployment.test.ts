@@ -40,4 +40,18 @@ describe('the native server block', () => {
     expect(stable).toBeDefined();
     expect(stable).toContain('expires 7d;');
   });
+
+  /**
+   * The share viewer's script and stylesheet are served by the API under `/v1/shares/assets/`,
+   * and they are the only paths under `/v1/` that end in an asset extension. nginx picks the
+   * longest matching prefix location and then still tries every regex location unless that prefix
+   * was declared `^~`, so a plain `location /v1/` hands `share.js` and `share.css` to the
+   * stable-asset block above, which answers from the web build on disk - where they are not - with
+   * its own 404. The page proxies fine, and a reader watches "Opening…" for ever.
+   */
+  test('proxies every /v1/ path to the API before a regex location can claim one', async () => {
+    const conf = await nginxConf();
+    expect(conf).toMatch(/^\s*location \^~ \/v1\/ \{/m);
+    expect(conf).not.toMatch(/^\s*location \/v1\/ \{/m);
+  });
 });

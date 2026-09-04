@@ -1,0 +1,144 @@
+/* The share dialog. Loaded with it, so the first paint carries none of this. */
+.share-dialog {
+  width: min(720px, 100%);
+}
+.share-dialog h3 {
+  font-size: 14px;
+  margin: 22px 0 6px;
+}
+.share-created {
+  margin: 14px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--accent-muted);
+  border-radius: 12px;
+  display: grid;
+  gap: 8px;
+}
+.share-created p {
+  margin: 0;
+}
+.share-created-url {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.share-created-url code {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+}
+.share-options {
+  display: grid;
+  gap: 8px;
+}
+.share-options .subtle {
+  margin: 0;
+}
+.share-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+.share-field {
+  display: grid;
+  gap: 4px;
+  font-size: 13px;
+}
+.share-field input,
+.share-field select {
+  font: inherit;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+  color: var(--text);
+}
+.share-artifacts {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 12px;
+  display: grid;
+  gap: 6px;
+}
+.share-artifacts legend {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 0 4px;
+}
+.share-preview-events {
+  list-style: none;
+  margin: 0;
+  padding: 10px 12px;
+  max-height: 340px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  display: grid;
+  gap: 10px;
+  font-size: 13px;
+}
+.share-preview-title {
+  margin: 0 0 6px;
+  font-weight: 600;
+}
+.share-preview-event {
+  display: grid;
+  gap: 2px;
+}
+.share-preview-kind {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.share-preview-line {
+  color: var(--muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.share-preview-files {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.share-preview-redacted,
+.share-preview-error {
+  margin: 8px 0 0;
+  font-size: 13px;
+  color: var(--caution, var(--muted));
+}
+.share-links ul {
+  list-style: none;
+  margin: 0 0 10px;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+.share-links li {
+  display: grid;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  font-size: 13px;
+}
+.share-links li.closed {
+  color: var(--muted);
+}
+.share-link-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.share-link-actions .secondary {
+  padding: 4px 8px;
+  font-size: 12px;
+}

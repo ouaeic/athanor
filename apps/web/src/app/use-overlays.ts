@@ -4,7 +4,7 @@ import type { SettingsPage } from '../SelfHostedSettings.js';
 /**
  * What is open over the workbench.
  *
- * Five independent cells, and the only rule between them is that none of them is on screen when the
+ * Six independent cells, and the only rule between them is that none of them is on screen when the
  * app opens — which is why the first paint carries none of the code behind them. They are gathered
  * here because "is anything open?" is a question three other parts of this screen ask: the first
  * focus declines to steal the cursor from a dialog, the notification policy is re-read whenever
@@ -16,6 +16,7 @@ export const useOverlays = () => {
   const [noticeLog, setNoticeLog] = useState(false);
   const [shortcutSheet, setShortcutSheet] = useState(false);
   const [palette, setPalette] = useState(false);
+  const [share, setShare] = useState(false);
   const openSettings = (page: SettingsPage = 'ai') => setSettingsPage(page);
   return {
     settingsPage,
@@ -28,6 +29,8 @@ export const useOverlays = () => {
     shortcutSheet,
     setShortcutSheet,
     palette,
-    setPalette
+    setPalette,
+    share,
+    setShare
   };
 };

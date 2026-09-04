@@ -26,6 +26,7 @@ export interface PaletteActions {
   archive: (task: Task) => void;
   copy: () => void;
   download: () => void;
+  share: () => void;
   remove: (task: Task) => void;
   openTab: (tab: InspectorTab) => void;
   openSettings: () => void;
@@ -119,6 +120,14 @@ export const paletteCommands = (input: {
         label: 'Download conversation',
         group: 'This conversation',
         run: actions.download
+      },
+      {
+        id: 'share-conversation',
+        label: task.shareCount
+          ? 'Manage the links to this conversation'
+          : 'Share this conversation',
+        group: 'This conversation',
+        run: actions.share
       },
       {
         id: 'delete-conversation',

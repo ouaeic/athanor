@@ -58,6 +58,22 @@ describe('the last net before a secret reaches somewhere it can be read', () => 
     );
   });
 
+  it('removes a share link whole, fragment included', () => {
+    // The path segment is a capability and the fragment is the key that opens what it names, so a
+    // link pasted into an error message is both halves of a secret. 22 characters of base64url in
+    // the path is the recognisable shape.
+    const id = 'AbCdEfGhIjKlMnOpQrStUv';
+    const key = 'k'.repeat(43);
+    expect(redactText(`opened https://box.example/v1/shares/${id}#1.${key} twice`)).toBe(
+      'opened https://box.example[REDACTED] twice'
+    );
+    // Without a fragment the path alone is still the capability.
+    expect(redactText(`GET /v1/shares/${id}/blob`)).toBe('GET [REDACTED]/blob');
+    // An owner-side route names a UUID, which is 36 characters: not a link, and not cut in half.
+    const owner = '/v1/shares/0f2b1c9e-8a7d-4c3b-9e1f-2a3b4c5d6e7f';
+    expect(redactText(owner)).toBe(owner);
+  });
+
   it('leaves ordinary words alone, because a net that catches everything is not read', () => {
     for (const ordinary of [
       'workspace/report.md',

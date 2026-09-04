@@ -81,6 +81,25 @@ describe('production configuration', () => {
     expect(() => loadConfig()).toThrow();
   });
 
+  /**
+   * Share links are on unless the operator writes the one word that turns them off. The empty
+   * spelling matters: a templated control.env can list the key with nothing after it, and that
+   * must read as absent rather than as "not true", or the template closes every link on the box.
+   */
+  it('reads SHARING_ENABLED as on when absent or empty, and off only when written false', () => {
+    productionEnvironment();
+    expect(loadConfig().SHARING_ENABLED).toBeUndefined();
+
+    vi.stubEnv('SHARING_ENABLED', '');
+    expect(loadConfig().SHARING_ENABLED).toBeUndefined();
+
+    vi.stubEnv('SHARING_ENABLED', 'true');
+    expect(loadConfig().SHARING_ENABLED).toBe(true);
+
+    vi.stubEnv('SHARING_ENABLED', 'false');
+    expect(loadConfig().SHARING_ENABLED).toBe(false);
+  });
+
   it('fails closed without installation secrets', () => {
     productionEnvironment();
     vi.stubEnv('DATA_MASTER_KEY', '');

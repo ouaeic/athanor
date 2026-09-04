@@ -8,6 +8,7 @@ import { TaskSignals, TaskStore } from './store/tasks.js';
 import { ScheduleStore } from './store/schedules.js';
 import { WorkspaceStore } from './store/workspaces.js';
 import { MaintenanceStore } from './store/maintenance.js';
+import { ShareStore } from './store/shares.js';
 
 /**
  * Re-exported for one release. `MEMORY_SOURCE_SEARCH_PER_TASK` moved to `store/sql/memory.ts`
@@ -26,7 +27,11 @@ export { MEMORY_SOURCE_SEARCH_PER_TASK } from './store/sql/memory.js';
  * `@athanor/data`'s new modules directly.
  */
 export { MAX_APPROVAL_PAGE } from './store/connectors.js';
-export { agentNotificationAad } from './store/notifications.js';
+export {
+  agentNotificationAad,
+  notificationDestinationAad,
+  notificationDestinationSenderAad
+} from './store/notifications.js';
 export type { StoredNotificationSettings } from './store/notifications.js';
 
 /**
@@ -86,6 +91,7 @@ export class DataStore {
   readonly #tasks: TaskStore;
   readonly #schedules: ScheduleStore;
   readonly #maintenance: MaintenanceStore;
+  readonly #shares: ShareStore;
 
   constructor(database: Database) {
     this.#identity = new IdentityStore(database);
@@ -102,6 +108,7 @@ export class DataStore {
     // spend guard on the same transaction handle that inserts the task it authorises.
     this.#schedules = new ScheduleStore(database, this.#billing, this.#taskSignals);
     this.#maintenance = new MaintenanceStore(database);
+    this.#shares = new ShareStore(database);
   }
 
   onTaskEvent(...args: Parameters<TaskSignals['onTaskEvent']>) {
@@ -845,6 +852,51 @@ export class DataStore {
     return this.#workspaces.deleteArtifact(...args);
   }
 
+  /** Forwarded to `store/shares.ts`: the encrypted snapshots behind share links. */
+  createShare(...args: Parameters<ShareStore['createShare']>) {
+    return this.#shares.createShare(...args);
+  }
+
+  listSharesForTask(...args: Parameters<ShareStore['listSharesForTask']>) {
+    return this.#shares.listSharesForTask(...args);
+  }
+
+  listShares(...args: Parameters<ShareStore['listShares']>) {
+    return this.#shares.listShares(...args);
+  }
+
+  getShareForOwner(...args: Parameters<ShareStore['getShareForOwner']>) {
+    return this.#shares.getShareForOwner(...args);
+  }
+
+  revokeShare(...args: Parameters<ShareStore['revokeShare']>) {
+    return this.#shares.revokeShare(...args);
+  }
+
+  revokeAllShares(...args: Parameters<ShareStore['revokeAllShares']>) {
+    return this.#shares.revokeAllShares(...args);
+  }
+
+  findLiveShareByHash(...args: Parameters<ShareStore['findLiveShareByHash']>) {
+    return this.#shares.findLiveShareByHash(...args);
+  }
+
+  recordView(...args: Parameters<ShareStore['recordView']>) {
+    return this.#shares.recordView(...args);
+  }
+
+  listShareArtifactEnvelopes(...args: Parameters<ShareStore['listShareArtifactEnvelopes']>) {
+    return this.#shares.listShareArtifactEnvelopes(...args);
+  }
+
+  getShareArtifact(...args: Parameters<ShareStore['getShareArtifact']>) {
+    return this.#shares.getShareArtifact(...args);
+  }
+
+  countSharesForTask(...args: Parameters<ShareStore['countSharesForTask']>) {
+    return this.#shares.countSharesForTask(...args);
+  }
+
   exportAccount(...args: Parameters<MaintenanceStore['exportAccount']>) {
     return this.#maintenance.exportAccount(...args);
   }
@@ -1053,6 +1105,10 @@ export class DataStore {
     return this.#notifications.deletePushSubscriptionById(...args);
   }
 
+  notificationTargetCounts(...args: Parameters<NotificationStore['notificationTargetCounts']>) {
+    return this.#notifications.notificationTargetCounts(...args);
+  }
+
   createAgentNotification(...args: Parameters<NotificationStore['createAgentNotification']>) {
     return this.#notifications.createAgentNotification(...args);
   }
@@ -1075,6 +1131,80 @@ export class DataStore {
 
   recordNotificationDelivery(...args: Parameters<NotificationStore['recordNotificationDelivery']>) {
     return this.#notifications.recordNotificationDelivery(...args);
+  }
+
+  upsertNotificationDestination(
+    ...args: Parameters<NotificationStore['upsertNotificationDestination']>
+  ) {
+    return this.#notifications.upsertNotificationDestination(...args);
+  }
+
+  getNotificationDestination(...args: Parameters<NotificationStore['getNotificationDestination']>) {
+    return this.#notifications.getNotificationDestination(...args);
+  }
+
+  getNotificationDestinationById(
+    ...args: Parameters<NotificationStore['getNotificationDestinationById']>
+  ) {
+    return this.#notifications.getNotificationDestinationById(...args);
+  }
+
+  listActiveNotificationDestinations(
+    ...args: Parameters<NotificationStore['listActiveNotificationDestinations']>
+  ) {
+    return this.#notifications.listActiveNotificationDestinations(...args);
+  }
+
+  startDestinationPairing(...args: Parameters<NotificationStore['startDestinationPairing']>) {
+    return this.#notifications.startDestinationPairing(...args);
+  }
+
+  completeDestinationPairing(...args: Parameters<NotificationStore['completeDestinationPairing']>) {
+    return this.#notifications.completeDestinationPairing(...args);
+  }
+
+  setDestinationLastUpdateId(...args: Parameters<NotificationStore['setDestinationLastUpdateId']>) {
+    return this.#notifications.setDestinationLastUpdateId(...args);
+  }
+
+  setDestinationDisabled(...args: Parameters<NotificationStore['setDestinationDisabled']>) {
+    return this.#notifications.setDestinationDisabled(...args);
+  }
+
+  setDestinationRedact(...args: Parameters<NotificationStore['setDestinationRedact']>) {
+    return this.#notifications.setDestinationRedact(...args);
+  }
+
+  deleteNotificationDestination(
+    ...args: Parameters<NotificationStore['deleteNotificationDestination']>
+  ) {
+    return this.#notifications.deleteNotificationDestination(...args);
+  }
+
+  recordDestinationDelivery(...args: Parameters<NotificationStore['recordDestinationDelivery']>) {
+    return this.#notifications.recordDestinationDelivery(...args);
+  }
+
+  getDestinationDelivery(...args: Parameters<NotificationStore['getDestinationDelivery']>) {
+    return this.#notifications.getDestinationDelivery(...args);
+  }
+
+  findDestinationDeliveryByExternalRef(
+    ...args: Parameters<NotificationStore['findDestinationDeliveryByExternalRef']>
+  ) {
+    return this.#notifications.findDestinationDeliveryByExternalRef(...args);
+  }
+
+  listDestinationDeliveriesAwaitingOutcome(
+    ...args: Parameters<NotificationStore['listDestinationDeliveriesAwaitingOutcome']>
+  ) {
+    return this.#notifications.listDestinationDeliveriesAwaitingOutcome(...args);
+  }
+
+  markDestinationDeliveryOutcome(
+    ...args: Parameters<NotificationStore['markDestinationDeliveryOutcome']>
+  ) {
+    return this.#notifications.markDestinationDeliveryOutcome(...args);
   }
 
   cleanupExpired(...args: Parameters<MaintenanceStore['cleanupExpired']>) {

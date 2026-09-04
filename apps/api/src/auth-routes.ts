@@ -14,6 +14,7 @@ import { recordSecurityEvent } from './security-events.js';
 import {
   createSession,
   destroySession,
+  hasRecentStepUp,
   sessionCookieName,
   STEP_UP_WINDOW_SECONDS
 } from './session.js';
@@ -213,11 +214,7 @@ export const registerAuthRoutes = (
   }): Promise<{ id: string }> => {
     const user = request.user;
     if (!user) throw new AthanorError('authentication_required', 'Sign in to continue', 401);
-    const token = request.cookies[sessionCookieName(secure)];
-    if (
-      !token ||
-      !(await store.hasRecentSessionStepUp(user.id, sha256(token), STEP_UP_WINDOW_SECONDS))
-    ) {
+    if (!(await hasRecentStepUp(store, user.id, request.cookies[sessionCookieName(secure)]))) {
       throw new AthanorError(
         'step_up_required',
         'Confirm this sensitive action with your passkey',

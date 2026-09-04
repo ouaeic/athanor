@@ -559,6 +559,11 @@ export const Task = z.object({
   /** Settled provider cost for this task so far. */
   spentUsd: z.number().nonnegative().default(0),
   queuedMessageCount: z.number().int().nonnegative().default(0),
+  /**
+   * How many links to a snapshot of this conversation are live - neither revoked nor expired. The
+   * count is all a client needs to draw the badge; the links themselves are read on demand.
+   */
+  shareCount: z.number().int().nonnegative().default(0),
   /** How far the fork that created this task reached back. Null for a task nobody rewound into. */
   rewind: RewindScope.nullable().default(null),
   /** The checkpoint the computer was put back to, when this fork rewound it. */
@@ -812,6 +817,133 @@ export const Artifact = z.object({
   createdAt: IsoDate
 });
 export type Artifact = z.infer<typeof Artifact>;
+
+/*
+ * Share links: a frozen, encrypted copy of one conversation that anyone holding the link can read.
+ *
+ * The link is `/v1/shares/<id>#1.<key>`. The path id is 16 random bytes in base64url - 22
+ * characters, 128 bits - and the box stores only its SHA-256, so a stolen table names nothing. The
+ * key after `#` is 32 random bytes the browser never sends: a fragment is not part of an HTTP
+ * request, so it reaches no log, no proxy and no link-preview bot. The box encrypts the snapshot
+ * under that key once, hands the link back once, and forgets the key. What it keeps is ciphertext
+ * it cannot open.
+ */
+
+/** The path segment a share is looked up by. Exactly this shape, or nothing is looked up at all. */
+export const SHARE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{22}$/;
+
+/** How long a link lives, in days. `null` is the deliberate choice of never. */
+export const ShareExpiryDays = z.union([z.literal(1), z.literal(7), z.literal(30), z.null()]);
+export type ShareExpiryDays = z.infer<typeof ShareExpiryDays>;
+
+export const SHARE_LIMITS = {
+  /** The snapshot as JSON, before compression. */
+  snapshotBytes: 8 * 1024 * 1024,
+  /** One artifact's bytes. */
+  artifactBytes: 64 * 1024 * 1024,
+  /** Everything one link carries, snapshot and artifacts together. */
+  totalBytes: 256 * 1024 * 1024,
+  /** How many artifacts one link may carry. */
+  artifacts: 50
+} as const;
+
+/**
+ * What the owner asked for. Every switch is off by default, so a link made without reading the
+ * form carries the least: the owner's messages, the assistant's replies, the plan, and one line per
+ * tool step. Reasoning and raw tool output are opted into, never out of.
+ */
+export const CreateShareRequest = z.object({
+  expiresInDays: ShareExpiryDays.default(30),
+  includeReasoning: z.boolean().default(false),
+  includeToolResults: z.boolean().default(false),
+  /** The artifacts the owner ticked. Each must belong to the task being shared. */
+  artifactIds: z.array(Id).max(SHARE_LIMITS.artifacts).default([]),
+  /** A name for the viewer's page, sealed inside the snapshot with everything else. */
+  publicTitle: z.string().trim().min(1).max(160).optional()
+});
+export type CreateShareRequest = z.input<typeof CreateShareRequest>;
+
+/** One link as the owner sees it. The lookup hash and the key are never on this record. */
+export const ShareRecord = z.object({
+  id: Id,
+  taskId: Id,
+  createdAt: IsoDate,
+  expiresAt: IsoDate.nullable(),
+  viewCount: z.number().int().nonnegative(),
+  lastViewedAt: IsoDate.nullable(),
+  revokedAt: IsoDate.nullable(),
+  version: z.number().int().positive()
+});
+export type ShareRecord = z.infer<typeof ShareRecord>;
+
+/** The link, served once. `url` is path and fragment; the client prefixes its own origin. */
+export const CreateShareResponse = z.object({ share: ShareRecord, url: z.string() });
+export type CreateShareResponse = z.infer<typeof CreateShareResponse>;
+
+/**
+ * The kinds a viewer can be shown. A subset of `TaskEventKind` by design: the kinds that carry
+ * tokenised URLs, cost, queued text or raw tool output are not on it and cannot be added by a
+ * switch - `tool_result` here is the one-line summary, and the payload text only rides in the
+ * `text` of that same line when the owner asked for it.
+ */
+export const ShareSnapshotEventKind = z.enum([
+  'user_message',
+  'assistant_message',
+  'assistant_reasoning',
+  'plan',
+  'status',
+  'tool_started',
+  'tool_result',
+  'question_asked',
+  'approval_requested',
+  'approval_resolved',
+  'notice',
+  'warning',
+  'error',
+  'completed'
+]);
+export type ShareSnapshotEventKind = z.infer<typeof ShareSnapshotEventKind>;
+
+/**
+ * What the viewer decrypts. No id of any kind: not the task's, not the workspace's, not an
+ * event's, not the owner's. `n` on an artifact is its index in this list and nothing else.
+ */
+export const ShareSnapshot = z.object({
+  v: z.literal(1),
+  title: z.string(),
+  createdAt: IsoDate,
+  events: z.array(
+    z.object({
+      kind: ShareSnapshotEventKind,
+      at: IsoDate,
+      text: z.string()
+    })
+  ),
+  artifacts: z.array(
+    z.object({
+      n: z.number().int().nonnegative(),
+      name: z.string(),
+      mimeType: z.string(),
+      sizeBytes: z.number().int().nonnegative(),
+      sha256: z.string()
+    })
+  )
+});
+export type ShareSnapshot = z.infer<typeof ShareSnapshot>;
+
+/**
+ * What the public blob route answers with: the sealed snapshot, and for each artifact the public
+ * half of its envelope so the viewer can open the bytes it fetches separately.
+ */
+export interface ShareBlob {
+  version: number;
+  envelope: { v: number; iv: string; tag: string; ciphertext: string; aad?: string };
+  manifest: Array<{
+    n: number;
+    sizeBytes: number;
+    envelope: { v: number; iv: string; tag: string; aad?: string };
+  }>;
+}
 
 export const ModelAvailability = z.enum(['available', 'degraded', 'unavailable', 'review']);
 export const ModelOpenness = z.enum([
@@ -1577,6 +1709,9 @@ export const BrowserPrimitiveAction = z.discriminatedUnion('type', [
   z.object({ type: z.literal('close_tab'), tabId: BrowserTabId }),
   // Reads a named tab in place: no bring-to-front, no change of active tab.
   z.object({ type: z.literal('inspect_tab'), tabId: BrowserTabId }),
+  // The page as a PNG, kept in the workspace. Workspace-relative like an upload path, and for the
+  // same reason: the runner judges the name against a concrete root and refuses what leaves it.
+  tabScoped({ type: z.literal('screenshot'), path: z.string().min(1).max(1_024) }),
   z.object({
     type: z.literal('dialog'),
     response: z.enum(['accept', 'dismiss']),

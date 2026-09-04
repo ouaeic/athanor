@@ -117,6 +117,12 @@ export interface TaskRecord {
    */
   spentUsd: number;
   queuedMessageCount: number;
+  /**
+   * Live share links - neither revoked nor expired. Optional on the record rather than zero,
+   * because the worker builds task records by hand in its own tests and a field it has no reason
+   * to know about must not be a field it has to name; every reader treats absent as none.
+   */
+  shareCount?: number;
   promptCiphertext: EncryptedEnvelope;
   agentStateCiphertext: EncryptedEnvelope | null;
   leaseOwner: string | null;
@@ -312,6 +318,41 @@ export interface WorkspacePreviewRecord {
   updatedAt: string;
 }
 
+/**
+ * One link to a frozen, encrypted copy of a conversation.
+ *
+ * `lookupHash` is the SHA-256 of the link's path segment and is the only thing the box holds that
+ * relates to the link; the key that opens `envelope` is in the link's fragment and nowhere here.
+ * `manifest` says how many artifacts ride with it and how large each is - names and types are
+ * inside the envelope.
+ */
+export interface TaskShareRecord {
+  id: string;
+  userId: string;
+  taskId: string;
+  workspaceId: string;
+  lookupHash: string;
+  envelope: EncryptedEnvelope;
+  manifest: Array<{ n: number; sizeBytes: number }>;
+  snapshotBytes: number;
+  version: number;
+  expiresAt: string | null;
+  viewCount: number;
+  lastViewedAt: string | null;
+  revokedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** The sealed bytes of one shared artifact, and the public half of the envelope that seals them. */
+export interface TaskShareArtifactRecord {
+  shareId: string;
+  n: number;
+  envelopeMeta: Omit<EncryptedEnvelope, 'ciphertext'>;
+  ciphertext: Buffer;
+  sizeBytes: number;
+}
+
 export interface PushSubscriptionRecord {
   id: string;
   userId: string;
@@ -331,7 +372,12 @@ export interface AgentNotificationRecord {
   createdAt: string;
 }
 
-export interface PendingNotificationRecord extends PushSubscriptionRecord {
+/**
+ * What a pending row says about the event, whichever way it is about to travel. The two row shapes
+ * below share this and differ only in the target: a device's push subscription, or a destination
+ * the owner paired.
+ */
+export interface PendingNotificationEvent {
   kind: NotificationKind;
   resourceId: string;
   taskId: string;
@@ -354,6 +400,85 @@ export interface PendingNotificationRecord extends PushSubscriptionRecord {
    * their own.
    */
   message: string | null;
+}
+
+/** A pending row addressed to one device, carrying what Web Push needs to reach it. */
+export interface PendingPushRow extends PushSubscriptionRecord, PendingNotificationEvent {
+  transport: 'push';
+}
+
+/**
+ * What the API seals into a destination row: the bot token the notifier sends with, the bot's
+ * username for the pairing link, and the loopback API token an answer typed on the phone is
+ * posted with, so a reply reaches the same route the web client uses and inherits its checks.
+ */
+export interface NotificationDestinationConfig {
+  botToken: string;
+  botUsername: string;
+  apiToken?: string;
+  apiTokenId?: string;
+}
+
+/** A pending row addressed to a paired destination rather than a device. */
+export interface PendingDestinationRow extends PendingNotificationEvent {
+  transport: 'telegram';
+  /** The destination's id, which is what its ledger and its retry state are keyed by. */
+  id: string;
+  userId: string;
+  createdAt: string;
+  updatedAt: string;
+  /**
+   * The numeric sender the owner paired with, which is also the private chat to send to. Sealed
+   * at rest like the token: null without a master key, and null when it will not open.
+   */
+  senderId: string | null;
+  /** Title and link only. The default, because the service in between is not end-to-end encrypted. */
+  redact: boolean;
+  /** Null without a master key, and null when the row will not decrypt - never sent then. */
+  config: NotificationDestinationConfig | null;
+}
+
+export type PendingNotificationRecord = PendingPushRow | PendingDestinationRow;
+
+export interface NotificationDestinationRecord {
+  id: string;
+  userId: string;
+  kind: 'telegram';
+  /** Decrypted only when the caller passed a master key and the envelope opened; null otherwise. */
+  config: NotificationDestinationConfig | null;
+  /** The bot's username, read from the sealed config; null when it could not be. */
+  botUsername: string | null;
+  /** The paired sender, opened only for a caller holding the master key; null otherwise. */
+  senderId: string | null;
+  /** Internal: the SHA-256 of the one-time pairing secret. Never served by a route. */
+  pairingHash: string | null;
+  pairingExpiresAt: string | null;
+  /** True while a minted pairing secret is still inside its window and unused. */
+  pairingPending: boolean;
+  lastUpdateId: number | null;
+  redact: boolean;
+  createdAt: string;
+  verifiedAt: string | null;
+  disabledAt: string | null;
+  updatedAt: string;
+}
+
+/** One row of the destination ledger, decorated with what the outcome sweep needs. */
+export interface DestinationDeliveryRecord {
+  destinationId: string;
+  kind: NotificationKind;
+  resourceId: string;
+  externalRef: string | null;
+  nonce: string | null;
+  deliveredAt: string;
+  outcomeAt: string | null;
+  /** The conversation the resource belongs to, when the join could find it. */
+  taskId: string | null;
+  /** For an approval row: its current status. Null for every other kind. */
+  approvalStatus: string | null;
+  /** The owner of the destination, so a handler can bind the outcome to them. */
+  userId: string;
+  senderId: string | null;
 }
 
 export interface SpendLimitsRecord {

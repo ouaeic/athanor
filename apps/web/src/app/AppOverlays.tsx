@@ -36,6 +36,15 @@ const NoticeLog = lazy(() =>
 );
 
 /**
+ * Sharing is a deliberate act on one conversation, reached from the palette or from the badge a
+ * shared conversation wears, and the dialog carries the preview renderer and the link list with
+ * it. Behind `lazy`, the first paint pays for the badge and nothing else.
+ */
+const ShareDialog = lazy(() =>
+  import('../ShareDialog.js').then(({ ShareDialog: Share }) => ({ default: Share }))
+);
+
+/**
  * Settings is a modal nobody has open on first paint, and it carries the provider forms, the spend
  * limits, the connector catalogue, the security pages and the QR encoder with it. Behind `lazy` all
  * of that costs nothing until the owner actually opens Settings.
@@ -47,7 +56,7 @@ const SelfHostedSettings = lazy(() =>
 );
 
 /**
- * The four things that open over the workbench, and nothing else.
+ * The five things that open over the workbench, and nothing else.
  *
  * Every one of them is code-split, every one is reached by a deliberate act, and none of them is on
  * screen when the app opens — which is the whole reason they are one component: the workbench below
@@ -87,6 +96,12 @@ export function AppOverlays(props: {
   onLogout: () => void;
   onSettingsPage: (page: SettingsPage | undefined) => void;
   onWorkspaceId: (id: string) => void;
+
+  shareOpen: boolean;
+  onCloseShare: () => void;
+  onShareNotice: (message: string) => void;
+  onShareError: (message: string) => void;
+  onShareCount: (count: number) => void;
 }) {
   return (
     <>
@@ -132,6 +147,17 @@ export function AppOverlays(props: {
             initialPrompt={props.schedulePrompt}
             onClose={props.onCloseSchedule}
             onChanged={props.onSchedulesChanged}
+          />
+        </Suspense>
+      )}
+      {props.shareOpen && props.task && (
+        <Suspense fallback={null}>
+          <ShareDialog
+            task={props.task}
+            onClose={props.onCloseShare}
+            onNotice={props.onShareNotice}
+            onError={props.onShareError}
+            onShareCount={props.onShareCount}
           />
         </Suspense>
       )}

@@ -58,6 +58,13 @@ const FIRST_MESSAGE_BUDGET_BYTES = 257_000;
 const FIRST_MESSAGE_ROOT = /[\\/]src[\\/]MarkdownBody\.tsx$/;
 
 /**
+ * The page both budgets above are measured from. An HTML entry's chunk is faced by the HTML file
+ * itself rather than by the script it loads, which is why this names `index.html` and not
+ * `src/main.tsx`.
+ */
+const APP_ENTRY = /[\\/]index\.html$/;
+
+/**
  * The same walk, three times used: it measures the first paint, it measures the first reply, and it
  * writes the hashed names down for the service worker, which cannot guess them and precached an
  * index.html it could not run.
@@ -67,8 +74,21 @@ const eagerBundleGraph = (): Plugin => ({
   apply: 'build',
   generateBundle(_options, bundle) {
     const byFileName = new Map(Object.values(bundle).map((item) => [item.fileName, item]));
-    const entry = Object.values(bundle).find((item) => item.type === 'chunk' && item.isEntry);
-    if (entry?.type !== 'chunk') return;
+    /*
+     * The app's own entry, named by the module it was built from and not by being the first entry
+     * in the bundle. "First entry" was correct while there was one; the share viewer is a second
+     * build with its own configuration precisely so it never shares this graph, but the day one
+     * is added to this configuration the first chunk marked `isEntry` is whichever the bundler
+     * emitted first, and the eager budget would silently measure the wrong page.
+     */
+    const entry = Object.values(bundle).find(
+      (item) => item.type === 'chunk' && item.isEntry && APP_ENTRY.test(item.facadeModuleId ?? '')
+    );
+    if (entry?.type !== 'chunk')
+      this.error(
+        `no entry chunk was built from ${APP_ENTRY.source}, so the eager budget measured nothing. ` +
+          'Point APP_ENTRY at the page the app is served from now.'
+      );
 
     /** Gzipped bytes of one emitted file, and the line the report prints for it. */
     const weigh = (fileName: string): { bytes: number; line: string } | undefined => {

@@ -141,6 +141,7 @@ export const taskResponse = (
   maxSpendUsd: task.maxSpendUsd,
   spentUsd: task.spentUsd,
   queuedMessageCount: task.queuedMessageCount,
+  shareCount: task.shareCount ?? 0,
   rewind: task.rewindScope ?? null,
   restoredCheckpointId: task.restoredCheckpointId ?? null,
   pinned: task.pinned,
@@ -478,6 +479,17 @@ const authRateLimitWindowMs = 15 * 60_000;
 const authRateLimitAttempts = 20;
 
 /**
+ * The share viewer's per-address budget: this many requests a minute across its public routes
+ * together - the page, its two assets, the ciphertext and the artifacts. Sized for a reader, not
+ * for a ceremony: one open of the largest link the product makes is fifty-four requests (a page,
+ * two assets, the ciphertext, `SHARE_LIMITS.artifacts` files), and an office behind one address
+ * opens more pages in a minute than a passkey would ever be tried. `checkShareRate` reads it; the
+ * box-wide ceiling on ciphertext reads in `routes/shares.ts` bounds every address together.
+ */
+export const SHARE_REQUESTS_PER_MINUTE = 120;
+const shareRateLimitWindowMs = 60_000;
+
+/**
  * Quiet hours travel as "HH:MM" and are stored as minutes past local midnight, because the owner
  * thinks in a clock and the notifier thinks in a comparison. Both directions live here so the read
  * route and the write route cannot disagree about the boundary.
@@ -674,7 +686,6 @@ export const createApiContext = async (config: ApiConfig, overrides: ApiOverride
   // Reading the file is what makes the relay survive a restart; a box whose owner turned it on
   // should not need to be told again after every update.
   await relay.start();
-  const authAttempts = new Map<string, { count: number; resetAt: number }>();
   /**
    * Every open activity stream, oldest first, per account. Insertion order is what lets a sixth
    * device take the place of the stalest connection rather than be refused: a single owner
@@ -688,34 +699,52 @@ export const createApiContext = async (config: ApiConfig, overrides: ApiOverride
    * order rather than by the number.
    */
   const nextEventStreamId = (): number => (lastEventStreamId += 1);
-  const checkAuthRate = (key: string): void => {
-    const now = Date.now();
-    const current = authAttempts.get(key);
-    if (!current || current.resetAt <= now) {
-      if (authAttempts.size >= 10_000) {
-        for (const [candidate, attempt] of authAttempts) {
-          if (attempt.resetAt <= now) authAttempts.delete(candidate);
+  /**
+   * A fixed-window counter per key. The map is bounded: past ten thousand live keys the expired
+   * ones are swept, and if that frees nothing the request is refused rather than remembered, so a
+   * flood of distinct addresses cannot grow the process without limit. Each surface gets its own
+   * counter with its own window and its own words, because a reader refused on a share link
+   * should not be told about sign-in.
+   */
+  const rateLimiter = (
+    windowMs: number,
+    limit: number,
+    code: string,
+    exhausted: string,
+    busy: string
+  ): ((key: string) => void) => {
+    const attempts = new Map<string, { count: number; resetAt: number }>();
+    return (key: string): void => {
+      const now = Date.now();
+      const current = attempts.get(key);
+      if (!current || current.resetAt <= now) {
+        if (attempts.size >= 10_000) {
+          for (const [candidate, attempt] of attempts) {
+            if (attempt.resetAt <= now) attempts.delete(candidate);
+          }
+          if (attempts.size >= 10_000) throw new AthanorError(code, busy, 429);
         }
-        if (authAttempts.size >= 10_000) {
-          throw new AthanorError(
-            'auth_rate_limited',
-            'Sign-in is temporarily busy; try again later',
-            429
-          );
-        }
+        attempts.set(key, { count: 1, resetAt: now + windowMs });
+        return;
       }
-      authAttempts.set(key, { count: 1, resetAt: now + authRateLimitWindowMs });
-      return;
-    }
-    current.count += 1;
-    if (current.count > authRateLimitAttempts) {
-      throw new AthanorError(
-        'auth_rate_limited',
-        'Too many sign-in attempts; try again later',
-        429
-      );
-    }
+      current.count += 1;
+      if (current.count > limit) throw new AthanorError(code, exhausted, 429);
+    };
   };
+  const checkAuthRate = rateLimiter(
+    authRateLimitWindowMs,
+    authRateLimitAttempts,
+    'auth_rate_limited',
+    'Too many sign-in attempts; try again later',
+    'Sign-in is temporarily busy; try again later'
+  );
+  const checkShareRate = rateLimiter(
+    shareRateLimitWindowMs,
+    SHARE_REQUESTS_PER_MINUTE,
+    'share_rate_limited',
+    'Too many requests from this address; try again in a minute',
+    'Shared links are temporarily busy; try again later'
+  );
   /**
    * Metering walks the whole agent disk, so it is never on a path a person is waiting behind.
    *
@@ -1058,6 +1087,7 @@ export const createApiContext = async (config: ApiConfig, overrides: ApiOverride
     requestMetrics,
     connectionManifest,
     checkAuthRate,
+    checkShareRate,
     openEventStreams,
     nextEventStreamId,
     hostStorageCache,

@@ -107,12 +107,20 @@ export const taskNameTokens = (nameIndex: ConversationNameIndex): [string, strin
  * the next one cannot half-fill the record either.
  *
  * The alias is `t` in all of them, which is why it is baked in rather than passed.
+ *
+ * `share_count` is the third figure, added for the same reason: the "Shared" badge is drawn from
+ * the record the sidebar holds, and a rename or a pin that handed back a record without it would
+ * take the badge off a conversation that still has a live link. Live means neither revoked nor
+ * expired - the same predicate the public lookup answers with, so the badge and the link agree.
  */
 export const TASK_LIVE_COUNTS = `
          (SELECT COUNT(*) FROM task_message_queue q
            WHERE q.task_id=t.id AND q.status='queued') AS queued_message_count,
          (SELECT COALESCE(SUM(u.cost_usd),0) FROM usage_entries u
-           WHERE u.task_id=t.id AND u.state='settled' AND u.cost_usd>0) AS spent_usd`;
+           WHERE u.task_id=t.id AND u.state='settled' AND u.cost_usd>0) AS spent_usd,
+         (SELECT COUNT(*) FROM task_shares s
+           WHERE s.task_id=t.id AND s.revoked_at IS NULL
+             AND (s.expires_at IS NULL OR s.expires_at > NOW())) AS share_count`;
 
 /**
  * Four tiers and a clock, and nothing per row that grows.

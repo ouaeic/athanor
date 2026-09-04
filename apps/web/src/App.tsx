@@ -320,6 +320,7 @@ export function App() {
       archive: (target) => void list.file(target, { archived: !target.archivedAt }),
       copy: () => exportConversation({ ...exportable, mode: 'copy' }),
       download: () => exportConversation({ ...exportable, mode: 'download' }),
+      share: () => overlays.setShare(true),
       remove: list.remove,
       openTab: inspector.openTab,
       openSettings: () => overlays.openSettings(),

@@ -41,6 +41,18 @@ The relevant adversaries are:
   on the runner, and nothing at all of the database, is reachable from outside; `action` and
   `holder` are control routes rather than streams, which is why they are named here individually
   instead of behind the word "stream".
+- The second exception is share links, and it is written down on the same terms. `GET
+/v1/shares/<id>`, `/v1/shares/<id>/blob`, `/v1/shares/<id>/artifacts/<n>` and
+  `/v1/shares/assets/*` answer without a session, and they are the only content routes on this
+  box that do. What they serve is ciphertext: a snapshot of one conversation, sealed under a key
+  that exists only in the fragment of the link the owner was handed once. No workspace key, no
+  session and no owner identity is on the row; `<id>` is stored only as its SHA-256 and compared in
+  constant time; the request hook returns before the session lookup, so these routes neither read a
+  cookie nor set one; every one of them is throttled per address through one bucket sized for a
+  reader, and the two data routes share a box-wide ceiling; a closed, expired, malformed or unknown link and a box with sharing switched
+  off answer one identical 404. Making a link takes a recent passkey; what the link shows is an
+  allow-list of kinds with the tool arguments, tool results, reasoning and every identifier left
+  out unless the owner switches the first two on; the credential net runs over all of it.
 - The first account claims the server; registration then closes by default.
 - Passkeys, origin checks, secure cookies, revocable sessions, and recent-authentication checks guard
   owner settings.

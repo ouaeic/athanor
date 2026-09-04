@@ -92,6 +92,22 @@ export const sessionUser = async (
   return resolved.user;
 };
 
+/**
+ * Whether the session behind this cookie completed a passkey ceremony inside the step-up window.
+ *
+ * One definition, because there were two: the auth routes and the request hook each carried a
+ * copy of this check, and a third caller - creating a share link, which hands out a capability
+ * over the owner's own transcript - would have been a third. Every route that guards a sensitive
+ * action reads the same window `STEP_UP_WINDOW_SECONDS` states, through this one function.
+ */
+export const hasRecentStepUp = async (
+  store: DataStore,
+  userId: string,
+  token: string | undefined
+): Promise<boolean> =>
+  Boolean(token) &&
+  (await store.hasRecentSessionStepUp(userId, sha256(token!), STEP_UP_WINDOW_SECONDS));
+
 export const destroySession = async (
   store: DataStore,
   reply: FastifyReply,

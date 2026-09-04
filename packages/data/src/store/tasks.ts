@@ -1254,6 +1254,9 @@ export class TaskStore {
       await tx.query('DELETE FROM task_message_queue WHERE task_id=$1', [id]);
       await tx.query('DELETE FROM task_plans WHERE task_id=$1', [id]);
       await tx.query('DELETE FROM approvals WHERE task_id=$1', [id]);
+      // A share is a frozen copy of this conversation, and a copy must not outlive what it copied.
+      // The foreign key cascades too; this is the invariant stated where the rest of them are.
+      await tx.query('DELETE FROM task_shares WHERE task_id=$1', [id]);
       await tx.query('DELETE FROM tasks WHERE id=$1', [id]);
       return { wasHeld: owned.rows[0].was_held === true };
     });

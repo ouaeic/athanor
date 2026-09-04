@@ -41,8 +41,8 @@ const Config = z.object({
     z.string().url().optional()
   ),
   PREVIEW_BASE_URL: sharedEnv.PREVIEW_BASE_URL,
-  API_HOST: z.string().default('127.0.0.1'),
-  API_PORT: z.coerce.number().int().positive().default(4100),
+  API_HOST: sharedEnv.API_HOST,
+  API_PORT: sharedEnv.API_PORT,
   PREVIEW_GATEWAY_HOST: z.string().default('127.0.0.1'),
   PREVIEW_GATEWAY_PORT: z.coerce.number().int().positive().default(4400),
   /**
@@ -145,7 +145,40 @@ const Config = z.object({
     .string()
     .default(
       'fcm.googleapis.com,updates.push.services.mozilla.com,web.push.apple.com,.notify.windows.com'
-    )
+    ),
+  /**
+   * Where the phone transport's bot API answers, for the two calls this process makes to it: the
+   * token check when a bot is added in Settings, and the test message. Shared with the notifier,
+   * which points its sender and poller at the same address, so a test can put both on one stub.
+   */
+  TELEGRAM_API_BASE_URL: sharedEnv.TELEGRAM_API_BASE_URL,
+  /**
+   * The server-wide switch on share links. Off, every public share route answers the same 404 an
+   * unknown link gets - existing links included, which come back when it is turned on again - and
+   * the owner's own routes refuse to mint one. On when absent, because a single-owner box sharing
+   * its owner's own conversations on the owner's say-so is the shipped shape; `false` is the one
+   * spelling that turns it off. Declared as optional-with-transform rather than through `bool`
+   * because that helper defaults to off, and a test that builds this record by hand should not
+   * have to name a setting to get the shipped behaviour. An empty value is absent, not off: a
+   * templated control.env that lists the key with nothing after it must not close every link.
+   */
+  SHARING_ENABLED: z.preprocess(
+    (value) => (value === '' ? undefined : value),
+    z
+      .string()
+      .transform((value) => value === 'true')
+      .optional()
+  ),
+  /**
+   * Where the built share viewer lives - its script and stylesheet, which the API serves under
+   * `/v1/shares/assets/` because that is the one path prefix the installed app's service worker
+   * hands to the network instead of answering with the app shell. Defaults to the web build's own
+   * output beside this package; set it when the two are deployed apart.
+   */
+  SHARE_VIEWER_DIR: z.preprocess(
+    (value) => (value === '' ? undefined : value),
+    z.string().optional()
+  )
 });
 
 export type ApiConfig = z.infer<typeof Config>;

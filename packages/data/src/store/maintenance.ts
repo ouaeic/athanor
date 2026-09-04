@@ -292,12 +292,34 @@ export class MaintenanceStore {
        WHERE expires_at < NOW() - INTERVAL '30 days'
           OR (status='revoked' AND updated_at < NOW() - INTERVAL '30 days')`
     );
+    // A closed share link on the same terms as a closed preview: the row stays a month so the
+    // owner's list can say what became of it, then goes. An expired link keeps its bytes for that
+    // month too - the owner may re-open the conversation and want to see what it carried - but
+    // nothing serves them, because the public lookup refuses an expired row in its own statement.
+    await this.database.query(
+      `DELETE FROM task_shares
+       WHERE expires_at < NOW() - INTERVAL '30 days'
+          OR (revoked_at IS NOT NULL AND revoked_at < NOW() - INTERVAL '30 days')`
+    );
     // One row per notification per device, and nothing ever removed them. They exist to stop a
     // message being sent twice, so they are only needed while the thing they settled is still
     // something `listPendingNotifications` would consider.
     await this.database.query(
       'DELETE FROM notification_deliveries WHERE delivered_at < NOW() - $1::interval',
       [NOTIFICATION_LEDGER_INTERVAL]
+    );
+    // The destination ledger, on the same horizon and for the same reason. An approval card whose
+    // outcome was never written back is past caring by then too: the approval itself lapsed within
+    // a day of being raised.
+    await this.database.query(
+      'DELETE FROM notification_destination_deliveries WHERE delivered_at < NOW() - $1::interval',
+      [NOTIFICATION_LEDGER_INTERVAL]
+    );
+    // A pairing secret nobody presented inside its window. The hash is useless once the window
+    // has closed - the completing UPDATE refuses it - so clearing it only makes the row say so.
+    await this.database.query(
+      `UPDATE notification_destinations SET pairing_hash=NULL, pairing_expires_at=NULL
+       WHERE pairing_hash IS NOT NULL AND pairing_expires_at <= NOW()`
     );
     // Streaming writes an assistant_delta several times a second, each an encrypted row of its own.
     // The assistant_message that closes the turn holds the final text, which makes every delta

@@ -48,6 +48,17 @@ No content logging by athanor does not mean no observation anywhere.
 - The owner's own mail and calendar servers, when connected, receive IMAP, SMTP submission and
   CalDAV requests from this computer and keep their own copies and connection logs, exactly as they
   do for any other client the owner uses.
+- This computer's own system journal records every privileged invocation the runner makes, because
+  the sudo the box ships cannot be told to omit them and the installer does not pretend otherwise.
+  What it holds for an agent command is the helper's path, the words `run`, `network` or
+  `isolated`, `confine` or `open`, the workspace root, the path of a spec file, and - as sudo's own
+  record of the directory it was started from - the workspace root again, because the runner
+  starts it from there and nowhere deeper. The command text, its arguments, its environment and
+  the directory inside the workspace it runs in travel in that file, which only the runner and
+  root can read and which the helper removes before the command starts. The owner's terminal is
+  recorded the same way, as the shell's path and its terminal settings; what is typed into it goes
+  down a pseudo-terminal the journal does not see. The journal is root-owned and never leaves the
+  machine.
 - The VPS/cloud operator can observe the host, disk, memory, and network depending on its service.
 - DNS, certificate authorities, network operators, and push relays see delivery metadata.
 - A connection relay, if the owner turned one on, sees the server's label, the address of the server
@@ -149,9 +160,39 @@ Task history, files, memory, and media are user-controlled. Expired sessions, ch
 records, notifications, and operational/security events have bounded cleanup paths. Operators should
 choose and document backup retention separately.
 
+## Share links
+
+A share link is the one way somebody who is not the owner reads anything this server holds, and it
+is a frozen, encrypted copy rather than a window. When the owner makes one, the server builds a
+snapshot of that conversation as it is at that moment, encrypts it under a fresh key, and hands back
+a link of the form `/v1/shares/<id>#1.<key>`. The key after `#` is never sent to the server: a
+browser does not transmit a fragment, so it reaches no log, no proxy and no link-preview bot. The
+server keeps the SHA-256 of `<id>`, the ciphertext, and nothing that can open it. A copy of the
+database or a backup holds bytes nobody can read without a link.
+
+What a snapshot carries is decided by an allow-list, not by omission: the owner's messages, the
+assistant's replies, the plan, one line per tool step - including the line that says a step failed,
+without the error's detail - questions and approvals as one-liners, the result, and the files the
+owner ticked. It never carries what a tool was given or what it returned, the agent's reasoning,
+screenshots, browser text, terminal output, preview addresses, cost, queued messages, connector
+data, the owner's name, or any internal identifier. Cost stays out whichever line quotes it: a run
+that paused at its spending limit is shown as "Paused at a spending limit." with no figures, and any
+other line the worker wrote that names an amount is left out. The owner may switch the
+reasoning and tool results on for one link; nothing else can be switched on. The same credential
+net that scrubs the logs runs over every string in the snapshot, and the dialog shows the exact
+snapshot before the link exists.
+
+A link expires after 30 days unless the owner chose a day, a week or never; the owner can close
+any link at once, or every link on a conversation; deleting the conversation deletes its links; a
+message written after the link was made is not in it. What the server records about readers is a
+count and the time of the last read - never an address, an agent string or an identity. A closed,
+expired or unknown link answers the same 404. `SHARING_ENABLED=false` turns the whole feature off,
+existing links included.
+
 ## One-owner warning
 
 The native server is a trusted-owner installation, not a hostile public multi-tenant service.
-Registration closes once the first owner exists, and there is no sharing model to invite anyone
-into. Anyone with server root can bypass application encryption at runtime, so the person who
-administers the machine is the person the data belongs to.
+Registration closes once the first owner exists, and nobody is invited in: the only thing a
+non-owner can ever read is a share link the owner chose to make, described above. Anyone with
+server root can bypass application encryption at runtime, so the person who administers the
+machine is the person the data belongs to.
