@@ -225,6 +225,52 @@ export const assertOpenedInPlace = async (
 const SHARED_MODE = 0o770;
 const RUNNER_ONLY_MODE = 0o700;
 
+/**
+ * Linux creation is relative to an open directory, so swapping an ancestor cannot redirect mkdir
+ * or O_CREAT before the descriptor identity check runs. Other hosts retain the checked-path
+ * development behavior because their descriptor filesystem does not support directory traversal.
+ */
+const withWorkspaceDirectory = async <T>(
+  root: string,
+  directory: string,
+  create: boolean,
+  work: (anchored: string) => Promise<T>
+): Promise<T> => {
+  const target = resolveInside(root, directory);
+  if (process.platform !== 'linux') {
+    await rejectSymlinkComponents(root, target, create);
+    if (create) await mkdir(target, { recursive: true, mode: SHARED_MODE });
+    await rejectSymlinkComponents(root, target);
+    return work(target);
+  }
+  let current = await open(
+    path.resolve(root),
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
+  );
+  try {
+    const relative = path.relative(path.resolve(root), target);
+    for (const component of relative.split(path.sep).filter(Boolean)) {
+      const child = path.join('/proc/self/fd', String(current.fd), component);
+      if (create) {
+        await mkdir(child, { mode: SHARED_MODE }).catch((error: unknown) => {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        });
+      }
+      const next = await open(
+        child,
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
+      );
+      const previous = current;
+      current = next;
+      await previous.close();
+    }
+    await assertOpenedInPlace(root, target, current);
+    return await work(path.join('/proc/self/fd', String(current.fd)));
+  } finally {
+    await current.close();
+  }
+};
+
 export const ensureWorkspace = async (root: string): Promise<void> => {
   await mkdir(root, { recursive: true, mode: SHARED_MODE });
   await mkdir(path.join(root, 'workspace'), { recursive: true, mode: SHARED_MODE });
@@ -681,9 +727,6 @@ const writeFileInWorkspace = async (
   if (content.length > maxBytes) throw new Error(`File exceeds ${maxBytes} byte write limit`);
   const target = resolveInside(root, requested);
   await rejectSymlinkComponents(root, target, true);
-  if (expectSha256 === undefined)
-    await mkdir(path.dirname(target), { recursive: true, mode: SHARED_MODE });
-  await rejectSymlinkComponents(root, target, true);
   const changedAfterRead = (): WorkspaceFileError =>
     new WorkspaceFileError(
       'This file changed after you read it, so writing the whole file would discard that change. Read it again and reapply your edit, or use file_patch, which matches on the surrounding text.',
@@ -697,13 +740,19 @@ const writeFileInWorkspace = async (
   const inspect = expectSha256 !== undefined || heldTo !== undefined;
   // A hash claims an existing file, including an empty one. Creating it during the check would
   // leave a file behind on refusal, or accept a deleted empty file as unchanged.
-  const handle = await open(
-    target,
-    (inspect ? constants.O_RDWR : constants.O_WRONLY) |
-      (expectSha256 === undefined ? constants.O_CREAT : 0) |
-      (exclusive ? constants.O_EXCL : 0) |
-      constants.O_NOFOLLOW,
-    0o660
+  const handle = await withWorkspaceDirectory(
+    root,
+    path.dirname(target),
+    expectSha256 === undefined,
+    (directory) =>
+      open(
+        path.join(directory, path.basename(target)),
+        (inspect ? constants.O_RDWR : constants.O_WRONLY) |
+          (expectSha256 === undefined ? constants.O_CREAT : 0) |
+          (exclusive ? constants.O_EXCL : 0) |
+          constants.O_NOFOLLOW,
+        0o660
+      )
   ).catch((error: unknown) => {
     if (expectSha256 !== undefined && (error as NodeJS.ErrnoException).code === 'ENOENT')
       throw changedAfterRead();
@@ -861,7 +910,7 @@ export const createWorkspaceFolder = async (
   const existing = await lstat(target).catch(() => null);
   if (existing && !existing.isDirectory())
     throw new WorkspaceFileError('A file already exists at that path', 409);
-  await mkdir(target, { recursive: true, mode: SHARED_MODE });
+  await withWorkspaceDirectory(root, target, true, async () => undefined);
   return { path: path.relative(root, target) };
 };
 
