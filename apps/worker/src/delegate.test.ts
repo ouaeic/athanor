@@ -505,6 +505,84 @@ describe('the contract a specialist report is held to', () => {
 });
 
 describe('what the lead is told not to rely on', () => {
+  it('drops invisible evidence without fetching it and tells the lead nothing was checked', async () => {
+    const readFile = vi.fn(async () => '');
+    const { result } = await runMission(
+      [
+        answer(
+          JSON.stringify({
+            answer: 'The notes prove the claim.',
+            evidence: [{ claim: 'the claim', source: 'notes.md', quotedSpan: '\u200b\u00ad' }]
+          })
+        )
+      ],
+      { runner: { readFile } }
+    );
+
+    expect(result.reports).toHaveLength(1);
+    expect(result.reports[0]).toMatchObject({
+      schemaValid: false,
+      citations: { checked: 0, cited: 0 }
+    });
+    expect(result.reports[0]?.schemaErrors?.join(' ')).toContain(
+      'quote that remains non-empty after text normalization'
+    );
+    expect(result.reports[0]?.evidenceChecks).toBeUndefined();
+    expect(result.reports[0]?.unverified).toContain('Nothing in this report was checked');
+    expect(readFile).not.toHaveBeenCalled();
+  });
+
+  it.each(['', 'A source about a different subject.'])(
+    'reports a readable source without the cited text as unverified: %j',
+    async (source) => {
+      const { result } = await runMission([answer(REPORT)], {
+        runner: { readFile: async () => source }
+      });
+
+      expect(result.reports).toHaveLength(1);
+      expect(result.reports[0]?.evidenceChecks).toEqual([
+        expect.objectContaining({ verified: false, reread: true })
+      ]);
+      expect(result.reports[0]?.citations).toEqual({ checked: 1, cited: 1 });
+      expect(result.reports[0]?.unverified).toContain('found the quoted span in none of them');
+    }
+  );
+
+  it('keeps valid normalized evidence and reports a dropped invisible quote alongside it', async () => {
+    const readFile = vi.fn(async () => 'The team’s ﬁrst tier — quarterly cover.');
+    const { result } = await runMission(
+      [
+        answer(
+          JSON.stringify({
+            answer: 'The first tier provides quarterly cover.',
+            evidence: [
+              { claim: 'empty claim', source: 'empty.md', quotedSpan: '\u200b' },
+              {
+                claim: 'quarterly cover',
+                source: 'notes.md',
+                quotedSpan: "the team's first tier - quarterly cover"
+              }
+            ]
+          })
+        )
+      ],
+      { runner: { readFile } }
+    );
+
+    expect(result.reports).toHaveLength(1);
+    expect(result.reports[0]).toMatchObject({
+      schemaValid: false,
+      citations: { checked: 1, cited: 1 }
+    });
+    expect(result.reports[0]?.schemaErrors?.join(' ')).toContain(
+      '1 of 2 evidence items were dropped'
+    );
+    expect(result.reports[0]?.evidenceChecks).toEqual([
+      expect.objectContaining({ verified: true, reread: true })
+    ]);
+    expect(readFile).toHaveBeenCalledExactlyOnceWith(workspaceId, taskId, 'notes.md');
+  });
+
   it('says nothing was checked when the specialist cited no sources', async () => {
     const { result } = await runMission([
       answer(JSON.stringify({ answer: 'Three tiers.', evidence: [] }))
@@ -707,6 +785,47 @@ describe('where the harness will go to check a citation', () => {
     ({
       call: async () => ({ sources: [{ url: landed, requestedUrl: requested, text: body }] })
     }) as unknown as Partial<AgentRunnerClient>;
+
+  it.each([
+    [
+      'a source error',
+      { sources: [{ requestedUrl: 'https://hostile.test/notes', error: 'HTTP 503' }] }
+    ],
+    [
+      'a source error carrying matching text',
+      {
+        sources: [
+          { requestedUrl: 'https://hostile.test/notes', error: 'HTTP 503', text: 'three tiers' }
+        ]
+      }
+    ],
+    ['no returned source', { sources: [] }],
+    ['no source text', { sources: [{ requestedUrl: 'https://hostile.test/notes' }] }]
+  ])('does not count %s as a reread or a missing quote', async (_case, response) => {
+    const { result, reads } = await runMission([answer(cite('https://hostile.test/notes'))], {
+      runner: { call: async () => response } as unknown as Partial<AgentRunnerClient>
+    });
+
+    expect(reads).toHaveLength(1);
+    expect(result.reports[0]?.evidenceChecks).toEqual([
+      expect.objectContaining({ verified: false, reread: false })
+    ]);
+    expect(result.reports[0]?.citations).toEqual({ checked: 0, cited: 1 });
+    expect(result.reports[0]?.unverified).toContain('could not open');
+    expect(result.reports[0]?.unverified).not.toContain('found the quoted span in none of them');
+  });
+
+  it('counts a successfully read empty page as reread without finding the quote', async () => {
+    const { result } = await runMission([answer(cite('https://hostile.test/notes'))], {
+      runner: readMany('')
+    });
+
+    expect(result.reports[0]?.evidenceChecks).toEqual([
+      expect.objectContaining({ verified: false, reread: true })
+    ]);
+    expect(result.reports[0]?.citations).toEqual({ checked: 1, cited: 1 });
+    expect(result.reports[0]?.unverified).toContain('found the quoted span in none of them');
+  });
 
   it('does not fetch an address the specialist named that this run has never been sent to', async () => {
     const { result, reads, state } = await runMission(

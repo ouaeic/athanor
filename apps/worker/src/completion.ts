@@ -797,6 +797,12 @@ export const normalisedSpan = (value: string): string =>
     .trim()
     .toLowerCase();
 
+/** An empty normalized quote carries no evidence, even though every string contains it. */
+export const quotedSpanMatchesSource = (source: string, quote: string): boolean => {
+  const span = normalisedSpan(quote);
+  return span.length > 0 && normalisedSpan(source).includes(span);
+};
+
 /**
  * The longest a cited `source` may be before the whole evidence item is dropped.
  *
@@ -896,13 +902,16 @@ export const validateDelegateReport = (text: string): DelegateReportValidation =
     const claim = textValue(entry?.claim).trim();
     const source = textValue(entry?.source).trim();
     const quotedSpan = textValue(entry?.quotedSpan).trim();
-    return claim && source && source.length <= MAX_EVIDENCE_SOURCE_CHARS && quotedSpan
+    return claim &&
+      source &&
+      source.length <= MAX_EVIDENCE_SOURCE_CHARS &&
+      normalisedSpan(quotedSpan).length > 0
       ? [{ claim, source, quotedSpan }]
       : [];
   });
   if (evidence.length !== rawEvidence.length)
     errors.push(
-      `${rawEvidence.length - evidence.length} of ${rawEvidence.length} evidence items were dropped: each needs "claim", "source" and "quotedSpan" as non-empty strings, with a "source" of at most ${MAX_EVIDENCE_SOURCE_CHARS} characters`
+      `${rawEvidence.length - evidence.length} of ${rawEvidence.length} evidence items were dropped: each needs "claim", "source" and "quotedSpan" as non-empty strings, with a "source" of at most ${MAX_EVIDENCE_SOURCE_CHARS} characters and a quote that remains non-empty after text normalization`
     );
   return { report: { answer: record.answer, evidence }, errors };
 };

@@ -4,12 +4,12 @@ import type { TaskRecord } from '@athanor/data';
 import { type ModelMessage, type ModelToolCall } from '@athanor/model-gateway';
 import { type AgentState } from './agent-state.js';
 import { delegateBudget, estimatedInferenceCostUsd, usageCredit } from './billing.js';
-import { normalisedSpan, type DelegateEvidenceCheck } from './completion.js';
+import { quotedSpanMatchesSource, type DelegateEvidenceCheck } from './completion.js';
 import { originsFromResult, providerWebProvenance, untrustedOriginOfResult } from './provenance.js';
 import { delegateSpecialists, routeTo } from './routing.js';
 import { DELEGATE_MAX_STEPS } from './turn-bounds.js';
 import { startStopWatch, withRequestDeadline } from './turn-lifecycle.js';
-import { boundedKnowledge, textValue } from './values.js';
+import { boundedKnowledge } from './values.js';
 // Straight from the file that owns it rather than through `agent.js`'s re-export, because what this
 // needs is the half `agent.js` does not forward: the reasons a report missed its contract, which are
 // what the one correction message below is written from.
@@ -150,11 +150,14 @@ async function verifyDelegateEvidence(
           `${root}/browser/read-many`,
           { urls: [item.source], maxCharactersPerPage: 20_000 }
         );
-        body = (read.sources ?? []).map((source) => textValue(source.text)).join('\n');
+        const source = read.sources?.[0];
+        if (!source || source.error !== undefined || typeof source.text !== 'string')
+          throw new Error(source?.error || 'The web reader returned no source text.');
+        body = source.text;
       } else {
         body = await context.runner.readFile(task.workspaceId, task.id, item.source);
       }
-      const found = normalisedSpan(body).includes(normalisedSpan(item.quotedSpan));
+      const found = quotedSpanMatchesSource(body, item.quotedSpan);
       checks.push({
         claim: item.claim,
         source: item.source,

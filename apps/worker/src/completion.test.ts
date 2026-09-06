@@ -15,6 +15,7 @@ import {
   normalisedSpan,
   observedCommands,
   parseDelegateReport,
+  quotedSpanMatchesSource,
   shellObservation,
   startTurnState,
   validateDelegateReport
@@ -840,9 +841,27 @@ describe('reading a specialist report against its contract', () => {
 
     expect(checked.report?.evidence).toHaveLength(1);
     expect(checked.errors).toEqual([
-      '1 of 2 evidence items were dropped: each needs "claim", "source" and "quotedSpan" as non-empty strings, with a "source" of at most 2048 characters'
+      '1 of 2 evidence items were dropped: each needs "claim", "source" and "quotedSpan" as non-empty strings, with a "source" of at most 2048 characters and a quote that remains non-empty after text normalization'
     ]);
   });
+
+  it.each(['\u00ad', '\u200b', '\u200c', '\u200d', '\u2060', '\ufeff', ' \u00ad\u200b\u00a0\n'])(
+    'rejects a quote with no text after normalization: %j',
+    (quotedSpan) => {
+      const valid = { claim: 'tiers', source: 'notes.md', quotedSpan: 'the ﬁrst tier' };
+      const checked = validateDelegateReport(
+        JSON.stringify({
+          answer: 'The first tier exists.',
+          evidence: [{ ...valid, quotedSpan }, valid]
+        })
+      );
+
+      expect(checked.report?.evidence).toEqual([valid]);
+      expect(checked.errors).toHaveLength(1);
+      expect(checked.errors[0]).toContain('1 of 2 evidence items were dropped');
+      expect(checked.errors[0]).toContain('quote that remains non-empty after text normalization');
+    }
+  );
 
   it('says so when evidence arrived as something the harness cannot re-read', () => {
     const checked = validateDelegateReport(
@@ -1047,14 +1066,19 @@ describe('a status the harness writes and the model cannot', () => {
  * publisher's apostrophe is curly, the ligature is one character, the hyphen is soft, the dash is
  * an en dash. Every one of those was athanor calling honest work fabricated.
  *
- * Written as a page and a span rather than as two normalised strings, because that is how the
- * production caller uses it - `verifyDelegateEvidence` puts both sides through this and asks
- * `.includes()`. A row that compared two normalised forms directly would pass on a matcher that
- * never sees the same input the harness gives it.
+ * The production matcher receives a complete page and the quoted span, so these cases exercise
+ * that boundary rather than reimplementing the comparison in the test.
  */
 describe('a quoted span and the page it was copied from', () => {
-  const found = (page: string, span: string): boolean =>
-    normalisedSpan(page).includes(normalisedSpan(span));
+  const found = quotedSpanMatchesSource;
+
+  it.each(['', ' \n\t', '\u00ad', '\u200b\u200c\u200d\u2060\ufeff', '\u00a0\u3000'])(
+    'never finds an empty normalized quote: %j',
+    (span) => {
+      expect(found('', span)).toBe(false);
+      expect(found('A source about a different subject.', span)).toBe(false);
+    }
+  );
 
   const PAGE =
     'Statement of accounts\n\nThe team’s ﬁrst quarter — the 2024–2025 review — closed\n' +
