@@ -1,9 +1,9 @@
 {
   "$stamp": {
-    "acceptedAt": "2026-09-04T02:12:23.533Z",
+    "acceptedAt": "2026-09-06T04:23:23.354Z",
     "version": "0.1.1",
-    "commit": "8e042e5",
-    "harness": "2024c9fe31cb"
+    "commit": "459d93c",
+    "harness": "93f789ba1422"
   },
   "ambiguous-a-question-before-looking-is-refused": {
     "modelCalls": 3,
@@ -224,7 +224,7 @@
   },
   "media-a-picture-the-lead-cannot-see-is-routed-to-a-specialist": {
     "modelCalls": 3,
-    "promptTokens": 31966,
+    "promptTokens": 32031,
     "catalogueTokens": 25117,
     "cachePrefix": 96,
     "displayedLines": 0
@@ -280,16 +280,16 @@
   },
   "research-a-browser-page-taints-the-turn-by-where-it-came-from": {
     "modelCalls": 2,
-    "promptTokens": 31961,
+    "promptTokens": 31946,
     "catalogueTokens": 25116,
     "cachePrefix": 95,
     "displayedLines": 0
   },
-  "research-a-desktop-observation-is-not-treated-as-untrusted": {
+  "research-a-desktop-observation-carries-untrusted-provenance": {
     "modelCalls": 2,
-    "promptTokens": 31757,
+    "promptTokens": 31935,
     "catalogueTokens": 25116,
-    "cachePrefix": 96,
+    "cachePrefix": 95,
     "displayedLines": 0
   },
   "research-a-long-mission-holds-its-own-window-down": {
@@ -310,6 +310,13 @@
     "modelCalls": 4,
     "promptTokens": 64987,
     "catalogueTokens": 50232,
+    "cachePrefix": 95,
+    "displayedLines": 0
+  },
+  "research-desktop-content-cannot-grant-memory-authority": {
+    "modelCalls": 2,
+    "promptTokens": 31941,
+    "catalogueTokens": 25116,
     "cachePrefix": 95,
     "displayedLines": 0
   },

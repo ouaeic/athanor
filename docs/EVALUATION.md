@@ -16,9 +16,8 @@ repeated the one before it byte for byte, how many commands the workspace ran, h
 the provider was charged for and on which route, and which gates fired. Delete a gate, run the suite,
 read the difference. That is the whole point.
 
-One fixture states a target the loop does not meet yet. It is reported as pending rather than as a
-failure, with the sentence saying what it is waiting on, so an open gap is visible in the report
-instead of being absent from it.
+A fixture for an unmet target may be marked pending with the reason it cannot pass. Pending rows
+remain visible in the report, and a pending row that passes must have its marker removed.
 
 Not every model call in a turn is a step of it. Two of them are somebody else's: the tool-free call
 a compaction makes to write its brief, and every step a delegated specialist takes inside its own
@@ -105,20 +104,20 @@ the whole block on every `pnpm check`. Accept a new baseline and this page fails
 is re-derived, naming the value it should now carry. The instruction is no longer advice.
 
 ```baseline
-fixtures                                                                              73
-long-a-finished-phase-is-never-declared.modelCalls                                    38
-long-a-finished-phase-is-never-declared.promptTokens                           1,462,301
-long-a-finished-phase-is-never-declared.catalogueTokens                          477,204
-long-a-finished-phase-is-never-declared.cachePrefix                                   95
-long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.modelCalls            40
-long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.promptTokens   1,408,856
-long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.catalogueTokens   489,763
-long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.cachePrefix           94
-long-finished-phases-condense-rather-than-shred.cachePrefix                           66
-compaction.extraModelCalls                                                             2
-compaction.tokensSaved                                                            53,445
-compaction.cachePointsGivenUp                                                          1
-floorWalk.cachePointsLost                                                             28
+fixtures                                                                             74
+long-a-finished-phase-is-never-declared.modelCalls                                   38
+long-a-finished-phase-is-never-declared.promptTokens                          1,462,301
+long-a-finished-phase-is-never-declared.catalogueTokens                         477,204
+long-a-finished-phase-is-never-declared.cachePrefix                                  95
+long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.modelCalls           40
+long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.promptTokens  1,408,856
+long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.catalogueTokens    489,763
+long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.cachePrefix          94
+long-finished-phases-condense-rather-than-shred.cachePrefix                          66
+compaction.extraModelCalls                                                            2
+compaction.tokensSaved                                                           53,445
+compaction.cachePointsGivenUp                                                         1
+floorWalk.cachePointsLost                                                            28
 ```
 
 The last four are derived rather than stored, and the check does the subtraction itself:

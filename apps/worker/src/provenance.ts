@@ -93,6 +93,7 @@ const ORIGIN_PHRASES: readonly string[] = [
   'web pages',
   'web page',
   'browser page',
+  'desktop application',
   'coding agent report',
   'delegated specialist',
   'background process output',
@@ -367,6 +368,10 @@ const unboundedOriginOfResult = (call: ModelToolCall, result: unknown): string |
       const host = originOf(textValue(record?.url));
       return host ? `browser page ${host}` : 'browser page';
     }
+    case 'desktop_observe':
+    case 'desktop_action':
+      // Window titles, accessibility text and pixels can all come from external documents.
+      return 'desktop application';
     case 'coding_agent':
       return textValue(call.arguments.action) === 'run' ? 'coding agent report' : null;
     // A specialist is a reader with the lead's tools and none of the lead's window. Whatever it
