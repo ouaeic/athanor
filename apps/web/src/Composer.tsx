@@ -1,543 +1,492 @@
-import { useRef, useState, type ReactNode, type RefObject } from 'react';
+import { lazy, Suspense, useEffect, useRef, useState } from 'react';
+import { ArrowUpRight, Paperclip, X, SlidersHorizontal, Mic, Square } from 'lucide-react';
+import type { Task, Workspace } from '@athanor/contracts';
+import type { Bootstrap, Draft, DraftAttachment } from './model';
+import { defaultPrivacy, isWorking, text, data } from './model';
+import { isNativeClient, post, put, request } from './client';
+import { Button, ErrorNotice, Field } from './ui';
+import { MAX_TASK_SPEND_USD } from './usage-model.js';
 import {
-  ArrowUp,
-  CalendarClock,
-  Camera,
-  CircleStop,
-  Redo2,
-  FolderKey,
-  Mic,
-  Paperclip,
-  Plus,
-  ShieldCheck,
-  Sparkles
-} from 'lucide-react';
-import { AttachmentTray } from './AttachmentTray.js';
-import { Dialog } from './Dialog.js';
-import {
-  composerContextLabel,
-  composerMenuItems,
-  composerPlaceholder,
-  modelChoiceFromValue,
-  modelSelectValue,
-  modelSheetGroups,
-  privacyLine,
-  sendsOnKey,
-  type ComposerMenuItem,
-  type ModelChoice
-} from './composer-state.js';
-import { securityModeCopy, securityModes } from './security-mode.js';
-import type { Attachment } from './attachments.js';
-import type { CatalogueModel, SecurityMode } from './types.js';
+  dictationSession,
+  serialDraftWriter,
+  spendCap,
+  transcriptionPayload,
+  uploadAttachments
+} from './composer-operations.js';
+import type { DictationState } from './composer-operations.js';
+const LocalFolderAttachments = lazy(() => import('./LocalFolderAttachments.js'));
 
-const menuIcons: Record<ComposerMenuItem['action'], ReactNode> = {
-  attach: <Paperclip />,
-  photo: <Camera />,
-  schedule: <CalendarClock />,
-  folder: <FolderKey />
-};
-
-/**
- * The message box, and the one row of controls under it.
- *
- * This is the control used every session and by every route into athanor, and its worst failures
- * are all failures of state: a box that goes dead while the agent is working, a Stop button that
- * turns back into Send the moment you start typing a correction, a model picker that pins a
- * conversation to a model that cannot answer. None of that is visible in a pure function, so it
- * lives in one component that renders from props alone and can be rendered in a test.
- *
- * It is two rows at every width, and that is a fixed budget rather than a layout that happens to
- * fit: measured at 375x812 the old composer was 176px at rest and 291px with the box full - 36% of
- * the phone - for a text field, six icon buttons, two full-width `<select>`s and a disclaimer
- * nobody reads twice. Everything that was permanent and rarely touched is now one tap behind the
- * `+` or the context chip, and nothing was removed.
- *
- * Typing is deliberately never blocked by work already in flight: the message is echoed locally and
- * the server decides when it runs. Disabling this box was the one thing that made a slow reply feel
- * like a frozen app.
- */
-export function Composer({
-  banners,
-  prompt,
-  onPrompt,
-  textareaRef,
-  attachments,
-  onRemoveAttachment,
-  onUploadFiles,
-  workspaceAvailable,
-  taskOpen,
-  taskLive,
-  busy,
-  canSend,
-  onSend,
-  onStop,
-  recording,
-  onToggleRecording,
-  onSchedule,
-  onImportFolder,
-  securityMode,
-  onSecurityMode,
-  providerConfigured,
-  enforceZeroDataRetention,
-  webSearchNote = '',
-  webSearchDisclosure = '',
-  onOpenAiSettings,
-  models,
-  unavailableModels,
-  modelReasons,
-  modelChoice,
-  onModelChoice,
-  capUsd,
-  onCapUsd,
-  taskCapUsd
-}: {
-  /** Whatever must appear directly above the composer: a storage warning, a block, a notice. */
-  banners?: ReactNode;
-  prompt: string;
-  onPrompt: (value: string) => void;
-  textareaRef?: RefObject<HTMLTextAreaElement | null>;
-  attachments: Attachment[];
-  onRemoveAttachment: (attachment: Attachment) => void;
-  onUploadFiles: (files: File[]) => void;
-  workspaceAvailable: boolean;
-  taskOpen: boolean;
-  /** The agent is working, so Stop is offered and a send becomes a queued follow-up. */
-  taskLive: boolean;
-  busy: boolean;
-  canSend: boolean;
-  onSend: (options?: { interrupt?: boolean }) => void;
-  onStop: () => void;
-  recording: boolean;
-  onToggleRecording: () => void;
-  onSchedule: () => void;
-  /** Only the native client can hand over a local folder, so the item only exists there. */
-  onImportFolder?: () => void;
-  securityMode: SecurityMode;
-  onSecurityMode: (mode: SecurityMode) => void;
-  providerConfigured: boolean;
-  enforceZeroDataRetention: boolean;
-  /** Where this conversation's searches go, when that is somewhere other than this computer. */
-  webSearchNote?: string;
-  /** The whole sentence behind that note, for the control's title. */
-  webSearchDisclosure?: string;
-  onOpenAiSettings: () => void;
-  models: CatalogueModel[];
-  unavailableModels: CatalogueModel[];
-  /** Why the router placed each model where it did, for the eight it explains. */
-  modelReasons?: Readonly<Record<string, string>>;
-  modelChoice: ModelChoice;
-  onModelChoice: (choice: ModelChoice) => void;
-  /**
-   * The ceiling for the next send, exactly as typed. Empty means the account's per-conversation cap.
-   *
-   * A string rather than a number because a half-typed "1." is a real state of this field and
-   * rounding it away under the cursor is how a number input eats what somebody is writing.
-   */
-  capUsd: string;
-  onCapUsd: (value: string) => void;
-  /** The ceiling the open conversation was started under, when it has one of its own. */
-  taskCapUsd?: number | null;
-}) {
-  const [dragging, setDragging] = useState(false);
-  const [menuOpen, setMenuOpen] = useState(false);
-  const [sheetOpen, setSheetOpen] = useState(false);
-  const filePicker = useRef<HTMLInputElement>(null);
-  const cameraAttachments = useRef<HTMLInputElement>(null);
-
-  const menuItems = composerMenuItems({
-    workspaceAvailable,
-    busy,
-    canImportFolder: Boolean(onImportFolder)
+export interface ComposerProps {
+  workspace: Workspace;
+  task?: Task | null;
+  bootstrap: Bootstrap;
+  initialDraft?: Draft;
+  scope?: string;
+  onSent: (task: Task) => void;
+  onDraft: (draft: Draft) => void;
+}
+export default function Composer({
+  workspace,
+  task = null,
+  bootstrap,
+  initialDraft,
+  scope,
+  onSent,
+  onDraft
+}: ComposerProps) {
+  const [body, setBody] = useState(initialDraft?.body ?? '');
+  const [attachments, setAttachments] = useState<DraftAttachment[]>(
+    initialDraft?.attachments ?? []
+  );
+  const [modelId, setModelId] = useState('');
+  const [privacyRoute, setPrivacyRoute] = useState(task?.privacyRoute ?? defaultPrivacy(bootstrap));
+  const [cap, setCap] = useState('');
+  const [interrupt, setInterrupt] = useState(false);
+  const [advanced, setAdvanced] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState<unknown>(null);
+  const [saved, setSaved] = useState('');
+  const [dictationState, setDictationState] = useState<DictationState>('idle');
+  const [pendingTask, setPendingTask] = useState<Task | null>(null);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const input = useRef<HTMLTextAreaElement>(null);
+  const voice = useRef<ReturnType<typeof dictationSession> | null>(null);
+  const voiceState = useRef<DictationState>('idle');
+  const uploadController = useRef<AbortController | null>(null);
+  const operation = useRef<{ signature: string; key: string } | null>(null);
+  const changed = useRef(false);
+  const sending = useRef(false);
+  const mounted = useRef(true);
+  const draftTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const draftRevision = useRef(0);
+  const [draftWrites] = useState(() =>
+    serialDraftWriter<Draft>((draft) => put('/v1/drafts', draft))
+  );
+  const onDraftRef = useRef(onDraft);
+  onDraftRef.current = onDraft;
+  useEffect(() => {
+    if (!changed.current || sending.current || busy) return;
+    const draft: Draft = { workspaceId: workspace.id, taskId: task?.id ?? null, body, attachments };
+    onDraftRef.current(draft);
+    const revision = ++draftRevision.current;
+    draftTimer.current = setTimeout(() => {
+      setSaved('Saving draft…');
+      void draftWrites
+        .save(draft)
+        .then(() => {
+          if (mounted.current && !sending.current && revision === draftRevision.current)
+            setSaved('Draft saved');
+        })
+        .catch((err: unknown) => {
+          if (mounted.current && !sending.current && revision === draftRevision.current) {
+            setSaved('Draft not synced');
+            setError(err);
+          }
+        });
+    }, 650);
+    return () => {
+      if (draftTimer.current) clearTimeout(draftTimer.current);
+    };
+  }, [body, attachments, workspace.id, task?.id, busy, draftWrites]);
+  useEffect(() => {
+    mounted.current = true;
+    voice.current = dictationSession({
+      getStream: () => navigator.mediaDevices.getUserMedia({ audio: true }),
+      createRecorder: (stream) => new MediaRecorder(stream),
+      transcribe: async (audio, signal) => {
+        const payload = await transcriptionPayload(audio, signal);
+        signal.throwIfAborted();
+        const result = await post<unknown>('/v1/audio/transcriptions', payload, { signal });
+        return text(data(result).text);
+      },
+      onText: (transcript) => {
+        changed.current = true;
+        setBody((current) => [current, transcript].filter(Boolean).join('\n'));
+        input.current?.focus();
+      },
+      onError: setError,
+      onState: (state) => {
+        voiceState.current = state;
+        setDictationState(state);
+      }
+    });
+    return () => {
+      mounted.current = false;
+      uploadController.current?.abort();
+      voice.current?.dispose();
+      voiceState.current = 'idle';
+      if (draftTimer.current) clearTimeout(draftTimer.current);
+    };
+  }, []);
+  async function upload(files: FileList | readonly File[] | null): Promise<boolean> {
+    if (
+      !files?.length ||
+      sending.current ||
+      uploadController.current ||
+      voiceState.current !== 'idle' ||
+      pendingTask
+    )
+      return false;
+    setUploading(true);
+    setError(null);
+    const controller = new AbortController();
+    uploadController.current = controller;
+    try {
+      await uploadAttachments(
+        Array.from(files),
+        attachments.length,
+        controller.signal,
+        (path, file, signal) =>
+          request(`/v1/workspaces/${workspace.id}/file?path=${encodeURIComponent(path)}`, {
+            method: 'PUT',
+            body: file,
+            headers: { 'Content-Type': 'application/octet-stream' },
+            signal
+          }),
+        (attachment) => {
+          if (!mounted.current) return;
+          changed.current = true;
+          setAttachments((current) => [...current, attachment]);
+        }
+      );
+      return true;
+    } catch (err) {
+      if (mounted.current && !controller.signal.aborted) setError(err);
+      return false;
+    } finally {
+      if (uploadController.current === controller) uploadController.current = null;
+      if (mounted.current) setUploading(false);
+      if (fileInput.current) fileInput.current.value = '';
+    }
+  }
+  const clearedDraft = (): Draft => ({
+    workspaceId: workspace.id,
+    taskId: task?.id ?? null,
+    body: '',
+    attachments: []
   });
-  const runMenuItem = (action: ComposerMenuItem['action']) => {
-    if (action === 'attach') filePicker.current?.click();
-    else if (action === 'photo') cameraAttachments.current?.click();
-    else if (action === 'schedule') onSchedule();
-    else onImportFolder?.();
-    setMenuOpen(false);
-  };
-
-  const selectedModel = modelSelectValue(modelChoice);
-  const contextLabel = composerContextLabel({
-    providerConfigured,
-    securityMode,
-    modelChoice,
-    // A pinned model that has gone unavailable still has to be named on the chip, or the chip stops
-    // describing the conversation at exactly the moment the owner needs to know why it will not run.
-    models: [...models, ...unavailableModels]
-  });
-
+  async function finishDelivery(result: Task) {
+    try {
+      await draftWrites.save(clearedDraft());
+      operation.current = null;
+      if (mounted.current) {
+        setPendingTask(null);
+        setSaved('');
+        onSent(result);
+      }
+    } catch (cause) {
+      if (mounted.current) {
+        setPendingTask(result);
+        setSaved('Work sent · draft not synced');
+        setError(
+          new Error(
+            'Your work was sent, but its saved draft could not be cleared. Retry draft sync to open it.',
+            { cause }
+          )
+        );
+      }
+    }
+  }
+  async function send() {
+    if (
+      !body.trim() ||
+      sending.current ||
+      uploadController.current ||
+      voiceState.current !== 'idle' ||
+      workspace.status !== 'running' ||
+      pendingTask
+    )
+      return;
+    let limit: number | undefined;
+    try {
+      limit = spendCap(cap);
+    } catch (cause) {
+      setError(cause);
+      return;
+    }
+    sending.current = true;
+    if (draftTimer.current) clearTimeout(draftTimer.current);
+    ++draftRevision.current;
+    setBusy(true);
+    setError(null);
+    const prompt = scope
+      ? `${body.trim()}\n\nSelected context for this direction:\n${scope}`
+      : body.trim();
+    const payload = {
+      prompt,
+      attachments: attachments.map((file) => file.path),
+      ...(modelId ? { modelId } : {}),
+      privacyRoute,
+      ...(limit !== undefined ? { maxSpendUsd: limit } : {}),
+      ...(task ? { interrupt } : { workspaceId: workspace.id })
+    };
+    const signature = JSON.stringify(payload);
+    if (operation.current?.signature !== signature)
+      operation.current = { signature, key: crypto.randomUUID() };
+    try {
+      await draftWrites.flush();
+      const result = await post<Task>(
+        task ? `/v1/tasks/${task.id}/messages` : '/v1/tasks',
+        payload,
+        { idempotencyKey: operation.current.key }
+      );
+      changed.current = false;
+      if (mounted.current) {
+        setBody('');
+        setAttachments([]);
+      }
+      onDraftRef.current(clearedDraft());
+      await finishDelivery(result);
+    } catch (err) {
+      if (mounted.current) setError(err);
+    } finally {
+      sending.current = false;
+      if (mounted.current) setBusy(false);
+    }
+  }
+  function dictate() {
+    if (voiceState.current === 'recording') {
+      voice.current?.stop();
+      return;
+    }
+    if (sending.current || uploadController.current || pendingTask || voiceState.current !== 'idle')
+      return;
+    setError(null);
+    void voice.current?.start();
+  }
+  const recording = dictationState === 'recording';
+  const voiceBusy = dictationState !== 'idle';
+  const editingDisabled = busy || Boolean(pendingTask);
+  const models = bootstrap.models.filter(
+    (model) => model.availability === 'available' && model.privacyRoute === privacyRoute
+  );
   return (
-    <section
-      className={`composer-wrap ${dragging ? 'dropping' : ''}`}
-      onDragOver={(event) => {
-        if (!event.dataTransfer.types.includes('Files')) return;
+    <form
+      className={`intent-editor ${task ? 'follow-up' : ''}`}
+      onSubmit={(event) => {
         event.preventDefault();
-        setDragging(true);
-      }}
-      onDragLeave={(event) => {
-        if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
-        setDragging(false);
-      }}
-      onDrop={(event) => {
-        if (!event.dataTransfer.files.length) return;
-        event.preventDefault();
-        setDragging(false);
-        onUploadFiles([...event.dataTransfer.files]);
+        void send();
       }}
     >
-      {/*
-        Anything that has to sit above the composer sits inside it, in flow.
-
-        These used to be absolutely positioned against the viewport with a hand-tuned `bottom` -
-        144px, then 188px at one breakpoint, then `var(--bottom-bar) + 182px` at another - while the
-        composer they were meant to clear is itself bottom-pinned and grows as the owner types. So
-        the numbers were always chasing a moving target, and a storage warning painted over the
-        first line of the sentence being written: the one moment the wording matters most. Stacked
-        here they move with the composer at every width and every height, and there is no number to
-        keep in sync.
-
-        Exactly one of them at a time - `composerStrip` decides which - so this needs no bound of
-        its own. The tallest thing that can appear here is the approval card, and that already caps
-        itself at 40vh and scrolls its own overflow, which is what keeps the message box on a 667px
-        phone where `.workbench` clips what does not fit.
-
-        This is also where a send that cannot go anywhere is answered: `sendBlock` names what is
-        wrong and the control that repairs it, and it is drawn here rather than inside the composer
-        so the message never competes with the row that has to stay two lines tall.
-      */}
-      {banners}
-      {/*
-        The halo burns while the machine does.
-
-        It used to orbit the composer for ever, which made the product's one piece of permanent
-        decoration exactly as informative as wallpaper. Bound to the turn it becomes the largest
-        thing on screen that says the computer is working - visible from across a room, and gone
-        the moment it stops.
-      */}
-      <div className={`composer ${taskLive ? 'working' : ''}`}>
-        <AttachmentTray attachments={attachments} onRemove={onRemoveAttachment} />
-        {/*
-          Writable while the box is still coming up.
-
-          This carried `disabled={!workspaceAvailable}`, which is the state a new owner arrives in
-          while their computer is being provisioned — so the first screen of the product was a grey
-          box that could not be typed into, and the one sentence written to explain that state was
-          gated behind having typed something. The draft is kept on this device and on the server,
-          the strip above says what is happening, and Enter answers with the block rather than
-          swallowing the keystroke; waiting is a fine thing to ask of someone, being stuck is not.
-        */}
-        <textarea
-          {...(textareaRef ? { ref: textareaRef } : {})}
-          rows={1}
-          value={prompt}
-          onPaste={(event) => {
-            // Screenshots arrive as clipboard files with no name; give them one so the upload path
-            // and the agent both have something meaningful to refer to.
-            const files = [...event.clipboardData.files];
-            if (!files.length) return;
+      {scope && <div className="scope-label">This direction includes your selected context.</div>}
+      <label className="sr-only" htmlFor={`intent-${task?.id ?? 'new'}`}>
+        {task ? 'Add direction to this work' : 'Describe what you want to do'}
+      </label>
+      <textarea
+        id={`intent-${task?.id ?? 'new'}`}
+        ref={input}
+        value={body}
+        disabled={editingDisabled || voiceBusy}
+        maxLength={200000}
+        rows={task ? 3 : 2}
+        onChange={(event) => {
+          changed.current = true;
+          setBody(event.target.value);
+        }}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
             event.preventDefault();
-            onUploadFiles(
-              files.map((file, index) =>
-                file.name
-                  ? file
-                  : new File([file], `pasted-${index + 1}.${file.type.split('/')[1] ?? 'png'}`, {
-                      type: file.type
-                    })
-              )
-            );
-          }}
-          onChange={(event) => onPrompt(event.target.value)}
-          placeholder={composerPlaceholder({ workspaceAvailable, taskOpen, taskLive })}
-          onKeyDown={(event) => {
-            if (!sendsOnKey(event)) return;
-            event.preventDefault();
-            onSend();
-          }}
-        />
-        <div className="composer-bottom">
-          {/*
-            One row, and it may never become two. It carries a new class rather than the one the
-            wrapping row had, because wrapping is exactly the behaviour being removed: below 430px
-            that row took a second and sometimes a third line and the composer grew under the
-            owner's thumb while they were reading it.
-          */}
-          <div className="composer-row">
-            <button
-              className="icon-btn"
-              aria-haspopup="menu"
-              aria-expanded={menuOpen}
-              title="Add to this message"
-              aria-label="Add to this message"
-              onClick={() => setMenuOpen(true)}
-            >
-              <Plus />
-            </button>
-            {/*
-              Voice keeps its own button at every width. It is the one input a phone is better at
-              than a laptop, and putting the best thing about the small screen two taps deep on the
-              small screen is the trade this row exists to avoid.
-            */}
-            <button
-              className={`icon-btn ${recording ? 'recording' : ''}`}
-              title={recording ? 'Stop voice recording' : 'Record a voice note'}
-              aria-label={recording ? 'Stop voice recording' : 'Record a voice note'}
-              aria-pressed={recording}
-              disabled={!workspaceAvailable || busy}
-              onClick={onToggleRecording}
-            >
-              {recording ? <CircleStop /> : <Mic />}
-            </button>
-            {/*
-              The hidden inputs stay on the row rather than inside the menu: the menu unmounts on
-              the same click that asks one of them to open, and a ref into an unmounted portal is
-              null - the tap would do nothing at all.
-            */}
-            <input
-              ref={filePicker}
-              hidden
-              type="file"
-              multiple
-              onChange={(event) => {
-                onUploadFiles(Array.from(event.target.files ?? []));
-                event.target.value = '';
-              }}
-            />
-            <input
-              ref={cameraAttachments}
-              hidden
-              type="file"
-              accept="image/*"
-              capture="environment"
-              onChange={(event) => {
-                onUploadFiles(Array.from(event.target.files ?? []));
-                event.target.value = '';
-              }}
-            />
-            {/*
-              One chip for how this turn is answered, in place of two selects and a footer.
-
-              Without a provider there is nothing to answer with, so the chip is the owner's move
-              and carries the one ember mark on this row. Ember is never used here for anything
-              else: a configured composer is a machine at rest and says so in silver.
-            */}
-            <button
-              className={`composer-context ${providerConfigured ? '' : 'needs-provider'}`}
-              aria-haspopup="dialog"
-              aria-expanded={sheetOpen}
-              title={
-                providerConfigured
-                  ? securityModeCopy[securityMode].description
-                  : 'Connect an AI provider'
-              }
-              onClick={() => setSheetOpen(true)}
-            >
-              {providerConfigured ? (
-                <ShieldCheck />
-              ) : (
-                <span className="composer-context-dot" aria-hidden="true" />
-              )}
-              <span className="composer-context-label">{contextLabel}</span>
-            </button>
-          </div>
-          {/*
-            Stop and Send are two controls, not one control in two moods. Stop used to appear only
-            while the composer was empty, so the realistic sequence — the agent goes wrong, you
-            start typing a correction, you decide to just stop it — silently turned Stop back into
-            Send and you had to delete what you typed to reach it. Escape does the same thing from
-            anywhere in the workbench.
-          */}
-          {taskLive && (
-            <button
-              className="send-btn stopping"
-              aria-label="Stop the agent"
-              title="Stop the agent (Esc)"
-              disabled={busy}
-              onClick={onStop}
-            >
-              <CircleStop />
-            </button>
-          )}
-          {/*
-            A third control while the agent is working, for the same reason Stop is a second one:
-            "queue this for after" and "no, do this instead" are different things to want, and a
-            send that guessed between them from the fact that the task happened to be busy would be
-            wrong half the time. Queueing stays on the plain arrow, so nothing changes for anyone
-            who is not steering.
-          */}
-          {taskLive && (
-            <button
-              className="send-btn correcting"
-              aria-label="Correct the running task now"
-              title="Apply now, keeping the work so far"
-              disabled={!canSend || busy}
-              onClick={() => onSend({ interrupt: true })}
-            >
-              {/* One word, because there is no hover on a phone: three round buttons appear together
-                  the moment work starts, two of them are arrows, and the only thing telling this one
-                  from Send was a `title` a touchscreen never shows. */}
-              <Redo2 />
-              <span>Now</span>
-            </button>
-          )}
-          <button
-            className="send-btn"
-            aria-label={taskLive ? 'Queue follow-up' : 'Send message'}
-            disabled={!canSend || busy}
-            onClick={() => onSend()}
-          >
-            <ArrowUp />
-          </button>
-        </div>
-      </div>
-      {menuOpen && (
-        <Dialog
-          backdropClassName="modal-backdrop composer-sheet-backdrop"
-          className="modal composer-sheet composer-menu"
-          label="Add to this message"
-          closeOnBackdrop
-          onClose={() => setMenuOpen(false)}
-        >
-          <div role="menu" aria-label="Add to this message">
-            {menuItems.map((item) => (
+            void send();
+          }
+        }}
+        placeholder={
+          task
+            ? 'Add a thought, ask a question, or shape the next step…'
+            : 'Describe what you want to do…'
+        }
+      />
+      {attachments.length > 0 && (
+        <div className="attachments">
+          {attachments.map((file) => (
+            <span key={file.path}>
+              {file.name}
               <button
-                key={item.action}
-                role="menuitem"
-                className="composer-sheet-row"
-                disabled={item.disabled}
-                onClick={() => runMenuItem(item.action)}
-              >
-                {menuIcons[item.action]}
-                <span className="composer-sheet-label">{item.label}</span>
-              </button>
-            ))}
-          </div>
-        </Dialog>
-      )}
-      {sheetOpen && (
-        <Dialog
-          backdropClassName="modal-backdrop composer-sheet-backdrop"
-          className="modal composer-sheet"
-          label="How this turn is answered"
-          closeOnBackdrop
-          onClose={() => setSheetOpen(false)}
-        >
-          <div className="composer-sheet-group">
-            <h3>How much it asks</h3>
-            {securityModes.map((mode) => (
-              <button
-                key={mode}
-                className={`composer-sheet-row ${mode === securityMode ? 'chosen' : ''}`}
-                aria-pressed={mode === securityMode}
-                disabled={!workspaceAvailable || busy}
+                type="button"
+                aria-label={`Remove ${file.name} from this direction`}
+                disabled={editingDisabled || uploading || voiceBusy}
                 onClick={() => {
-                  onSecurityMode(mode);
-                  setSheetOpen(false);
+                  changed.current = true;
+                  setAttachments((current) => current.filter((item) => item.path !== file.path));
                 }}
               >
-                <span className="composer-sheet-label">{securityModeCopy[mode].label}</span>
-                <span className="composer-sheet-note">{securityModeCopy[mode].description}</span>
+                <X size={13} />
               </button>
-            ))}
-          </div>
-          {/*
-            The one thing about money that nothing in this product ever asked.
-
-            `maxSpendUsd` is on the create route, the follow-up route, both trajectory arms and the
-            schedule, and honoured by `resolveSpendCeiling` at every one of them — and no control
-            anywhere sent it. The account-wide per-conversation cap is the only door there was, and
-            its own comment explains that it reserves its whole value the moment work is queued, so
-            raising it for one big job charges every other conversation started that morning for it.
-          */}
-          <div className="composer-sheet-group">
-            <h3>{taskOpen ? 'What this turn may cost' : 'What this conversation may cost'}</h3>
-            <label className="composer-sheet-row">
-              <span className="composer-sheet-label">Stop at (USD)</span>
-              <input
-                type="number"
-                inputMode="decimal"
-                min="0.01"
-                step="0.01"
-                placeholder="Account default"
-                value={capUsd}
-                onChange={(event) => onCapUsd(event.target.value)}
+            </span>
+          ))}
+        </div>
+      )}
+      <div className="intent-toolbar">
+        <div className="row">
+          <input
+            ref={fileInput}
+            type="file"
+            multiple
+            disabled={editingDisabled || uploading || voiceBusy}
+            className="sr-only"
+            tabIndex={-1}
+            aria-label="Attach files"
+            onChange={(event) => upload(event.target.files)}
+          />
+          <Button
+            aria-label="Attach files"
+            onClick={() => fileInput.current?.click()}
+            disabled={editingDisabled || uploading || voiceBusy}
+          >
+            <Paperclip size={18} />
+          </Button>
+          {isNativeClient() && (
+            <Suspense fallback={null}>
+              <LocalFolderAttachments
+                disabled={editingDisabled || uploading || voiceBusy}
+                remaining={Math.max(0, 20 - attachments.length)}
+                onFiles={upload}
+                onCancel={() => uploadController.current?.abort()}
               />
-              <span className="composer-sheet-note">
-                {taskCapUsd
-                  ? `Left empty, this turn runs under your account’s per-conversation cap. This conversation was started with a ceiling of $${taskCapUsd.toFixed(2)}.`
-                  : 'Left empty, your account’s per-conversation cap applies. Work stops when the ceiling is reached.'}
-              </span>
-            </label>
-          </div>
-          {providerConfigured ? (
-            modelSheetGroups({
-              models,
-              unavailableModels,
-              enforceZeroDataRetention,
-              ...(modelReasons ? { reasons: modelReasons } : {})
-            }).map((group) => (
-              <div className="composer-sheet-group" key={group.label}>
-                <h3>{group.label}</h3>
-                {group.options.map((option) => (
-                  <button
-                    key={option.value}
-                    className={`composer-sheet-row ${
-                      option.value === selectedModel ? 'chosen' : ''
-                    }`}
-                    aria-pressed={option.value === selectedModel}
-                    disabled={option.disabled}
-                    onClick={() => {
-                      onModelChoice(modelChoiceFromValue(option.value));
-                      setSheetOpen(false);
-                    }}
-                  >
-                    <span className="composer-sheet-label">{option.label}</span>
-                    {option.note ? (
-                      <span className="composer-sheet-note">{option.note}</span>
-                    ) : undefined}
-                  </button>
-                ))}
-              </div>
-            ))
-          ) : (
-            <button
-              className="composer-sheet-connect"
-              onClick={() => {
-                setSheetOpen(false);
-                onOpenAiSettings();
-              }}
-            >
-              <Sparkles />
-              Connect an AI provider
-            </button>
+            </Suspense>
           )}
-          {/*
-            The footer used to carry five separate statements: no-logs, the privacy route, which
-            model, how images are routed, and "your persistent agent computer". Four of those said
-            something the owner already knows or cannot act on, and the fifth was printed under
-            every conversation for ever, which is how a fact worth a glance became wallpaper. What
-            remains is the one line that changes between installs - where inference goes, and where
-            a search goes when that is somewhere else - inside the sheet that changes it.
-          */}
-          <button
-            className={`composer-sheet-privacy ${
-              enforceZeroDataRetention ? 'private' : 'provider-policy'
-            }`}
-            title={
-              webSearchDisclosure
-                ? `${webSearchDisclosure} Change this in Settings.`
-                : 'Change model privacy in Settings'
-            }
+          {typeof MediaRecorder !== 'undefined' && (
+            <Button
+              aria-label={recording ? 'Stop dictation' : 'Dictate direction'}
+              onClick={dictate}
+              disabled={editingDisabled || uploading || (voiceBusy && !recording)}
+            >
+              {recording ? <Square size={16} /> : <Mic size={18} />}
+            </Button>
+          )}
+          <Button
+            aria-label="Model and spending options"
+            aria-expanded={advanced}
+            disabled={editingDisabled || uploading || voiceBusy}
+            onClick={() => setAdvanced(!advanced)}
+          >
+            <SlidersHorizontal size={17} />
+            <span>
+              {modelId
+                ? (models.find((model) => model.id === modelId)?.displayName ?? 'Chosen model')
+                : 'Automatic'}
+            </span>
+          </Button>
+        </div>
+        <Button
+          type="submit"
+          className="primary"
+          disabled={
+            !body.trim() ||
+            uploading ||
+            voiceBusy ||
+            Boolean(pendingTask) ||
+            workspace.status !== 'running'
+          }
+          busy={busy}
+        >
+          {task ? (interrupt ? 'Steer now' : 'Send') : 'Begin'}
+          <ArrowUpRight size={18} />
+        </Button>
+      </div>
+      {uploading && (
+        <div className="row muted" role="status">
+          Uploading…<Button onClick={() => uploadController.current?.abort()}>Cancel upload</Button>
+        </div>
+      )}
+      {voiceBusy && (
+        <div className="row muted" role="status">
+          {dictationState === 'requesting'
+            ? 'Waiting for microphone access…'
+            : recording
+              ? 'Recording…'
+              : 'Transcribing…'}
+          <Button onClick={() => voice.current?.cancel()}>Cancel dictation</Button>
+        </div>
+      )}
+      {pendingTask && (
+        <div className="row">
+          <Button
+            busy={busy}
             onClick={() => {
-              setSheetOpen(false);
-              onOpenAiSettings();
+              if (sending.current) return;
+              sending.current = true;
+              setBusy(true);
+              setError(null);
+              void finishDelivery(pendingTask).finally(() => {
+                sending.current = false;
+                if (mounted.current) setBusy(false);
+              });
             }}
           >
-            <ShieldCheck />
-            <span>{privacyLine({ enforceZeroDataRetention, webSearchNote })}</span>
-          </button>
-        </Dialog>
+            Retry draft sync and open work
+          </Button>
+        </div>
       )}
-    </section>
+      {advanced && (
+        <div className="intent-options">
+          <Field label="Model">
+            <select
+              disabled={editingDisabled || uploading || voiceBusy}
+              value={modelId}
+              onChange={(event) => setModelId(event.target.value)}
+            >
+              <option value="">Automatic · match this request</option>
+              {models.map((model) => (
+                <option key={model.id} value={model.id}>
+                  {model.displayName}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="Privacy route">
+            <select
+              value={privacyRoute}
+              disabled={
+                editingDisabled ||
+                uploading ||
+                voiceBusy ||
+                bootstrap.instance.enforceZeroDataRetention
+              }
+              onChange={(event) => {
+                setPrivacyRoute(event.target.value === 'external' ? 'external' : 'provider_zdr');
+                setModelId('');
+              }}
+            >
+              <option value="provider_zdr">Zero data retention</option>
+              <option value="external">External provider</option>
+            </select>
+          </Field>
+          <Field
+            label={task ? 'Additional spend limit (USD)' : 'Task spend limit (USD)'}
+            hint="Leave blank to use your account limits."
+          >
+            <input
+              type="number"
+              min="0.01"
+              max={MAX_TASK_SPEND_USD}
+              disabled={editingDisabled || uploading || voiceBusy}
+              step="0.01"
+              value={cap}
+              onChange={(event) => setCap(event.target.value)}
+              placeholder="Account default"
+            />
+          </Field>
+        </div>
+      )}
+      {task && isWorking(task) && (
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={interrupt}
+            disabled={editingDisabled || uploading || voiceBusy}
+            onChange={(event) => setInterrupt(event.target.checked)}
+          />
+          Steer the current run now
+          {!interrupt && <span className="muted"> · otherwise queued after current work</span>}
+        </label>
+      )}
+      <ErrorNotice error={error} />
+      {saved && (
+        <small className="draft-status" role="status">
+          {saved}
+        </small>
+      )}
+    </form>
   );
 }

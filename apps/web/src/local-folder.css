@@ -1,0 +1,16 @@
+.local-folder-list {
+  display: grid;
+  gap: 12px;
+  max-height: 50vh;
+  overflow: auto;
+  padding: 12px 0;
+}
+.local-folder-list .button {
+  justify-content: flex-start;
+}
+.local-folder-list .check {
+  align-items: flex-start;
+}
+.local-folder-list .check span {
+  overflow-wrap: anywhere;
+}
