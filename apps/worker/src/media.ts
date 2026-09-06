@@ -1,9 +1,10 @@
+import { AUDIO_READ_MAX_SECONDS, type MediaModelOption } from '@athanor/contracts';
 import {
-  AUDIO_READ_MAX_SECONDS,
-  MEDIA_VIDEO_UNAVAILABLE_REASON,
-  type MediaModelOption
-} from '@athanor/contracts';
-import { managedMediaModels } from '@athanor/model-gateway';
+  managedMediaModels,
+  nativeTranscriptionBound,
+  quoteMediaPrice,
+  type TranscriptionBound
+} from '@athanor/model-gateway';
 
 /**
  * What generated media costs, decided here rather than by the model.
@@ -20,31 +21,12 @@ export const managedMediaCatalog = {
     ...managedMediaModels.image,
     /** Flat per image up to a megapixel, then a small area surcharge, as the provider bills it. */
     estimate: (input: { width: number; height: number }) =>
-      managedMediaModels.image.baseUsdPerImage +
-      Math.max(0, (input.width * input.height) / 1_000_000 - 1) * 0.001
+      (managedMediaModels.image.baseUsdPerImage * (input.width * input.height)) / 1_000_000
   },
   audio: {
     ...managedMediaModels.audio,
     estimate: (input: { characterCount: number }) =>
       (input.characterCount * managedMediaModels.audio.usdPerMillionCharacters) / 1_000_000
-  },
-  /**
-   * Kept as an answer rather than an offer, and the one modality the owner cannot be given a
-   * picker for.
-   *
-   * Image and speech became the owner's choice because there is a request shape behind each of
-   * them - `/images` and `/audio/speech`, both exercised - so a catalogue of routes is a catalogue
-   * of things that would actually run. There is no video request shape here at all: no endpoint,
-   * no response parser, no pricing unit. A modality select listing video models would be a control
-   * with nothing on the other side of it, which is worse than the refusal, so Settings states this
-   * sentence where the picker would be instead.
-   */
-  video: {
-    modelId: '',
-    displayName: 'Video generation',
-    license: 'not available',
-    available: false,
-    reason: MEDIA_VIDEO_UNAVAILABLE_REASON
   }
 } as const;
 
@@ -60,6 +42,7 @@ export interface StoredMediaRoutes {
   image?: MediaModelOption;
   audio?: MediaModelOption;
   transcription?: MediaModelOption;
+  video?: MediaModelOption;
 }
 
 /**
@@ -72,6 +55,8 @@ export interface StoredMediaRoutes {
  * catalogue generates exactly as it did before.
  */
 export interface ResolvedMediaModel {
+  route?: MediaModelOption;
+  transcriptionBound?: TranscriptionBound;
   modelId: string;
   displayName: string;
   usdPerImage: number | null;
@@ -87,10 +72,21 @@ export interface ResolvedMediaModel {
 }
 
 export const resolvedMediaModel = (
-  kind: 'image' | 'audio',
+  kind: 'image' | 'audio' | 'video',
   routes?: StoredMediaRoutes
 ): ResolvedMediaModel => {
   const option = routes?.[kind];
+  if (kind === 'video')
+    return {
+      ...(option ? { route: option } : {}),
+      modelId: option?.providerModelId ?? '',
+      displayName: option?.displayName ?? 'Video',
+      usdPerImage: null,
+      usdPerMillionCharacters: null,
+      usdPerMinute: null,
+      voice: undefined,
+      priceKnown: Boolean(option?.pricing?.length)
+    };
   // A stored route for the wrong modality is not usable as this one's answer, and silently pricing
   // an image against a speech route is the kind of mix-up an owner would only see on the invoice.
   //
@@ -120,6 +116,7 @@ export const resolvedMediaModel = (
           priceKnown: true
         };
   return {
+    route: option,
     modelId: option.providerModelId,
     displayName: option.displayName,
     usdPerImage: option.usdPerImage,
@@ -128,88 +125,56 @@ export const resolvedMediaModel = (
     voice: option.defaultVoice ?? undefined,
     priceKnown:
       option.priceSource !== 'unknown' &&
-      (kind === 'image' ? option.usdPerImage !== null : option.usdPerMillionCharacters !== null)
+      (kind === 'image'
+        ? option.usdPerImage !== null || Boolean(option.pricing?.length)
+        : option.usdPerMillionCharacters !== null)
   };
 };
 
-/**
- * The route that reads a recording, or nothing.
- *
- * Deliberately not folded into the resolver above, because it cannot keep that function's promise:
- * image and speech fall back to a reviewed model athanor has itself run and priced, and no such
- * model exists on this side for transcription. Inventing one would be a licence claim about
- * something nobody reviewed and a price about something nobody billed. Null means the owner has
- * chosen nothing yet, which the caller answers by asking the provider what it has - one request,
- * and only when there is no choice to honour.
- */
+/** Resolve only the selected recording route and its complete price evidence. */
 export const resolvedTranscriptionRoute = (
-  routes?: StoredMediaRoutes
+  routes?: StoredMediaRoutes,
+  nativeConnection = false
 ): ResolvedMediaModel | null => {
   const option = routes?.transcription;
   if (!option || option.modality !== 'transcription' || !option.providerModelId) return null;
+  const rate =
+    option.priceSource === 'unknown'
+      ? null
+      : option.pricing?.length
+        ? quoteMediaPrice(option.pricing, { seconds: 60 })
+        : finiteRate(option.usdPerMinute);
+  const bound = nativeConnection ? nativeTranscriptionBound(option) : null;
   return {
+    route: option,
+    ...(bound ? { transcriptionBound: bound } : {}),
     modelId: option.providerModelId,
     displayName: option.displayName,
     usdPerImage: null,
     usdPerMillionCharacters: null,
-    usdPerMinute: option.usdPerMinute,
+    usdPerMinute: rate,
     voice: undefined,
-    priceKnown: option.priceSource !== 'unknown' && option.usdPerMinute !== null
+    priceKnown: rate !== null
   };
 };
-
-/**
- * The unit transcription is quoted and billed in, and so the smallest stretch of a recording that
- * can be sent to find out what a minute of it costs.
- */
-export const TRANSCRIPTION_BILLING_MINUTE_SECONDS = 60;
-
-/**
- * What this computer is entitled to say a minute of reading costs on a route, and on what evidence.
- *
- * Three states rather than a number, because two of them used to arrive here as the same zero. A
- * published price is the provider's own figure carried on the owner's chosen route. A measured one
- * is arithmetic on a reading the provider has already billed, on this route, in this task - the
- * same kind of evidence the two seeded media prices carry, and the only kind this side can come by
- * for a route nobody publishes. Unknown is neither, and it is not free.
- */
-export interface TranscriptionRate {
-  usdPerMinute: number | null;
-  source: 'published' | 'measured' | 'unknown';
-}
 
 const finiteRate = (value: number | null | undefined): number | null =>
   typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 
-/**
- * The strongest evidence available about a route's price, published beating measured.
- *
- * The published figure wins where there is one: it is what the provider will bill, whereas the
- * measured one is what it billed for a particular reading, and a route with tiered or rounded
- * duration billing can differ between the two.
- */
-export const transcriptionRate = (
-  model: ResolvedMediaModel | null,
-  measuredUsdPerMinute?: number | null
-): TranscriptionRate => {
+export interface TranscriptionRate {
+  usdPerMinute: number | null;
+  source: 'published' | 'unknown';
+}
+
+/** A previous invoice is an observation, not a bound on another recording's token usage. */
+export const transcriptionRate = (model: ResolvedMediaModel | null): TranscriptionRate => {
   const published = model?.priceKnown ? finiteRate(model.usdPerMinute) : null;
-  if (published !== null) return { usdPerMinute: published, source: 'published' };
-  const measured = finiteRate(measuredUsdPerMinute);
-  if (measured !== null) return { usdPerMinute: measured, source: 'measured' };
-  return { usdPerMinute: null, source: 'unknown' };
+  return published === null
+    ? { usdPerMinute: null, source: 'unknown' }
+    : { usdPerMinute: published, source: 'published' };
 };
 
-/**
- * Dollars per minute, read back off a reading the provider itself put a price on.
- *
- * Only from the provider's own figure. `transcribe` falls back to multiplying duration by whatever
- * per-minute price it was handed when the response states no cost, and deriving a rate from that
- * would be this side reading its own guess back to itself and promoting it to a measurement - which
- * is exactly how a constant nobody measured ends up tagged as one.
- *
- * The provider's duration is preferred over the prepared one for the same reason the ledger prefers
- * it: what was billed is what a price per billed minute has to be divided by.
- */
+/** Record invoice arithmetic for reporting only; admission never reads this measurement. */
 export const transcriptionRateFromReading = (
   reading: { costUsd: number; billedSeconds: number | null; costFromProvider: boolean },
   preparedSeconds: number
@@ -221,79 +186,35 @@ export const transcriptionRateFromReading = (
   return Math.round(((cost * 60) / seconds) * 1e6) / 1e6;
 };
 
-/**
- * What a reading of this length will cost at a known rate, before a second of it is sent.
- *
- * Rounded up to the minute, because that is how duration billing is quoted and rounding down would
- * make the card understate every job.
- */
-export const transcriptionEstimateAtRate = (seconds: number, rate: TranscriptionRate): number =>
-  Math.ceil(Math.max(0, seconds) / 60) * (rate.usdPerMinute ?? 0);
+/** Round duration up to a billing minute before checking the owner's limit. */
+export const transcriptionEstimateAtRate = (
+  seconds: number,
+  rate: TranscriptionRate
+): number | null =>
+  rate.usdPerMinute === null ? null : Math.ceil(Math.max(0, seconds) / 60) * rate.usdPerMinute;
 
-/**
- * What a reading is expected to cost, from its duration and the best price anyone has stated.
- *
- * A route nobody has priced still lands on zero here, and that zero is now a floor rather than a
- * claim: it is the true lower bound on a cost nothing on this computer has any evidence about, and
- * `transcriptionWindow` below is what stops the guard being asked to enforce a cap against it.
- * Inventing a number instead would put a price claim about a model nobody billed in front of the
- * owner, which is the defect this repository already carries once and is not repeating.
- */
 export const transcriptionEstimateUsd = (
   seconds: number,
-  model: ResolvedMediaModel | null,
-  measuredUsdPerMinute?: number | null
-): number => transcriptionEstimateAtRate(seconds, transcriptionRate(model, measuredUsdPerMinute));
+  model: ResolvedMediaModel | null
+): number | null =>
+  transcriptionEstimateAtRate(seconds, transcriptionRate(model)) ??
+  model?.transcriptionBound?.reservationUsd ??
+  null;
 
-/**
- * A route restated with the price this computer has since been billed for it.
- *
- * For the approval card, which reads `priceKnown` and otherwise says the cost cannot be known until
- * the provider bills it. That sentence is true of a route nobody has ever read a recording on, and
- * it stops being true the moment one has: the provider has stated a figure by then, and repeating
- * the admission in front of a number this side is holding is the interface reporting an absence it
- * could answer. A published price is left exactly as it was - it is the stronger evidence and this
- * has nothing to add to it.
- */
-export const transcriptionRouteWithMeasuredRate = (
-  route: ResolvedMediaModel | null,
-  measuredUsdPerMinute?: number | null
-): ResolvedMediaModel | null => {
-  if (!route) return null;
-  const rate = transcriptionRate(route, measuredUsdPerMinute);
-  if (rate.source !== 'measured') return route;
-  return { ...route, usdPerMinute: rate.usdPerMinute, priceKnown: true };
-};
-
-/**
- * The stretch of a recording one reading is allowed to send.
- *
- * The whole of what was asked for, once anyone has said what a minute costs. While nobody has, the
- * first reading is cut to a single billing minute - not to save the owner money, since the rest is
- * read by the calls that follow and the total duration billed is the same, but because a cap cannot
- * be enforced against an estimate of zero. Ninety minutes of unknown price went past the spend
- * guard in one request and the guard was told it was free; one minute of unknown price comes back
- * with the provider's own figure attached, and every minute after it is priced, checked against the
- * daily cap and refused if it does not fit.
- *
- * So a long recording behaves the same way before and after a provider publishes a price: the same
- * audio is read, the same money is spent, the same cap stops it in the same place. What changes is
- * that the number the owner is shown stops being a zero nobody stood behind.
- */
+/** Clip once before preparation; native bounds must never activate provider auto-chunking. */
 export const transcriptionWindow = (input: {
   startSeconds: number;
   endSeconds?: number | undefined;
-  rate: TranscriptionRate;
-}): { endSeconds: number; measuring: boolean } => {
+  maxSeconds: number;
+}): { endSeconds: number; limited: boolean } => {
   const start = Math.max(0, Math.floor(input.startSeconds));
   const asked = Number(input.endSeconds);
   const requested =
     Number.isFinite(asked) && asked > start
       ? Math.min(86_400, Math.floor(asked))
       : Math.min(86_400, start + AUDIO_READ_MAX_SECONDS);
-  if (input.rate.usdPerMinute !== null) return { endSeconds: requested, measuring: false };
-  const measuring = Math.min(requested, start + TRANSCRIPTION_BILLING_MINUTE_SECONDS);
-  return { endSeconds: measuring, measuring: measuring < requested };
+  const endSeconds = Math.min(requested, start + input.maxSeconds, start + AUDIO_READ_MAX_SECONDS);
+  return { endSeconds, limited: endSeconds < requested };
 };
 
 const clamp = (value: unknown, minimum: number, maximum: number, fallback: number): number => {
@@ -314,23 +235,55 @@ const mediaCharacterCount = (value: unknown): number => clamp(value, 1, 20_000, 
  * unknown kind estimates zero rather than throwing, because the caller that rejects it is the
  * dispatch arm, not the pricer.
  */
-export const mediaEstimateUsd = (input: {
+export interface MediaEstimateInput {
   kind: string;
   width?: unknown;
   height?: unknown;
   characterCount?: unknown;
+  count?: unknown;
+  quality?: unknown;
+  resolution?: unknown;
+  size?: unknown;
+  duration?: unknown;
+  inputReferenceCount?: number;
   /**
    * The route this generation will take, when the caller has resolved the owner's choice. Omitting
    * it prices against the reviewed default, which is what every caller did when the default was the
    * only model there was.
    */
   model?: ResolvedMediaModel;
-}): number => {
+}
+export const mediaQuoteUsd = (input: MediaEstimateInput): number | null => {
+  if (input.model?.route?.pricing?.length)
+    return quoteMediaPrice(input.model.route.pricing, {
+      width: mediaDimension(input.width),
+      height: mediaDimension(input.height),
+      count: Math.max(1, Math.min(10, Number(input.count) || 1)),
+      characters: mediaCharacterCount(input.characterCount),
+      ...(input.kind === 'video' && Number.isFinite(Number(input.duration))
+        ? { seconds: Number(input.duration) }
+        : {}),
+      ...(typeof (input.kind === 'video' ? (input.size ?? input.resolution) : input.quality) ===
+      'string'
+        ? {
+            variant: String(
+              input.kind === 'video' ? (input.size ?? input.resolution) : input.quality
+            )
+          }
+        : {}),
+      ...(input.inputReferenceCount === undefined
+        ? {}
+        : { inputImageCount: input.inputReferenceCount })
+    });
+  if (input.model && !input.model.priceKnown) return null;
   if (input.kind === 'image') {
     const width = mediaDimension(input.width);
     const height = mediaDimension(input.height);
     const base = input.model?.usdPerImage ?? managedMediaCatalog.image.baseUsdPerImage;
-    return base + Math.max(0, (width * height) / 1_000_000 - 1) * 0.001;
+    return (
+      (input.model?.route ? base : (base * (width * height)) / 1_000_000) *
+      Math.max(1, Math.min(10, Number(input.count) || 1))
+    );
   }
   if (input.kind === 'audio') {
     const characters = mediaCharacterCount(input.characterCount);
@@ -338,8 +291,9 @@ export const mediaEstimateUsd = (input: {
       input.model?.usdPerMillionCharacters ?? managedMediaCatalog.audio.usdPerMillionCharacters;
     return (characters * perMillion) / 1_000_000;
   }
-  return 0;
+  return null;
 };
+export const mediaEstimateUsd = (input: MediaEstimateInput): number => mediaQuoteUsd(input) ?? 0;
 
 /**
  * The cumulative media-spend threshold, which now lives in the contracts package because the

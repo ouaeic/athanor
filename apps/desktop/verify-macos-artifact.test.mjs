@@ -5,12 +5,12 @@ import { assertNoMacSensitiveContent, validateMacInfo } from './verify-macos-art
 function validInfo() {
   return {
     CFBundleIdentifier: 'org.athanor.ai',
-    CFBundleName: 'athanor',
+    CFBundleName: 'garden',
     CFBundleShortVersionString: '0.1.0',
     CFBundleVersion: '1',
     CFBundleExecutable: 'athanor-desktop',
     LSMinimumSystemVersion: '12.0',
-    CFBundleURLTypes: [{ CFBundleURLSchemes: ['athanor'] }],
+    CFBundleURLTypes: [{ CFBundleURLSchemes: ['garden', 'athanor'] }],
     NSAppTransportSecurity: {
       NSExceptionDomains: {
         localhost: {

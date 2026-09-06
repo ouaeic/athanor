@@ -401,6 +401,13 @@ export class NotificationStore {
           -- cap, and is resumed five weeks later completes inside the window with its row already
           -- gone. tasks.schedule_id (migration 62) is on the row itself and cannot be pruned.
           AND (t.status='failed' OR t.schedule_id IS NULL)
+          -- Durable media publishes its own ready or failure notice after the text turn ends.
+          AND (t.status<>'completed' OR NOT EXISTS (
+            SELECT 1 FROM provider_media_jobs m WHERE m.user_id=t.user_id AND m.task_id=t.id
+              AND (m.status<>'completed' OR m.created_at >= COALESCE(
+                (SELECT e.created_at FROM task_events e WHERE e.task_id=t.id AND e.kind='user_message'
+                 ORDER BY e.sequence DESC LIMIT 1),t.created_at))
+          ))
           AND COALESCE(t.completed_at,t.updated_at)>NOW()-$2::interval
          UNION ALL
          -- A task the box stopped at a ceiling, which is the one pause nobody chose and which

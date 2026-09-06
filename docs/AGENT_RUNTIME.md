@@ -238,14 +238,14 @@ anything.
 
 There is a fourth brake, and it is the only one that acts before any money is spent: the pre-flight
 price ceiling. `sudo athanor price-ceiling` names a maximum input and output rate in dollars per
-million tokens, and every place athanor picks a model _for_ the owner ranks against it — the lead at
+million tokens, and every place garden picks a model _for_ the owner ranks against it — the lead at
 task creation, the vision specialist, the model the picker recommends, and the support picker behind
 titling and the subscription flows. When the ceiling empties the catalogue the outcome is `blocked`,
 answered with the cheapest route that could have done the work and what it costs, rather than a
 silent substitution or a `model_unavailable` that would send the owner to change their privacy
 route. The spend caps in Settings watch what a task has already spent and halt it; this half is the
 one that works while the owner is asleep. A model the owner picks by name is never constrained by
-it: the ceiling governs what athanor chooses, not what they choose.
+it: the ceiling governs what garden chooses, not what they choose.
 
 The window is bounded by condensing rather than by cutting. When the live window passes 70% of the
 input budget — or when the model itself calls `compact_context` because a phase is genuinely
@@ -348,7 +348,7 @@ kill every job the instant it begins. The other ceiling is in the agent's own to
 `timeoutSeconds` with `maximum: 86400` and describes it to the model as up to 24 hours in the
 background. That schema is a static object in `apps/worker/src/tool-catalogue.ts`, identical on
 every box that sends `shell` at all: the per-box narrowing withdraws whole tools and rewrites only
-`connector_action`, never this. Nothing in athanor validates a tool call against it either - the
+`connector_action`, never this. Nothing in garden validates a tool call against it either - the
 `shell` arm passes the model's arguments to the runner unchanged, so the cap is what the model is
 told rather than something the worker enforces - but a model that follows its own schema never asks
 for more than a day. So an owner with a forty-hour assembly who raises the runner ceiling has raised
@@ -395,7 +395,7 @@ browser, and that was wrong three ways with one shape: a challenge on the engine
 for the rest of the session, taking the whole web capability off the task and leaving the tool’s own
 advice — carry on elsewhere — with no elsewhere to point at; a search required the agent to be
 holding the browser, so research stopped dead whenever the owner was using their own Chromium, which
-athanor actively encourages; and three delegated specialists contended on that one session, so one
+garden actively encourages; and three delegated specialists contended on that one session, so one
 wall took down the lead and every specialist at once.
 
 The session browser remains a second attempt and only a second attempt, because the original
@@ -456,7 +456,7 @@ details, and other secure input transfer control to the user and suspend agent o
 - OpenCode runs in non-sharing JSON mode with a fail-closed permission policy and uses only publisher
   logins that OpenCode officially supports;
 - all three run from the selected repository, preserve resumable session IDs when the publisher
-  exposes one, emit compact progress, and stop with the Athanor task;
+  exposes one, emit compact progress, and stop with the garden task;
 - a task routed through provider ZDR cannot silently cross into a subscription CLI because publisher
   retention is a separate policy; and
 - the lead model remains responsible for review, verification, and the user-facing result.
@@ -471,7 +471,7 @@ hard-code root-relative assets may need an explicit base path.
 A private preview has no lifetime the agent can choose and no clock counting down. What bounds it is
 use: every visit pushes an idle deadline thirty days out, so an app the owner actually opens still
 answers next month, and one they have forgotten closes itself rather than leaving a bearer token
-sitting in a chat history. A port that a preview publishes cannot be one of athanor's own — the
+sitting in a chat history. A port that a preview publishes cannot be one of garden's own — the
 runner is told the full set and refuses it. Nothing may publish the API or the database.
 
 ## Model continuity and vision
@@ -479,7 +479,7 @@ runner is told the full set and refuses it. Nothing may publish the API or the d
 The selected lead owns the plan and final answer. Routing reads the live registry rather than the
 snapshot taken when the task was leased, and a model advertised as vision-capable is only sent an
 image when its current modalities still accept one and its route satisfies the task’s privacy
-setting. When the lead cannot inspect a required image, Athanor selects an eligible vision route,
+setting. When the lead cannot inspect a required image, garden selects an eligible vision route,
 asks a bounded observation question, and returns that evidence to the lead; when no eligible
 specialist exists, or the specialist call fails, the lead is told so explicitly and works from the
 semantic tool output alone. The UI explains the handoff before execution.
@@ -518,8 +518,8 @@ them, and an `embed_state` enum to sequence a queue that did not exist. Nothing 
 and no query ever read one, so what shipped was an index of nothing and a capability flag reporting
 a channel the retrieval query had no branch for — which is worse than not having it, because it
 reads as a component the main path depends on. Migration 54 drops the columns, the indexes and the
-enum. The `vector` extension itself is left alone: that migration removes what athanor put in the
-database, and an extension the owner may be using elsewhere is not athanor's to withdraw.
+enum. The `vector` extension itself is left alone: that migration removes what garden put in the
+database, and an extension the owner may be using elsewhere is not garden's to withdraw.
 
 Finishing it is not a question of where to get vectors. Memory bodies are sealed before they reach
 PostgreSQL and are searchable only through a keyed blind index, so the database never holds the

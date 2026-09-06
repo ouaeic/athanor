@@ -38,6 +38,11 @@ jobs:
       - run: pnpm license:check
       - run: pnpm license:rust
       - run: pnpm native:configure
+      - name: Install Linux native test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libwebkit2gtk-4.1-dev
+          pkg-config --atleast-version=2.40 webkit2gtk-4.1
       - run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked
 
   desktop:
@@ -154,9 +159,9 @@ jobs:
           projectPath: apps/desktop
           tauriScript: pnpm exec tauri
           tagName: ${{ github.ref_name }}
-          releaseName: 'athanor ${{ needs.validate.outputs.version }}'
+          releaseName: 'garden ${{ needs.validate.outputs.version }}'
           releaseBody: |
-            Native athanor clients. This release is a draft until the documented
+            Native garden clients. This release is a draft until the documented
             platform-signing and packaged-client acceptance gates are complete.
           releaseDraft: true
           prerelease: false
@@ -168,14 +173,14 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           app_count=$(
-            find apps/desktop/src-tauri/target -type d -name athanor.app | wc -l | tr -d ' '
+            find apps/desktop/src-tauri/target -type d -name garden.app | wc -l | tr -d ' '
           )
           dmg_count=$(
             find apps/desktop/src-tauri/target -type f -name '*.dmg' | wc -l | tr -d ' '
           )
           test "$app_count" -eq 1
           test "$dmg_count" -eq 1
-          app=$(find apps/desktop/src-tauri/target -type d -name athanor.app)
+          app=$(find apps/desktop/src-tauri/target -type d -name garden.app)
           dmg=$(find apps/desktop/src-tauri/target -type f -name '*.dmg')
           node apps/desktop/verify-macos-artifact.mjs \
             "$app" \

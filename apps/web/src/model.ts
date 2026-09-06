@@ -5,6 +5,7 @@ import type {
   TaskPlan,
   Workspace,
   PrivacyRoute,
+  TaskReasoningEffort,
   TaskSchedule
 } from '@athanor/contracts';
 export interface DraftAttachment {
@@ -19,6 +20,12 @@ export interface Draft {
   body: string;
   attachments: DraftAttachment[];
   updatedAt?: string;
+  controls?: {
+    modelId: string;
+    reasoningEffort: TaskReasoningEffort;
+    privacyRoute: PrivacyRoute;
+    spendCap: string;
+  };
 }
 export interface Bootstrap {
   user: {
@@ -33,10 +40,17 @@ export interface Bootstrap {
   scheduleRunCounts: Record<string, number>;
   schedules: TaskSchedule[];
   drafts: Draft[];
-  models: Pick<
+  models: (Pick<
     ModelRelease,
-    'id' | 'providerModelId' | 'displayName' | 'provider' | 'availability' | 'privacyRoute'
-  >[];
+    | 'id'
+    | 'providerModelId'
+    | 'displayName'
+    | 'provider'
+    | 'availability'
+    | 'privacyRoute'
+    | 'reasoning'
+  > &
+    Partial<Pick<ModelRelease, 'modalities' | 'nativeInputPricing'>>)[];
   instance: {
     mode: string;
     providerConfigured: boolean;
@@ -77,6 +91,17 @@ export const statusLabel: Record<Task['status'], string> = {
 };
 export const isWorking = (task: Task): boolean =>
   ['queued', 'planning', 'running'].includes(task.status);
+export const hasOngoingWork = (task: Task): boolean =>
+  isWorking(task) || task.deliveryStatus === 'pending';
+export const needsAttention = (task: Task): boolean =>
+  ['awaiting_user', 'awaiting_resource', 'failed'].includes(task.status) ||
+  (task.status === 'completed' && task.deliveryStatus === 'incomplete');
+export const taskStatusLabel = (task: Task): string =>
+  task.status === 'completed' && task.deliveryStatus === 'pending'
+    ? 'Generating media'
+    : task.status === 'completed' && task.deliveryStatus === 'incomplete'
+      ? 'Delivery needs attention'
+      : statusLabel[task.status];
 export const isFinished = (task: Task): boolean =>
   ['completed', 'failed', 'cancelled'].includes(task.status);
 export const data = (value: unknown): Record<string, unknown> =>

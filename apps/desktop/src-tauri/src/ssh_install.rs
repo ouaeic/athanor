@@ -210,7 +210,7 @@ fn pairing_ticket(output: &str) -> Option<String> {
         .lines()
         .map(str::trim)
         .find(|line| {
-            line.starts_with("athanor://pair/")
+            (line.starts_with("garden://pair/") || line.starts_with("athanor://pair/"))
                 && line.len() <= 32_000
                 && line.chars().all(|character| {
                     character.is_ascii_alphanumeric() || "-_:/".contains(character)
@@ -351,7 +351,7 @@ pub async fn install(mut request: InstallServerRequest) -> Result<InstallServerR
     channel
         .exec(true, install_command(&username))
         .await
-        .map_err(|error| format!("Could not start the Athanor installer: {error}"))?;
+        .map_err(|error| format!("Could not start the garden installer: {error}"))?;
     let mut output = Vec::new();
     let mut exit_status = None;
     tokio::time::timeout(Duration::from_secs(45 * 60), async {

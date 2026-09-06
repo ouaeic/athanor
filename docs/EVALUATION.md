@@ -46,7 +46,7 @@ pnpm eval:arms                # two configurations, the same work, one differenc
 
 Four rigs, and they answer four different questions. This one prices the loop. `eval:context` asks
 whether narrowing the window cost the agent anything it needed. `eval:injection` replays a published
-untrusted-content benchmark against the floor. `eval:arms` holds two configurations of athanor
+untrusted-content benchmark against the floor. `eval:arms` holds two configurations of garden
 against the same sample, which is the only honest way to settle an argument about what should be
 resident. Each has a `--ci` or offline arm that needs no provider key.
 
@@ -129,14 +129,14 @@ is the size of what their tools returned.
 
 Each row is one fixture: its shape, the model calls it cost, the prompt tokens the provider would
 bill for across those calls, how many of those were the tool catalogue, the largest single window
-athanor prepared, how much of each request was a byte-for-byte repeat of the one before it, and the
+garden prepared, how much of each request was a byte-for-byte repeat of the one before it, and the
 drift of each against `evals/baseline.json`. Under the table, `WHAT FAILED` names the fixtures whose
 expectations broke, each with the prose statement of what it was protecting; `WHAT IS PENDING` names
 the stated targets the loop does not meet yet, which are not regressions; `WHAT THE HOLDS COST`
 totals how many fixtures each gate fired on and how many extra model calls it bought.
 
 `tokens` and `cat` are the two halves of one correction, and it is worth stating plainly what it
-changed. The column used to sum athanor's own window estimate, which is the number the compaction
+changed. The column used to sum garden's own window estimate, which is the number the compaction
 trigger is compared against — and that number counts none of `body.tools`. So the largest fixed cost
 the product pays was invisible to the one instrument built to price it: deleting the entire tool
 catalogue would have moved the headline column by nothing at all. `tokens` is now what a provider
@@ -150,7 +150,7 @@ whatever it condensed. A row whose peak approaches its window is a row about to 
 requests, and nothing in this table could previously see it.
 
 Token drift of a few tokens with no step change is the runtime block's clock, which carries the
-current time and is rebuilt on every step. Anything larger is a real change in what athanor sends.
+current time and is rebuilt on every step. Anything larger is a real change in what garden sends.
 
 The `cached` column is the other half of what a long task costs, and the half nothing here could
 previously see. Every provider that bills a cached prefix bills it as a prefix — the read stops at
@@ -278,4 +278,4 @@ return.
 
 The model is scripted, so nothing here measures model judgement. It measures the harness: what the
 loop does with a given trajectory. A fixture where the scripted model behaves well and one where it
-behaves badly are both statements about athanor's response, not about any model's quality.
+behaves badly are both statements about garden's response, not about any model's quality.

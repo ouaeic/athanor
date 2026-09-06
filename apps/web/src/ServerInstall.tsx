@@ -5,7 +5,7 @@ import { Button, ErrorNotice } from './ui.js';
 import './native.css';
 
 const INSTALL_COMMAND =
-  'curl -fsSL https://raw.githubusercontent.com/ouaeic/athanor/v0.1.1/install.sh | sudo env ATHANOR_REF=v0.1.1 sh';
+  'curl -fsSL https://raw.githubusercontent.com/ouaeic/athanor/v0.2.0/install.sh | sudo env ATHANOR_REF=v0.2.0 sh';
 
 export default function ServerInstall({ installerUrl }: { installerUrl?: string | null }) {
   const [copied, setCopied] = useState(false);
@@ -24,7 +24,7 @@ export default function ServerInstall({ installerUrl }: { installerUrl?: string 
     <section className="server-install">
       <h2>A home for your work.</h2>
       <p>
-        Install athanor on your Linux server. Your work, tools and model credentials stay on your
+        Install garden on your Linux server. Your work, tools and model credentials stay on your
         computer.
       </p>
       {installer && (

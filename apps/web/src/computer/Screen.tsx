@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { DesktopHolder } from '@athanor/contracts';
+import type { DesktopHolder, BrowserTabState, BrowserTabCleanup } from '@athanor/contracts';
+import { Maximize2, Minimize2, Pin, X } from 'lucide-react';
+import { remotePoint } from './screen-geometry';
+import { useExpandedView } from '../use-expanded-view';
 import { get, post } from '../client.js';
 import { jpegPayload, PAGE_VIEWPORT, socketAddress } from './transport.js';
 import { message } from './format.js';
@@ -14,6 +17,8 @@ interface ScreenState {
   activeApplication?: string;
   pendingDialog?: { type: string; message: string } | null;
   botWall?: { kind?: string; message?: string } | null;
+  tabs?: BrowserTabState[];
+  cleanup?: BrowserTabCleanup;
 }
 interface Snapshot {
   screenshotBase64?: string;
@@ -50,6 +55,7 @@ export default function Screen({
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [launch, setLaunch] = useState('');
   const canvas = useRef<HTMLCanvasElement>(null);
+  const { ref: viewer, expanded, toggle: toggleExpanded } = useExpandedView<HTMLDivElement>();
   const socket = useRef<WebSocket | null>(null);
   const pending = useRef(new Map<string, Ack>());
   const base = `/v1/workspaces/${workspaceId}/${surface}`;
@@ -354,7 +360,7 @@ export default function Screen({
   }, [base, clear, surface, workspaceId]);
   const controlling = connected && state.holder !== 'agent';
   return (
-    <div className="stack">
+    <div className={`stack garden-screen-surface ${expanded ? 'expanded' : ''}`} ref={viewer}>
       <div className="row">
         <strong>
           {state.title ||
@@ -401,11 +407,69 @@ export default function Screen({
         >
           {surface === 'browser' ? 'Inspect page' : 'Inspect desktop'}
         </button>
+        <button className="button" onClick={() => void run(toggleExpanded)}>
+          {expanded ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
+          {expanded ? 'Exit full screen' : 'Full screen'}
+        </button>
       </div>
       {error && (
         <p className="error" role="alert">
           {error}
         </p>
+      )}
+      {surface === 'browser' && state.holder !== 'secure_input' && (
+        <div className="garden-browser-tabstrip" aria-label="Browser tabs">
+          {(state.tabs ?? []).map((tab) => (
+            <div className={`garden-browser-tab ${tab.active ? 'active' : ''}`} key={tab.tabId}>
+              <button
+                disabled={!controlling}
+                aria-pressed={tab.active}
+                title={tab.url}
+                onClick={() => void run(() => action({ type: 'select_tab', tabId: tab.tabId }))}
+              >
+                {tab.title || tab.url || 'Untitled tab'}
+              </button>
+              <button
+                className={tab.pinned ? 'pinned' : ''}
+                aria-label={`${tab.pinned ? 'Unpin' : 'Keep'} ${tab.title || 'tab'}`}
+                aria-pressed={tab.pinned}
+                title={
+                  tab.pinned
+                    ? 'Kept open'
+                    : tab.protectedReason === 'owner'
+                      ? 'Your tabs stay open'
+                      : 'Keep this tab open'
+                }
+                onClick={() =>
+                  void run(async () => {
+                    const result = await post<{ tabs: BrowserTabState[] }>(
+                      `${base}/tabs/${encodeURIComponent(tab.tabId)}/retention`,
+                      { pinned: !tab.pinned }
+                    );
+                    setState((current) => ({ ...current, tabs: result.tabs }));
+                  })
+                }
+              >
+                <Pin size={12} />
+              </button>
+              <button
+                aria-label={`Close ${tab.title || 'tab'}`}
+                disabled={!controlling}
+                onClick={() => void run(() => action({ type: 'close_tab', tabId: tab.tabId }))}
+              >
+                <X size={13} />
+              </button>
+            </div>
+          ))}
+          {state.cleanup && state.cleanup.closed > 0 && (
+            <span
+              className="garden-tab-cleanup"
+              title="Eligible idle agent tabs close automatically. Your tabs and kept tabs stay open."
+            >
+              {state.cleanup.closed} idle tabs cleared
+            </span>
+          )}
+        </div>
       )}
       {surface === 'browser' && (
         <form
@@ -423,6 +487,7 @@ export default function Screen({
           <button
             className="button"
             type="button"
+            aria-label="Go back in the browser"
             disabled={!controlling}
             onClick={() => void run(() => action({ type: 'back' }))}
           >
@@ -486,8 +551,7 @@ export default function Screen({
             void run(() =>
               action({
                 type: 'click_at',
-                x: Math.min(1440, ((e.clientX - rect.left) / rect.width) * state.width),
-                y: Math.min(900, ((e.clientY - rect.top) / rect.height) * state.height),
+                ...remotePoint({ x: e.clientX, y: e.clientY }, rect, state),
                 ...(surface === 'desktop' ? { button: 'left', clicks: 1 } : {})
               })
             );

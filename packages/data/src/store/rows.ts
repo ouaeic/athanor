@@ -139,6 +139,8 @@ export const mapTask = (row: Record<string, unknown>): TaskRecord => {
     userId: String(row.user_id),
     workspaceId: String(row.workspace_id),
     parentTaskId: optionalText(row.parent_task_id),
+    parentMissionId: optionalText(row.parent_mission_id),
+    hasCodingFamily: Boolean(row.has_coding_family),
     branchedFromEventId: optionalText(row.branched_from_event_id),
     forkKind: optionalText(row.fork_kind) as TaskRecord['forkKind'],
     scheduleId: optionalText(row.schedule_id),
@@ -151,6 +153,9 @@ export const mapTask = (row: Record<string, unknown>): TaskRecord => {
     archivedAt: row.archived_at ? iso(row.archived_at) : null,
     status: String(row.status),
     modelId: String(row.model_id),
+    reasoningEffort: (optionalText(row.reasoning_effort) ?? 'auto') as NonNullable<
+      TaskRecord['reasoningEffort']
+    >,
     privacyRoute: String(row.privacy_route),
     securityMode: (optionalText(row.security_mode) ?? 'balanced') as TaskRecord['securityMode'],
     maxComputeCredits: Number(row.max_compute_credits),
@@ -158,6 +163,15 @@ export const mapTask = (row: Record<string, unknown>): TaskRecord => {
     maxSpendUsd: numericOrNull(row.max_spend_usd),
     spentUsd: Number(row.spent_usd ?? 0),
     queuedMessageCount: Number(row.queued_message_count ?? 0),
+    ...(row.pending_delivery_count !== undefined
+      ? {
+          deliveryStatus: optionalText(row.delivery_status) as Exclude<
+            TaskRecord['deliveryStatus'],
+            undefined
+          >,
+          pendingDeliveryCount: Number(row.pending_delivery_count)
+        }
+      : {}),
     shareCount: Number(row.share_count ?? 0),
     promptCiphertext: json<EncryptedEnvelope>(row.prompt_ciphertext),
     agentStateCiphertext: row.agent_state_ciphertext
@@ -194,6 +208,9 @@ export const mapTaskMessage = (row: Record<string, unknown>): TaskMessageQueueRe
   userId: String(row.user_id),
   promptCiphertext: json<EncryptedEnvelope>(row.prompt_ciphertext),
   modelId: String(row.model_id),
+  reasoningEffort: (optionalText(row.reasoning_effort) ?? 'auto') as NonNullable<
+    TaskRecord['reasoningEffort']
+  >,
   privacyRoute: String(row.privacy_route),
   maxComputeCredits: Number(row.max_compute_credits),
   maxSpendUsd: numericOrNull(row.max_spend_usd),

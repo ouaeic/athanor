@@ -1,23 +1,22 @@
 import { randomInt, randomUUID } from 'node:crypto';
-import { sha256, AthanorError } from '@athanor/core';
-import { MediaClient, type ModelToolCall } from '@athanor/model-gateway';
+import { AthanorError } from '@athanor/core';
+import {
+  MediaClient,
+  MediaProviderRejectionError,
+  type ModelToolCall
+} from '@athanor/model-gateway';
 import { type ExecObservation } from '../agent-state.js';
-import { transcriptionRouteAllowed } from '../routing.js';
 import { spendHalt } from '../turn-bounds.js';
 import { textValue } from '../values.js';
-import {
-  managedMediaCatalog,
-  mediaDimension,
-  mediaEstimateUsd,
-  resolvedMediaModel,
-  resolvedTranscriptionRoute,
-  transcriptionEstimateAtRate,
-  transcriptionRate,
-  transcriptionRateFromReading,
-  transcriptionWindow
-} from '../media.js';
+import { mediaDimension, mediaQuoteUsd, resolvedMediaModel } from '../media.js';
 import { type ToolContext } from '../tool-dispatch.js';
-import { clampNumber, finiteNumber } from './numbers.js';
+import { clampNumber } from './numbers.js';
+import { GenerationControls, mediaArguments, describeMediaControls } from '../media-controls.js';
+import { prepareMediaReferences, queueVideoGeneration } from '../media-generation.js';
+import { executeMediaLibrary } from '../media-library.js';
+import { queueVideoBatch } from '../media-batches.js';
+import { transcribeRecording } from '../audio-reading.js';
+import { stageNativeInput } from '../native-input.js';
 
 /**
  * The document tools: reading what the owner has stored, and making new media from it.
@@ -30,7 +29,7 @@ export async function executeDocumentTool(
   context: ToolContext,
   call: ModelToolCall
 ): Promise<unknown> {
-  const { task, state } = context;
+  const { task } = context;
   const root = `/v1/workspaces/${task.workspaceId}`;
   switch (call.name) {
     case 'document_read': {
@@ -82,194 +81,14 @@ export async function executeDocumentTool(
         );
       return JSON.parse(result.stdout) as unknown;
     }
-    case 'audio_read': {
-      // Resolved before anything else, so a computer with no provider connected says so rather
-      // than encoding ninety minutes of audio first and then discovering it cannot send it.
-      const secret = await context.inferenceCredential(task);
-      const path = textValue(call.arguments.path);
-      // One of the three clamps in the nine domain modules that already defended against `NaN`,
-      // by way of a `|| 0` nobody outside this arm knew was load-bearing. It says the same thing
-      // now in the words every other arm uses.
-      const startSeconds = clampNumber(call.arguments.startSeconds, {
-        min: 0,
-        max: 86_400,
-        fallback: 0,
-        integer: true
-      });
-      const endValue = finiteNumber(call.arguments.endSeconds);
-      const maxCharacters = clampNumber(call.arguments.maxCharacters, {
-        min: 1_000,
-        max: 200_000,
-        fallback: 40_000
-      });
-      const client = new MediaClient({
-        baseUrl: secret.baseUrl,
-        ...(secret.apiKey ? { apiKey: secret.apiKey } : {}),
-        appUrl: context.config.PUBLIC_APP_URL,
-        openRouter: secret.provider === 'openrouter'
-      });
-      // The owner's own choice first. Asking the provider what it has is the fallback for an owner
-      // who has never opened the media section, and it is one request rather than a compiled-in
-      // model id: nothing in this repository has run a transcription route, so an id written here
-      // would be a claim about a model nobody checked.
-      const chosen = resolvedTranscriptionRoute(secret.mediaRoutes);
-      const modelId =
-        chosen?.modelId ??
-        (await client.transcriptionModels().catch(() => [] as string[]))[0] ??
-        '';
-      if (!modelId)
-        throw new AthanorError(
-          'transcription_route_unavailable',
-          'The connected provider offers no model that reads recordings, so this file cannot be transcribed. Choosing a transcription model in Settings, or connecting a provider that has one, is what opens this route.',
-          503
-        );
-      // Asked before a second of the recording is cut, so a task that cannot send it never
-      // encodes it either.
-      if (!transcriptionRouteAllowed(secret.mediaRoutes?.transcription, task.privacyRoute))
-        throw new AthanorError(
-          'transcription_privacy_conflict',
-          'This task requires zero-retention model routing, and the transcription route this computer would use does not offer a zero-retention endpoint, so Athanor will not send a private recording to it. Choosing a transcription model that offers one in Settings, or starting a standard-privacy task if you deliberately want this one, is what opens this route.'
-        );
-      // What a minute of this route costs, on the best evidence this task holds: the price the
-      // owner's catalogue published, or failing that the one measured from a reading the provider
-      // has already billed here. While it is neither, the window below is cut to a single billing
-      // minute, so the guard is never asked to enforce a cap against an estimate of zero.
-      const rate = transcriptionRate(chosen, state.transcriptionRates?.[modelId]);
-      const readingWindow = transcriptionWindow({
-        startSeconds,
-        ...(endValue !== null && endValue > startSeconds ? { endSeconds: endValue } : {}),
-        rate
-      });
-      const prepared = await context.runner.prepareAudio(task.workspaceId, task.id, {
-        path,
-        startSeconds,
-        endSeconds: readingWindow.endSeconds
-      });
-      // Priced on what was actually cut rather than on what was asked for, and checked before the
-      // recording leaves this computer. Duration billing means the money is spent the moment the
-      // request is accepted, so a guard that ran afterwards would be a report rather than a brake.
-      const decision = await context.store.spendGuard({
-        userId: task.userId,
-        taskId: task.id,
-        estimateUsd: transcriptionEstimateAtRate(prepared.preparedSeconds, rate),
-        includeOpenCommitments: true
-      });
-      if (decision.outcome === 'deny')
-        throw new AthanorError(
-          'spend_cap_reached',
-          `${spendHalt(decision)} Nothing was transcribed and nothing was charged; say so and carry on with the work that costs nothing.`
-        );
-      const reading = await client
-        .transcribe({
-          model: modelId,
-          audio: prepared.bytes,
-          format: prepared.format,
-          seconds: prepared.preparedSeconds,
-          usdPerMinute: rate.usdPerMinute
-        })
-        .catch((error: unknown) => {
-          throw new AthanorError(
-            'audio_read_failed',
-            error instanceof Error ? error.message : 'The recording could not be read'
-          );
-        });
-      // What the provider charged for a minute of this route, now that it has charged for one.
-      //
-      // This is the whole point of the short first window. From here the next reading of the same
-      // recording is priced on a figure that came from an invoice rather than from nothing, so the
-      // daily cap applies to it exactly as it applies to a route whose price was published all
-      // along. A provider that states no cost teaches nothing and is left unrecorded rather than
-      // recorded as free.
-      const measured = transcriptionRateFromReading(reading, prepared.preparedSeconds);
-      if (measured !== null)
-        state.transcriptionRates = { ...(state.transcriptionRates ?? {}), [modelId]: measured };
-      // Recorded between the charge and everything that could still fail, exactly as a generation
-      // is. The provider has billed by this line, and media spend was the least visible line on a
-      // task's bill precisely because a path existed that spent money without writing one of these.
-      await context.store.recordUsage({
-        userId: task.userId,
-        workspaceId: task.workspaceId,
-        taskId: task.id,
-        kind: 'model_inference',
-        resourceClass: 'media:transcription',
-        quantity: Math.max(1, Math.round(reading.billedSeconds ?? prepared.preparedSeconds)),
-        unit: 'second',
-        credits: 0,
-        costUsd: reading.costUsd,
-        state: 'settled',
-        /*
-         * The route is part of what makes two readings two charges.
-         *
-         * This key was the task, the path and the window, and nothing else, though the arm has
-         * just resolved a model id and records it in `providerRef` on the line below. Change the
-         * media route mid-task - the owner pins one in Settings, or the provider's list comes
-         * back in a different order - and re-read the same window: the provider bills for the
-         * second reading and `recordUsage` deduplicates the row away, so the money is spent and
-         * the ledger every spend cap is measured against never hears about it. The
-         * `generate_media` writer nineteen lines below keys on a per-generation id and cannot
-         * collide; this is the same fix, put where the two charges actually differ.
-         */
-        idempotencyKey: `transcription:${task.id}:${sha256(`${modelId}:${path}:${prepared.startSeconds}:${prepared.preparedSeconds}`)}`,
-        providerRef: `${secret.provider}:${modelId}`
-      });
-      // The whole transcript goes to a file before any of it is cut for the window. What was paid
-      // for is not thrown away because the model asked for forty thousand characters, and reading
-      // the rest of it is a free file_read rather than a second minute-billed request.
-      const transcriptPath = `${path}${prepared.startSeconds > 0 ? `.from-${prepared.startSeconds}s` : ''}.transcript.txt`;
-      await context.runner
-        .writeFile(task.workspaceId, task.id, transcriptPath, reading.text)
-        .catch(() => undefined);
-      const text = reading.text.slice(0, maxCharacters);
-      return {
-        path,
-        transcriptPath,
-        startSeconds: prepared.startSeconds,
-        secondsRead: Math.round(prepared.preparedSeconds),
-        ...(prepared.durationSeconds === null
-          ? {}
-          : { durationSeconds: Math.round(prepared.durationSeconds) }),
-        // Where the next reading starts, when the recording carries on past this window. Without
-        // it a bounded read of a long recording is a dead end the model cannot get past.
-        ...(prepared.more
-          ? { nextStartSeconds: prepared.startSeconds + Math.round(prepared.preparedSeconds) }
-          : {}),
-        characters: reading.text.length,
-        truncated: reading.text.length > text.length,
-        modelId,
-        // Null rather than zero when nobody has said what this cost. The provider stated no
-        // figure and publishes no per-minute price, so `transcribe` had nothing to multiply and
-        // returned zero - and a zero handed to the model here comes back to the owner as the
-        // sentence "that reading was free", which is a claim this computer cannot make.
-        ...(reading.costFromProvider || rate.usdPerMinute !== null
-          ? {
-              costUsd: reading.costUsd,
-              billedBy: reading.costFromProvider
-                ? 'connected provider'
-                : `this route's ${rate.source} price per minute`
-            }
-          : {
-              costUsd: null,
-              billedBy:
-                'not known here: the provider stated no cost for this reading and publishes no per-minute price for this route. It will appear on the provider account.'
-            }),
-        // Said when the window was cut short to find out what a minute costs, so the model reads
-        // a deliberately short first reading as the start of a long one rather than as the end of
-        // the recording. Not said when the recording ended inside that minute anyway: there is no
-        // rest to go back for, and pointing at a `nextStartSeconds` that is not there would send
-        // the model looking for audio that does not exist.
-        ...(readingWindow.measuring && prepared.more
-          ? {
-              pricing: `No per-minute price is published for ${modelId}, so this first reading was limited to one billed minute to establish what it costs. Continue from nextStartSeconds to read the rest.`
-            }
-          : {}),
-        text,
-        ...(reading.text.length > text.length
-          ? {
-              instruction: `This is the first ${text.length} of ${reading.text.length} characters. The whole transcript of this stretch is at ${transcriptPath}; read the rest of it there rather than transcribing again.`
-            }
-          : {})
-      };
-    }
+    case 'audio_read':
+      if (
+        call.arguments.options &&
+        typeof call.arguments.options === 'object' &&
+        'action' in call.arguments.options
+      )
+        return stageNativeInput(context, call);
+      return transcribeRecording(context, call);
     case 'document_search': {
       const query = textValue(call.arguments.query).trim();
       if (!query) throw new AthanorError('document_query_empty', 'Document search needs a query');
@@ -310,9 +129,43 @@ export async function executeDocumentTool(
       // Resolved first because it is the same lookup the old assertion made, and asking for it
       // up front means an unconfigured provider is reported as one rather than as a spend refusal.
       const secret = await context.inferenceCredential(task);
-      const kind = textValue(call.arguments.kind);
-      if (kind === 'video')
-        throw new AthanorError('media_privacy_unavailable', managedMediaCatalog.video.reason);
+      const args = mediaArguments(call.arguments);
+      if (
+        args.action !== undefined &&
+        (typeof args.action !== 'string' ||
+          !['describe', 'status', 'generate', 'library', 'batch'].includes(args.action))
+      )
+        throw new AthanorError(
+          'media_action_invalid',
+          'Choose generate, describe, status or library',
+          400
+        );
+      const kind = textValue(args.kind);
+      if (args.action === 'library') return executeMediaLibrary(context, call, secret);
+      if (args.action === 'batch') return queueVideoBatch(context, call, secret);
+      if (args.action === 'describe')
+        return {
+          routes: secret.mediaRoutes ?? {},
+          controls: describeMediaControls()
+        };
+      if (args.action === 'status') {
+        const job = await context.store.getMediaJob(task.userId, textValue(args.jobId));
+        if (!job || job.taskId !== task.id)
+          throw new AthanorError('media_job_not_found', 'Video job not found', 404);
+        return {
+          mediaJobId: job.id,
+          operation: job.operation,
+          durationSeconds: job.durationSeconds,
+          extensionCount: job.extensionCount,
+          sourceJobId: job.sourceJobId,
+          status: job.status,
+          progress: job.progress,
+          path: job.status === 'completed' ? job.outputPath : null,
+          artifactId: job.artifactId,
+          costUsd: job.costUsd
+        };
+      }
+      if (kind === 'video') return queueVideoGeneration(context, call, secret);
       if (kind !== 'image' && kind !== 'audio')
         throw new AthanorError('media_kind_invalid', 'Choose image or audio');
       // The owner's choice, or the reviewed default when they have not made one. Read from the
@@ -320,18 +173,53 @@ export async function executeDocumentTool(
       // resolved the route at the moment it was chosen, so an automatic mode settles then rather
       // than drifting between one generation and the next.
       const media = resolvedMediaModel(kind, secret.mediaRoutes);
+      const controls = GenerationControls.parse(args);
+      const voice = controls.voice ?? media.voice;
+      const references = await prepareMediaReferences(context, controls.inputReferences ?? []);
+      if (secret.mediaRoutes && (!media.route || media.route.unavailableReason))
+        throw new AthanorError(
+          'media_route_unavailable',
+          'Choose an available route for this modality in Settings',
+          409
+        );
+      const preparedMask = controls.mask
+        ? (await prepareMediaReferences(context, [controls.mask]))[0]
+        : undefined;
       const modelId = media.modelId;
-      const prompt = textValue(call.arguments.prompt).trim();
+      const prompt = textValue(args.prompt).trim();
       if (!prompt) throw new AthanorError('media_prompt_empty', 'A media prompt is required');
-      const width = mediaDimension(call.arguments.width);
-      const height = mediaDimension(call.arguments.height);
-      const estimateUsd = mediaEstimateUsd({
+      const width = mediaDimension(args.width);
+      const height = mediaDimension(args.height);
+      const quotedUsd = mediaQuoteUsd({
         kind,
         width,
         height,
         characterCount: prompt.length,
+        count: controls.count,
+        quality: controls.quality,
+        inputReferenceCount: references.length,
         model: media
       });
+      const explicitLimit =
+        typeof args.maxCostUsd === 'number' &&
+        Number.isFinite(args.maxCostUsd) &&
+        args.maxCostUsd > 0 &&
+        args.maxCostUsd <= 10_000
+          ? args.maxCostUsd
+          : null;
+      if (quotedUsd === null && explicitLimit === null)
+        throw new AthanorError(
+          'media_reservation_required',
+          'This route has no complete request price. Include options.maxCostUsd in the approval.',
+          400
+        );
+      const estimateUsd = quotedUsd ?? explicitLimit!;
+      if (explicitLimit !== null && estimateUsd > explicitLimit)
+        throw new AthanorError(
+          'media_reservation_exceeded',
+          'The media quote exceeds the selected spending reservation',
+          402
+        );
       const generation = randomUUID();
       // Where it will be written, decided before a penny is spent. The runner accepts writes only
       // under `workspace/` (and the artifact store), so a model that answers this parameter with
@@ -342,8 +230,8 @@ export async function executeDocumentTool(
       // `assertUserDataPath` reads a bare name the same way, so this predicts the runner rather
       // than departing from it. It stays because prediction is the point: the check has to happen
       // on this side of the provider's invoice, not at the write.
-      const extension = kind === 'image' ? 'png' : 'mp3';
-      const requested = textValue(call.arguments.path).trim().replace(/^\.\//, '');
+      const extension = controls.outputFormat ?? (kind === 'image' ? 'png' : 'mp3');
+      const requested = textValue(args.path).trim().replace(/^\.\//, '');
       if (requested.split('/').includes('..'))
         throw new AthanorError(
           'media_path_invalid',
@@ -354,12 +242,6 @@ export async function executeDocumentTool(
         : requested.startsWith('workspace/') || requested.startsWith('.athanor/')
           ? requested
           : `workspace/${requested}`;
-      // Checked before the request, and settled from the provider's own figure after it. A queued
-      // generation used to need every other in-flight job added to this estimate, because none of
-      // them had billed yet and so none of them appeared in the ledger the guard reads; a burst
-      // would all pass the cap together and the owner found out from the invoice. Generating in
-      // the call means the charge is recorded the moment it is incurred, so the ordinary guard is
-      // the whole of it.
       const decision = await context.store.spendGuard({
         userId: task.userId,
         taskId: task.id,
@@ -371,9 +253,21 @@ export async function executeDocumentTool(
           'spend_cap_reached',
           `${spendHalt(decision)} Nothing was generated and nothing was charged; say so and carry on with the work that costs nothing.`
         );
-      const seed = Number.isSafeInteger(call.arguments.seed)
-        ? Number(call.arguments.seed)
-        : randomInt(0, 2 ** 31 - 1);
+      const usage = {
+        userId: task.userId,
+        workspaceId: task.workspaceId,
+        taskId: task.id,
+        kind: 'model_inference',
+        resourceClass: `media:${kind}`,
+        quantity: 1,
+        unit: 'generation',
+        credits: 0,
+        idempotencyKey: `media:${task.id}:${call.id}`,
+        providerRef: `${secret.provider}:${modelId}`
+      };
+      let reserved = false;
+      let settled = false;
+      const seed = Number.isSafeInteger(args.seed) ? Number(args.seed) : randomInt(0, 2 ** 31 - 1);
       const generated = await new MediaClient({
         baseUrl: secret.baseUrl,
         ...(secret.apiKey ? { apiKey: secret.apiKey } : {}),
@@ -388,63 +282,92 @@ export async function executeDocumentTool(
           width,
           height,
           seed,
+          ...Object.fromEntries(
+            Object.entries(controls).filter(
+              ([name]) => name !== 'inputReferences' && name !== 'mask'
+            )
+          ),
+          ...(references.length ? { inputReferences: references } : {}),
+          ...(preparedMask ? { mask: preparedMask } : {}),
+          ...(media.route?.pricing ? { pricing: media.route.pricing } : {}),
+          ...(media.route?.capabilities ? { capabilities: media.route.capabilities } : {}),
+          ...(media.route?.providerEndpointTag
+            ? { providerEndpointTag: media.route.providerEndpointTag }
+            : {}),
           // Only when the resolved route names one: a voice belongs to a specific speech model's
           // own list, and sending one model's voice name to another is a request the provider
           // has no way to honour.
-          ...(media.voice ? { voice: media.voice } : {}),
+          ...(voice ? { voice } : {}),
+          onBeforeSubmit: async () => {
+            await context.store.recordUsage({
+              ...usage,
+              costUsd: estimateUsd,
+              state: 'reserved',
+              reserveAgainstCaps: true
+            });
+            reserved = true;
+          },
+          onUsage: async (receipt) => {
+            if (receipt.costKnown && !settled) {
+              await context.store.recordUsage({
+                ...usage,
+                costUsd: receipt.costUsd,
+                state: 'settled',
+                settleReservation: true
+              });
+              settled = true;
+            }
+          },
           usdPerImage: media.usdPerImage,
           usdPerMillionCharacters: media.usdPerMillionCharacters
         })
-        .catch((error: unknown) => {
+        .catch(async (error: unknown) => {
+          if (reserved && !settled && error instanceof MediaProviderRejectionError)
+            await context.store.recordUsage({
+              ...usage,
+              costUsd: 0,
+              state: 'released',
+              settleReservation: true
+            });
           throw new AthanorError(
             'media_generation_failed',
             error instanceof Error ? error.message : 'Media generation failed'
           );
         });
 
-      // Recorded here, between the charge and everything that could still fail. The provider has
-      // billed by this line, and the ledger is the only account of media spend there is now: it
-      // feeds the caps, the cumulative approval card and the breakdown the owner reads. Writing it
-      // after the file write meant a refused path, a cancelled turn or a restarted runner threw
-      // the money away silently and left the model free to try again at the same price.
-      await context.store.recordUsage({
-        userId: task.userId,
-        workspaceId: task.workspaceId,
-        taskId: task.id,
-        kind: 'model_inference',
-        resourceClass: `media:${kind}`,
-        quantity: 1,
-        unit: 'generation',
-        credits: 0,
-        // The provider's own figure where it gave one, so the ledger settles on what was charged
-        // rather than on what this side guessed beforehand.
-        costUsd: generated.costUsd,
-        state: 'settled',
-        idempotencyKey: `media:${generation}`,
-        providerRef: `${secret.provider}:${modelId}`
-      });
-
       // One output is the ordinary case, so the resolved path is used as it stands; a provider
       // that returned several gets them numbered beside it rather than overwriting itself.
       const written = generated.outputs.map((output, index) => ({
-        path: index === 0 ? base : base.replace(/(\.[^./]+)?$/, `-${index + 1}$1`),
+        path: (index === 0 ? base : base.replace(/(\.[^./]+)?$/, `-${index + 1}$1`)).replace(
+          /\.[^./]+$/,
+          `.${output.filename.split('.').at(-1)}`
+        ),
         bytes: output.bytes
       }));
       for (const output of written)
         await context.runner.writeBytes(task.workspaceId, task.id, output.path, output.bytes);
       const paths = written.map((output) => output.path);
-      const usage = await context.runner.call<{ storageBytes: number }>(
+      const storageUsage = await context.runner.call<{ storageBytes: number }>(
         task.workspaceId,
         task.id,
         'files.read',
         `${root}/usage`
       );
-      await context.store.setWorkspaceStorage(task.userId, task.workspaceId, usage.storageBytes);
+      await context.store.setWorkspaceStorage(
+        task.userId,
+        task.workspaceId,
+        storageUsage.storageBytes
+      );
       return {
         kind,
         modelId,
         paths,
-        costUsd: generated.costUsd,
+        costUsd: generated.costKnown === false ? null : generated.costUsd,
+        costSource: generated.costFromProvider
+          ? 'provider'
+          : generated.costKnown
+            ? 'quote'
+            : 'unresolved',
         billedBy: 'connected provider',
         instruction:
           kind === 'image'

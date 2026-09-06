@@ -63,7 +63,7 @@ export function assertNoIosSensitiveContent(label, bytes) {
 
 export function validateIosInfo(info, expectedVersion) {
   invariant(info.CFBundleIdentifier === 'org.athanor.ai', 'iOS bundle identifier changed');
-  invariant(info.CFBundleName === 'athanor', 'iOS bundle name changed');
+  invariant(info.CFBundleName === 'garden', 'iOS bundle name changed');
   invariant(
     info.CFBundleShortVersionString === expectedVersion,
     'iOS and Tauri versions do not match'
@@ -78,7 +78,7 @@ export function validateIosInfo(info, expectedVersion) {
   );
   const schemes = (info.CFBundleURLTypes ?? []).flatMap((entry) => entry.CFBundleURLSchemes ?? []);
   invariant(
-    schemes.length === 1 && schemes[0] === 'athanor',
+    schemes.length === 2 && schemes.includes('garden') && schemes.includes('athanor'),
     'iOS pairing deep-link boundary changed'
   );
   const transport = info.NSAppTransportSecurity ?? {};

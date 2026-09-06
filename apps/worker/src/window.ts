@@ -397,27 +397,18 @@ export const assemblePreamble = async (deps: WindowDeps, input: PreambleInput): 
   // Read here, ahead of the two frozen blocks, because it is a network call and the runner is
   // slow to say no; it is spliced into the window below them, after the pack. See the comment on
   // that splice for why the order is what it is.
-  /*
-   * Three names, most specific first, and the order is the whole of the rule.
-   *
-   * `ATHANOR.md` is what the owner wrote for THIS computer and wins outright. `OPEN_CLOUD.md` is
-   * the name it carried before the rename and is still read so a box that has one does not quietly
-   * change behaviour under its owner. `AGENTS.md` is the shared convention the surrounding tooling
-   * writes, and it is read LAST on purpose: a brief addressed to every agent that might open the
-   * repository must not outrank one addressed to this one. Where both exist the specific file is
-   * the owner's more recent and more deliberate instruction.
-   *
-   * The name was already known here - `tools/repository.ts` globs it inside `code_context` - so an
-   * owner who had written down how their project works could watch the agent read the file as a
-   * search hit and still ignore it as an instruction. That is the gap this closes.
-   */
+  // A product-specific brief takes precedence over shared repository guidance.
   const brief = await deps.runner
-    .readFile(task.workspaceId, task.id, 'workspace/ATHANOR.md')
+    .readFile(task.workspaceId, task.id, 'workspace/GARDEN.md')
     .catch(() =>
       deps.runner
-        .readFile(task.workspaceId, task.id, 'workspace/OPEN_CLOUD.md')
+        .readFile(task.workspaceId, task.id, 'workspace/ATHANOR.md')
         .catch(() =>
-          deps.runner.readFile(task.workspaceId, task.id, 'workspace/AGENTS.md').catch(() => '')
+          deps.runner
+            .readFile(task.workspaceId, task.id, 'workspace/OPEN_CLOUD.md')
+            .catch(() =>
+              deps.runner.readFile(task.workspaceId, task.id, 'workspace/AGENTS.md').catch(() => '')
+            )
         )
     );
   const knowledgeMarker = 'CURATED ENCRYPTED KNOWLEDGE';

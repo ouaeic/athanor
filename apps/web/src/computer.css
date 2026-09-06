@@ -256,3 +256,105 @@ button.computer-file-row:hover {
     scroll-behavior: auto;
   }
 }
+.garden-browser-tabstrip {
+  display: flex;
+  overflow-x: auto;
+  align-items: stretch;
+  gap: 4px;
+  min-width: 0;
+  padding-bottom: 3px;
+  scrollbar-width: thin;
+}
+.garden-browser-tab {
+  display: flex;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 8px 8px 3px 3px;
+  flex-shrink: 0;
+  max-width: 235px;
+  background: var(--panel);
+}
+.garden-browser-tab.active {
+  border-color: var(--line-strong);
+  background: var(--raised);
+}
+.garden-browser-tab button {
+  border: 0;
+  background: none;
+  padding: 10px 8px;
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  color: var(--muted);
+}
+.garden-browser-tab button:first-child {
+  display: block;
+  min-width: 80px;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+  font-size: 11px;
+}
+.garden-browser-tab button.pinned {
+  color: var(--accent);
+}
+.garden-tab-cleanup {
+  color: var(--dim);
+  font-size: 10px;
+  padding: 10px;
+  align-self: center;
+  white-space: nowrap;
+}
+.garden-screen-surface .computer-screen {
+  width: 100%;
+}
+.garden-screen-surface .computer-screen canvas {
+  max-height: 65dvh;
+  width: auto;
+  max-width: 100%;
+  margin-inline: auto;
+}
+.garden-screen-surface.expanded {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  height: 100dvh;
+  overflow-y: auto;
+  background: var(--bg);
+  padding: max(14px, env(safe-area-inset-top, 0px)) 20px max(14px, env(safe-area-inset-bottom, 0px));
+}
+.garden-screen-surface.expanded .computer-screen canvas {
+  max-height: 75dvh;
+}
+.garden-computation-values {
+  display: grid;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+.garden-computation-values > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.25rem 0.75rem;
+  padding: 0.6rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+}
+.garden-computation-values pre {
+  grid-column: 1 / -1;
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.garden-computation-files {
+  list-style: none;
+  padding: 0;
+}
+.garden-computation-files li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  overflow-wrap: anywhere;
+}

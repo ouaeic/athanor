@@ -75,6 +75,7 @@ class FakeLink implements RelayLink {
       openStreams: 0,
       usedBytes: 0,
       quota: null,
+      previewPort: null,
       lastError: null,
       nextAttemptAtMs: null
     };
@@ -126,6 +127,7 @@ const supervisorOn = (
     localHost: '127.0.0.1',
     localPort: 8443,
     localHttpPort: 8080,
+    localPreviewPort: 8444,
     log: silentLogger,
     createLink: async (config, onStatus) => {
       const link = new FakeLink(config.label, config.host, onStatus, () =>
@@ -188,6 +190,50 @@ describe('a box ships with no relay', () => {
 });
 
 describe('turning the relay on', () => {
+  test.each([undefined, 9445])(
+    'starts an existing enrollment with runtime listener options despite stored preview port %s',
+    async (storedPreviewPort) => {
+      const directory = await temporaryDirectory('garden-relay-preview-upgrade-');
+      await writeFile(
+        join(directory, 'settings.json'),
+        JSON.stringify({
+          enabled: true,
+          host: 'relay.example',
+          label: 'enrolled',
+          pinnedRelaySpkiSha256: 'pinned-relay-key',
+          localPort: 8443,
+          localHttpPort: 8080,
+          localPreviewPort: storedPreviewPort
+        })
+      );
+      const links: FakeLink[] = [];
+      const seen: unknown[] = [];
+      const relay = supervisorOn(directory, links, {
+        localPreviewPort: 9444,
+        createLink: async (config, onStatus) => {
+          seen.push(config);
+          const link = new FakeLink(config.label, config.host, onStatus);
+          links.push(link);
+          return link;
+        }
+      });
+      await relay.start();
+      expect(links).toHaveLength(1);
+      expect(links[0]?.started).toBe(1);
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toMatchObject({
+        localPort: 8443,
+        localHttpPort: 8080,
+        localPreviewPort: 9444,
+        enabled: true,
+        label: 'enrolled',
+        pinnedRelaySpkiSha256: 'pinned-relay-key'
+      });
+      expect(relay.publicHostname()).toBe('enrolled.relay.example');
+      relay.close();
+    }
+  );
+
   test('records the label and the pinned relay key, and dials', async () => {
     const directory = await temporaryDirectory('athanor-relay-on-');
     const links: FakeLink[] = [];
@@ -349,6 +395,33 @@ describe('turning the relay off', () => {
 });
 
 describe('what the box advertises', () => {
+  test('advertises only an online negotiated preview listener on its enrolled hostname', async () => {
+    const directory = await temporaryDirectory('garden-relay-preview-origin-');
+    const links: FakeLink[] = [];
+    const relay = supervisorOn(directory, links);
+    await relay.start();
+    expect(relay.publicPreviewOrigin()).toBeNull();
+    await relay.enroll({ host: 'relay.example.com', token: 'arly1_token' });
+    expect(links).toHaveLength(1);
+    const link = links[0]!;
+    expect(relay.publicPreviewOrigin()).toBeNull();
+    link.status = { ...link.status, previewPort: 9443 };
+    expect(relay.publicPreviewOrigin()).toBe(
+      'https://label-for-relay.example.com.relay.example.com:9443'
+    );
+    for (const port of [null, 0, 80, 443, 65_536, 1.5, NaN]) {
+      link.status = { ...link.status, previewPort: port };
+      expect(relay.publicPreviewOrigin(), `port ${port}`).toBeNull();
+    }
+    for (const state of ['off', 'connecting', 'waiting', 'revoked'] as const) {
+      link.status = { ...link.status, state, previewPort: 9443 };
+      expect(relay.publicPreviewOrigin(), state).toBeNull();
+    }
+    link.status = { ...link.status, state: 'online', previewPort: 9443 };
+    await relay.disable();
+    expect(relay.publicPreviewOrigin()).toBeNull();
+  });
+
   test('offers the relay last, and only once', () => {
     const direct = ['https://box.example.net', 'https://203.0.113.9'];
     expect(withRelayEndpoint(direct, 'abc.relay.example.com')).toEqual([
@@ -371,6 +444,7 @@ const testConfig = (directory: string): ApiConfig => ({
   RELAY_LOCAL_HOST: '127.0.0.1',
   RELAY_LOCAL_PORT: 8443,
   RELAY_LOCAL_HTTP_PORT: 8080,
+  RELAY_LOCAL_PREVIEW_PORT: 8444,
   PUBLIC_APP_URL: 'http://localhost:5173',
   PREVIEW_BASE_URL: 'http://preview.localhost:4400',
   API_HOST: '127.0.0.1',
@@ -464,7 +538,7 @@ describe('the relay routes an owner uses', () => {
     });
     const decode = (uri: string): Record<string, unknown> =>
       JSON.parse(
-        Buffer.from(uri.replace('athanor://pair/', ''), 'base64url').toString('utf8')
+        Buffer.from(uri.replace(/^(?:garden|athanor):\/\/pair\//, ''), 'base64url').toString('utf8')
       ) as Record<string, unknown>;
     const ticket = decode(ticketOn.json<{ uri: string }>().uri);
     expect(ticket.endpoints).toEqual([

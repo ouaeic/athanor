@@ -85,7 +85,6 @@ export const registerApprovalRoutes = (context: RouteContext): void => {
             'approval_unavailable',
             'Approval is missing, resolved, or expired'
           );
-        await store.setTaskStatusForUser(user.id, String(approval.taskId), 'queued');
         return { ok: true };
       });
     }

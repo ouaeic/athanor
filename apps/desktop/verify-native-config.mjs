@@ -1,4 +1,24 @@
 import { readdir, readFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+
+// The guarded native transport is copied verbatim; dependency upgrades require reviewing its
+// binary/channel behavior and the cross-platform frame-injection contract before replacing it.
+const ipcSource = JSON.parse(
+  await readFile(new URL('./src-tauri/src/vendor/tauri-ipc-source.json', import.meta.url), 'utf8')
+);
+const cargoLock = await readFile(new URL('./src-tauri/Cargo.lock', import.meta.url), 'utf8');
+const tauriVersion = cargoLock.match(/\[\[package\]\]\s+name = "tauri"\s+version = "([^"]+)"/)?.[1];
+if (
+  !tauriVersion ||
+  tauriVersion !== ipcSource.version ||
+  Object.keys(ipcSource.files).length !== 2
+)
+  throw new Error('Review the guarded IPC transport against the pinned Tauri dependency.');
+for (const [name, expected] of Object.entries(ipcSource.files)) {
+  const bytes = await readFile(new URL(`./src-tauri/src/vendor/${name}`, import.meta.url));
+  if (createHash('sha256').update(bytes).digest('hex') !== expected)
+    throw new Error(`The attributed upstream IPC transport changed: ${name}`);
+}
 
 const config = JSON.parse(
   await readFile(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8')
@@ -12,21 +32,6 @@ const loopbackNotifications = JSON.parse(
     'utf8'
   )
 );
-/**
- * The desktop half of the same permission, which exists because this file pins the mobile half.
- *
- * A Tauri capability that names any platform applies to no other, and `loopback-notifications`
- * names `android` and `iOS` only - so every packaged macOS, Windows and Linux client was silent.
- * The main window is loaded from `http://localhost:<port>`, which is a remote execution context,
- * and the only other capability holding `notification:default` has no `remote` block and therefore
- * covers local app URLs alone. Widening the mobile file was the obvious repair and this script's
- * exact-match on its `platforms` array refused it, so the fix landed as a sibling file instead.
- *
- * That left the sibling verified by nothing: it is the one file standing between a packaged client
- * and silence, and until this read existed, deleting it broke every desktop notification without
- * failing a single gate. The union check below is the assertion that actually matters - it is about
- * coverage of the five shipped targets rather than about either file's own list.
- */
 const loopbackNotificationsDesktop = JSON.parse(
   await readFile(
     new URL('./src-tauri/capabilities/loopback-notifications-desktop.json', import.meta.url),
@@ -137,7 +142,12 @@ const requiredIosTransportPolicy = [
   '<key>NSIncludesSubdomains</key>',
   '<false/>'
 ];
-const requiredIosPairing = ['CFBundleURLTypes', 'CFBundleURLSchemes', '<string>athanor</string>'];
+const requiredIosPairing = [
+  'CFBundleURLTypes',
+  'CFBundleURLSchemes',
+  '<string>garden</string>',
+  '<string>athanor</string>'
+];
 const requiredApplePrivacyAndLan = [
   'NSBonjourServices',
   '<string>_athanor._tcp</string>',
@@ -154,26 +164,26 @@ const expectedDesktopIcons = [
   'icons/icon.ico'
 ];
 if (
+  JSON.stringify(config.app?.security?.capabilities) !== JSON.stringify(['default']) ||
   configuredUrl !== undefined ||
   remoteCapability !== undefined ||
   config.app?.withGlobalTauri !== false ||
-  JSON.stringify(desktopSchemes) !== JSON.stringify(['athanor']) ||
+  JSON.stringify(desktopSchemes) !== JSON.stringify(['garden', 'athanor']) ||
   !Array.isArray(mobileLinks) ||
   mobileLinks.length !== 1 ||
-  JSON.stringify(mobileLinks[0]?.scheme) !== JSON.stringify(['athanor']) ||
+  JSON.stringify(mobileLinks[0]?.scheme) !== JSON.stringify(['garden', 'athanor']) ||
   mobileLinks[0]?.appLink !== false ||
   !Array.isArray(permissions) ||
   !permissions.includes('core:event:default') ||
   !permissions.includes('deep-link:default') ||
   loopbackNotifications.local !== false ||
   JSON.stringify(loopbackNotifications.windows) !== JSON.stringify(['main']) ||
-  JSON.stringify(loopbackNotifications.remote?.urls) !== JSON.stringify(['http://localhost:*/*']) ||
+  JSON.stringify(loopbackNotifications.remote?.urls) !== JSON.stringify([]) ||
   JSON.stringify(loopbackNotifications.platforms) !== JSON.stringify(['android', 'iOS']) ||
   JSON.stringify(notificationPermissions) !== JSON.stringify(['notification:default']) ||
   loopbackNotificationsDesktop.local !== false ||
   JSON.stringify(loopbackNotificationsDesktop.windows) !== JSON.stringify(['main']) ||
-  JSON.stringify(loopbackNotificationsDesktop.remote?.urls) !==
-    JSON.stringify(['http://localhost:*/*']) ||
+  JSON.stringify(loopbackNotificationsDesktop.remote?.urls) !== JSON.stringify([]) ||
   JSON.stringify(loopbackNotificationsDesktop.platforms) !==
     JSON.stringify(['macOS', 'windows', 'linux']) ||
   JSON.stringify(desktopNotificationPermissions) !== JSON.stringify(['notification:default']) ||
@@ -181,10 +191,12 @@ if (
     JSON.stringify(['android', 'iOS', 'linux', 'macOS', 'windows'].sort()) ||
   loopbackNative.local !== false ||
   JSON.stringify(loopbackNative.windows) !== JSON.stringify(['main']) ||
-  JSON.stringify(loopbackNative.remote?.urls) !== JSON.stringify(['http://localhost:*/*']) ||
+  JSON.stringify(loopbackNative.remote?.urls) !== JSON.stringify([]) ||
   JSON.stringify(nativePermissions) !==
     JSON.stringify([
       'allow-native-capabilities',
+      'allow-open-authorization-browser',
+      'allow-open-preview-browser',
       'allow-choose-folder',
       'allow-revoke-folder',
       'allow-list-local-folder',

@@ -2,13 +2,12 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import {
   ArrowLeft,
   ArrowUpRight,
-  Check,
   ChevronRight,
   FileText,
   GitBranch,
   History,
-  Layers,
   MessageSquare,
+  Mic,
   MoreHorizontal,
   Pause,
   Play,
@@ -23,6 +22,7 @@ import type {
   Task,
   TaskEvent,
   TaskPlan,
+  TaskPresentation,
   Workspace,
   TaskRewindPreview,
   RewindScope
@@ -37,8 +37,8 @@ import {
   isWorking,
   lastEvent,
   money,
-  planProgress,
   statusLabel,
+  taskStatusLabel,
   strings,
   surfaceAnswer,
   text
@@ -49,9 +49,15 @@ import type { StreamConnection } from './stream';
 import { Button, Dialog, Empty, ErrorNotice, Field, Spinner } from './ui';
 import { DecisionCard } from './DecisionQueue';
 import { createQuestionAnswerSender } from './task-actions';
+import { TaskOutputs, TaskProgress } from './TaskCanvas';
+import WorkTrace from './WorkTrace';
 import { modeFloors } from './asking-rules';
+import { effortLabel } from './reasoning-options';
 const Markdown = lazy(() => import('./MarkdownBody'));
 const Composer = lazy(() => import('./Composer'));
+const VoiceSession = lazy(() => import('./voice/VoiceSession'));
+const MediaJobs = lazy(() => import('./MediaJobs'));
+const CodingMissions = lazy(() => import('./CodingMissions'));
 const Share = lazy(() => import('./Sharing'));
 const ResultPreview = lazy(() =>
   import('./computer/ResultPreview').then((module) => ({ default: module.ResultPreview }))
@@ -66,6 +72,7 @@ export interface TaskSurfaceProps {
   onTask: (task: Task) => void;
   onRefresh: () => void;
   onBack: () => void;
+  onOpenTask: (id: string) => void;
   onComputer: (
     tool: 'files' | 'terminal' | 'browser' | 'desktop' | 'previews' | 'processes' | 'checkpoints'
   ) => void;
@@ -80,11 +87,13 @@ export default function TaskSurface({
   onTask,
   onRefresh,
   onBack,
+  onOpenTask,
   onComputer
 }: TaskSurfaceProps) {
   const [events, setEvents] = useState<TaskEvent[]>([]);
   const [plan, setPlan] = useState<TaskPlan | null>(null);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
+  const [presentation, setPresentation] = useState<TaskPresentation | null>(null);
   const [preview, setPreview] = useState<Artifact | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<unknown>(null);
@@ -93,6 +102,7 @@ export default function TaskSurface({
     'direction' | 'history' | 'plan' | 'settings' | 'share' | 'brief' | null
   >(null);
   const [busy, setBusy] = useState(false);
+  const [voiceOpen, setVoiceOpen] = useState(false);
   const [historyMore, setHistoryMore] = useState(false);
   const [historyPage, setHistoryPage] = useState<TaskEvent[]>([]);
   const [evidence, setEvidence] = useState<TaskEvent | null>(null);
@@ -112,10 +122,11 @@ export default function TaskSurface({
       const results = await Promise.allSettled([
         get<Task>(`/v1/tasks/${task.id}`, options),
         get<TaskPlan | null>(`/v1/tasks/${task.id}/plan`, options),
-        get<Artifact[]>(`/v1/workspaces/${workspace.id}/artifacts`, options)
+        get<Artifact[]>(`/v1/workspaces/${workspace.id}/artifacts`, options),
+        get<TaskPresentation>(`/v1/tasks/${task.id}/presentation`, options)
       ]);
       if (signal?.aborted) return;
-      const [nextTask, nextPlan, nextArtifacts] = results;
+      const [nextTask, nextPlan, nextArtifacts, nextPresentation] = results;
       if (nextTask.status === 'fulfilled') onTaskRef.current(nextTask.value);
       else setError(nextTask.reason);
       if (nextPlan.status === 'fulfilled') setPlan(nextPlan.value);
@@ -123,12 +134,15 @@ export default function TaskSurface({
       if (nextArtifacts.status === 'fulfilled')
         setArtifacts(nextArtifacts.value.filter((item) => item.taskId === task.id));
       else setError(nextArtifacts.reason);
+      if (nextPresentation.status === 'fulfilled') setPresentation(nextPresentation.value);
+      else setError(nextPresentation.reason);
     },
     [task.id, workspace.id]
   );
   useEffect(() => {
     const controller = new AbortController();
     let unsubscribe: () => void = () => undefined;
+    let refreshTimer: ReturnType<typeof setTimeout> | undefined;
     setLoading(true);
     setError(null);
     void Promise.all([
@@ -163,12 +177,18 @@ export default function TaskSurface({
                   'artifact',
                   'plan',
                   'status',
-                  'cost'
+                  'cost',
+                  'preview',
+                  'tool_result'
                 ].includes(event.kind)
               )
             ) {
-              void reload(controller.signal);
-              onRefreshRef.current();
+              if (!refreshTimer)
+                refreshTimer = setTimeout(() => {
+                  refreshTimer = undefined;
+                  void reload(controller.signal);
+                  onRefreshRef.current();
+                }, 1000);
             }
           },
           onConnection: setConnection,
@@ -188,15 +208,37 @@ export default function TaskSurface({
       controller.abort();
       unsubscribe();
       clearInterval(timer);
+      clearTimeout(refreshTimer);
     };
   }, [task.id, reload, isFinished(task)]);
+  async function inspectEvidence(id: string) {
+    const existing = events.find((event) => event.id === id);
+    if (existing) return setEvidence(existing);
+    const sequence = presentation?.progress.milestones.find((item) => item.id === id)?.sequence;
+    if (sequence === undefined) return;
+    try {
+      const page = await loadEventPage(task.id, { after: Math.max(0, sequence - 1), limit: 1 });
+      const event = page.events.find((item) => item.id === id);
+      if (!event) throw new Error('This recorded action is no longer available.');
+      setEvidence(event);
+    } catch (cause) {
+      setError(cause);
+    }
+  }
   const answer = surfaceAnswer(events);
   const completionEvent = lastEvent(events, 'completed');
   const completion = data(completionEvent?.payload);
   const verification = data(completion.verification);
+  const pendingDelivery = (presentation?.delivery?.status ?? task.deliveryStatus) === 'pending';
+  const deliveryFailed = (presentation?.delivery?.status ?? task.deliveryStatus) === 'incomplete';
+  const displayStatus =
+    task.status === 'completed' && pendingDelivery
+      ? 'Generating media'
+      : task.status === 'completed' && deliveryFailed
+        ? 'Delivery needs attention'
+        : taskStatusLabel(task);
   const question = activeQuestion(events, task);
   const questionData = data(question?.payload);
-  const progress = planProgress(plan);
   const taskDecisions = decisions.filter((decision) => decision.taskId === task.id);
   const latestActivity = [...events]
     .reverse()
@@ -268,430 +310,480 @@ export default function TaskSurface({
   function selectedContext() {
     const selection = window.getSelection()?.toString().trim() ?? '';
     setScope(selection.slice(0, 12000));
-    setPanel('direction');
+    document.getElementById(`intent-${task.id}`)?.focus();
   }
   return (
-    <section className="work-surface">
-      <div className="work-navigation">
-        <Button className="quiet-button" onClick={onBack}>
-          <ArrowLeft size={16} />
-          All work
-        </Button>
-        <div className="row">
-          <span
-            className={`connection ${connection}`}
-            title={
-              connection === 'connected'
-                ? 'Live updates connected'
-                : connection === 'idle'
-                  ? 'Checking for late updates'
-                  : connection
-            }
+    <section className="garden-task">
+      <div className="garden-task-scroll">
+        <div className="garden-work-navigation">
+          <Button
+            className="quiet-button"
+            onClick={() => (task.parentTaskId ? onOpenTask(task.parentTaskId) : onBack())}
           >
-            {' '}
-            <i />
-            {connection === 'connected'
-              ? 'Live'
-              : connection === 'idle'
-                ? 'Up to date'
-                : connection === 'closed'
-                  ? 'Disconnected'
-                  : 'Reconnecting'}
-          </span>
-          <Button aria-label="Work options" onClick={() => setPanel('settings')}>
-            <MoreHorizontal size={19} />
+            <ArrowLeft size={16} />
+            {task.parentTaskId ? 'Return to parent work' : 'All work'}
           </Button>
-        </div>
-      </div>
-      <div className="work-heading">
-        <div>
-          <div className="eyebrow">
-            {workspace.name}
-            <ChevronRight size={12} /> {statusLabel[task.status]}
-          </div>
-          <h1>{task.title}</h1>
-        </div>
-        <div className="work-heading-actions">
-          <Button onClick={() => setPanel('share')} aria-label="Share this work">
-            <Share2 size={17} />
-            <span>Share</span>
-          </Button>
-          <Button className="primary" onClick={() => setPanel('direction')}>
-            <Plus size={17} />
-            Add direction
-          </Button>
-        </div>
-      </div>
-      <div className="run-summary">
-        <div className={`status-line ${isWorking(task) ? 'active' : ''}`}>
-          <i />
-          <span>{statusLabel[task.status]}</span>
-          {task.queuedMessageCount > 0 && (
-            <span className="badge">{task.queuedMessageCount} queued</span>
-          )}
-        </div>
-        <div className="row">
-          <span className="muted">
-            {money(task.spentUsd)}
-            {task.maxSpendUsd !== null && ` / ${money(task.maxSpendUsd)}`}
-          </span>
-          {!isFinished(task) && (
-            <Button
-              className="quiet-button"
-              busy={busy}
-              onClick={() =>
-                action(['paused', 'awaiting_resource'].includes(task.status) ? 'resume' : 'pause')
+          <div className="row">
+            <span
+              className={`connection ${connection}`}
+              title={
+                connection === 'connected'
+                  ? 'Live updates connected'
+                  : connection === 'idle'
+                    ? 'Checking for late updates'
+                    : connection
               }
             >
-              {['paused', 'awaiting_resource'].includes(task.status) ? (
-                <Play size={14} />
-              ) : (
-                <Pause size={14} />
-              )}{' '}
-              {['paused', 'awaiting_resource'].includes(task.status) ? 'Resume' : 'Pause'}
-            </Button>
-          )}
-        </div>
-      </div>
-      <ErrorNotice
-        error={error}
-        onRetry={() => {
-          setError(null);
-          void reload();
-        }}
-      />
-      {plan && (
-        <div className="plan-ribbon">
-          <button className="plan-overview" onClick={() => setPanel('plan')}>
-            <span className="eyebrow">The plan</span>
-            <span>
-              {progress.completed} of {progress.total} steps
+              {' '}
+              <i />
+              {connection === 'connected'
+                ? 'Live'
+                : connection === 'idle'
+                  ? 'Up to date'
+                  : connection === 'closed'
+                    ? 'Disconnected'
+                    : 'Reconnecting'}
             </span>
-          </button>
-          <ol>
-            {plan.steps.map((step, index) => (
-              <li key={step.id} className={step.status}>
-                <button
-                  onClick={() => {
-                    setScope(`Plan v${plan.version}, step ${index + 1}: ${step.title}`);
-                    setPanel('direction');
-                  }}
-                >
-                  <span>
-                    {step.status === 'completed' ? (
-                      <Check size={13} />
-                    ) : (
-                      String(index + 1).padStart(2, '0')
-                    )}
-                  </span>
-                  {step.title}
-                </button>
-              </li>
-            ))}
-          </ol>
-          <Button aria-label="Edit plan" onClick={() => setPanel('plan')}>
-            <Layers size={16} />
-          </Button>
+            <Button aria-label="Work options" onClick={() => setPanel('settings')}>
+              <MoreHorizontal size={19} />
+            </Button>
+          </div>
         </div>
-      )}
-      {loading ? (
-        <Spinner label="Opening this work…" />
-      ) : (
-        <div className={`work-layout ${taskDecisions.length || question ? 'has-decision' : ''}`}>
-          <div className="work-primary">
-            {answer.markdown ? (
-              <article className="result-surface">
-                <div className="result-toolbar">
-                  <span className="eyebrow">
-                    {answer.partial
-                      ? 'Taking shape'
-                      : answer.previous
-                        ? 'Previous result'
-                        : task.status !== 'completed'
-                          ? 'Latest update'
-                          : completion.interrupted
-                            ? 'Unverified answer'
-                            : 'The result'}
-                  </span>
-                  <div className="row">
-                    <Button className="quiet-button" onClick={selectedContext}>
-                      Shape selection
-                      <ArrowUpRight size={14} />
-                    </Button>
-                    <Button
-                      className="quiet-button"
-                      onClick={() => navigator.clipboard.writeText(answer.markdown).catch(setError)}
-                    >
-                      Copy
-                    </Button>
+        <div className="garden-work-heading">
+          <div>
+            <div className="eyebrow">
+              {workspace.name}
+              <ChevronRight size={12} /> {displayStatus}
+            </div>
+            <h1>{task.title}</h1>
+          </div>
+          <div className="garden-heading-actions">
+            {!task.parentTaskId && (
+              <Button onClick={() => setVoiceOpen(true)} aria-label="Live voice">
+                <Mic size={17} />
+                <span>Voice</span>
+              </Button>
+            )}
+            <Button onClick={() => setPanel('share')} aria-label="Share this work">
+              <Share2 size={17} />
+              <span>Share</span>
+            </Button>
+            <Button
+              className="primary"
+              onClick={() => document.getElementById(`intent-${task.id}`)?.focus()}
+            >
+              <Plus size={17} />
+              Add direction
+            </Button>
+          </div>
+        </div>
+        <div className="run-summary">
+          <div className={`status-line ${isWorking(task) || pendingDelivery ? 'active' : ''}`}>
+            <i />
+            <span>{displayStatus}</span>
+            {task.queuedMessageCount > 0 && (
+              <span className="badge">{task.queuedMessageCount} queued</span>
+            )}
+          </div>
+          <div className="row">
+            <span className="muted">
+              {money(task.spentUsd)}
+              {task.maxSpendUsd !== null && ` / ${money(task.maxSpendUsd)}`}
+            </span>
+            {!isFinished(task) && (
+              <Button
+                className="quiet-button"
+                busy={busy}
+                onClick={() =>
+                  action(['paused', 'awaiting_resource'].includes(task.status) ? 'resume' : 'pause')
+                }
+              >
+                {['paused', 'awaiting_resource'].includes(task.status) ? (
+                  <Play size={14} />
+                ) : (
+                  <Pause size={14} />
+                )}{' '}
+                {['paused', 'awaiting_resource'].includes(task.status) ? 'Resume' : 'Pause'}
+              </Button>
+            )}
+          </div>
+        </div>
+        <ErrorNotice
+          error={error}
+          onRetry={() => {
+            setError(null);
+            void reload();
+          }}
+        />
+        {loading ? (
+          <Spinner label="Opening this work…" />
+        ) : (
+          <div className="garden-task-layout">
+            <div className="garden-task-primary">
+              <Suspense fallback={null}>
+                <MediaJobs taskId={task.id} onDelivered={reload} />
+              </Suspense>
+              {presentation && !presentation.results.length && (
+                <WorkTrace
+                  progress={presentation.progress}
+                  onEvidence={(id) => void inspectEvidence(id)}
+                />
+              )}
+              {presentation && (
+                <TaskOutputs
+                  events={events}
+                  artifacts={artifacts}
+                  presentation={presentation}
+                  onArtifact={(id) => setPreview(artifacts.find((item) => item.id === id) ?? null)}
+                />
+              )}
+              {answer.markdown ? (
+                <article className="garden-answer">
+                  <div className="result-toolbar">
+                    <span className="eyebrow">
+                      {answer.partial
+                        ? 'Taking shape'
+                        : answer.previous
+                          ? 'Previous result'
+                          : task.status !== 'completed'
+                            ? 'Latest update'
+                            : completion.interrupted
+                              ? 'Unverified answer'
+                              : 'The result'}
+                    </span>
+                    <div className="row">
+                      <Button className="quiet-button" onClick={selectedContext}>
+                        Shape selection
+                        <ArrowUpRight size={14} />
+                      </Button>
+                      <Button
+                        className="quiet-button"
+                        onClick={() =>
+                          navigator.clipboard.writeText(answer.markdown).catch(setError)
+                        }
+                      >
+                        Copy
+                      </Button>
+                    </div>
                   </div>
-                </div>
-                <Suspense fallback={<Spinner label="Opening the result…" />}>
-                  <Markdown>{answer.markdown}</Markdown>
-                </Suspense>
-                {answer.partial && (
-                  <div className="writing-indicator" role="status">
-                    Writing…
-                  </div>
-                )}
-              </article>
-            ) : (
-              <article className="progress-surface">
-                <div className="growth-diagram" aria-hidden="true">
-                  <span />
-                  <span />
-                  <span />
-                  <span />
-                  <span />
-                </div>
-                <div className="eyebrow">
-                  {isWorking(task) ? 'Work in motion' : statusLabel[task.status]}
-                </div>
-                <h2>
-                  {task.status === 'awaiting_user'
-                    ? 'A moment for your judgement.'
-                    : task.status === 'paused'
-                      ? 'Ready when you are.'
-                      : task.status === 'failed'
-                        ? 'Let’s find a way forward.'
-                        : task.status === 'awaiting_resource'
-                          ? 'Waiting for what it needs.'
+                  <Suspense fallback={<Spinner label="Opening the result…" />}>
+                    <Markdown>{answer.markdown}</Markdown>
+                  </Suspense>
+                  {answer.partial && (
+                    <div className="writing-indicator" role="status">
+                      Writing…
+                    </div>
+                  )}
+                </article>
+              ) : (
+                <article className="garden-working-note">
+                  <span className="eyebrow">{statusLabel[task.status]}</span>
+                  <h2>
+                    {task.status === 'awaiting_user'
+                      ? 'Your input will shape the next step.'
+                      : task.status === 'paused'
+                        ? 'Ready to continue.'
+                        : task.status === 'failed'
+                          ? 'This work needs attention.'
                           : task.status === 'cancelled'
-                            ? 'The work is safely stopped.'
-                            : 'Your idea is taking shape.'}
-                </h2>
-                <p>{latestActivity?.summary || 'The first update will appear here.'}</p>
-                {
+                            ? 'This work has stopped.'
+                            : 'Making room for your idea.'}
+                  </h2>
+                  <p>
+                    {presentation?.progress.current?.title ??
+                      latestActivity?.summary ??
+                      'The first recorded update will appear here.'}
+                  </p>
                   <Button className="quiet-button" onClick={() => setPanel('brief')}>
                     Read your brief
                     <ArrowUpRight size={14} />
                   </Button>
-                }
-              </article>
-            )}
-            {completionEvent && (
-              <section
-                className={`completion-record ${completion.interrupted || verification.status === 'checks_failed' || verification.status === 'checks_did_not_run' ? 'needs-review' : ''}`}
-              >
-                <div className="row between">
-                  <span className="eyebrow">
-                    {(lastEvent(events, 'user_message')?.sequence ?? 0) > completionEvent.sequence
-                      ? 'Previous completion'
-                      : 'Completion record'}
-                  </span>
-                  <span className="badge">
-                    {completion.interrupted
-                      ? 'Review needed'
-                      : verification.status === 'verified'
-                        ? 'Verified'
-                        : verification.status === 'not_applicable'
-                          ? 'No executable checks needed'
-                          : verification.status === 'checks_failed'
-                            ? 'Checks failed'
-                            : verification.status === 'checks_did_not_run'
-                              ? 'Checks did not run'
-                              : 'Verification not recorded'}
-                  </span>
-                </div>
-                {text(completion.summary) && <p>{text(completion.summary)}</p>}
-                {strings(verification.remainingRisks).length > 0 && (
-                  <div className="remaining-risks">
-                    <strong>Still to consider</strong>
-                    <ul>
-                      {strings(verification.remainingRisks).map((risk, index) => (
-                        <li key={index}>{risk}</li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-                {Array.isArray(verification.evidence) && verification.evidence.length > 0 && (
-                  <details>
-                    <summary>Evidence and checks</summary>
-                    <ul className="evidence-list">
-                      {verification.evidence.map((item, index) => {
-                        const record = data(item);
-                        const call = text(record.toolCallId);
-                        const source = events.find(
-                          (event) =>
-                            text(data(event.payload).toolCallId) === call &&
-                            event.kind === 'tool_result'
-                        );
-                        return (
-                          <li key={index}>
-                            <span>{text(record.claim)}</span>
-                            <small>{text(record.source).replaceAll('_', ' ')}</small>
-                            {source && (
-                              <Button onClick={() => setEvidence(source)}>Inspect evidence</Button>
-                            )}
-                          </li>
-                        );
-                      })}
-                    </ul>
-                    {completion.acceptance !== undefined && (
-                      <pre>{JSON.stringify(completion.acceptance, null, 2)}</pre>
-                    )}
-                  </details>
-                )}
-              </section>
-            )}
-            {artifacts.length > 0 && (
-              <section className="result-shelf">
-                <div className="section-heading">
-                  <h2>Made with this work</h2>
-                  <Button onClick={() => onComputer('files')}>
-                    All files
-                    <ArrowUpRight size={15} />
-                  </Button>
-                </div>
-                <div className="artifact-grid">
-                  {artifacts.map((artifact) => (
-                    <button
-                      type="button"
-                      className="artifact-tile"
-                      key={artifact.id}
-                      onClick={() => setPreview(artifact)}
-                    >
-                      <FileText size={24} />
-                      <span>{artifact.name}</span>
-                      <small>
-                        Version {artifact.version} · {artifact.mimeType.split('/').at(-1)}
-                      </small>
-                      <ArrowUpRight className="artifact-arrow" size={17} />
-                    </button>
-                  ))}
-                </div>
-              </section>
-            )}
-          </div>
-          {(taskDecisions.length > 0 || question) && (
-            <aside className="work-attention">
-              {taskDecisions.map((decision) => (
-                <DecisionCard
-                  key={decision.id}
-                  decision={decision}
-                  onComputer={onComputer}
-                  onResolved={() => {
-                    onRefresh();
-                    void reload();
-                  }}
-                />
-              ))}
-              {question && (
-                <article className="question-card">
-                  <div className="eyebrow">
-                    <MessageSquare size={14} />
-                    Your judgement
-                  </div>
-                  <h2>{text(questionData.question, question.summary)}</h2>
-                  {text(questionData.why) && <p>{text(questionData.why)}</p>}
-                  <div className="stack">
-                    {strings(questionData.options).map((option) => (
-                      <Button key={option} disabled={busy} onClick={() => answerQuestion(option)}>
-                        {option}
-                        <ArrowUpRight size={15} />
-                      </Button>
-                    ))}
-                  </div>
-                  <form
-                    onSubmit={(event) => {
-                      event.preventDefault();
-                      void answerQuestion(questionAnswer);
-                    }}
-                  >
-                    <Field label="Your answer">
-                      <textarea
-                        value={questionAnswer}
-                        onChange={(event) => setQuestionAnswer(event.target.value)}
-                        rows={3}
-                      />
-                    </Field>
-                    <Button
-                      type="submit"
-                      className="primary"
-                      disabled={!questionAnswer.trim()}
-                      busy={busy}
-                    >
-                      Send answer
-                      <ArrowUpRight size={16} />
-                    </Button>
-                  </form>
                 </article>
               )}
-            </aside>
-          )}
-        </div>
-      )}
-      {notices.length > 0 && (
-        <details className="notices">
-          <summary>
-            {notices.length} recent {notices.length === 1 ? 'notice' : 'notices'}
-          </summary>
-          {notices.map((event) => (
-            <article key={event.id}>
-              <strong>{event.summary}</strong>
-              <p>{text(data(event.payload).detail)}</p>
-              <Button onClick={() => setEvidence(event)}>Inspect</Button>
-            </article>
-          ))}
-        </details>
-      )}
-      <div className="work-tools">
-        <span className="eyebrow">With this work</span>
-        <Button onClick={() => onComputer('terminal')}>
-          <Terminal size={16} />
-          Terminal
-        </Button>
-        <Button onClick={() => onComputer('browser')}>Browser</Button>
-        <Button onClick={() => onComputer('desktop')}>Desktop</Button>
-        <Button onClick={() => onComputer('files')}>Files</Button>
-        <Button onClick={() => onComputer('previews')}>Previews</Button>
-        <Button
-          onClick={() => {
-            setHistoryPage(events.slice(-250));
-            setHistoryMore((events.at(-250)?.sequence ?? events[0]?.sequence ?? 1) > 1);
-            setPanel('history');
-          }}
-        >
-          <History size={16} />
-          Activity
-        </Button>
-        <Button onClick={() => setPanel('plan')}>Plan</Button>
-      </div>
-      {panel === 'direction' && (
-        <Dialog
-          title="Shape this work"
-          onClose={() => {
-            setPanel(null);
-            setScope('');
-          }}
-        >
-          {scope && (
-            <div className="selected-context">
-              <span className="eyebrow">Selected context</span>
-              <p>{scope}</p>
-              <Button onClick={() => setScope('')}>
-                <X size={13} />
-                Clear selection
-              </Button>
+              {completionEvent && (
+                <section
+                  className={`completion-record ${completion.interrupted || verification.status === 'checks_failed' || verification.status === 'checks_did_not_run' || verification.status === 'delivery_incomplete' ? 'needs-review' : ''}`}
+                >
+                  <div className="row between">
+                    <span className="eyebrow">
+                      {(lastEvent(events, 'user_message')?.sequence ?? 0) > completionEvent.sequence
+                        ? 'Previous completion'
+                        : 'Completion record'}
+                    </span>
+                    <span className="badge">
+                      {completion.interrupted
+                        ? 'Review needed'
+                        : verification.status === 'delivery_pending'
+                          ? pendingDelivery
+                            ? 'Generation continues'
+                            : deliveryFailed
+                              ? 'Delivery needs attention'
+                              : presentation?.delivery?.status === 'ready'
+                                ? 'Delivered'
+                                : 'Checking delivery'
+                          : verification.status === 'delivery_incomplete'
+                            ? 'Delivery needs attention'
+                            : verification.status === 'verified'
+                              ? 'Verified'
+                              : verification.status === 'not_applicable'
+                                ? 'No executable checks needed'
+                                : verification.status === 'checks_failed'
+                                  ? 'Checks failed'
+                                  : verification.status === 'checks_did_not_run'
+                                    ? 'Checks did not run'
+                                    : 'Verification not recorded'}
+                    </span>
+                  </div>
+                  {!answer.markdown && text(completion.summary) && (
+                    <p>{text(completion.summary)}</p>
+                  )}
+                  {strings(verification.remainingRisks).length > 0 && (
+                    <div className="remaining-risks">
+                      <strong>Still to consider</strong>
+                      <ul>
+                        {strings(verification.remainingRisks).map((risk, index) => (
+                          <li key={index}>{risk}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {Array.isArray(verification.evidence) && verification.evidence.length > 0 && (
+                    <details>
+                      <summary>Evidence and checks</summary>
+                      <ul className="evidence-list">
+                        {verification.evidence.map((item, index) => {
+                          const record = data(item);
+                          const call = text(record.toolCallId);
+                          const source = events.find(
+                            (event) =>
+                              text(data(event.payload).toolCallId) === call &&
+                              event.kind === 'tool_result'
+                          );
+                          return (
+                            <li key={index}>
+                              <span>{text(record.claim)}</span>
+                              <small>{text(record.source).replaceAll('_', ' ')}</small>
+                              {source && (
+                                <Button onClick={() => setEvidence(source)}>
+                                  Inspect evidence
+                                </Button>
+                              )}
+                            </li>
+                          );
+                        })}
+                      </ul>
+                      {completion.acceptance !== undefined && (
+                        <pre>{JSON.stringify(completion.acceptance, null, 2)}</pre>
+                      )}
+                    </details>
+                  )}
+                </section>
+              )}
+              {!presentation && artifacts.length > 0 && (
+                <section className="result-shelf">
+                  <div className="section-heading">
+                    <h2>Made with this work</h2>
+                    <Button onClick={() => onComputer('files')}>
+                      All files
+                      <ArrowUpRight size={15} />
+                    </Button>
+                  </div>
+                  <div className="artifact-grid">
+                    {artifacts.map((artifact) => (
+                      <button
+                        type="button"
+                        className="artifact-tile"
+                        key={artifact.id}
+                        onClick={() => setPreview(artifact)}
+                      >
+                        <FileText size={24} />
+                        <span>{artifact.name}</span>
+                        <small>
+                          Version {artifact.version} · {artifact.mimeType.split('/').at(-1)}
+                        </small>
+                        <ArrowUpRight className="artifact-arrow" size={17} />
+                      </button>
+                    ))}
+                  </div>
+                </section>
+              )}
             </div>
-          )}
-          <Suspense fallback={<Spinner />}>
-            <Composer
-              workspace={workspace}
-              task={task}
-              bootstrap={bootstrap}
-              {...(draft ? { initialDraft: draft } : {})}
-              {...(scope ? { scope } : {})}
-              onDraft={onDraft}
-              onSent={(result) => {
-                onTask(result);
-                setPanel(null);
-                setScope('');
-                onRefresh();
-              }}
-            />
-          </Suspense>
-        </Dialog>
+            <div className="garden-task-aside">
+              <Suspense fallback={null}>
+                <CodingMissions taskId={task.id} onOpenTask={onOpenTask} onChange={reload} />
+              </Suspense>
+              {(taskDecisions.length > 0 || question) && (
+                <aside className="work-attention">
+                  {taskDecisions.map((decision) => (
+                    <DecisionCard
+                      key={decision.id}
+                      decision={decision}
+                      onComputer={onComputer}
+                      onResolved={() => {
+                        onRefresh();
+                        void reload();
+                      }}
+                    />
+                  ))}
+                  {question && (!task.parentMissionId || taskDecisions.length === 0) && (
+                    <article className="question-card" id={`question-${task.id}`}>
+                      <div className="eyebrow">
+                        <MessageSquare size={14} />
+                        Your judgement
+                      </div>
+                      <h2>{text(questionData.question, question.summary)}</h2>
+                      {text(questionData.why) && <p>{text(questionData.why)}</p>}
+                      <div className="stack">
+                        {strings(questionData.options).map((option) => (
+                          <Button
+                            key={option}
+                            disabled={busy}
+                            onClick={() => answerQuestion(option)}
+                          >
+                            {option}
+                            <ArrowUpRight size={15} />
+                          </Button>
+                        ))}
+                      </div>
+                      <form
+                        onSubmit={(event) => {
+                          event.preventDefault();
+                          void answerQuestion(questionAnswer);
+                        }}
+                      >
+                        <Field label="Your answer">
+                          <textarea
+                            value={questionAnswer}
+                            onChange={(event) => setQuestionAnswer(event.target.value)}
+                            rows={3}
+                          />
+                        </Field>
+                        <Button
+                          type="submit"
+                          className="primary"
+                          disabled={!questionAnswer.trim()}
+                          busy={busy}
+                        >
+                          Send answer
+                          <ArrowUpRight size={16} />
+                        </Button>
+                      </form>
+                    </article>
+                  )}
+                </aside>
+              )}
+              {presentation && (
+                <TaskProgress
+                  presentation={presentation}
+                  onPlan={() => setPanel('plan')}
+                  onEvidence={(id) => void inspectEvidence(id)}
+                />
+              )}
+            </div>
+          </div>
+        )}
+        {notices.length > 0 && (
+          <details className="notices">
+            <summary>
+              {notices.length} recent {notices.length === 1 ? 'notice' : 'notices'}
+            </summary>
+            {notices.map((event) => (
+              <article key={event.id}>
+                <strong>{event.summary}</strong>
+                <p>{text(data(event.payload).detail)}</p>
+                <Button onClick={() => setEvidence(event)}>Inspect</Button>
+              </article>
+            ))}
+          </details>
+        )}
+        <div className="work-tools">
+          <span className="eyebrow">With this work</span>
+          <Button onClick={() => onComputer('terminal')}>
+            <Terminal size={16} />
+            Terminal
+          </Button>
+          <Button onClick={() => onComputer('browser')}>Browser</Button>
+          <Button onClick={() => onComputer('desktop')}>Desktop</Button>
+          <Button onClick={() => onComputer('files')}>Files</Button>
+          <Button onClick={() => onComputer('previews')}>Previews</Button>
+          <Button
+            onClick={() => {
+              setHistoryPage(events.slice(-250));
+              setHistoryMore((events.at(-250)?.sequence ?? events[0]?.sequence ?? 1) > 1);
+              setPanel('history');
+            }}
+          >
+            <History size={16} />
+            Activity
+          </Button>
+          <Button onClick={() => setPanel('plan')}>Plan</Button>
+        </div>
+      </div>
+      <div className="garden-task-composer">
+        {task.parentMissionId ? (
+          <div className="selected-context garden-mission-context">
+            <p>This specialist uses the model and budget assigned by its parent work.</p>
+            <small className="muted">
+              {bootstrap.models.find((model) => model.id === task.modelId)?.displayName ??
+                task.modelId}
+              {' · '}Effort {effortLabel(task.reasoningEffort ?? 'auto')}
+            </small>
+            <div className="row">
+              {question && taskDecisions.length === 0 && (
+                <Button
+                  onClick={() => {
+                    const card = document.getElementById(`question-${task.id}`);
+                    card?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+                    card?.querySelector('textarea')?.focus({ preventScroll: true });
+                  }}
+                >
+                  Reply to the question
+                </Button>
+              )}
+              {task.parentTaskId && (
+                <Button onClick={() => onOpenTask(task.parentTaskId!)}>
+                  Continue in parent work
+                </Button>
+              )}
+            </div>
+          </div>
+        ) : (
+          <>
+            {scope && (
+              <div className="selected-context">
+                <span className="eyebrow">Selected context</span>
+                <p>{scope}</p>
+                <Button onClick={() => setScope('')} aria-label="Clear selected context">
+                  <X size={14} />
+                </Button>
+              </div>
+            )}
+            <Suspense fallback={<Spinner />}>
+              <Composer
+                workspace={workspace}
+                task={task}
+                bootstrap={bootstrap}
+                {...(draft ? { initialDraft: draft } : {})}
+                {...(scope ? { scope } : {})}
+                onDraft={onDraft}
+                onSent={(result) => {
+                  onTask(result);
+                  setScope('');
+                  onRefresh();
+                }}
+              />
+            </Suspense>
+          </>
+        )}
+      </div>
+      {voiceOpen && (
+        <Suspense fallback={null}>
+          <VoiceSession
+            task={task}
+            onClose={() => setVoiceOpen(false)}
+            onTaskChanged={() => void reload()}
+          />
+        </Suspense>
       )}
       {panel === 'brief' && (
         <Dialog title="Your brief" onClose={() => setPanel(null)}>

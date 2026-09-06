@@ -15,7 +15,7 @@
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "NODE_OPTIONS=--conditions=development vitest run && NODE_OPTIONS=--conditions=development tsx scripts/relay-roundtrip.mts"
+    "test": "NODE_OPTIONS=--conditions=development vitest run && NODE_OPTIONS=--conditions=development tsx scripts/relay-roundtrip.mts && NODE_OPTIONS=--conditions=development tsx scripts/relay-bind-refusal.mts"
   },
   "dependencies": {
     "@athanor/relay": "workspace:*",

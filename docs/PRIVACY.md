@@ -1,6 +1,6 @@
 # Privacy
 
-## What athanor stores
+## What garden stores
 
 Your installation stores:
 
@@ -16,7 +16,7 @@ Your installation stores:
 Task and credential encryption uses the installation master key. Workspace files rely on host/volume
 encryption unless the file format itself is encrypted.
 
-## What athanor does not intentionally log
+## What garden does not intentionally log
 
 Application logs, metrics, notification labels, and connector audit summaries exclude:
 
@@ -33,7 +33,7 @@ channel and scan all logs.
 
 ## “No logging” boundary
 
-No content logging by athanor does not mean no observation anywhere.
+No content logging by garden does not mean no observation anywhere.
 
 - The model provider receives inference content.
 - Codex and Claude Code send repository context and prompts under the owner’s publisher account.
@@ -74,11 +74,11 @@ billing, or network metadata.
 ## Credentials
 
 Provider and connector credentials are encrypted before database storage and are never returned after
-save. API tokens are displayed once; athanor stores only a one-way digest, prefix, scopes, expiry, and
+save. API tokens are displayed once; garden stores only a one-way digest, prefix, scopes, expiry, and
 last-use time.
 
 Codex/Claude OAuth state is controlled by the publisher CLI under the persistent workspace home, not
-the athanor credential table. It is therefore included in full workspace backups.
+the garden credential table. It is therefore included in full workspace backups.
 
 Browser secure-input mode suspends agent observation and control while the user types a password,
 payment detail, CAPTCHA, or other human-only value.

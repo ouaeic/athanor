@@ -67,6 +67,7 @@ const configFor = (directory: string): ApiConfig => ({
   RELAY_LOCAL_HOST: '127.0.0.1',
   RELAY_LOCAL_PORT: 443,
   RELAY_LOCAL_HTTP_PORT: 80,
+  RELAY_LOCAL_PREVIEW_PORT: 8443,
   PUBLIC_APP_URL: 'http://localhost:5173',
   PREVIEW_BASE_URL: 'http://preview.localhost:4400',
   API_HOST: '127.0.0.1',

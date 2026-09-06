@@ -1,3 +1,4 @@
+import { taskReasoningEffort } from './reasoning.js';
 /**
  * The three ceilings a turn can reach, and the one closing call it is given when it does.
  *
@@ -480,11 +481,16 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
    * changing it re-bills the entire prefix at the write price. Keeping it is the cheaper of the two
    * even on the arm where the turn is ending because the money ran out.
    */
-  const reasoningEffort = reasoningEffortForStep({
+  const automaticEffort = reasoningEffortForStep({
     ...state,
     estimatedInputTokens: preparedContext.estimatedInputTokens,
     inputBudgetTokens: modelInputBudget(model.contextTokens, maxOutputTokens, reservedTokens)
   });
+  const reasoningEffort = taskReasoningEffort(
+    state.ownerReasoningEffort,
+    automaticEffort,
+    model.reasoning
+  );
   const flusher = createStreamFlusher();
   let streamEvents = Promise.resolve();
   // Swallowed for the reason the loop's own frame writer swallows it: this is the call that
@@ -522,6 +528,7 @@ Nothing you produced was rolled back and none of it is lost. This same task cont
         temperature: 0.2,
         maxTokens: maxOutputTokens,
         reasoningEffort,
+        ...(model.reasoning ? { reasoningOptions: model.reasoning } : {}),
         sessionId,
         signal,
         onTextDelta: (delta) => {

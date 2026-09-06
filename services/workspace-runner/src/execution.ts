@@ -1,3 +1,4 @@
+import { assertMissionWorkspaceOpen, trackMissionInvocation } from './mission-processes.js';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
 import path from 'node:path';
@@ -16,31 +17,10 @@ import {
   type HostStorage
 } from './host-storage.js';
 import { limitedInvocation, type CommandLimits } from './limits.js';
-import { sandboxedInvocation, type AgentSandbox } from './sandbox.js';
+import { isCodingMissionWorkspace, sandboxedInvocation, type AgentSandbox } from './sandbox.js';
 import { awaitChildExit, killProcessTree } from './subprocess.js';
 
-/**
- * Why athanor runs commands here rather than handing them to a provider's hosted interpreter, so
- * the question is answered once instead of every time somebody notices the option exists.
- *
- * The hosted sandboxes are strictly smaller machines. Anthropic's code execution container has, in
- * its own documentation, "Internet access: Completely disabled for security" and "no internet
- * access, so Claude can't download or install additional packages at runtime"; it expires thirty
- * days after creation and is checkpointed after minutes of inactivity. OpenAI's hosted shell is
- * billed per twenty-minute container session by memory tier. OpenRouter's `openrouter:shell` runs
- * "in an isolated container - not on OpenRouter infrastructure or your machine" and is Responses-API
- * only, which is not the endpoint athanor speaks.
- *
- * What is on this side of the boundary instead: the owner's own persistent Linux computer, with
- * their files, their installed software, real network access, background processes that can be
- * polled rather than blocked on, a pinned interpreter and toolchain, and state that survives
- * between tasks and between weeks. There is nothing a provider sandbox does better, and the same
- * verdict follows for a provider patch tool against `file_patch` and a provider image tool against
- * `generate_media`, which prices a request against the owner's spend limit before anything is
- * spent. The one genuinely good thing in that region of the API - a model writing code to filter
- * search results before they reach its context - comes free with the provider web tools and needs
- * none of this. The persistent machine is the product.
- */
+/** Native commands share the owner's workspace, resource ceilings and approval floor. */
 
 export const ExecRequest = z
   .object({
@@ -667,6 +647,7 @@ export const hostSearchPath = [
 
 /** The command as the kernel will receive it, after every refusal, the sandbox and the limiter. */
 export interface PreparedInvocation {
+  processTreeLease?: string;
   executable: string;
   args: string[];
   cwd: string;
@@ -679,6 +660,10 @@ export interface PreparedInvocation {
  * why the checks below can be stated once instead of once per schema.
  */
 export interface InvocationRequest {
+  /** Runner-selected lifecycle containment; never copied from a command request body. */
+  superviseProcessTree?: boolean;
+  /** Curated native capability restriction; never copied from a command request body. */
+  requireNetworkIsolation?: boolean;
   executable: string;
   args: string[];
   cwd: string;
@@ -735,6 +720,19 @@ export const prepareInvocation = async (
   request: InvocationRequest,
   policy: InvocationPolicy
 ): Promise<PreparedInvocation> => {
+  assertMissionWorkspaceOpen(workspaceRoot);
+  const mission = await isCodingMissionWorkspace(workspaceRoot);
+  const requireNetworkIsolation = mission || request.requireNetworkIsolation === true;
+  if (requireNetworkIsolation && request.network)
+    throw new Error('This isolated native capability cannot enable network access');
+  if (
+    requireNetworkIsolation &&
+    (!policy.sandbox?.confineFilesystem || policy.sandbox.networkIsolation !== true)
+  )
+    throw new Error('This native capability requires measured filesystem and network isolation');
+  const packagePolicy: SystemPackagePolicy = requireNetworkIsolation
+    ? { mode: 'refused', helper: policy.systemPackages.helper }
+    : policy.systemPackages;
   const searchPath = agentSearchPath(workspaceRoot);
   // Asked first, so a policy the caller believes it is applying is refused before anything runs.
   const environment = agentEnvironment(workspaceRoot, searchPath, request.env);
@@ -755,7 +753,7 @@ export const prepareInvocation = async (
   let args = request.args;
   let sandbox = policy.sandbox;
 
-  if (policy.systemPackages.mode === 'refused') {
+  if (packagePolicy.mode === 'refused') {
     // One sentence for the whole family: on this path none of them is rewritten onto anything, so
     // there is no second outcome to distinguish and no reason to make the caller read six.
     if (
@@ -766,7 +764,11 @@ export const prepareInvocation = async (
       privilegedHelperInvocation(request, privilegedHelpers) ??
       privilegedHelperInvocation(asResolved, privilegedHelpers)
     ) {
-      throw new Error('Privilege and system-package operations cannot run as background processes');
+      throw new Error(
+        requireNetworkIsolation
+          ? 'Privilege and system-package operations cannot run in an isolated native capability'
+          : 'Privilege and system-package operations cannot run as background processes'
+      );
     }
   } else {
     if (privilegeEscalationBinary(request) ?? privilegeEscalationBinary(asResolved)) {
@@ -791,7 +793,7 @@ export const prepareInvocation = async (
       );
     }
     if (packageManager === 'direct') {
-      const { allowed, helper } = policy.systemPackages;
+      const { allowed, helper } = packagePolicy;
       if (!allowed || !helper) {
         throw new Error('An approved system-packages capability is required');
       }
@@ -824,25 +826,24 @@ export const prepareInvocation = async (
 
   // The limiter wraps the sandbox rather than the other way round: resource limits are inherited
   // across exec, so setting them outermost applies them to everything underneath.
-  const limited = limitedInvocation(
-    sandbox
-      ? await sandboxedInvocation(
-          { executable, args },
-          environment,
-          sandbox,
-          policy.isolateNetwork && !request.network,
-          // The workspace this command belongs to, which is the one directory tree a confined
-          // command may write in. Named here rather than derived inside the helper's caller
-          // because this is the only place that knows it, and both execution paths - the
-          // foreground command and the background session - arrive at this line.
-          workspaceRoot,
-          cwd
-        )
-      : { executable, args },
-    policy.limits,
-    policy.limiter
-  );
+  const sandboxed = sandbox
+    ? await sandboxedInvocation(
+        { executable, args },
+        environment,
+        sandbox,
+        requireNetworkIsolation || (policy.isolateNetwork && !request.network),
+        // The workspace this command belongs to, which is the one directory tree a confined
+        // command may write in. Named here rather than derived inside the helper's caller
+        // because this is the only place that knows it, and both execution paths - the
+        // foreground command and the background session - arrive at this line.
+        workspaceRoot,
+        cwd,
+        request.superviseProcessTree === true
+      )
+    : { executable, args };
+  const limited = limitedInvocation(sandboxed, policy.limits, policy.limiter);
   return {
+    ...('processTreeLease' in sandboxed ? { processTreeLease: sandboxed.processTreeLease } : {}),
     executable: limited.executable,
     args: limited.args,
     // Where the process is started matters as much as what it is handed when the process is
@@ -921,6 +922,7 @@ const startGuardedChild = async (
     detached: true,
     shell: false
   });
+  trackMissionInvocation(workspaceRoot, prepared, child);
 
   const output = boundedCollector(options.maxOutputBytes);
   const errors = boundedCollector(options.maxOutputBytes);

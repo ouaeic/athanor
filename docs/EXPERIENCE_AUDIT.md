@@ -4,7 +4,7 @@
 
 The default path requires four concepts:
 
-1. install athanor on a computer;
+1. install garden on a computer;
 2. create the owner passkey;
 3. connect model access;
 4. ask for an outcome.
@@ -94,5 +94,5 @@ Before a stable tag:
 10. no-content-canary log scan.
 
 Dynamic public-address UX must state the physical boundary: an off-site client that was offline
-cannot discover an unknown new public IP without a stable hostname or rendezvous service. Athanor
+cannot discover an unknown new public IP without a stable hostname or rendezvous service. garden
 must never disguise a relay, VPN, or directory as “automatic broadcasting.”

@@ -619,6 +619,31 @@ describe('file organisation and toolchain routes', () => {
     });
   });
 
+  it('binds original recording receipts to file-read authority and the requested workspace', async () => {
+    const { app, id, root, token } = await harness();
+    await writeFile(path.join(root, 'workspace', 'source.wav'), 'approved recording');
+    const url = `/v1/workspaces/${id}/audio/source`;
+    const request = (requested: string, scopes = ['files.read'], audience = url) =>
+      app.inject({
+        method: 'POST',
+        url,
+        headers: { authorization: `Bearer ${token(scopes, { method: 'POST', path: audience })}` },
+        payload: { path: requested }
+      });
+    const accepted = await request('workspace/source.wav');
+    expect(accepted.statusCode).toBe(200);
+    const receipt = accepted.json<{ sourceSha256: string; sourceBytes: number }>();
+    expect(receipt.sourceSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(receipt.sourceBytes).toBe(Buffer.byteLength('approved recording'));
+    expect((await request('workspace/source.wav', ['exec'])).statusCode).toBe(403);
+    expect(
+      (await request('workspace/source.wav', ['files.read'], `/v1/workspaces/${id}/audio/prepare`))
+        .statusCode
+    ).toBe(403);
+    expect((await request('../../escape')).statusCode).toBe(400);
+    expect((await request('.athanor/browser/Cookies')).statusCode).toBe(400);
+  });
+
   it('will not prepare a recording for a token that may only read files elsewhere', async () => {
     const { app, id, token } = await harness();
     // The route only ever reads a file the owner already has, so `files.read` is the whole of what

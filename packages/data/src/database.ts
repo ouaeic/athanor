@@ -1,4 +1,5 @@
 import { PGlite } from '@electric-sql/pglite';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import pg from 'pg';
@@ -57,6 +58,7 @@ const acquireAdvisoryLock = async <T>(
 };
 
 class PostgresDatabase implements Database {
+  readonly #transaction = new AsyncLocalStorage<Database>();
   readonly #pool: pg.Pool;
   readonly #connectionString: string;
   /**
@@ -87,15 +89,21 @@ class PostgresDatabase implements Database {
   }
 
   async query<T extends Record<string, unknown>>(sql: string, params: unknown[] = []) {
+    const transaction = this.#transaction.getStore();
+    if (transaction) return transaction.query<T>(sql, params);
     const result = await this.#pool.query<T>(sql, params);
     return { rows: result.rows, rowCount: result.rowCount ?? result.rows.length };
   }
 
   async exec(sql: string) {
+    const transaction = this.#transaction.getStore();
+    if (transaction) return transaction.exec(sql);
     await this.#pool.query(sql);
   }
 
   async transaction<T>(callback: (database: Database) => Promise<T>): Promise<T> {
+    const active = this.#transaction.getStore();
+    if (active) return callback(active);
     const client = await this.#pool.connect();
     const scoped: Database = {
       query: async <R extends Record<string, unknown>>(sql: string, params: unknown[] = []) => {
@@ -114,7 +122,7 @@ class PostgresDatabase implements Database {
     };
     await client.query('BEGIN');
     try {
-      const result = await callback(scoped);
+      const result = await this.#transaction.run(scoped, () => callback(scoped));
       await client.query('COMMIT');
       return result;
     } catch (error) {
@@ -226,6 +234,7 @@ class PostgresDatabase implements Database {
 class EmbeddedDatabase implements Database {
   readonly #db: PGlite;
   readonly #locks = new Map<number, Promise<void>>();
+  readonly #transaction = new AsyncLocalStorage<Database>();
 
   constructor(databasePath: string) {
     if (databasePath !== ':memory:')
@@ -234,6 +243,8 @@ class EmbeddedDatabase implements Database {
   }
 
   async query<T extends Record<string, unknown>>(sql: string, params: unknown[] = []) {
+    const transaction = this.#transaction.getStore();
+    if (transaction) return transaction.query<T>(sql, params);
     const result = await this.#db.query<T>(sql, params);
     return {
       rows: result.rows,
@@ -242,41 +253,33 @@ class EmbeddedDatabase implements Database {
   }
 
   async exec(sql: string) {
+    const transaction = this.#transaction.getStore();
+    if (transaction) return transaction.exec(sql);
     await this.#db.exec(sql);
   }
 
   async transaction<T>(callback: (database: Database) => Promise<T>): Promise<T> {
-    // PGlite is one backend on one connection, so the database itself would serve as the handle,
-    // and for a long time it was the handle. What that cost only shows up under nesting: the inner
-    // transaction() issued a second BEGIN, which PostgreSQL answers with a warning and ignores, and
-    // the inner COMMIT then committed the outer transaction for real - so the outer ROLLBACK had
-    // nothing left to undo and both writes landed. PostgresDatabase.transaction flattens a nested
-    // call onto the one transaction it opened, where the outer rollback takes the inner write with
-    // it. Every test in this repository runs on pglite and every installed box runs on postgres, so
-    // that difference is atomicity the suite can prove and the product does not have. The same
-    // scoped object here gives both drivers the same answer.
-    const scoped: Database = {
-      query: async <R extends Record<string, unknown>>(sql: string, params: unknown[] = []) =>
-        this.query<R>(sql, params),
-      exec: (sql: string) => this.exec(sql),
-      transaction: async <R>(nested: (database: Database) => Promise<R>) => nested(scoped),
-      withAdvisoryLock: <R>(key: number, locked: () => Promise<R>) =>
-        this.withAdvisoryLock(key, locked),
-      notify: (channel: string) => this.notify(channel),
-      listen: (channel: string) => this.listen(channel),
-      // The backend belongs to everything else in the process; a transaction handle owns nothing
-      // it could close. PostgresDatabase says the same about its pooled client.
-      close: async () => undefined
-    };
-    await this.#db.exec('BEGIN');
-    try {
-      const result = await callback(scoped);
-      await this.#db.exec('COMMIT');
-      return result;
-    } catch (error) {
-      await this.#db.exec('ROLLBACK');
-      throw error;
-    }
+    const active = this.#transaction.getStore();
+    if (active) return callback(active);
+    // The native scope queues competing callers; nested domain calls share this one transaction.
+    return this.#db.transaction(async (transaction) => {
+      const scoped: Database = {
+        query: async <R extends Record<string, unknown>>(sql: string, params: unknown[] = []) => {
+          const result = await transaction.query<R>(sql, params);
+          return { rows: result.rows, rowCount: result.rows.length || result.affectedRows || 0 };
+        },
+        exec: async (sql: string) => {
+          await transaction.exec(sql);
+        },
+        transaction: async <R>(nested: (database: Database) => Promise<R>) => nested(scoped),
+        withAdvisoryLock: <R>(key: number, locked: () => Promise<R>) =>
+          this.withAdvisoryLock(key, locked),
+        notify: (channel: string) => this.notify(channel),
+        listen: (channel: string) => this.listen(channel),
+        close: async () => undefined
+      };
+      return this.#transaction.run(scoped, () => callback(scoped));
+    });
   }
 
   // PGlite is a single backend embedded in this process, so pg_advisory_lock would be taken and

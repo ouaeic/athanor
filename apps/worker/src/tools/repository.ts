@@ -1,3 +1,4 @@
+import { executeCodingMission } from '../coding-missions.js';
 import { AthanorError } from '@athanor/core';
 import { type ModelToolCall } from '@athanor/model-gateway';
 import { type ExecObservation, type ProcessObservation } from '../agent-state.js';
@@ -16,6 +17,7 @@ import {
 import { type ToolContext } from '../tool-dispatch.js';
 import { diagnosticsLanguage, diagnosticsSelection } from './diagnostics.js';
 import { clampNumber } from './numbers.js';
+import { executeCodeIntelligenceTool } from './code-intelligence.js';
 
 /**
  * The repository tools: reading a codebase, and handing work to a coding agent inside it.
@@ -752,6 +754,12 @@ export async function executeRepositoryTool(
            */
           ...SETTLED_ORDER,
           '--glob',
+          'GARDEN.md',
+          '--glob',
+          'ATHANOR.md',
+          '--glob',
+          'OPEN_CLOUD.md',
+          '--glob',
           'AGENTS.md',
           '--glob',
           'CONTRIBUTING.md',
@@ -791,6 +799,8 @@ export async function executeRepositoryTool(
       };
     }
     case 'code_diagnostics': {
+      if (call.arguments.action && call.arguments.action !== 'check')
+        return executeCodeIntelligenceTool(context, call);
       const path = textValue(call.arguments.path, 'workspace');
       const requested = textValue(call.arguments.language, 'auto');
       /*
@@ -860,6 +870,7 @@ export async function executeRepositoryTool(
       };
     }
     case 'coding_agent': {
+      if (call.arguments.agent === 'garden') return executeCodingMission(context, call);
       const action = textValue(call.arguments.action);
       const agent = textValue(call.arguments.agent);
       if (!['codex', 'claude', 'opencode'].includes(agent))

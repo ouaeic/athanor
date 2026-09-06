@@ -15,7 +15,6 @@
 import { randomUUID } from 'node:crypto';
 import {
   MEDIA_APPROVAL_USD,
-  MEDIA_VIDEO_UNAVAILABLE_REASON,
   ModelRelease,
   OwnerPreferences,
   resolveWebToolPlan
@@ -49,12 +48,16 @@ import {
   applyOpenRouterPrivacyPolicy,
   refreshOpenRouterCatalog,
   refreshOpenRouterMediaCatalog,
+  refreshOpenAIMediaCatalog,
+  isNativeOpenAIEndpoint,
+  describeOpenRouterImageModel,
+  quoteMediaPrice,
   resolveMediaModel,
   seedMediaModels,
   seedModels
 } from '@athanor/model-gateway';
 import type { z } from 'zod';
-import { TRANSCRIPTION_RATE_SAMPLES, ownerPriceCeiling, workspaceResponse } from '../context.js';
+import { ownerPriceCeiling, workspaceResponse } from '../context.js';
 import type { InferenceSecret } from '../context.js';
 import type { ServerBase } from '../http/server-context.js';
 import { errorFields } from '../log.js';
@@ -397,7 +400,7 @@ export const createServerSupport = (context: ServerBase) => {
     if (existing.length >= serverLimits.maxWorkspaces)
       throw new AthanorError(
         'computer_already_exists',
-        'This athanor installation already has its persistent computer',
+        'This garden installation already has its persistent computer',
         409
       );
     const remainingStorage =
@@ -641,30 +644,76 @@ export const createServerSupport = (context: ServerBase) => {
     | undefined;
 
   const mediaCatalogFor = async (secret: InferenceSecret): Promise<MediaModelOption[]> => {
-    // Only OpenRouter publishes a feed this can be built from. Ollama Cloud and a directly
-    // configured endpoint list model ids and nothing about modality or price, so there is no honest
-    // way to tell a generator from a chat model in their answer - the reviewed routes are what is
-    // offered there, and Settings says why rather than showing an empty list.
-    if (secret.provider !== 'openrouter' || !secret.apiKey) return seedMediaModels();
+    const native = secret.provider !== 'openrouter' && isNativeOpenAIEndpoint(secret.baseUrl);
+    if ((!native && secret.provider !== 'openrouter') || !secret.apiKey) return [];
     const key = `${secret.baseUrl}|${sha256(secret.apiKey)}|${secret.enforceZeroDataRetention}`;
     const now = Date.now();
     if (mediaCatalogCache?.key === key && mediaCatalogCache.expiresAt > now)
       return mediaCatalogCache.options;
     try {
-      const options = await refreshOpenRouterMediaCatalog({
+      const options = await (native ? refreshOpenAIMediaCatalog : refreshOpenRouterMediaCatalog)({
         baseUrl: secret.baseUrl,
         apiKey: secret.apiKey,
         requireZeroDataRetention: secret.enforceZeroDataRetention,
         ...(overrides.modelCatalogFetch ? { fetch: overrides.modelCatalogFetch } : {})
       });
-      mediaCatalogCache = { key, expiresAt: now + MEDIA_CATALOG_TTL_MS, options };
-      return options;
+      const usable = options.map((model) =>
+        model.modality === 'video' && model.requiresRetentionApproval
+          ? { ...model, unavailableReason: null }
+          : model
+      );
+      mediaCatalogCache = { key, expiresAt: now + MEDIA_CATALOG_TTL_MS, options: usable };
+      return usable;
     } catch {
       // A provider that cannot be reached must not empty the picker: the reviewed routes are still
       // what this box would generate with, and saying so is better than an empty select and no
       // reason. The failure is not cached, so the next open tries again.
-      return mediaCatalogCache?.options ?? seedMediaModels();
+      return mediaCatalogCache?.key === key
+        ? mediaCatalogCache.options
+        : (native ? [] : seedMediaModels()).map((model) => ({
+            ...model,
+            usdPerImage: null,
+            usdPerMillionCharacters: null,
+            priceSource: 'unknown' as const,
+            unavailableReason:
+              'The provider catalogue could not be verified. Try again when the connection is available.'
+          }));
     }
+  };
+
+  const imageRouteCache = new Map<string, { expiresAt: number; route: MediaModelOption }>();
+  const hydrateImageRoute = async (
+    secret: InferenceSecret,
+    model: MediaModelOption
+  ): Promise<MediaModelOption> => {
+    if (secret.provider !== 'openrouter' || !secret.apiKey) return model;
+    const key = `${secret.baseUrl}|${sha256(secret.apiKey)}|${model.id}|${secret.enforceZeroDataRetention}`;
+    const cached = imageRouteCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) return cached.route;
+    const routes = await describeOpenRouterImageModel(model, {
+      baseUrl: secret.baseUrl,
+      apiKey: secret.apiKey,
+      requireZeroDataRetention: true,
+      ...(overrides.modelCatalogFetch ? { fetch: overrides.modelCatalogFetch } : {})
+    });
+    // The pin and its quote must refer to the same endpoint. Unknown prices follow known quotes.
+    const cost = (route: MediaModelOption) =>
+      quoteMediaPrice(route.pricing, { width: 1024, height: 1024, count: 1 }) ?? Infinity;
+    routes.sort(
+      (left, right) =>
+        cost(left) - cost(right) ||
+        (left.providerEndpointTag ?? '').localeCompare(right.providerEndpointTag ?? '')
+    );
+    const route = routes[0];
+    if (!route)
+      throw new AthanorError(
+        'media_route_unavailable',
+        'The selected image model has no verified private endpoint',
+        409
+      );
+    if (imageRouteCache.size >= 32) imageRouteCache.clear();
+    imageRouteCache.set(key, { expiresAt: Date.now() + MEDIA_CATALOG_TTL_MS, route });
+    return route;
   };
 
   /**
@@ -675,7 +724,15 @@ export const createServerSupport = (context: ServerBase) => {
     const { secret } = await inferenceCredential(userId);
     const options = await mediaCatalogFor(secret);
     const selection = secret.mediaModels ?? {};
-    const modality = (kind: 'image' | 'audio' | 'transcription'): MediaModalityState => {
+    const image = resolveMediaModel(options, selection.image, 'image');
+    const effectiveImage = image
+      ? await hydrateImageRoute(secret, image).catch(() => ({
+          ...image,
+          unavailableReason:
+            'The selected image endpoint could not be verified. Choose a model or try again.'
+        }))
+      : null;
+    const modality = (kind: 'image' | 'audio' | 'transcription' | 'video'): MediaModalityState => {
       const forKind = options.filter((option) => option.modality === kind);
       const choice = selection[kind] ?? { automatic: true, preference: 'balanced', modelId: '' };
       return {
@@ -686,9 +743,11 @@ export const createServerSupport = (context: ServerBase) => {
           : secret.enforceZeroDataRetention
             ? 'No route your provider offers for this has a verified private endpoint. Allowing providers that may retain data would offer more.'
             : 'This provider account lists nothing that does this.',
-        options: forKind,
+        options: forKind.map((option) =>
+          kind === 'image' && effectiveImage?.id === option.id ? effectiveImage : option
+        ),
         choice,
-        effective: resolveMediaModel(options, choice, kind)
+        effective: kind === 'image' ? effectiveImage : resolveMediaModel(options, choice, kind)
       };
     };
     return {
@@ -696,17 +755,7 @@ export const createServerSupport = (context: ServerBase) => {
         modality('image'),
         modality('audio'),
         modality('transcription'),
-        {
-          modality: 'video',
-          available: false,
-          // One string in contracts, read by the worker that refuses the call and by the screen
-          // that explains the absence. A second copy of a policy is how the stale one ends up
-          // winning, which is the audit's own finding about approvals.
-          reason: MEDIA_VIDEO_UNAVAILABLE_REASON,
-          options: [],
-          choice: { automatic: true, preference: 'balanced', modelId: '' },
-          effective: null
-        }
+        modality('video')
       ],
       approvalThresholdUsd: MEDIA_APPROVAL_USD
     };
@@ -722,13 +771,25 @@ export const createServerSupport = (context: ServerBase) => {
     selection: MediaModelSelection | undefined
   ): Promise<InferenceSecret['mediaRoutes']> => {
     const options = await mediaCatalogFor(secret);
-    const image = resolveMediaModel(options, selection?.image, 'image');
+    const selectedImage = resolveMediaModel(options, selection?.image, 'image');
+    const image = selectedImage
+      ? await hydrateImageRoute(secret, selectedImage).catch((error: unknown) => {
+          if (selection?.image && !selection.image.automatic) throw error;
+          return {
+            ...selectedImage,
+            unavailableReason:
+              'The automatic image endpoint could not be verified. Choose an image model or try again.'
+          };
+        })
+      : null;
     const audio = resolveMediaModel(options, selection?.audio, 'audio');
     const transcription = resolveMediaModel(options, selection?.transcription, 'transcription');
+    const video = selection?.video ? resolveMediaModel(options, selection.video, 'video') : null;
     return {
       ...(image ? { image } : {}),
       ...(audio ? { audio } : {}),
-      ...(transcription ? { transcription } : {})
+      ...(transcription ? { transcription } : {}),
+      ...(video ? { video } : {})
     };
   };
 
@@ -763,7 +824,7 @@ export const createServerSupport = (context: ServerBase) => {
       provider: model.provider,
       privacyRoute: model.privacyRoute,
       appUrl: config.PUBLIC_APP_URL,
-      appTitle: 'athanor',
+      appTitle: 'garden',
       enforceZeroDataRetention: secret.provider === 'openrouter' && secret.enforceZeroDataRetention
     });
     /*
@@ -809,39 +870,6 @@ export const createServerSupport = (context: ServerBase) => {
       providerRef: `${model.provider}:${model.providerModelId}`,
       resourceClass: model.usageClass
     };
-  };
-
-  /**
-   * What a minute of reading has actually cost this account, from readings the provider has already
-   * billed for.
-   *
-   * The transcription feed publishes no per-minute price - `openrouter-catalog.ts` writes
-   * `usdPerMinute: null, priceSource: 'unknown'` for every one of these models - so a pinned route
-   * almost never carries a figure, and a guard priced from nothing is a guard that only fires once
-   * the cap is already breached. The ledger is the one place a real number lives, and it is exactly
-   * the evidence the agent's own `audio_read` promotes to a `measured` rate: arithmetic on readings
-   * the provider put a price on. Averaged over the last few so one oddly-billed note does not
-   * become the price of every note after it, and bounded so this stays an indexed read.
-   *
-   * Wave 6 folds this into the store beside `spendGuard`; it is a local query here because the step
-   * that needed it did not own that file.
-   */
-  const measuredTranscriptionUsdPerMinute = async (userId: string): Promise<number | null> => {
-    const result = await database.query<{ cost_usd: number; quantity: number }>(
-      `SELECT cost_usd,quantity FROM usage_entries
-       WHERE user_id=$1 AND resource_class='media:transcription' AND unit='second'
-         AND state='settled' AND cost_usd>0 AND quantity>0
-       ORDER BY created_at DESC LIMIT $2`,
-      [userId, TRANSCRIPTION_RATE_SAMPLES]
-    );
-    let cost = 0;
-    let seconds = 0;
-    for (const row of result.rows) {
-      cost += Number(row.cost_usd);
-      seconds += Number(row.quantity);
-    }
-    if (!(cost > 0) || !(seconds > 0)) return null;
-    return (cost * 60) / seconds;
   };
 
   /**
@@ -914,7 +942,6 @@ export const createServerSupport = (context: ServerBase) => {
     mediaSettings,
     mediaRoutesFor,
     titleCompletion,
-    measuredTranscriptionUsdPerMinute,
     EXECUTING_STATUSES,
     SETTLED_STATUSES,
     assertWorkspaceHasNoActiveWork

@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import cookie from '@fastify/cookie';
 import { AthanorError, sha256 } from '@athanor/core';
 import { createDatabase, DataStore, migrateDatabase, type Database } from '@athanor/data';
@@ -145,6 +145,28 @@ const buildHarness = async (): Promise<Harness> => {
     );
   });
 
+  app.post('/v1/previews/:previewId/rotate-access', async () => {
+    handlerRuns++;
+    return { rotated: true };
+  });
+  app.get('/v1/workspaces/:workspaceId/download', async () => {
+    handlerRuns++;
+    return 'source';
+  });
+  app.get('/v1/tasks/:taskId/bundle', async () => {
+    handlerRuns++;
+    return 'zip';
+  });
+  for (const kind of ['computation', 'debugger']) {
+    app.get(`/v1/workspaces/:workspaceId/${kind}`, async () => {
+      handlerRuns++;
+      return { privateInspection: true };
+    });
+    app.post(`/v1/workspaces/:workspaceId/${kind}/:session/control`, async () => {
+      handlerRuns++;
+      return { stopped: true };
+    });
+  }
   await app.ready();
   disposers.push(async () => {
     await app.close();
@@ -189,6 +211,116 @@ const seedOwnerWorkspace = async (
 };
 
 describe('workspace pre-handler', () => {
+  test('requires explicit preview write and file-read scopes for resets and result downloads', async () => {
+    const harness = await buildHarness();
+    const owner = await seedOwnerWorkspace(harness.store, 'scope-owner');
+    const tokens = new Map<string, string>();
+    for (const scope of [
+      'tasks:read',
+      'workspaces:read',
+      'workspaces:write',
+      'files:read'
+    ] as const) {
+      const token = `oc_live_${randomBytes(32).toString('base64url')}`;
+      await harness.store.createApiToken({
+        userId: owner.userId,
+        label: scope,
+        tokenHash: sha256(token),
+        prefix: token.slice(0, 12),
+        scopes: [scope],
+        expiresAt: new Date(Date.now() + 60_000)
+      });
+      tokens.set(scope, `Bearer ${token}`);
+    }
+    const reset = `/v1/previews/${randomUUID()}/rotate-access`;
+    for (const scope of ['tasks:read', 'workspaces:read', 'files:read']) {
+      const denied = await harness.app.inject({
+        method: 'POST',
+        url: reset,
+        headers: { authorization: tokens.get(scope)! }
+      });
+      expect(denied.statusCode).toBe(403);
+    }
+    expect(harness.handlerRuns()).toBe(0);
+    expect(
+      (
+        await harness.app.inject({
+          method: 'POST',
+          url: reset,
+          headers: { authorization: tokens.get('workspaces:write')! }
+        })
+      ).statusCode
+    ).toBe(200);
+    for (const url of [
+      `/v1/workspaces/${owner.workspaceId}/download`,
+      `/v1/tasks/${randomUUID()}/bundle`,
+      `/v1/workspaces/${owner.workspaceId}/computation`,
+      `/v1/workspaces/${owner.workspaceId}/debugger`
+    ]) {
+      expect(
+        (
+          await harness.app.inject({
+            method: 'GET',
+            url,
+            headers: { authorization: tokens.get('tasks:read')! }
+          })
+        ).statusCode
+      ).toBe(403);
+      expect(
+        (
+          await harness.app.inject({
+            method: 'GET',
+            url,
+            headers: { authorization: tokens.get('workspaces:read')! }
+          })
+        ).statusCode
+      ).toBe(403);
+      expect(
+        (
+          await harness.app.inject({
+            method: 'GET',
+            url,
+            headers: { authorization: tokens.get('files:read')! }
+          })
+        ).statusCode
+      ).toBe(200);
+    }
+  });
+  test('reserves live computation and debugger controls for signed-in devices', async () => {
+    const harness = await buildHarness();
+    const owner = await seedOwnerWorkspace(harness.store, 'inspection-owner');
+    const token = `oc_live_${randomBytes(32).toString('base64url')}`;
+    await harness.store.createApiToken({
+      userId: owner.userId,
+      label: 'automation',
+      tokenHash: sha256(token),
+      prefix: token.slice(0, 12),
+      scopes: ['workspaces:write', 'files:write', 'files:read'],
+      expiresAt: new Date(Date.now() + 60_000)
+    });
+    for (const kind of ['computation', 'debugger']) {
+      const url = `/v1/workspaces/${owner.workspaceId}/${kind}/session/control`;
+      const denied = await harness.app.inject({
+        method: 'POST',
+        url,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { action: 'stop' }
+      });
+      expect(denied.statusCode).toBe(403);
+    }
+    expect(harness.handlerRuns()).toBe(0);
+    const cookie = await harness.cookieFor(owner.userId);
+    for (const kind of ['computation', 'debugger']) {
+      const response = await harness.app.inject({
+        method: 'POST',
+        url: `/v1/workspaces/${owner.workspaceId}/${kind}/session/control`,
+        headers: { cookie, origin: 'https://athanor.test' },
+        payload: { action: 'stop' }
+      });
+      expect(response.statusCode).toBe(200);
+    }
+    expect(harness.handlerRuns()).toBe(2);
+  });
   /**
    * The net Wave 6 said did not exist. Delete the `workspaceBelongsToUser` check in
    * `registerAuthHooks` and this is the assertion that goes red - the handler below has no opinion

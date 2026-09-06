@@ -13,7 +13,7 @@ import { parseRelayConfig, type RelayConfig } from './config.js';
 import { deriveLabel, publicKeySpkiDer } from './index.js';
 import { createLogger, silentLogger, type Logger } from './log.js';
 import { METRIC_NAMES, Metrics } from './metrics.js';
-import { TLS_ALERT_UNRECOGNIZED_NAME, type BindFrame } from './protocol.js';
+import { CONTROL_ALPN, TLS_ALERT_UNRECOGNIZED_NAME, type BindFrame } from './protocol.js';
 import { Registry } from './registry.js';
 import { RelayServer } from './relay.js';
 import { createSelfSignedCertificate, generateIdentityKeyPair } from './x509.js';
@@ -50,6 +50,7 @@ const startRelay = async (
     relayDomain: RELAY_DOMAIN,
     listenHost: '127.0.0.1',
     httpsPort: 0,
+    previewPort: 0,
     controlPort: 0,
     httpPort: 0,
     metricsPort: 0,
@@ -167,7 +168,8 @@ interface ConnectedBox {
 const connectBox = async (
   harness: Harness,
   box: Box,
-  token: string | null
+  token: string | null,
+  caps?: readonly string[]
 ): Promise<ConnectedBox> => {
   const binds: BindFrame[] = [];
   const client = new BoxHarness({
@@ -176,6 +178,7 @@ const connectBox = async (
     controlHost: RELAY_DOMAIN,
     key: box.keyPem,
     cert: box.certPem,
+    ...(caps ? { caps } : {}),
     onBind: boxOnBind(box, binds)
   });
   cleanups.push(async () => client.close());
@@ -233,6 +236,96 @@ const probe = async (
   });
   return { sent: hello.length, received };
 };
+
+describe('isolated preview forwarding', () => {
+  it('routes preview TLS with its own logical port and the box certificate', async () => {
+    const relay = await startRelay();
+    const box = makeBox();
+    const { token } = relay.registry.createInvite('preview', 60_000);
+    const connected = await connectBox(relay, box, token);
+    expect(relay.server.previewPort).toBeGreaterThan(0);
+    const client = connectTls({
+      host: '127.0.0.1',
+      port: relay.server.previewPort!,
+      servername: `${box.label}.${RELAY_DOMAIN}`,
+      rejectUnauthorized: false
+    });
+    cleanups.push(async () => {
+      client.destroy();
+    });
+    await once(client, 'secureConnect');
+    expect(client.getPeerX509Certificate()?.fingerprint256).toBe(
+      new X509Certificate(box.certPem).fingerprint256
+    );
+    client.write('preview');
+    const [reply] = (await once(client, 'data')) as [Buffer];
+    expect(reply.toString()).toBe('echo:preview');
+    expect(connected.binds).toHaveLength(1);
+    expect(connected.binds[0]?.port).toBe(8443);
+    expect(relay.metrics.read(METRIC_NAMES.bytesRelayed)).toBeGreaterThan(0);
+  });
+
+  it('refuses preview traffic to a box that only implements owner and HTTP listeners', async () => {
+    const relay = await startRelay();
+    const box = makeBox();
+    const { token } = relay.registry.createInvite('legacy', 60_000);
+    const connected = await connectBox(relay, box, token, ['http1', 'h2']);
+    const tunnel = relay.server.tunnelFor(box.label)!;
+    expect(tunnel.parkedCount).toBeGreaterThan(0);
+    const parked = tunnel.parkedCount;
+    const client = connectTls({
+      host: '127.0.0.1',
+      port: relay.server.previewPort!,
+      servername: `${box.label}.${RELAY_DOMAIN}`,
+      rejectUnauthorized: false
+    });
+    cleanups.push(async () => {
+      client.destroy();
+    });
+    const outcome = await new Promise<string>((resolve) => {
+      client.once('secureConnect', () => resolve('connected'));
+      client.once('error', () => resolve('refused'));
+    });
+    expect(outcome).toBe('refused');
+    expect(connected.binds).toHaveLength(0);
+    expect(tunnel.parkedCount).toBe(parked);
+    expect(tunnel.activeCount).toBe(0);
+  });
+
+  it('does not accept control connections on the preview listener', async () => {
+    const relay = await startRelay();
+    expect(relay.server.previewPort).toBeGreaterThan(0);
+    const box = makeBox();
+    const client = connectTls({
+      host: '127.0.0.1',
+      port: relay.server.previewPort!,
+      servername: RELAY_DOMAIN,
+      key: box.keyPem,
+      cert: box.certPem,
+      rejectUnauthorized: false,
+      ALPNProtocols: [CONTROL_ALPN]
+    });
+    cleanups.push(async () => {
+      client.destroy();
+    });
+    const outcome = await new Promise<string>((resolve) => {
+      client.once('secureConnect', () => resolve('connected'));
+      client.once('error', () => resolve('refused'));
+    });
+    expect(outcome).toBe('refused');
+  });
+
+  it('advertises absent previews when the operator disables the separate listener', async () => {
+    const relay = await startRelay({ previewPort: null });
+    const box = makeBox();
+    const { token } = relay.registry.createInvite('disabled-preview', 60_000);
+    const connected = await connectBox(relay, box, token);
+    expect(relay.server.previewPort).toBeNull();
+    const welcome = connected.harness.messages.find((message) => message.t === 'welcome');
+    expect(welcome).toBeDefined();
+    expect(welcome?.t === 'welcome' && welcome.caps).toEqual([]);
+  });
+});
 
 describe('handshake and forwarding', () => {
   it('enrolls a box, derives its label and relays bytes end to end', async () => {

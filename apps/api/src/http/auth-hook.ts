@@ -65,6 +65,8 @@ const publicPaths = new Set([
   '/v1/auth/register/verify',
   '/v1/auth/login/options',
   '/v1/auth/login/verify',
+  '/v1/auth/native/start',
+  '/v1/auth/native/redeem',
   '/v1/auth/recover/options',
   '/v1/auth/recover/verify',
   /*
@@ -103,6 +105,8 @@ const publicPaths = new Set([
  * caller address the way account recovery already is.
  */
 const authRateLimitedPaths = new Set([
+  '/v1/auth/native/start',
+  '/v1/auth/native/:id/decision',
   /*
    * Registration is the first-owner ceremony and was the one pair on `publicPaths` that this table
    * did not cover, which made the comment above false. It is gated on a pairing code presented by a
@@ -207,6 +211,10 @@ const requiredApiTokenScope = (method: string, route: string): ApiTokenScope | u
    * every reason to know.
    */
   if (route === '/v1/tasks/:taskId/security-mode') return writing ? undefined : 'tasks:read';
+  if (route === '/v1/tasks/:taskId/bundle') return 'files:read';
+  if (route === '/v1/coding-missions/:missionId/review') return 'files:read';
+  if (route === '/v1/coding-missions/:missionId/integrate') return 'files:write';
+  if (route === '/v1/coding-missions/:missionId/cancel') return 'tasks:write';
   // One `/v1/tasks` write is not a task write: `POST /v1/tasks/:taskId/trajectory` with a
   // `computer` or `both` rewind replaces the filesystem. This table is read from `onRequest`,
   // before a body exists, so that one is refused at its own route instead.
@@ -235,6 +243,14 @@ const requiredApiTokenScope = (method: string, route: string): ApiTokenScope | u
      */
     if (route === '/v1/workspaces/:workspaceId/security-mode')
       return writing ? undefined : 'workspaces:read';
+    if (route === '/v1/workspaces/:workspaceId/download') return 'files:read';
+    if (
+      route === '/v1/workspaces/:workspaceId/computation' ||
+      route === '/v1/workspaces/:workspaceId/debugger' ||
+      route === '/v1/workspaces/:workspaceId/computation/:session/control' ||
+      route === '/v1/workspaces/:workspaceId/debugger/:session/control'
+    )
+      return writing ? undefined : 'files:read';
     if (route.includes('/file')) return writing ? 'files:write' : 'files:read';
     if (route.includes('/browser') || route.includes('/desktop') || route.includes('/terminal'))
       return 'workspaces:write';

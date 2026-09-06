@@ -1,4 +1,4 @@
-const SHELL_CACHE = 'athanor-shell-2026-09-06';
+const SHELL_CACHE = 'garden-shell-2026-09-06';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 self.addEventListener('install', (event) => {
@@ -16,7 +16,10 @@ self.addEventListener('activate', (event) => {
       const names = await caches.keys();
       await Promise.all(
         names
-          .filter((name) => name.startsWith('athanor') && name !== SHELL_CACHE)
+          .filter(
+            (name) =>
+              (name.startsWith('athanor') || name.startsWith('garden')) && name !== SHELL_CACHE
+          )
           .map((name) => caches.delete(name))
       );
       await self.clients.claim();
@@ -48,7 +51,7 @@ self.addEventListener('fetch', (event) => {
         } catch {
           return (
             (await (await caches.open(SHELL_CACHE)).match('/')) ||
-            new Response('You are offline. Reconnect to open athanor.', {
+            new Response('You are offline. Reconnect to open garden.', {
               status: 503,
               headers: { 'content-type': 'text/plain; charset=utf-8' }
             })
@@ -109,7 +112,7 @@ self.addEventListener('push', (event) => {
               .slice(0, 2)
           : [];
       await self.registration.showNotification(
-        typeof payload.title === 'string' ? payload.title : 'athanor',
+        typeof payload.title === 'string' ? payload.title : 'garden',
         {
           body: typeof payload.body === 'string' ? payload.body : 'Your work has an update.',
           tag: typeof payload.tag === 'string' ? payload.tag : undefined,

@@ -1,3 +1,4 @@
+import { parkCodingMissionWait } from '../coding-missions.js';
 /**
  * The batch of calls the model proposed, and the nine gates each one passes before it runs.
  *
@@ -265,6 +266,21 @@ export const dispatchToolCalls = async (
     // the interface said the task had stopped. honorUserControl seals the calls that never ran,
     // so the transcript stays answerable if the task is later resumed.
     if (await honorUserControl()) return 'returned';
+    if (
+      (call.name === 'finish' ||
+        (call.name === 'coding_agent' &&
+          call.arguments.agent === 'garden' &&
+          call.arguments.action === 'wait')) &&
+      (await parkCodingMissionWait(
+        deps,
+        task,
+        key,
+        state,
+        call,
+        response.toolCalls.slice(callIndex + 1)
+      ))
+    )
+      return 'returned';
     /*
      * Plan mode, in front of everything that can start a tool rather than in front of the floor.
      *

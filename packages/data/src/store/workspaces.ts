@@ -83,7 +83,7 @@ export class WorkspaceStore {
     const result = await this.database.query(
       `SELECT w.*, k.wrapped_key, k.wrapping_mode FROM workspaces w
        JOIN workspace_keys k ON k.workspace_id = w.id
-       WHERE w.user_id = $1 ORDER BY w.created_at DESC`,
+       WHERE w.user_id = $1 AND w.internal_parent_task_id IS NULL ORDER BY w.created_at DESC`,
       [userId]
     );
     return result.rows.map(mapWorkspace);
@@ -813,13 +813,15 @@ export class WorkspaceStore {
 
   async listArtifacts(
     userId: string,
-    workspaceId: string
+    workspaceId: string,
+    taskId?: string,
+    limit?: number
   ): Promise<Array<Record<string, unknown>>> {
     const result = await this.database.query(
       `SELECT a.* FROM artifacts a JOIN workspaces w ON w.id=a.workspace_id
-       WHERE a.workspace_id=$2 AND w.user_id=$1
-       ORDER BY a.created_at DESC`,
-      [userId, workspaceId]
+       WHERE a.workspace_id=$2 AND w.user_id=$1 AND ($3::uuid IS NULL OR a.task_id=$3)
+       ORDER BY a.created_at DESC LIMIT $4`,
+      [userId, workspaceId, taskId ?? null, limit ?? null]
     );
     return result.rows.map((row) => ({
       id: String(row.id),

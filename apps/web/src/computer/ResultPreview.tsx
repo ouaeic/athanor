@@ -1,9 +1,10 @@
-import { useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import type { Artifact } from '@athanor/contracts';
 import { responseError } from '../client.js';
 import { shareArtifactDocument } from '../share-html.js';
 import { message, mimeTypeForFile } from './format.js';
 import '../computer.css';
+const Markdown = lazy(() => import('../MarkdownBody'));
 
 export function ResultPreview({ artifact }: { artifact: Artifact }) {
   const url = `/v1/artifacts/${artifact.id}/content`;
@@ -78,6 +79,14 @@ export function ResultPreview({ artifact }: { artifact: Artifact }) {
         sandbox=""
         referrerPolicy="no-referrer"
       />
+    );
+  if (plain && /\.md(?:own)?$/i.test(artifact.name) && artifact.sizeBytes <= 262144)
+    return content === null ? (
+      <p className="muted">Loading document…</p>
+    ) : (
+      <Suspense fallback={<p className="muted">Opening document…</p>}>
+        <Markdown>{content}</Markdown>
+      </Suspense>
     );
   if (plain && artifact.sizeBytes <= 262144)
     return <pre className="computer-log">{content ?? 'Loading preview…'}</pre>;

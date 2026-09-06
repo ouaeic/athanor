@@ -6,6 +6,7 @@ import type {
   ConnectorScope,
   NotificationKind,
   TaskEventKind,
+  TaskReasoningEffort,
   TaskScheduleSpec
 } from '@athanor/contracts';
 import type { SecurityMode } from '@athanor/contracts';
@@ -77,10 +78,15 @@ export interface WorkspaceRecord {
 }
 
 export interface TaskRecord {
+  /** Current delivery read model, populated in one aggregate for a requested task page. */
+  deliveryStatus?: 'pending' | 'ready' | 'incomplete' | null;
+  pendingDeliveryCount?: number;
   id: string;
   userId: string;
   workspaceId: string;
   parentTaskId: string | null;
+  parentMissionId?: string | null;
+  hasCodingFamily?: boolean;
   branchedFromEventId: string | null;
   forkKind: 'branch' | 'edit' | 'retry' | null;
   /**
@@ -105,6 +111,7 @@ export interface TaskRecord {
   archivedAt: string | null;
   status: string;
   modelId: string;
+  reasoningEffort?: TaskReasoningEffort;
   privacyRoute: string;
   securityMode: SecurityMode;
   maxComputeCredits: number;
@@ -155,6 +162,7 @@ export interface TaskMessageQueueRecord {
   userId: string;
   promptCiphertext: EncryptedEnvelope;
   modelId: string;
+  reasoningEffort?: TaskReasoningEffort;
   privacyRoute: string;
   maxComputeCredits: number;
   maxSpendUsd: number | null;

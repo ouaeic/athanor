@@ -1,3 +1,4 @@
+import { discardMissionInvocation, trackMissionInvocation } from './mission-processes.js';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
@@ -15,7 +16,7 @@ import {
 } from './execution.js';
 import { ensureWorkspace } from './files.js';
 import { belowHostStorageFloor, hostStorage as probeHostStorage } from './host-storage.js';
-import { type AgentSandbox } from './sandbox.js';
+import { isCodingMissionWorkspace, type AgentSandbox } from './sandbox.js';
 import {
   DEFAULT_SERVICE_POLICY,
   givenUp,
@@ -26,6 +27,10 @@ import {
   serviceView,
   ServiceRegistry,
   SERVICE_LIMIT_PER_WORKSPACE,
+  JOB_HISTORY_LIMIT,
+  JOB_LOG_BYTES,
+  JOB_CHECKPOINT_MS,
+  ServiceLaunchSchema,
   workspaceDirectories,
   type ServiceLaunch,
   type ServicePolicy,
@@ -35,47 +40,55 @@ import { agentAccountUid, agentListeningSockets, listeningSocketsOfGroup } from 
 import { reachOfBindAddress } from '@athanor/core';
 import { awaitChildExit, DEFAULT_FLUSH_GRACE_MS } from './subprocess.js';
 
-const BackgroundRequest = z.object({
-  executable: z.string().min(1).max(4096),
-  /** 8,192 for the reason `ExecRequest` states: a per-contig scatter is thousands of arguments. */
-  args: z.array(z.string().max(100_000)).max(8_192).default([]),
-  cwd: z.string().default('workspace'),
-  env: z.record(z.string(), z.string()).default({}),
-  /*
-   * An hour by default, and NO maximum here. The DEFAULT stays an hour on purpose: it is what a
-   * caller that names nothing gets, and a job with no stated deadline should not be able to hold a
-   * slot for a day by omission. A long job says how long it is.
-   *
-   * The `.max(86_400)` this line used to carry was the same defect as the hour it replaced,
-   * arriving from the other side. `MAX_BACKGROUND_SECONDS` is documented as the ceiling and an
-   * owner can raise it, and until this was removed raising it above a day did nothing at all:
-   * measured on this branch with the ceiling set to 172,800 and 129,600s asked for, the answer was
-   * `runner_invalid_request - timeoutSeconds: too big: expected number to be <=86400`. A zod
-   * sentence, naming a number that was no longer this box's limit, for a run the box was configured
-   * to allow. So the owner with a forty-hour assembly - the work this computer exists for - could
-   * not ask for it by any configuration, and the message told them the wrong reason.
-   *
-   * There is exactly one authority on how long a background command may run now, and it is
-   * `refuseUnreachableTimeout` against the configured ceiling, a few lines into `start`. It names
-   * the real number of the box it is running on. What would change this line: nothing, because the
-   * number it used to hold has moved to where it can be configured.
-   */
-  timeoutSeconds: z.number().int().positive().default(3_600),
-  stdin: z.string().max(10_000_000).optional(),
-  network: z.boolean().default(false),
-  maxOutputBytes: z
-    .number()
-    .int()
-    .min(4_096)
-    .max(20 * 1024 * 1024)
-    .default(1024 * 1024),
-  /*
-   * Naming the service is what turns a background session into one the computer keeps running: the
-   * name is the record the owner reads, so there is no way to declare a service without saying what
-   * it is. A service ignores `timeoutSeconds` entirely - the hour was the bug.
-   */
-  service: z.string().min(1).max(120).optional()
-});
+const BackgroundRequest = z
+  .object({
+    executable: z.string().min(1).max(4096),
+    /** 8,192 for the reason `ExecRequest` states: a per-contig scatter is thousands of arguments. */
+    args: z.array(z.string().max(100_000)).max(8_192).default([]),
+    cwd: z.string().default('workspace'),
+    env: z.record(z.string(), z.string()).default({}),
+    /*
+     * An hour by default, and NO maximum here. The DEFAULT stays an hour on purpose: it is what a
+     * caller that names nothing gets, and a job with no stated deadline should not be able to hold a
+     * slot for a day by omission. A long job says how long it is.
+     *
+     * The `.max(86_400)` this line used to carry was the same defect as the hour it replaced,
+     * arriving from the other side. `MAX_BACKGROUND_SECONDS` is documented as the ceiling and an
+     * owner can raise it, and until this was removed raising it above a day did nothing at all:
+     * measured on this branch with the ceiling set to 172,800 and 129,600s asked for, the answer was
+     * `runner_invalid_request - timeoutSeconds: too big: expected number to be <=86400`. A zod
+     * sentence, naming a number that was no longer this box's limit, for a run the box was configured
+     * to allow. So the owner with a forty-hour assembly - the work this computer exists for - could
+     * not ask for it by any configuration, and the message told them the wrong reason.
+     *
+     * There is exactly one authority on how long a background command may run now, and it is
+     * `refuseUnreachableTimeout` against the configured ceiling, a few lines into `start`. It names
+     * the real number of the box it is running on. What would change this line: nothing, because the
+     * number it used to hold has moved to where it can be configured.
+     */
+    timeoutSeconds: z.number().int().positive().default(3_600),
+    stdin: z.string().max(10_000_000).optional(),
+    network: z.boolean().default(false),
+    maxOutputBytes: z
+      .number()
+      .int()
+      .min(4_096)
+      .max(20 * 1024 * 1024)
+      .default(1024 * 1024),
+    /*
+     * Naming the service is what turns a background session into one the computer keeps running: the
+     * name is the record the owner reads, so there is no way to declare a service without saying what
+     * it is. A service ignores `timeoutSeconds` entirely - the hour was the bug.
+     */
+    service: z.string().min(1).max(120).optional(),
+    job: z.string().min(1).max(120).optional(),
+    checkpointResume: ServiceLaunchSchema.optional()
+  })
+  .refine((request) => !(request.service && request.job), 'Choose a service or a finite job')
+  .refine(
+    (request) => !request.checkpointResume || Boolean(request.job),
+    'A checkpoint resume command requires a finite job'
+  );
 
 type Status = 'running' | 'completed' | 'failed' | 'timed_out' | 'stopped';
 
@@ -105,6 +118,7 @@ interface Session {
   timeout?: NodeJS.Timeout;
   /** The host-disk floor watch, cleared the moment the process is no longer writing to it. */
   diskFloor?: NodeJS.Timeout;
+  settled?: Promise<void>;
 }
 
 /** Everything needed to put a service's process back, held once per supervised service. */
@@ -117,6 +131,8 @@ interface Supervised {
   restart?: NodeJS.Timeout;
   /** Set before a deliberate kill so the exit that follows is not read as a death to recover from. */
   retiring: boolean;
+  outputOffset?: number;
+  settledSession?: Session;
   /**
    * What the kernel says this service is listening on, or undefined for not yet observed.
    *
@@ -202,9 +218,14 @@ const noteOnStderr = (session: Session, note: string): void => {
 };
 
 export class ProcessManager {
+  readonly #quiesced = new Set<string>();
   readonly #sessions = new Map<string, Session>();
   readonly #supervised = new Map<string, Supervised>();
+  readonly #jobs = new Map<string, Supervised>();
+  readonly #recoveries = new Map<string, Promise<boolean>>();
+  #jobCheckpoint: NodeJS.Timeout | undefined;
   readonly #registries = new Map<string, ServiceRegistry>();
+  readonly #declarations = new Map<string, Promise<unknown>>();
   readonly #flushGraceMs: number;
   readonly #policy: ServicePolicy;
   /**
@@ -254,23 +275,53 @@ export class ProcessManager {
     isolateNetwork: boolean,
     guards: Guards = {}
   ) {
+    if (this.#quiesced.has(workspaceId))
+      throw new Error('The coding mission execution scope is closed');
     const request = BackgroundRequest.parse(value);
     const name = request.service;
     if (name !== undefined)
-      return this.#declareService(workspaceRoot, workspaceId, owner, name, request, {
-        isolateNetwork,
-        guards
-      });
+      return this.#declareInOrder(workspaceId, () =>
+        this.#declareService(workspaceRoot, workspaceId, owner, name, request, {
+          isolateNetwork,
+          guards
+        })
+      );
     // Below the service branch because a service has no deadline at all, so the ceiling is not its
     // business. Everything else is answered before it starts rather than killed part-way through:
     // see `refuseUnreachableTimeout`, which is where the argument for refusing over clamping is.
     refuseUnreachableTimeout(value, maximumSeconds, true);
+    if (request.job)
+      return this.#declareInOrder(workspaceId, () =>
+        this.#declareJob(workspaceRoot, workspaceId, owner, request, {
+          maximumSeconds,
+          isolateNetwork,
+          guards
+        })
+      );
     const session = await this.#launch(workspaceRoot, workspaceId, owner, request, {
       maximumSeconds,
       isolateNetwork,
       guards
     });
     return this.#view(session, false);
+  }
+
+  #declareInOrder<T>(workspaceId: string, declare: () => Promise<T>): Promise<T> {
+    const previous = this.#declarations.get(workspaceId) ?? Promise.resolve();
+    const next = previous
+      .catch(() => undefined)
+      .then(() => {
+        if (this.#quiesced.has(workspaceId))
+          throw new Error('The coding mission execution scope is closed');
+        return declare();
+      });
+    this.#declarations.set(workspaceId, next);
+    void next
+      .finally(() => {
+        if (this.#declarations.get(workspaceId) === next) this.#declarations.delete(workspaceId);
+      })
+      .catch(() => undefined);
+    return next;
   }
 
   /**
@@ -290,6 +341,8 @@ export class ProcessManager {
       guards: Guards;
       id?: string;
       onSettled?: (session: Session) => void;
+      finite?: boolean;
+      deadlineAt?: string;
     }
   ): Promise<Session> {
     const guards = options.guards;
@@ -306,6 +359,10 @@ export class ProcessManager {
       // helper, and this path owes both.
       systemPackages: { mode: 'refused', helper: guards.systemPackageHelper }
     });
+    if (this.#quiesced.has(workspaceId)) {
+      await discardMissionInvocation(prepared);
+      throw new Error('The coding mission execution scope is closed');
+    }
     const child = spawn(prepared.executable, prepared.args, {
       cwd: prepared.cwd,
       env: prepared.env,
@@ -314,6 +371,7 @@ export class ProcessManager {
       detached: true,
       shell: false
     });
+    trackMissionInvocation(workspaceRoot, prepared, child);
     const id = options.id ?? `proc_${randomUUID()}`;
     const supervised = options.onSettled !== undefined;
     // A service has no deadline. That is the whole point of it: the hour was what made a link the
@@ -322,21 +380,27 @@ export class ProcessManager {
       request.timeoutSeconds,
       options.maximumSeconds ?? request.timeoutSeconds
     );
-    const timeout = supervised
-      ? undefined
-      : setTimeout(() => {
-          const session = this.#sessions.get(id);
-          if (!session || session.status !== 'running') return;
-          session.status = 'timed_out';
-          // The deadline states itself in the log, exactly as the disk floor and the owner's stop
-          // do. This was the one stop on this path that left `status: "timed_out"` beside an empty
-          // stderr, which reads to a model like a job that died for no reason it can name.
-          noteOnStderr(
-            session,
-            timedOutNote(allowedSeconds, options.maximumSeconds ?? allowedSeconds, true)
+    const timeout =
+      supervised && !options.finite
+        ? undefined
+        : setTimeout(
+            () => {
+              const session = this.#sessions.get(id);
+              if (!session || session.status !== 'running') return;
+              session.status = 'timed_out';
+              // The deadline states itself in the log, exactly as the disk floor and the owner's stop
+              // do. This was the one stop on this path that left `status: "timed_out"` beside an empty
+              // stderr, which reads to a model like a job that died for no reason it can name.
+              noteOnStderr(
+                session,
+                timedOutNote(allowedSeconds, options.maximumSeconds ?? allowedSeconds, true)
+              );
+              stopProcessTree(child);
+            },
+            options.deadlineAt
+              ? Math.max(1, Date.parse(options.deadlineAt) - Date.now())
+              : allowedSeconds * 1_000
           );
-          stopProcessTree(child);
-        }, allowedSeconds * 1_000);
     timeout?.unref();
     const session: Session = {
       id,
@@ -349,7 +413,11 @@ export class ProcessManager {
       stderr: boundedCollector(request.maxOutputBytes),
       startedAt: new Date().toISOString(),
       ...(timeout
-        ? { timeout, deadlineAt: new Date(Date.now() + allowedSeconds * 1_000).toISOString() }
+        ? {
+            timeout,
+            deadlineAt:
+              options.deadlineAt ?? new Date(Date.now() + allowedSeconds * 1_000).toISOString()
+          }
         : {})
     };
     this.#sessions.set(id, session);
@@ -423,7 +491,7 @@ export class ProcessManager {
       }
       setTimeout(() => this.#sessions.delete(id), 60 * 60 * 1_000).unref();
     };
-    void awaitChildExit(child, this.#flushGraceMs).then(
+    session.settled = awaitChildExit(child, this.#flushGraceMs).then(
       ({ exitCode, signal }) => settle(exitCode === 0 ? 'completed' : 'failed', exitCode, signal),
       // A command that never started - a missing executable, an unexecutable file - emits 'error'
       // and no 'exit'. Without this the session would sit at `running` until its timeout killed a
@@ -483,6 +551,301 @@ export class ProcessManager {
     return registry;
   }
 
+  async #declareJob(
+    root: string,
+    workspaceId: string,
+    owner: string,
+    request: z.infer<typeof BackgroundRequest>,
+    options: { maximumSeconds: number; isolateNetwork: boolean; guards: Guards }
+  ) {
+    const registry = this.#registry(root, workspaceId);
+    if (registry.list().length === 0) await registry.load();
+    const active = registry
+      .list()
+      .filter(
+        (record) => record.kind !== 'job' || ['running', 'interrupted'].includes(record.state)
+      );
+    if (active.length >= SERVICE_LIMIT_PER_WORKSPACE)
+      throw new Error(
+        'This workspace has reached its limit of active persistent processes. Stop one before starting another.'
+      );
+    const record = newServiceRecord({
+      workspaceId,
+      owner,
+      name: request.job!,
+      kind: 'job',
+      launch: ServiceLaunchSchema.parse(request),
+      ...(request.checkpointResume ? { checkpointResume: request.checkpointResume } : {}),
+      deadlineAt: new Date(Date.now() + request.timeoutSeconds * 1_000).toISOString()
+    });
+    // Journal before executing: an uncertain launch may require attention, but may never become
+    // an unrecorded command that a restart blindly executes again.
+    await registry.put(record, true);
+    const job: Supervised = {
+      record,
+      registry,
+      root,
+      isolateNetwork: options.isolateNetwork,
+      guards: options.guards,
+      retiring: false
+    };
+    this.#jobs.set(record.id, job);
+    this.#startJobCheckpoint();
+    try {
+      const session = await this.#launch(root, workspaceId, owner, request, {
+        ...options,
+        id: record.id,
+        finite: true,
+        ...(record.deadlineAt ? { deadlineAt: record.deadlineAt } : {}),
+        onSettled: () => this.#jobDied(record.id)
+      });
+      record.startedAt = session.startedAt;
+      record.pid = session.status === 'running' ? session.child.pid : undefined;
+      record.deadlineAt = session.deadlineAt;
+      this.#captureJob(job, session, true);
+      await registry.flush();
+      await this.#pruneJobHistory(workspaceId);
+      return this.#view(session, false);
+    } catch (cause) {
+      record.state = 'failed';
+      record.lastExit = {
+        at: new Date().toISOString(),
+        exitCode: null,
+        signal: null,
+        reason: cause instanceof Error ? cause.message.slice(0, 200) : 'Could not start'
+      };
+      await registry.put(record);
+      throw cause;
+    }
+  }
+
+  #startJobCheckpoint(): void {
+    if (this.#jobCheckpoint) return;
+    this.#jobCheckpoint = setInterval(() => {
+      for (const [id, job] of this.#jobs) {
+        const session = this.#sessions.get(id);
+        if (session?.status === 'running' && !job.retiring) this.#captureJob(job, session);
+      }
+    }, JOB_CHECKPOINT_MS);
+    this.#jobCheckpoint.unref();
+  }
+
+  #captureJob(job: Supervised, session: Session, force = false): void {
+    const bytes = session.stdout.bytes + session.stderr.bytes + (job.outputOffset ?? 0);
+    if (!force && job.record.output?.bytes === bytes) return;
+    const bounded = (text: string, stream: 'stdout' | 'stderr') => {
+      const collector = boundedCollector(JOB_LOG_BYTES);
+      collector.push(Buffer.from(text));
+      return collector.text(stream);
+    };
+    job.record.output = {
+      stdout: bounded(session.stdout.text('stdout'), 'stdout'),
+      stderr: bounded(session.stderr.text('stderr'), 'stderr'),
+      bytes,
+      savedAt: new Date().toISOString()
+    };
+    if (!job.retiring) job.record.state = session.status;
+    if (session.finishedAt) {
+      job.record.pid = undefined;
+      job.record.lastExit = {
+        at: session.finishedAt,
+        exitCode: session.exitCode ?? null,
+        signal: session.signal ?? null,
+        reason: session.status
+      };
+    }
+    void job.registry.put(job.record);
+  }
+
+  #jobDied(id: string): void {
+    const job = this.#jobs.get(id);
+    const session = this.#sessions.get(id);
+    if (!job || !session || job.retiring) return;
+    if (!session.child.pid && this.#recoveries.has(id)) return;
+    this.#captureJob(job, session, true);
+    void this.#pruneJobHistory(job.record.workspaceId);
+  }
+
+  async #pruneJobHistory(workspaceId: string): Promise<void> {
+    const terminal = [...this.#jobs.values()]
+      .filter(
+        (job) =>
+          job.record.workspaceId === workspaceId &&
+          !['running', 'interrupted'].includes(job.record.state)
+      )
+      .sort(
+        (a, b) =>
+          Date.parse(a.record.lastExit?.at ?? a.record.createdAt) -
+          Date.parse(b.record.lastExit?.at ?? b.record.createdAt)
+      );
+    for (const job of terminal.slice(0, Math.max(0, terminal.length - JOB_HISTORY_LIMIT))) {
+      this.#jobs.delete(job.record.id);
+      this.#sessions.delete(job.record.id);
+      await job.registry.remove(job.record.id);
+    }
+  }
+
+  #resumeJob(job: Supervised): Promise<boolean> {
+    const pending = this.#recoveries.get(job.record.id);
+    if (pending) return pending;
+    const next = Promise.resolve().then(() => this.#recoverJob(job));
+    this.#recoveries.set(job.record.id, next);
+    void next
+      .finally(() => {
+        if (this.#recoveries.get(job.record.id) === next) this.#recoveries.delete(job.record.id);
+      })
+      .catch(() => undefined);
+    return next;
+  }
+
+  async #recoverJob(job: Supervised): Promise<boolean> {
+    const record = job.record;
+    if (!['running', 'interrupted'].includes(record.state)) return false;
+    await reclaimOrphan(record);
+    record.pid = undefined;
+    record.state = 'interrupted';
+    record.lastExit = {
+      at: new Date().toISOString(),
+      exitCode: null,
+      signal: null,
+      reason: 'Runner stopped before a terminal result was recorded'
+    };
+    await job.registry.put(record, true);
+    if (!record.checkpointResume) return false;
+    const remaining = record.deadlineAt
+      ? Math.ceil((Date.parse(record.deadlineAt) - Date.now()) / 1_000)
+      : 0;
+    if (remaining <= 0) {
+      record.state = 'timed_out';
+      record.lastExit.reason = 'The declared job deadline has passed';
+      await job.registry.put(record);
+      return false;
+    }
+    try {
+      const session = await this.#launch(
+        job.root,
+        record.workspaceId,
+        record.owner,
+        { ...record.checkpointResume, timeoutSeconds: remaining },
+        {
+          isolateNetwork: job.isolateNetwork,
+          guards: job.guards,
+          id: record.id,
+          finite: true,
+          ...(record.deadlineAt ? { deadlineAt: record.deadlineAt } : {}),
+          onSettled: () => this.#jobDied(record.id)
+        }
+      );
+      if (!session.child.pid) {
+        await session.settled;
+        record.state = 'interrupted';
+        record.lastExit = {
+          at: new Date().toISOString(),
+          exitCode: null,
+          signal: null,
+          reason: 'Checkpoint program could not start; check its executable and working directory'
+        };
+        this.#sessions.delete(record.id);
+        await job.registry.put(record);
+        return false;
+      }
+      if (record.output) {
+        session.stdout.push(Buffer.from(record.output.stdout));
+        session.stderr.push(Buffer.from(record.output.stderr));
+        job.outputOffset = Math.max(
+          0,
+          record.output.bytes - session.stdout.bytes - session.stderr.bytes
+        );
+      }
+      record.restarts += 1;
+      record.startedAt = session.startedAt;
+      record.pid = session.status === 'running' ? session.child.pid : undefined;
+      this.#captureJob(job, session, true);
+      await job.registry.flush();
+      return true;
+    } catch (cause) {
+      record.state = 'interrupted';
+      record.lastExit.reason =
+        cause instanceof Error ? cause.message.slice(0, 200) : 'Checkpoint resume could not start';
+      await job.registry.put(record);
+      return false;
+    }
+  }
+
+  recoveryPlan(workspaceId: string, owner: string | null, id: string) {
+    const job = this.#jobs.get(id);
+    if (
+      !job ||
+      job.record.workspaceId !== workspaceId ||
+      (owner !== null && job.record.owner !== owner)
+    )
+      throw new Error('Finite job not found');
+    const record = job.record;
+    if (record.state !== 'interrupted')
+      throw new Error('Only an interrupted finite job can resume');
+    if (!record.checkpointResume)
+      throw new Error('This job has no declared checkpoint recovery command');
+    const { executable, args, cwd, network } = record.checkpointResume;
+    return {
+      jobId: id,
+      name: record.name,
+      deadlineAt: record.deadlineAt,
+      checkpointResume: { executable, args, cwd, network }
+    };
+  }
+
+  async resumeJob(workspaceId: string, owner: string | null, id: string) {
+    this.recoveryPlan(workspaceId, owner, id);
+    const job = this.#jobs.get(id)!;
+    await this.#resumeJob(job);
+    const session = this.#sessions.get(id);
+    return session ? this.#view(session, false) : this.#jobView(job, false);
+  }
+
+  #jobView(job: Supervised, includeLogs: boolean) {
+    const record = job.record;
+    const finished = record.state !== 'running';
+    return {
+      sessionId: record.id,
+      status: record.state,
+      command: [record.launch.executable, ...record.launch.args],
+      startedAt: record.startedAt,
+      ranForMs: Math.max(
+        0,
+        Date.parse(
+          finished ? (record.lastExit?.at ?? record.startedAt) : new Date().toISOString()
+        ) - Date.parse(record.startedAt)
+      ),
+      outputBytes: record.output?.bytes ?? 0,
+      service: undefined,
+      ...(!finished && record.deadlineAt
+        ? { remainingMs: Math.max(0, Date.parse(record.deadlineAt) - Date.now()) }
+        : {}),
+      ...(record.deadlineAt ? { deadlineAt: record.deadlineAt } : {}),
+      ...(finished && record.lastExit
+        ? {
+            finishedAt: record.lastExit.at,
+            exitCode: record.lastExit.exitCode,
+            signal: record.lastExit.signal
+          }
+        : {}),
+      lifetime: 'job' as const,
+      job: {
+        jobId: record.id,
+        name: record.name,
+        state: record.state,
+        createdAt: record.createdAt,
+        startedAt: record.startedAt,
+        restarts: record.restarts,
+        checkpointResumable: Boolean(record.checkpointResume),
+        ...(record.lastExit ? { lastExit: record.lastExit } : {})
+      },
+      ...(includeLogs
+        ? { stdout: record.output?.stdout ?? '', stderr: record.output?.stderr ?? '' }
+        : {})
+    };
+  }
+
   async #declareService(
     root: string,
     workspaceId: string,
@@ -493,7 +856,13 @@ export class ProcessManager {
   ) {
     const registry = this.#registry(root, workspaceId);
     if (registry.list().length === 0) await registry.load();
-    if (registry.list().length >= SERVICE_LIMIT_PER_WORKSPACE)
+    if (
+      registry
+        .list()
+        .filter(
+          (record) => record.kind !== 'job' || ['running', 'interrupted'].includes(record.state)
+        ).length >= SERVICE_LIMIT_PER_WORKSPACE
+    )
       throw new Error(
         `This computer already keeps ${SERVICE_LIMIT_PER_WORKSPACE} services running. Stop one before starting another.`
       );
@@ -531,6 +900,7 @@ export class ProcessManager {
       retiring: false
     });
     await registry.put(record);
+    if (session.status !== 'running') this.#serviceDied(record.id);
     return this.#view(session, false);
   }
 
@@ -657,6 +1027,8 @@ export class ProcessManager {
     // A deliberate stop, a workspace-wide stop, or a shutdown. The process ending is the intended
     // outcome, not something to recover from.
     if (supervised.retiring) return;
+    if (supervised.settledSession === session) return;
+    supervised.settledSession = session;
     const record = supervised.record;
     const ranForMs = Math.max(0, Date.now() - Date.parse(record.startedAt));
     record.lastExit = {
@@ -784,10 +1156,22 @@ export class ProcessManager {
   ): Promise<number> {
     const registry = this.#registry(root, workspaceId);
     const records = await registry.load();
+    if (await isCodingMissionWorkspace(root)) {
+      this.#quiesced.add(workspaceId);
+      return 0;
+    }
     if (records.length === 0) return 0;
     await ensureWorkspace(root);
     let started = 0;
     for (const record of records) {
+      if (record.kind === 'job') {
+        if (this.#jobs.has(record.id)) continue;
+        const job: Supervised = { record, registry, root, isolateNetwork, guards, retiring: false };
+        this.#jobs.set(record.id, job);
+        this.#startJobCheckpoint();
+        if (await this.#resumeJob(job)) started += 1;
+        continue;
+      }
       if (this.#supervised.has(record.id)) continue;
       await reclaimOrphan(record);
       // A give-up is not permanent across a restart: the runner coming back is a different
@@ -806,6 +1190,7 @@ export class ProcessManager {
       await this.#relaunchService(record.id);
       started += 1;
     }
+    await this.#pruneJobHistory(workspaceId);
     return started;
   }
 
@@ -882,13 +1267,22 @@ export class ProcessManager {
    * product will restart across reboots, that no agent can name, cannot be turned off by asking.
    */
   list(workspaceId: string, owner: string) {
-    return [...this.#sessions.values()]
-      .filter(
-        (session) =>
-          session.workspaceId === workspaceId &&
-          (session.owner === owner || this.#supervised.has(session.id))
-      )
-      .map((session) => this.#view(session, false));
+    return [
+      ...[...this.#sessions.values()]
+        .filter(
+          (session) =>
+            session.workspaceId === workspaceId &&
+            (session.owner === owner ||
+              this.#supervised.has(session.id) ||
+              this.#jobs.has(session.id))
+        )
+        .map((session) => this.#view(session, false)),
+      ...[...this.#jobs.values()]
+        .filter(
+          (job) => job.record.workspaceId === workspaceId && !this.#sessions.has(job.record.id)
+        )
+        .map((job) => this.#jobView(job, false))
+    ];
   }
 
   /**
@@ -903,9 +1297,16 @@ export class ProcessManager {
    * boundary that matters here, and the capability token already carries it.
    */
   listWorkspace(workspaceId: string) {
-    return [...this.#sessions.values()]
-      .filter((session) => session.workspaceId === workspaceId)
-      .map((session) => this.#view(session, false));
+    return [
+      ...[...this.#sessions.values()]
+        .filter((session) => session.workspaceId === workspaceId)
+        .map((session) => this.#view(session, false)),
+      ...[...this.#jobs.values()]
+        .filter(
+          (job) => job.record.workspaceId === workspaceId && !this.#sessions.has(job.record.id)
+        )
+        .map((job) => this.#jobView(job, false))
+    ];
   }
 
   /**
@@ -927,6 +1328,21 @@ export class ProcessManager {
       })
       .parse(value);
     const session = this.#sessions.get(id);
+    const job = this.#jobs.get(id);
+    if (!session && job?.record.workspaceId === workspaceId && request.action !== 'write') {
+      if (request.action === 'kill' && ['running', 'interrupted'].includes(job.record.state)) {
+        job.retiring = true;
+        job.record.state = 'stopped';
+        job.record.lastExit = {
+          at: new Date().toISOString(),
+          exitCode: null,
+          signal: null,
+          reason: 'Stopped by owner or task'
+        };
+        void job.registry.put(job.record);
+      }
+      return this.#jobView(job, request.action === 'log' || request.action === 'poll');
+    }
     /*
      * A declared service is reachable by any task in its workspace, for exactly the two verbs the
      * owner's own null case was widened to, and for the same stated reason: stopping and reading
@@ -937,7 +1353,8 @@ export class ProcessManager {
      * Without this, `list` above would have been a worse defect than the one it fixed: a service
      * the agent can finally see and still cannot act on is a row that reads as a bug in the tool.
      */
-    const durable = this.#supervised.has(id) && session?.workspaceId === workspaceId;
+    const durable =
+      (this.#supervised.has(id) || this.#jobs.has(id)) && session?.workspaceId === workspaceId;
     const mayReach =
       owner === null || session?.owner === owner || (durable && request.action !== 'write');
     if (
@@ -952,6 +1369,7 @@ export class ProcessManager {
       if (supervised) this.#retireService(supervised);
       if (session.status === 'running') {
         session.status = 'stopped';
+        if (job) this.#captureJob(job, session, true);
         this.#stop(session);
       }
     }
@@ -969,6 +1387,17 @@ export class ProcessManager {
    * that is what brings the services back.
    */
   close() {
+    const endings: Promise<void>[] = [];
+    if (this.#jobCheckpoint) clearInterval(this.#jobCheckpoint);
+    this.#jobCheckpoint = undefined;
+    for (const [id, job] of this.#jobs) {
+      const session = this.#sessions.get(id);
+      if (session?.status === 'running') {
+        job.record.state = 'interrupted';
+        job.retiring = true;
+        this.#captureJob(job, session, true);
+      }
+    }
     for (const supervised of this.#supervised.values()) {
       supervised.retiring = true;
       if (supervised.restart) clearTimeout(supervised.restart);
@@ -976,11 +1405,18 @@ export class ProcessManager {
     this.#supervised.clear();
     this.#stopListenerSweepIfIdle();
     for (const session of this.#sessions.values()) {
+      if (session.settled) endings.push(session.settled);
       if (session.timeout) clearTimeout(session.timeout);
       if (session.diskFloor) clearInterval(session.diskFloor);
       if (session.status === 'running') this.#stop(session);
     }
     this.#sessions.clear();
+    this.#jobs.clear();
+    return Promise.all(endings).then(() => this.flush());
+  }
+
+  async flush(): Promise<void> {
+    await Promise.all([...this.#registries.values()].map((registry) => registry.flush()));
   }
 
   /**
@@ -988,7 +1424,57 @@ export class ProcessManager {
    * the services should not come back either; a snapshot or a checkpoint restore passes it off and
    * calls `resumeWorkspace` once the tree is settled.
    */
+  isWorkspaceBusy(workspaceId: string): boolean {
+    return (
+      this.#declarations.has(workspaceId) ||
+      [...this.#sessions.values()].some(
+        (session) => session.workspaceId === workspaceId && session.status === 'running'
+      ) ||
+      [...this.#supervised.values()].some(
+        (entry) => entry.record.workspaceId === workspaceId && !entry.retiring
+      ) ||
+      [...this.#jobs.values()].some(
+        (entry) => entry.record.workspaceId === workspaceId && entry.record.state === 'running'
+      )
+    );
+  }
+
+  async quiesceWorkspace(workspaceId: string): Promise<void> {
+    this.#quiesced.add(workspaceId);
+    const registries = new Set<ServiceRegistry>();
+    const drain = () => {
+      const registry = this.#registries.get(workspaceId);
+      if (registry) registries.add(registry);
+      const endings = [...this.#sessions.values()]
+        .filter((session) => session.workspaceId === workspaceId)
+        .map((session) => session.settled ?? Promise.resolve());
+      this.stopWorkspace(workspaceId);
+      if (registry) for (const record of registry.list()) void registry.remove(record.id);
+      return endings;
+    };
+    const recoveries = [...this.#jobs.values()]
+      .filter((job) => job.record.workspaceId === workspaceId)
+      .map((job) => this.#recoveries.get(job.record.id));
+    const endings = drain();
+    await Promise.allSettled([this.#declarations.get(workspaceId), ...recoveries]);
+    endings.push(...drain());
+    await Promise.all(endings);
+    await Promise.all([...registries].map((registry) => registry.flush(true)));
+    this.#registries.delete(workspaceId);
+  }
+
   stopWorkspace(workspaceId: string, options: { forget?: boolean } = {}) {
+    for (const [id, job] of this.#jobs) {
+      if (job.record.workspaceId !== workspaceId) continue;
+      const session = this.#sessions.get(id);
+      if (session?.status === 'running') {
+        job.record.state = 'interrupted';
+        job.retiring = true;
+        this.#captureJob(job, session, true);
+      }
+      this.#jobs.delete(id);
+      if (options.forget) void job.registry.remove(id);
+    }
     for (const [id, supervised] of this.#supervised) {
       if (supervised.record.workspaceId !== workspaceId) continue;
       supervised.retiring = true;
@@ -1048,6 +1534,25 @@ export class ProcessManager {
       )
       .map((supervised) => supervised.record.name);
     const stopped: string[] = [];
+    for (const [id, job] of this.#jobs) {
+      if (
+        job.record.workspaceId !== workspaceId ||
+        job.record.owner !== owner ||
+        this.#sessions.has(id) ||
+        job.record.state !== 'interrupted'
+      )
+        continue;
+      job.retiring = true;
+      job.record.state = 'stopped';
+      job.record.lastExit = {
+        at: new Date().toISOString(),
+        exitCode: null,
+        signal: null,
+        reason: OWNER_STOPPED_NOTE
+      };
+      void job.registry.put(job.record);
+      stopped.push(id);
+    }
     for (const [id, session] of this.#sessions) {
       if (session.workspaceId !== workspaceId || session.owner !== owner) continue;
       if (this.#supervised.has(id)) continue;
@@ -1056,6 +1561,8 @@ export class ProcessManager {
       if (session.diskFloor) clearInterval(session.diskFloor);
       session.status = 'stopped';
       noteOnStderr(session, OWNER_STOPPED_NOTE);
+      const job = this.#jobs.get(id);
+      if (job) this.#captureJob(job, session, true);
       this.#stop(session);
       stopped.push(id);
     }
@@ -1103,6 +1610,7 @@ export class ProcessManager {
    */
   #view(session: Session, includeLogs: boolean) {
     const supervised = this.#supervised.get(session.id);
+    const job = this.#jobs.get(session.id);
     const ranToMs = session.finishedAt ? Date.parse(session.finishedAt) : Date.now();
     return {
       sessionId: session.id,
@@ -1110,7 +1618,9 @@ export class ProcessManager {
       command: session.command,
       startedAt: session.startedAt,
       ranForMs: Math.max(0, ranToMs - Date.parse(session.startedAt)),
-      outputBytes: session.stdout.bytes + session.stderr.bytes,
+      outputBytes: session.stdout.bytes + session.stderr.bytes + (job?.outputOffset ?? 0),
+      lifetime: job ? ('job' as const) : supervised ? ('service' as const) : ('task' as const),
+      ...(job ? { job: this.#jobView(job, false).job } : {}),
       ...(session.deadlineAt ? { deadlineAt: session.deadlineAt } : {}),
       ...(session.deadlineAt && !session.finishedAt
         ? { remainingMs: Math.max(0, Date.parse(session.deadlineAt) - Date.now()) }

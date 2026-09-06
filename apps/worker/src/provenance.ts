@@ -373,7 +373,9 @@ const unboundedOriginOfResult = (call: ModelToolCall, result: unknown): string |
       // Window titles, accessibility text and pixels can all come from external documents.
       return 'desktop application';
     case 'coding_agent':
-      return textValue(call.arguments.action) === 'run' ? 'coding agent report' : null;
+      return ['run', 'review'].includes(textValue(call.arguments.action))
+        ? 'coding agent report'
+        : null;
     // A specialist is a reader with the lead's tools and none of the lead's window. Whatever it
     // read, the lead is now holding a model's rendering of - so the taint crosses with the report,
     // named by what the specialist actually touched rather than by the fact that a delegate ran.

@@ -53,7 +53,8 @@ export async function uploadAttachments(
 
 // Base64 expands by a third; this remains below the API's transcription payload limit.
 export const MAX_DICTATION_BYTES = 14_000_000;
-export const MAX_DICTATION_MILLISECONDS = 5 * 60_000;
+export const MAX_DICTATION_SECONDS = 300;
+export const MAX_DICTATION_MILLISECONDS = MAX_DICTATION_SECONDS * 1000;
 export type DictationState = 'idle' | 'requesting' | 'recording' | 'transcribing';
 interface DictationOptions {
   getStream: () => Promise<MediaStream>;
@@ -119,8 +120,25 @@ export function dictationSession(options: DictationOptions) {
     }
   };
   return {
-    async start() {
+    async start(limits?: { maxMilliseconds: number }) {
       if (current || disposed) return;
+      if (limits && !Number.isFinite(limits.maxMilliseconds)) {
+        options.onError(
+          new Error('The dictation duration limit is invalid. Review the model options again.')
+        );
+        return;
+      }
+      const maxMilliseconds = Math.min(
+        MAX_DICTATION_MILLISECONDS,
+        options.maxMilliseconds ?? MAX_DICTATION_MILLISECONDS,
+        limits?.maxMilliseconds ?? MAX_DICTATION_MILLISECONDS
+      );
+      if (!Number.isFinite(maxMilliseconds) || maxMilliseconds < 1000) {
+        options.onError(
+          new Error('The dictation duration limit is invalid. Review the model options again.')
+        );
+        return;
+      }
       const run: Recording = { controller: new AbortController(), chunks: [], bytes: 0 };
       current = run;
       state('requesting');
@@ -157,7 +175,7 @@ export function dictationSession(options: DictationOptions) {
         state('recording');
         run.timer = setTimeout(() => {
           if (current === run && recorder.state !== 'inactive') recorder.stop();
-        }, options.maxMilliseconds ?? MAX_DICTATION_MILLISECONDS);
+        }, maxMilliseconds);
       } catch (error) {
         release(run);
         if (current === run && !disposed) {

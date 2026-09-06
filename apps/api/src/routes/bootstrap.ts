@@ -13,11 +13,13 @@ import type { HostStorage } from '../context.js';
 import { requireUser } from '../http/auth-hook.js';
 import type { RouteContext } from '../http/server-context.js';
 import { currentPeriod, serverLimits } from '../plans.js';
+import { withTaskDeliveryStatus } from '../task-delivery-status.js';
 
 export const registerBootstrapRoutes = (context: RouteContext): void => {
   const {
     app,
     store,
+    database,
     masterKey,
     cachedHostStorage,
     privateTaskResponse,
@@ -27,9 +29,10 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
     modelsForUser,
     webSearchRouteFor,
     ensurePrimaryWorkspace,
+    relay,
     config
   } = context;
-  app.get('/v1/bootstrap', async (request) => {
+  app.get('/v1/bootstrap', async (request, reply) => {
     const user = requireUser(request.user);
     const { start: periodStart, end: periodEnd } = currentPeriod();
     /**
@@ -54,6 +57,12 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
                 // sentence too.
                 const opened = decryptJson<{
                   body: string;
+                  controls?: {
+                    modelId: string;
+                    reasoningEffort: string;
+                    privacyRoute: string;
+                    spendCap: string;
+                  };
                   attachments?: Array<{
                     path: string;
                     name: string;
@@ -65,6 +74,7 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
                   workspaceId: workspace.id,
                   taskId: row.taskId,
                   body: opened.body,
+                  ...(opened.controls ? { controls: opened.controls } : {}),
                   attachments: opened.attachments ?? [],
                   updatedAt: row.updatedAt
                 };
@@ -122,7 +132,7 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
           Boolean(entry[1])
         )
     );
-    return {
+    const response = {
       user,
       drafts,
       workspaces: workspaces.map((workspace) =>
@@ -135,7 +145,7 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
         )
       ),
       tasks: await Promise.all(
-        tasks.tasks.map((task) =>
+        (await withTaskDeliveryStatus(database, user.id, tasks.tasks)).map((task) =>
           privateTaskResponse(
             task,
             workspaces.find((workspace) => workspace.id === task.workspaceId)
@@ -174,7 +184,13 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
         // asserted server-side is one nobody notices breaking.
         provider: model.provider,
         availability: model.availability,
-        privacyRoute: model.privacyRoute
+        privacyRoute: model.privacyRoute,
+        modalities: model.modalities,
+        ...(model.nativeInputPricing &&
+        model.modalities.some((kind) => kind === 'audio' || kind === 'video')
+          ? { nativeInputPricing: model.nativeInputPricing }
+          : {}),
+        ...(model.reasoning ? { reasoning: model.reasoning } : {})
       })),
       instance: {
         mode: 'self_hosted',
@@ -206,5 +222,9 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
         providerSpend: spend
       }
     };
+    reply.header('x-athanor-preview-base-url', config.PREVIEW_BASE_URL);
+    const relayPreviewOrigin = relay.publicPreviewOrigin();
+    if (relayPreviewOrigin) reply.header('x-athanor-relay-preview-origin', relayPreviewOrigin);
+    return response;
   });
 };

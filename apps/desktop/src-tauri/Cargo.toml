@@ -1,6 +1,6 @@
 [package]
 name = "athanor-desktop"
-version = "0.1.1"
+version = "0.2.0"
 description = "Native shell and permission broker for athanor"
 authors = ["athanor contributors"]
 license = "AGPL-3.0-only"
@@ -29,6 +29,7 @@ sha2 = "0.10"
 tauri = { version = "2", features = [] }
 tauri-plugin-deep-link = "2"
 tauri-plugin-notification = "2"
+tauri-plugin-opener = "2"
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["__rustls-tls", "connect"] }

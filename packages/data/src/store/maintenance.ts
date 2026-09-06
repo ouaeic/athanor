@@ -261,6 +261,7 @@ export class MaintenanceStore {
 
   async cleanupExpired(securityEventRetentionDays = 30, deltaPruneLimit = 10_000): Promise<void> {
     await this.database.query('DELETE FROM auth_challenges WHERE expires_at <= NOW()');
+    await this.database.query('DELETE FROM native_authorizations WHERE expires_at <= NOW()');
     await this.database.query('DELETE FROM sessions WHERE expires_at <= NOW()');
     await this.database.query(
       "DELETE FROM device_enrollments WHERE created_at < NOW() - INTERVAL '7 days'"

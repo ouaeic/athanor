@@ -144,8 +144,9 @@ function voiceHarness(
   const onText = vi.fn();
   const onError = vi.fn();
   const onState = vi.fn();
+  const getStream = vi.fn(() => options.permission ?? Promise.resolve(stream));
   const session = dictationSession({
-    getStream: () => options.permission ?? Promise.resolve(stream),
+    getStream,
     createRecorder,
     transcribe,
     onText,
@@ -162,6 +163,7 @@ function voiceHarness(
     stopTrack,
     stream,
     recorder,
+    getStream,
     stopRecording: fake.stop,
     createRecorder,
     transcribe,
@@ -231,15 +233,57 @@ describe('dictation lifetime and bounds', () => {
 
   it('stops at the recording time limit and transcribes the captured audio once', async () => {
     vi.useFakeTimers();
-    const voice = voiceHarness({ maxMilliseconds: 100 });
+    const voice = voiceHarness({ maxMilliseconds: 1000 });
     await voice.session.start();
     voice.emit('audio');
-    await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(1000);
     expect(voice.stopRecording).toHaveBeenCalledOnce();
     expect(voice.stopTrack).toHaveBeenCalled();
     expect(voice.transcribe).toHaveBeenCalledOnce();
     expect(voice.onText).toHaveBeenCalledWith('A useful direction.');
     expect(voice.onState).toHaveBeenLastCalledWith('idle');
+    voice.session.dispose();
+  });
+
+  it('uses each reviewed model duration without carrying a previous recording limit forward', async () => {
+    vi.useFakeTimers();
+    const voice = voiceHarness({ maxMilliseconds: 5000 });
+    await voice.session.start({ maxMilliseconds: 2000 });
+    voice.emit('first recording');
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(voice.stopRecording).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(voice.transcribe).toHaveBeenCalledOnce();
+    await voice.session.start({ maxMilliseconds: 4000 });
+    voice.emit('second recording');
+    await vi.advanceTimersByTimeAsync(3999);
+    expect(voice.stopRecording).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(voice.transcribe).toHaveBeenCalledTimes(2);
+    expect(voice.stopTrack).toHaveBeenCalledTimes(2);
+    voice.session.dispose();
+  });
+
+  it('refuses invalid model duration before requesting the microphone', async () => {
+    const rejected = [0, -1, 999, NaN, Infinity];
+    expect(rejected.length).toBeGreaterThan(0);
+    for (const maxMilliseconds of rejected) {
+      const voice = voiceHarness();
+      await voice.session.start({ maxMilliseconds });
+      expect(voice.getStream).not.toHaveBeenCalled();
+      expect(voice.onError).toHaveBeenCalledOnce();
+      voice.session.dispose();
+    }
+  });
+
+  it('keeps the absolute recording limit when both optional limits are larger', async () => {
+    vi.useFakeTimers();
+    const voice = voiceHarness({ maxMilliseconds: 600_000 });
+    await voice.session.start({ maxMilliseconds: 600_000 });
+    voice.emit('audio');
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(voice.transcribe).toHaveBeenCalledOnce();
+    expect(voice.stopTrack).toHaveBeenCalledOnce();
     voice.session.dispose();
   });
 

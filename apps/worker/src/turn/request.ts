@@ -1,3 +1,5 @@
+import { taskReasoningEffort } from '../reasoning.js';
+import type { ReasoningEffort } from '@athanor/contracts';
 /**
  * Everything that has to be true, and everything that has to be measured, before a request is sent.
  *
@@ -50,7 +52,7 @@ export interface TurnRequestDeps {
 /** The three things the generation phase reads off this one. */
 export interface PreparedStepRequest {
   readonly preparedContext: PreparedContext;
-  readonly reasoningEffort: 'low' | 'medium' | 'high';
+  readonly reasoningEffort: ReasoningEffort | undefined;
   /** Held so the derivation invariant re-derives from the same options this request used. */
   readonly windowOptions: {
     precedingTokens: number;
@@ -125,18 +127,28 @@ export const prepareStepRequest = async (
   );
   state.toolOutputFloor = preparedContext.olderToolOutputChars;
   state.preparedInputTokens = preparedContext.estimatedInputTokens;
-  const reasoningEffort = reasoningEffortForStep({
+  const automaticEffort = reasoningEffortForStep({
     ...state,
     estimatedInputTokens: preparedContext.estimatedInputTokens,
     inputBudgetTokens: modelInputBudget(model.contextTokens, maxOutputTokens, reservedTokens)
   });
+  const reasoningEffort = taskReasoningEffort(
+    state.ownerReasoningEffort,
+    automaticEffort,
+    model.reasoning
+  );
   // The ratchet, recorded rather than recomputed: once a turn has become the kind of turn that
   // needs the full budget it does not stop being one, and pinning the field is also what keeps
   // the provider's cached trajectory from being discarded on the next flip. The opening step is
   // deliberately excluded - it is high because it is the opening step, not because the work is
   // hard, and letting it set the floor would make every task high for its whole length. A tool
   // that threw is excluded for the same reason: it raises this step and not the turn.
-  if (state.step > 0 && reasoningEffort === 'high' && effortFloorEarned(state))
+  if (
+    (!state.ownerReasoningEffort || state.ownerReasoningEffort === 'auto') &&
+    state.step > 0 &&
+    reasoningEffort === 'high' &&
+    effortFloorEarned(state)
+  )
     state.reasoningFloor = 'high';
   await deps.assertProviderConfigured(task);
   return { preparedContext, reasoningEffort, windowOptions };

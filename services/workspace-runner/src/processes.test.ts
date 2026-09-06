@@ -105,7 +105,7 @@ describe('background process manager', () => {
         exitCode: 0,
         stdout: 'finished'
       });
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -135,7 +135,7 @@ describe('background process manager', () => {
       const finished = await settledStatus(manager, started.sessionId);
       expect(finished.status).toBe('completed');
       expect(finished.stdout).toContain('LATE');
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -167,7 +167,7 @@ describe('background process manager', () => {
       const finished = await settledStatus(manager, started.sessionId);
       expect(finished.status).toBe('completed');
       expect(finished.stdout).not.toContain('LATE');
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -190,7 +190,7 @@ describe('background process manager', () => {
         false
       );
       expect(await settledStatus(manager, started.sessionId)).toMatchObject({ status: 'failed' });
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -236,7 +236,7 @@ describe('background process manager', () => {
       expect(finished.stdout).not.toContain('--fsize');
       expect(finished.stdout).toContain('--nproc=512');
       expect(finished.stdout).toContain('|done');
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -282,7 +282,7 @@ describe('background process manager', () => {
       expect(await realpath((finished.stdout ?? '').trim())).toBe(await realpath(chosen));
       expect(await realpath(await readFile(`${record}.pwd`, 'utf8'))).toBe(await realpath(root));
       expect(await readFile(record, 'utf8')).not.toContain('acme-lawsuit-discovery');
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -343,7 +343,7 @@ describe('background process manager', () => {
       // `workspace/`, so a Rust toolchain's 88,021 files are not walked by every checkpoint, and
       // outside `.athanor`, which is the runner's alone.
       expect(path.relative(root, finished.stdout ?? '')).toBe('.home');
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -379,7 +379,7 @@ describe('background process manager', () => {
       const finished = await settledStatus(manager, started.sessionId);
       expect(finished.status).toBe('completed');
       expect(finished.stdout).toBe(`false|${permission}`);
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -399,7 +399,7 @@ describe('background process manager', () => {
         false
       )
     ).rejects.toThrow('does not accept PATH, SECRET');
-    manager.close();
+    await manager.close();
   });
 
   /*
@@ -456,7 +456,7 @@ describe('background process manager', () => {
       command: [process.execPath, ...args]
     });
     expect(manager.listWorkspace('workspace-1')[0]?.startedAt).toEqual(expect.any(String));
-    manager.close();
+    await manager.close();
   });
 
   /*
@@ -513,7 +513,7 @@ describe('background process manager', () => {
         stopped: [],
         services: []
       });
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -544,7 +544,7 @@ describe('background process manager', () => {
       victim.sessionId
     ]);
     expect(() => manager.stopOwner('workspace-1', null, {})).toThrow('which task');
-    manager.close();
+    await manager.close();
   });
 
   it('does not allow background privilege or package operations in host-native mode', async () => {
@@ -562,7 +562,7 @@ describe('background process manager', () => {
         false
       )
     ).rejects.toThrow('cannot run as background processes');
-    manager.close();
+    await manager.close();
   });
 
   it('refuses a background command that names a privileged helper directly', async () => {
@@ -601,7 +601,7 @@ describe('background process manager', () => {
           systemPackageHelper: packageHelper
         })
       ).rejects.toThrow('cannot run as background processes');
-    manager.close();
+    await manager.close();
   });
 });
 
@@ -645,7 +645,7 @@ describe('the host disk floor on the background path', () => {
       // Said on the session's own stderr, because `poll` is the only place the agent ever finds
       // out why a background job it started is no longer running.
       expect(settled.stderr).toContain('last of the host disk');
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -674,7 +674,7 @@ describe('the host disk floor on the background path', () => {
     expect(settled.status).toBe('failed');
     expect(settled.signal).toBe('SIGKILL');
     expect(settled.stderr).toContain('killed outright by the computer');
-    manager.close();
+    await manager.close();
   });
 
   /*
@@ -721,7 +721,7 @@ describe('the host disk floor on the background path', () => {
     const settled = await settledStatus(manager, started.sessionId);
     expect(settled.status).toBe('failed');
     expect(settled.exitCode).toBe(1);
-    manager.close();
+    await manager.close();
     return settled.stderr ?? '';
   };
 
@@ -793,7 +793,7 @@ describe('the host disk floor on the background path', () => {
       status: 'completed',
       stdout: 'fine'
     });
-    manager.close();
+    await manager.close();
   });
 
   it(
@@ -832,7 +832,7 @@ describe('the host disk floor on the background path', () => {
       expect(
         manager.action('workspace-1', 'task-1', started.sessionId, { action: 'poll' }).service
       ).toMatchObject({ state: 'crash_looped', restarts: 0 });
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -868,7 +868,7 @@ describe('watching a long background job', () => {
       const settled = await settledStatus(manager, started.sessionId);
       expect(settled.status).toBe('timed_out');
       expect(settled.stderr).toContain('1s timeout');
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -918,7 +918,7 @@ describe('watching a long background job', () => {
       expect(settled.status).toBe('timed_out');
       expect(settled.stderr).toContain('1s timeout');
       expect(settled.stderr).not.toContain('killed outright by the computer');
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -938,7 +938,7 @@ describe('watching a long background job', () => {
           false
         )
       ).rejects.toThrow(/200s/);
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -973,7 +973,7 @@ describe('watching a long background job', () => {
         )
         .toBeGreaterThan(first.ranForMs);
       manager.action('workspace-1', 'task-1', started.sessionId, { action: 'kill' });
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -1007,7 +1007,7 @@ describe('watching a long background job', () => {
       expect(finished.stdout?.startsWith('BEGIN')).toBe(true);
       expect(finished.stdout?.endsWith('END')).toBe(true);
       expect(finished.stdout).toContain('bytes omitted from stdout');
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -1083,7 +1083,7 @@ describe('what a restart would destroy', () => {
 
       manager.action('workspace-1', 'task-1', short.sessionId, { action: 'kill' });
       expect(manager.backgroundWork()).toEqual({ commands: 0, longestRemainingMs: null });
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -1136,7 +1136,7 @@ describe('reaching a service the declaring task has finished with', () => {
       expect(manager.list('workspace-1', 'task-1').map((view) => view.sessionId)).toContain(
         ephemeral.sessionId
       );
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -1157,7 +1157,7 @@ describe('reaching a service the declaring task has finished with', () => {
         manager.action('workspace-1', 'task-2', started.sessionId, { action: 'kill' }).status
       ).toBe('stopped');
       expect(manager.listWorkspace('workspace-1').map((view) => view.status)).toEqual(['stopped']);
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -1176,7 +1176,7 @@ describe('reaching a service the declaring task has finished with', () => {
       expect(() =>
         manager.action('workspace-1', 'task-2', started.sessionId, { action: 'write', data: 'x' })
       ).toThrow('Background process not found');
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -1200,7 +1200,7 @@ describe('reaching a service the declaring task has finished with', () => {
       expect(() =>
         manager.action('workspace-1', 'task-2', ephemeral.sessionId, { action: 'poll' })
       ).toThrow('Background process not found');
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -1247,7 +1247,7 @@ describe('saying that a service is reachable from outside this computer', () => 
       expect(view.stderr).toContain('anyone who can reach this computer');
       // Written once, however many times the sweep runs: at 20ms it has run several times by now.
       expect(view.stderr?.match(/is listening on/g)?.length).toBe(1);
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -1268,7 +1268,7 @@ describe('saying that a service is reachable from outside this computer', () => 
       const view = manager.action('workspace-1', 'task-1', started.sessionId, { action: 'log' });
       expect(view.service).toMatchObject({ listening: ['127.0.0.1:8097'] });
       expect(view.stderr ?? '').not.toContain('anyone who can reach this computer');
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -1297,7 +1297,7 @@ describe('saying that a service is reachable from outside this computer', () => 
         30,
         false
       );
-      first.close();
+      await first.close();
 
       const rebooted = new ProcessManager(undefined, undefined, 20, async () => [
         { address: '0.0.0.0', port: 8096 }
@@ -1307,7 +1307,7 @@ describe('saying that a service is reachable from outside this computer', () => 
 
       const [row] = rebooted.listWorkspace('workspace-1');
       expect(row?.service).toMatchObject({ name: 'files', listening: ['0.0.0.0:8096'] });
-      rebooted.close();
+      await rebooted.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -1327,7 +1327,7 @@ describe('saying that a service is reachable from outside this computer', () => 
       const view = manager.action('workspace-1', 'task-1', started.sessionId, { action: 'poll' });
       expect(view.service).toMatchObject({ name: 'files' });
       expect(view.service).not.toHaveProperty('listening');
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );

@@ -482,13 +482,37 @@ export const agentTools: ModelTool[] = [
   {
     name: 'set_plan',
     description:
-      'Create or revise the short user-visible execution plan. Call this before material work, whenever the approach changes, and to mark a step in_progress when you start it and completed when it is verified. The user watches this plan while long work runs, so keeping step status current is how progress is visible. A step keeps its previous status unless you change it; reusing a step title preserves its identity.',
+      'Set the visible plan before material work and revise it when the approach changes. Mark steps in_progress when started and completed when verified. Reusing a title preserves identity and status unless changed.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       required: ['steps'],
       properties: {
         branchName: { type: 'string', description: 'Short name for this plan branch.' },
+        outputs: {
+          type: 'array',
+          maxItems: 8,
+          description:
+            'Declare outputs before building. Apps need a live preview or checked runnable package; directories scope project ZIPs. Omitted outputs persist.',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['kind', 'title'],
+            properties: {
+              kind: { type: 'string', enum: ['app', 'document', 'dataset', 'media', 'answer'] },
+              title: { type: 'string' },
+              files: { type: 'array', maxItems: 50, items: { type: 'string' } },
+              directories: { type: 'array', maxItems: 4, items: { type: 'string' } },
+              delivery: { type: 'string', enum: ['preview', 'package'] },
+              run: {
+                type: 'object',
+                additionalProperties: false,
+                required: ['command', 'acceptanceCheckId'],
+                properties: { command: { type: 'string' }, acceptanceCheckId: { type: 'string' } }
+              }
+            }
+          }
+        },
         steps: {
           type: 'array',
           minItems: 1,
@@ -577,7 +601,7 @@ export const agentTools: ModelTool[] = [
   {
     name: 'shell',
     description:
-      'Run one executable directly on the user’s persistent Linux computer. Use background=true for long analyses, service as well for a server, then process to inspect or stop them. There is no shell here, so nothing expands: put every argument in args, and when you genuinely need a pipe, a glob or a redirect run `bash -lc` or `python3 -c` and pass the script as one argument.',
+      'Run an executable on the owner’s Linux computer. Use background=true and job for finite work, service for servers; process inspects or stops them. Nothing expands: use args; for pipes, globs or redirects run `bash -lc` or `python3 -c` with the script as one argument.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -592,26 +616,34 @@ export const agentTools: ModelTool[] = [
           // ENOENT: the command already runs inside workspace/, so a path in it that repeats the
           // prefix lands in workspace/workspace/. Measured live in six of ten tasks. The runner
           // now reads a bare cwd from workspace/ too, so this clause is about the command text.
-          description:
-            'The command already runs inside workspace/, so a relative path in it is probe/x, never workspace/probe/x.'
+          description: 'It already runs inside workspace/: use probe/x, never workspace/probe/x.'
         },
         timeoutSeconds: {
           type: 'integer',
           minimum: 1,
-          maximum: 86_400,
           description:
-            'How long the command may run before it is stopped: 5 minutes by default and 1 hour at most in the foreground; 1 hour by default and up to 24 in the background. A service ignores this.'
+            'Deadline: foreground defaults to 5 minutes, at most 1 hour; background defaults to 1 hour, capped by this computer’s configured limit. Services have no deadline.'
         },
         background: {
           type: 'boolean',
           default: false,
           description:
-            'Return immediately with a session ID while the process keeps running. It lasts until its timeout, until process(action=kill), or until this computer restarts - unless you name it as a service.'
+            'Return a process session ID immediately. Set job for durable finite work or service for a server.'
         },
         service: {
           type: 'string',
           description:
-            'Name it and the computer keeps it running: no timeout, restarted whenever it exits, even successfully - so never for work meant to finish. For anything you hand the user a link to. Needs background=true; process(action=kill) stops it for good.'
+            'Name a server: no deadline, restarted after every exit and reboot. Needs background=true. Use job for finite work; process(action=kill) stops a service permanently.'
+        },
+        job: {
+          type: 'string',
+          description:
+            'Name finite background work; retains identity, logs and result across restarts. Success never reruns. Requires background=true, no service.'
+        },
+        checkpointResumeCommand: {
+          type: 'string',
+          description:
+            'Job recovery shell command: safely continue saved work after interruption. Without it, recovery requires attention. Approval covers this command too.'
         },
         stdin: { type: 'string' },
         maxOutputBytes: {
@@ -620,7 +652,7 @@ export const agentTools: ModelTool[] = [
           maximum: 20971520,
           default: 1048576,
           description:
-            'Maximum returned bytes per stdout or stderr stream. Keep this small; save large results to a workspace file and inspect targeted ranges.'
+            'Bytes per output stream. Save large results to files and read targeted ranges.'
         },
         network: {
           type: 'boolean',
@@ -649,15 +681,19 @@ export const agentTools: ModelTool[] = [
   {
     name: 'process',
     description:
-      'List, inspect, read logs from, write to, or stop background processes and services created by shell(background=true). poll and log return the current status and output and come back immediately, so check on a long build or a running server with one of them rather than sleeping or starting the work over. list carries each service’s name, restarts and last exit.',
+      'Background status/log/input/stop and declared-checkpoint resume (never completed jobs). describe exposes native persistent Python/JavaScript cells, plots/checkpoints and task debugging via compute/debug options; cached status is code-free.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       required: ['action'],
       properties: {
-        action: { type: 'string', enum: ['list', 'poll', 'log', 'kill', 'write'] },
+        action: {
+          type: 'string',
+          enum: ['list', 'poll', 'log', 'kill', 'write', 'resume', 'describe', 'compute', 'debug']
+        },
         sessionId: { type: 'string' },
-        data: { type: 'string', description: 'Input to send when action is write.' }
+        data: { type: 'string', description: 'Input when action=write.' },
+        options: { type: 'object' }
       }
     }
   },
@@ -785,11 +821,25 @@ export const agentTools: ModelTool[] = [
   {
     name: 'code_diagnostics',
     description:
-      'Run repository-native compiler, analyzer, or syntax diagnostics across the supported language catalog and return concise grounded output. Use after code changes and before claiming success. A clean diagnostic is not a passing test suite, so run the project’s own test command as well before saying a change works.',
+      'Run project diagnostics after edits, then run tests separately. For native TypeScript/JavaScript or Python definitions, references and rename previews, use action=describe for controls.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
+        action: {
+          enum: [
+            'check',
+            'describe',
+            'start',
+            'status',
+            'stop',
+            'diagnostics',
+            'definition',
+            'references',
+            'rename'
+          ]
+        },
+        options: { type: 'object' },
         path: { type: 'string', default: 'workspace' },
         language: {
           type: 'string',
@@ -820,14 +870,18 @@ export const agentTools: ModelTool[] = [
   {
     name: 'coding_agent',
     description:
-      'Use an official subscription coding CLI installed on this computer. status checks installation and sign-in, setup installs the official CLI from its publisher, and run hands one bounded repository task to Codex, Claude Code, or OpenCode. Credentials stay in that CLI profile and are never returned to athanor. Check status first, and hand over only when the user has signed one of them in and the job is a large self-contained code change: use file_patch, shell and code_diagnostics yourself for ordinary editing. It cannot see this conversation, so the prompt has to stand alone. A zero-retention task refuses run outright.',
+      'Use garden for isolated native coding specialists with shared task budgets, ordinary approvals and reviewed integration. Call describe for options; run starts one self-contained mission, status or review reads it, wait parks without model polling, integrate applies an inspected digest, and cancel stops it. Optional signed-in subscription CLIs also support status, setup and bounded run; their credentials stay in their own profiles, and zero-retention tasks refuse them. For small changes use file_patch and shell directly.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       required: ['action', 'agent'],
       properties: {
-        action: { type: 'string', enum: ['status', 'setup', 'run'] },
-        agent: { type: 'string', enum: [...SUBSCRIPTION_AGENTS] },
+        action: {
+          type: 'string',
+          enum: ['describe', 'status', 'setup', 'run', 'review', 'wait', 'integrate', 'cancel']
+        },
+        agent: { type: 'string', enum: ['garden', ...SUBSCRIPTION_AGENTS] },
+        options: { type: 'object', description: 'Native options from describe.' },
         prompt: {
           type: 'string',
           description: 'A self-contained coding mission. Required for run.'
@@ -1235,7 +1289,7 @@ export const agentTools: ModelTool[] = [
   {
     name: 'skill',
     description:
-      'List, progressively load, create, update, or remove reviewed reusable procedures. Two tiers are visible: the vetted built-in library that ships with athanor, and skills saved for this workspace. Only the compact index is kept in context; view loads the full procedure, and built-in skills are opened by name. Every write is shown to the user in full and saved only once they approve it, so propose one after the work rather than mid-task. Built-in skills are read-only: reusing a built-in name is reviewed as an explicit owner override rather than a replacement.',
+      'List, progressively load, create, update, or remove reviewed reusable procedures. Two tiers are visible: the vetted built-in library that ships with garden, and skills saved for this workspace. Only the compact index is kept in context; view loads the full procedure, and built-in skills are opened by name. Every write is shown to the user in full and saved only once they approve it, so propose one after the work rather than mid-task. Built-in skills are read-only: reusing a built-in name is reviewed as an explicit owner override rather than a replacement.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1306,16 +1360,16 @@ export const agentTools: ModelTool[] = [
      * two things a model cannot discover without spending the owner's money to find out.
      */
     description:
-      'Listen to a recording already on this computer and get back what was said, as text. This is how you handle a voice memo, a meeting or call recording, a voicemail, a lecture, an interview, or the audio track of a video or screen recording - anything the user asks you to summarise, quote from or act on. Whatever their phone or app recorded is converted here first, so m4a, mp3, wav, aac, opus, ogg, flac, amr, wma, mp4, mov, mkv and webm all work. Reading is billed by the minute of recording, so one call covers at most 90 minutes: the result gives the full length of the file, how much of it was read and where the rest starts, and the whole transcript of that stretch is written beside the recording so re-reading any part of it with file_read costs nothing more. Use startSeconds to carry on where a previous call stopped, or to read one stretch of a long recording. It reads recordings that already exist; use generate_media to make speech.',
+      'Read a workspace recording. By default, transcribe speech from audio or video; m4a, mp3, wav, aac, opus, ogg, flac, amr, wma, mp4, mov, mkv and webm are converted locally. Each billed call reads at most 90 minutes and writes its transcript beside the source. The result gives the full duration, covered range and next start; use startSeconds to continue or inspect a stretch, and file_read to revisit a saved transcript free. For sounds or moving visuals themselves, options.action="native" with kind="audio" or "video" sends the exact file once to the selected model on its next ordinary reply, with approval and a spending reservation. options.action="describe" gives native formats, bounds and selected-model support. Use generate_media to make speech or video.',
     parameters: {
       type: 'object',
       additionalProperties: false,
-      required: ['path'],
       properties: {
         path: { type: 'string' },
         startSeconds: { type: 'integer', minimum: 0, maximum: 86_400, default: 0 },
         endSeconds: { type: 'integer', minimum: 1, maximum: 86_400 },
-        maxCharacters: { type: 'integer', minimum: 1_000, maximum: 200_000, default: 40_000 }
+        maxCharacters: { type: 'integer', minimum: 1_000, maximum: 200_000, default: 40_000 },
+        options: { type: 'object', additionalProperties: true }
       }
     }
   },
@@ -1340,41 +1394,31 @@ export const agentTools: ModelTool[] = [
   },
   {
     name: 'generate_media',
-    /**
-     * Video was in both enums and in both descriptions, and every route to it throws: the provider
-     * states that asynchronous video generation is not eligible for zero-data-retention, so there
-     * is nothing behind it. A model asked for a clip read that it was on offer, spent a call
-     * finding out, and the owner watched a capability fail that was never there.
-     *
-     * The refusal stays; what went with it is the half the operating contract already states
-     * unconditionally, in the same request, a few hundred bytes earlier - that no model weights
-     * run here and that ffmpeg through shell is what edits video the user already has. That is a
-     * fact about the computer, which is the contract's job; what is left here is the fact about
-     * this tool, which is that asking it for a clip will not work. Paying for the machine fact
-     * twice bought nothing, and the ceiling test above is explicit that prose restating the
-     * system prompt is what gets trimmed.
-     */
     description:
-      'Create an image or a speech asset through the user-configured provider: a logo, icon, banner, cover, thumbnail, illustration, picture, photo or diagram, or a voiceover, narration or other spoken audio. The file is written into the workspace and its path returned, and the provider cost is priced from this request and checked against the user’s spending limit before anything is spent. Video cannot be generated at all.',
+      'Make images, speech or video. Describe lists routes, prices and controls. Video/batch need retention approval and deliver artifacts in the background. Status reads a job; library manages native assets.',
     parameters: {
       type: 'object',
       additionalProperties: false,
-      required: ['kind', 'prompt'],
       properties: {
-        kind: { type: 'string', enum: ['image', 'audio'] },
+        action: { type: 'string', enum: ['generate', 'describe', 'status', 'library', 'batch'] },
+        kind: { type: 'string', enum: ['image', 'audio', 'video'] },
+        jobId: { type: 'string' },
         prompt: {
           type: 'string',
-          description:
-            'A production-ready generation prompt containing the requested content and style; for speech, the exact words to be spoken, which are also what the provider bills for.'
+          description: 'Content; exact words for speech.'
         },
         path: {
           type: 'string',
-          description:
-            'Where to write it, under workspace/ and ending .png for an image or .mp3 for speech. Defaults to a generated name in workspace/generated/.'
+          description: 'Workspace output path.'
         },
         width: { type: 'integer', minimum: 256, maximum: 4096, default: 1024 },
         height: { type: 'integer', minimum: 256, maximum: 4096, default: 1024 },
-        seed: { type: 'integer', minimum: 0, maximum: 2147483647 }
+        seed: { type: 'integer', minimum: 0, maximum: 2147483647 },
+        options: {
+          type: 'object',
+          additionalProperties: true,
+          description: 'Model controls and references; describe returns the validated schema.'
+        }
       }
     }
   },
@@ -1422,7 +1466,7 @@ export const agentTools: ModelTool[] = [
        * research PDFs included, and not on the page it had just written. The page was one path
        * away and worked. Nothing in the tool had ever said which address the owner arrives at.
        */
-      'Expose an app already listening on a port of this computer as a link, and place an Open button directly in chat. Start the server first and bind it to 0.0.0.0. The user lands on that port’s root, so give path when the root is a file index rather than your app, and the link answers only while that port keeps listening. A private reach only they can open closes after a month with no visits; a public one anyone holding the address can open stays up until they revoke it and always stops for their approval, so ask for public only when they wanted that.',
+      'Expose an app already listening on a port of this computer as a link, and place an Open button directly in chat. Start the server and bind it to 127.0.0.1. The user lands on that port’s root, so give path when the root is a file index rather than your app, and the link answers only while that port keeps listening. A private reach only they can open closes after a month with no visits; a public one anyone holding the address can open stays up until they revoke it and always stops for their approval, so ask for public only when they wanted that.',
     parameters: {
       type: 'object',
       additionalProperties: false,

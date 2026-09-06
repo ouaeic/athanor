@@ -1,3 +1,4 @@
+import type { ReasoningEffort } from '@athanor/contracts';
 /**
  * The one call in the turn that spends the owner's money, and the four watches around it.
  *
@@ -32,6 +33,8 @@ import type { ModelRelease } from '@athanor/contracts';
 import type { DataStore, TaskRecord } from '@athanor/data';
 import type { ModelResponse } from '@athanor/model-gateway';
 import type { AgentState, AgentWorkerConfig } from '../agent-state.js';
+import type { AgentRunnerClient } from '../runner-client.js';
+import { materializeNativeInputs } from '../native-input.js';
 import {
   COMPACT_CONTEXT_TOOL,
   estimatedContextTokens,
@@ -53,6 +56,7 @@ import { createStreamChannel } from './stream-channel.js';
 
 /** What generating one step needs from the worker that owns it. */
 export interface TurnGenerateDeps {
+  readonly runner: AgentRunnerClient;
   readonly store: DataStore;
   readonly config: AgentWorkerConfig;
   /** Keeps the lease alive across a generation that outruns it, which a full window routinely does. */
@@ -68,7 +72,7 @@ export interface TurnGenerateDeps {
       preparedContext: PreparedContext;
       reservedTokens: number;
       turn: number;
-      reasoningEffort: 'low' | 'medium' | 'high';
+      reasoningEffort: ReasoningEffort | undefined;
     }
   ): Promise<void>;
   /** Reached here only to repair a window the route refused as too large. */
@@ -216,13 +220,20 @@ export const generateModelStep = async (
    * against a literal in `generate-session.test.ts`.
    */
   const sessionId = sha256(`athanor-task:${await turnRoutingTaskId(deps, task, key)}`).slice(0, 64);
+  const nativeRequest = await materializeNativeInputs(
+    deps.runner,
+    task,
+    state,
+    preparedContext.messages,
+    model
+  );
   const stopWatch = startStopWatch(() => deps.store.taskClaim(task.id), deps.config.WORKER_ID);
   const response = await deps
     .withLeaseRenewal(task, () =>
       withRequestDeadline((signal) =>
         gateway.chat(provider, {
           ...routeTo(model),
-          messages: preparedContext.messages,
+          ...nativeRequest,
           // No provider-side tools ride here, on any route. The agent's request offers the model
           // the tools the model calls; the provider's search is spent by `#providerWebSearch`, on
           // a request built for it, when the model calls `web_search`. Sending it alongside would
@@ -232,6 +243,7 @@ export const generateModelStep = async (
           temperature: 0.2,
           maxTokens: maxOutputTokens,
           reasoningEffort,
+          ...(model.reasoning ? { reasoningOptions: model.reasoning } : {}),
           sessionId,
           signal: AbortSignal.any([signal, looping.signal, stopWatch.signal]),
           onTextDelta: (delta) => {
@@ -275,6 +287,7 @@ export const generateModelStep = async (
       return null;
     })
     .finally(() => stopWatch.stop());
+  if (response && state.pendingNativeInputs?.length) delete state.pendingNativeInputs;
   /*
    * Read off the watch and not off the response, deliberately.
    *

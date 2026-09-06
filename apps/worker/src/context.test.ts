@@ -1431,11 +1431,14 @@ describe('the operating contract in the window', () => {
     ).toHaveLength(1);
   });
 
-  it('replaces an older preamble in place, keeping the goal at index 1', () => {
+  it.each([
+    'You operate a persistent, private Linux cloud computer. Old text.',
+    '# athanor operating contract\nStored task instructions.'
+  ])('replaces a stored preamble in place, keeping the goal at index 1: %s', (old) => {
     const messages: ModelMessage[] = [
       {
         role: 'system',
-        content: 'You operate a persistent, private Linux cloud computer. Old text.'
+        content: old
       },
       { role: 'user', content: 'Do the work' }
     ];
@@ -1677,7 +1680,7 @@ describe('the contract as a function of the box it is on', () => {
       'pdftoppm',
       'image_read',
       'Document toolchain',
-      'no video generation here at all',
+      'No model weights run on this computer',
       '127.0.0.1',
       'anti-bot challenge'
     ])

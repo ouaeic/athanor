@@ -1,3 +1,4 @@
+import { removeCodingMissionFamily } from '../coding-mission-cleanup.js';
 /**
  * The computer itself: making one, listing them, resizing, pausing, and deleting.
  *
@@ -11,7 +12,7 @@ import type { Workspace } from '@athanor/contracts';
 import { AthanorError } from '@athanor/core';
 import type { UserRecord } from '@athanor/data';
 import { z } from 'zod';
-import { legacyWorkspaceBriefPath, workspaceBriefPath, workspaceResponse } from '../context.js';
+import { legacyWorkspaceBriefPaths, workspaceBriefPath, workspaceResponse } from '../context.js';
 import { requireUser } from '../http/auth-hook.js';
 import type { RouteContext } from '../http/server-context.js';
 import { serverLimits } from '../plans.js';
@@ -215,7 +216,10 @@ export const registerWorkspaceRoutes = (context: RouteContext): void => {
           acceptAnyStatus: true
         });
       let response = await readBrief(workspaceBriefPath);
-      if (response.status === 404) response = await readBrief(legacyWorkspaceBriefPath);
+      for (const legacyPath of legacyWorkspaceBriefPaths) {
+        if (response.status !== 404) break;
+        response = await readBrief(legacyPath);
+      }
       if (response.status === 404) return { markdown: '', path: workspaceBriefPath };
       if (!response.ok)
         throw new AthanorError(
@@ -281,6 +285,18 @@ export const registerWorkspaceRoutes = (context: RouteContext): void => {
             'confirmation_failed',
             'Type the exact workspace name to delete it'
           );
+        const tasks = await store.listTasks(user.id, workspace.id);
+        if (tasks.some((task) => task.parentMissionId))
+          throw new AthanorError(
+            'coding_mission_scoped',
+            'Remove an isolated specialist workspace through its parent task',
+            409
+          );
+        await store.updateWorkspaceStatus(workspace.id, 'deleting');
+        for (const task of tasks) await store.cancelTaskAndReleaseReservations(user.id, task.id);
+        // Parent row cancellation serializes with any mission that was still being allocated.
+        for (const task of await store.listTasks(user.id, workspace.id))
+          if (task.hasCodingFamily) await removeCodingMissionFamily(context, task);
         await meterWorkspace(workspace);
         await runner.request({
           workspaceId: workspace.id,

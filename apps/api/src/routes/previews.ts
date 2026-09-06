@@ -13,11 +13,13 @@ import { requireUser } from '../http/auth-hook.js';
 import type { RouteContext } from '../http/server-context.js';
 import { serverLimits } from '../plans.js';
 import { recordSecurityEvent } from '../security-events.js';
+import { issuePreviewAccess } from '../preview-access.js';
 
 export const registerPreviewRoutes = (context: RouteContext): void => {
   const {
     app,
     store,
+    masterKey,
     runner,
     reservedPreviewPortSet,
     workspacePreviewResponse,
@@ -105,6 +107,24 @@ export const registerPreviewRoutes = (context: RouteContext): void => {
 
   app.post<{ Params: { previewId: string } }>(
     '/v1/previews/:previewId/access',
+    async (request, reply) => {
+      reply.header('cache-control', 'private, no-store');
+      const user = requireUser(request.user);
+      return idempotent(request, reply, user, async () => {
+        const preview = await store.getWorkspacePreview(user.id, request.params.previewId);
+        if (
+          !preview ||
+          preview.status !== 'active' ||
+          (preview.expiresAt !== null && new Date(preview.expiresAt).getTime() <= Date.now())
+        )
+          throw new AthanorError('preview_unavailable', 'Preview is expired or revoked', 404);
+        return workspacePreviewResponse(preview, issuePreviewAccess(preview, masterKey));
+      });
+    }
+  );
+
+  app.post<{ Params: { previewId: string } }>(
+    '/v1/previews/:previewId/rotate-access',
     async (request, reply) => {
       const user = requireUser(request.user);
       return idempotent(request, reply, user, async () => {

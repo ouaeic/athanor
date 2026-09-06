@@ -95,18 +95,37 @@ describe('relay is off unless it is deliberately turned on', () => {
 });
 
 describe('which listener a bound stream reaches', () => {
-  it('sends relayed :80 to the box’s own :80 and everything else to the TLS listener', () => {
-    const config = RelayClientConfigSchema.parse({ localPort: 8443, localHttpPort: 8080 });
+  it('maps each advertised listener explicitly', () => {
+    const config = RelayClientConfigSchema.parse({
+      localPort: 9443,
+      localHttpPort: 8080,
+      localPreviewPort: 9444
+    });
     // A relayed :80 connection is plaintext HTTP. Delivering it to the TLS listener would look
     // like a working relay right up to the first certificate renewal over it.
     expect(localPortForBind(config, 80)).toBe(8080);
-    expect(localPortForBind(config, 443)).toBe(8443);
+    expect(localPortForBind(config, 443)).toBe(9443);
+    expect(localPortForBind(config, 8443)).toBe(9444);
   });
 
   it('defaults to the ports a box actually serves on', () => {
     const config = RelayClientConfigSchema.parse({});
     expect(localPortForBind(config, 443)).toBe(443);
     expect(localPortForBind(config, 80)).toBe(80);
+    expect(localPortForBind(config, 8443)).toBe(8443);
+  });
+});
+
+describe('preview listener authority', () => {
+  it.each([0, 22, 4400, 65535, -1, NaN, Infinity])('refuses unadvertised bind port %s', (port) => {
+    expect(localPortForBind(RelayClientConfigSchema.parse({}), port)).toBeNull();
+  });
+  it.each([443, 80])('refuses a preview listener shared with owner or HTTP port %s', (port) => {
+    expect(RelayClientConfigSchema.safeParse({ localPreviewPort: port }).success).toBe(false);
+    // Typed callers can still provide an object without parsing it; forwarding must fail closed.
+    expect(
+      localPortForBind({ ...RelayClientConfigSchema.parse({}), localPreviewPort: port }, 8443)
+    ).toBeNull();
   });
 });
 

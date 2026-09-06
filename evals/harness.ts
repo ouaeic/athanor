@@ -761,7 +761,8 @@ const mediaResponse = (
   url: string,
   init?: RequestInit
 ): Response | null => {
-  const image = url.endsWith('/images');
+  const image =
+    url.endsWith('/images') || url.endsWith('/images/generations') || url.endsWith('/images/edits');
   if (!image && !url.endsWith('/audio/speech')) return null;
   state.media += 1;
   // The route the provider was actually asked for, read off the wire rather than off the tool call.
@@ -769,7 +770,11 @@ const mediaResponse = (
   // model passed - is a claim about what will be generated. This is the request that gets billed,
   // and it is the only place a seam between the owner's choice and the generation is visible.
   state.mediaModels.push(asText(bodyOf(init).model));
-  const base64 = stub.media?.base64 ?? ONE_PIXEL_PNG;
+  const base64 =
+    stub.media?.base64 ??
+    (image
+      ? ONE_PIXEL_PNG
+      : Buffer.from([0x49, 0x44, 0x33, 4, 0, 0, 0, 0, 0, 0]).toString('base64'));
   const costUsd = stub.media?.costUsd ?? 0.01;
   return image
     ? json({ data: [{ b64_json: base64 }], usage: { cost: costUsd } })
@@ -2967,7 +2972,7 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
   const events: Array<{ kind: string; summary: string; payload: unknown }> = [];
   const approvals: string[] = [];
   /**
-   * The approvals table, as far as the resume needs it: the row `createApproval` wrote, by id, with
+   * The approvals table, as far as the resume needs it: the row `parkTaskForApproval` wrote, with
    * the status the auto-approver flips. `getApproval` answers from here unconditionally - a pending
    * row is what production returns for a card nobody has answered, so answering it moves nothing
    * for a fixture that parks.
@@ -3096,6 +3101,7 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
     // nothing for it to move. A fixture that wants a stale skill declares one.
     curateWorkspaceSkills: async () => undefined,
     listWorkspaceSkills: async () => skillRows,
+    listMediaJobs: async () => [],
     getLatestTaskPlan: async () => plan,
     createTaskPlan: async (input: Record<string, unknown>) => {
       // The boilerplate fallback is recognised structurally rather than by what it says: it is the
@@ -3171,13 +3177,15 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
       id: 'notification',
       ...input
     }),
-    createApproval: async (input: {
+    parkTaskForApproval: async (input: {
+      id: string;
+      agentStateCiphertext: TaskRecord['agentStateCiphertext'];
       action?: unknown;
       previewHash?: unknown;
       expiresAt?: unknown;
     }) => {
       approvals.push(asText(input.action));
-      const id = `approval-${approvals.length}`;
+      const id = input.id;
       // The hash travels with the row because `turn/resume.ts` recomputes it over the call it is
       // about to run and refuses the call when the two differ. A stub that dropped it would make
       // every approved resume a refusal.
@@ -3188,10 +3196,25 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
         expiresAt: input.expiresAt,
         action: asText(input.action)
       });
-      return id;
+      finalStatus = 'awaiting_user';
+      if (fixture.autoApprove === true)
+        task = {
+          ...task,
+          status: 'awaiting_user',
+          agentStateCiphertext: input.agentStateCiphertext,
+          leaseOwner: null,
+          leaseExpiresAt: null
+        };
+      return true;
     },
     getApproval: async (id: string) => approvalRows.get(id) ?? null,
-    recordUsage: async (input: { kind?: unknown; costUsd?: unknown; quantity?: unknown }) => {
+    recordUsage: async (input: {
+      kind?: unknown;
+      costUsd?: unknown;
+      quantity?: unknown;
+      state?: unknown;
+    }) => {
+      if (input.state === 'reserved' || input.state === 'released') return;
       usageRows.push({
         kind: asText(input.kind),
         costUsd: typeof input.costUsd === 'number' ? input.costUsd : 0,

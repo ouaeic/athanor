@@ -9,12 +9,12 @@ export async function requireDownloadSupport(): Promise<void> {
   } catch {
     throw new ApiError(
       'download_support_unavailable',
-      'Download support could not be checked. Reopen athanor, or open your workspace in a web browser to save this file.'
+      'Download support could not be checked. Reopen garden, or open your workspace in a web browser to save this file.'
     );
   }
   if (!supported)
     throw new ApiError(
       'downloads_unsupported',
-      'This app cannot save downloads on this device. Open your athanor workspace in a web browser or the desktop app to save this file.'
+      'This app cannot save downloads on this device. Open your garden workspace in a web browser or the desktop app to save this file.'
     );
 }

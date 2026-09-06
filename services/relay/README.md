@@ -51,6 +51,14 @@ Copy `config.example.json` to `/etc/athanor-relay.json` and set `relayDomain`, `
 `tlsKeyPath`. Everything else has a working default. Quotas are documented under
 [Limits and defaults](#limits-and-defaults).
 
+Generated apps use the separate `previewPort` listener from the example configuration. Allow that
+TCP port through the relay firewall as well as the owner HTTPS port. It forwards encrypted traffic
+to the box's preview-only TLS listener, configured by `RELAY_LOCAL_PREVIEW_PORT`; it must never
+point at the owner application listener. Set `previewPort` to `null` only when app previews should
+be unavailable through this relay. Client and relay negotiate this support before forwarding; a
+client that has not advertised it is refused for previews. Existing owner and certificate-renewal
+traffic keeps its own routes. Update the relay before using isolated preview links through it.
+
 ### 4. Run it
 
 ```sh

@@ -3316,5 +3316,250 @@ export const migrations = [
         AND u.idempotency_key=q.reservation_key AND u.task_id=q.task_id AND u.user_id=q.user_id
         AND u.kind='task_compute' AND u.state='reserved';
     `
+  },
+  {
+    version: 85,
+    name: 'task_reasoning_preferences',
+    sql: `
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS reasoning_effort TEXT NOT NULL DEFAULT 'auto'
+        CHECK (reasoning_effort IN ('auto','none','minimal','low','medium','high','xhigh','max'));
+      ALTER TABLE task_message_queue ADD COLUMN IF NOT EXISTS reasoning_effort TEXT NOT NULL DEFAULT 'auto'
+        CHECK (reasoning_effort IN ('auto','none','minimal','low','medium','high','xhigh','max'));
+    `
+  },
+  {
+    version: 86,
+    name: 'durable_provider_media_submissions',
+    sql: `
+      CREATE TABLE IF NOT EXISTS provider_media_jobs (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        request_key TEXT NOT NULL UNIQUE,
+        request_hash TEXT NOT NULL,
+        request_ciphertext JSONB NOT NULL,
+        model_id TEXT NOT NULL,
+        operation TEXT NOT NULL DEFAULT 'generate' CHECK (operation IN ('generate','edit','extend')),
+        source_job_id UUID REFERENCES provider_media_jobs(id),
+        duration_seconds INTEGER CHECK (duration_seconds BETWEEN 1 AND 120),
+        extension_count INTEGER NOT NULL DEFAULT 0 CHECK (extension_count BETWEEN 0 AND 6),
+        status TEXT NOT NULL CHECK (status IN ('queued','submitting','submission_uncertain','pending','in_progress','delivering','completed','failed','cancelled','expired','delivery_failed')),
+        provider_job_id TEXT,
+        progress DOUBLE PRECISION CHECK (progress >= 0 AND progress <= 100),
+        reservation_usd DOUBLE PRECISION NOT NULL CHECK (reservation_usd >= 0 AND reservation_usd < 'Infinity'),
+        cost_usd DOUBLE PRECISION CHECK (cost_usd >= 0 AND cost_usd < 'Infinity'),
+        cost_source TEXT NOT NULL DEFAULT 'unresolved' CHECK (cost_source IN ('provider','quote','unresolved')),
+        watching BOOLEAN NOT NULL DEFAULT TRUE,
+        retention_approved_at TIMESTAMPTZ NOT NULL,
+        output_path TEXT,
+        artifact_id UUID,
+        error_ciphertext JSONB,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_poll_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        lease_owner TEXT,
+        lease_expires_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS provider_media_jobs_poll_idx ON provider_media_jobs(next_poll_at)
+        WHERE watching AND status IN ('queued','submitting','pending','in_progress','delivering');
+      CREATE INDEX IF NOT EXISTS provider_media_jobs_task_idx ON provider_media_jobs(user_id,task_id,created_at DESC);
+    `
+  },
+  {
+    version: 87,
+    name: 'task_presentation_read_indexes',
+    sql: `
+      CREATE INDEX IF NOT EXISTS task_events_evidence_cursor_idx ON task_events(task_id,sequence DESC)
+        WHERE kind NOT IN ('assistant_delta','assistant_reasoning');
+      CREATE INDEX IF NOT EXISTS task_events_delivery_receipt_idx ON task_events(task_id,kind,sequence DESC)
+        WHERE kind IN ('preview','completed');
+      CREATE INDEX IF NOT EXISTS artifacts_task_created_idx ON artifacts(task_id,created_at DESC);
+    `
+  },
+  {
+    version: 88,
+    name: 'native_media_asset_intents',
+    sql: `
+      CREATE TABLE IF NOT EXISTS provider_media_assets (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        provider_hash TEXT NOT NULL,
+        request_key TEXT NOT NULL UNIQUE,
+        request_hash TEXT NOT NULL,
+        request_ciphertext JSONB NOT NULL,
+        result_ciphertext JSONB,
+        status TEXT NOT NULL DEFAULT 'submitting' CHECK (status IN ('submitting','completed','submission_uncertain','failed')),
+        reservation_usd DOUBLE PRECISION NOT NULL CHECK (reservation_usd>0 AND reservation_usd<=10000),
+        cost_usd DOUBLE PRECISION CHECK (cost_usd>=0 AND cost_usd<=10000),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS provider_media_assets_workspace_idx ON provider_media_assets(user_id,workspace_id,provider_hash,created_at DESC);
+    `
+  },
+  {
+    version: 89,
+    name: 'native_coding_missions',
+    sql: `
+      ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS internal_parent_task_id UUID REFERENCES tasks(id) ON DELETE CASCADE;
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS parent_task_id UUID REFERENCES tasks(id) ON DELETE CASCADE;
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS parent_mission_id UUID;
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS has_coding_family BOOLEAN NOT NULL DEFAULT FALSE;
+      CREATE INDEX IF NOT EXISTS tasks_parent_task_idx ON tasks(parent_task_id) WHERE parent_task_id IS NOT NULL;
+      CREATE TABLE IF NOT EXISTS coding_families (
+        parent_task_id UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+        ceiling_credits DOUBLE PRECISION NOT NULL CHECK(ceiling_credits>0),
+        initial_credits DOUBLE PRECISION NOT NULL CHECK(initial_credits>=0),
+        wait_requested BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS coding_missions (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        parent_task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        child_task_id UUID NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
+        child_workspace_id UUID NOT NULL UNIQUE REFERENCES workspaces(id) ON DELETE CASCADE,
+        request_key TEXT NOT NULL UNIQUE,
+        request_hash TEXT NOT NULL,
+        manifest_ciphertext JSONB NOT NULL,
+        phase TEXT NOT NULL DEFAULT 'preparing' CHECK(phase IN ('preparing','active','conflicted','integrating','integrated','cancelled','failed')),
+        generation INTEGER NOT NULL DEFAULT 1 CHECK(generation>0),
+        runner_generation INTEGER NOT NULL DEFAULT 0,
+        runner_sealed BOOLEAN NOT NULL DEFAULT FALSE,
+        allocated_credits DOUBLE PRECISION NOT NULL CHECK(allocated_credits>0),
+        review_digest TEXT,
+        changed_files INTEGER CHECK(changed_files>=0),
+        conflicts INTEGER CHECK(conflicts>=0),
+        detail_ciphertext JSONB,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS coding_missions_parent_idx ON coding_missions(user_id,parent_task_id,created_at);
+      CREATE TABLE IF NOT EXISTS coding_family_calls (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        original_task_id UUID NOT NULL,
+        parent_task_id UUID REFERENCES coding_families(parent_task_id) ON DELETE SET NULL,
+        task_id UUID REFERENCES tasks(id) ON DELETE SET NULL,
+        reserved_credits DOUBLE PRECISION NOT NULL CHECK(reserved_credits>=0),
+        actual_credits DOUBLE PRECISION CHECK(actual_credits>=0),
+        reserved_usd DOUBLE PRECISION NOT NULL DEFAULT 0 CHECK(reserved_usd>=0),
+        actual_usd DOUBLE PRECISION CHECK(actual_usd>=0),
+        usage_id UUID REFERENCES usage_entries(id),
+        state TEXT NOT NULL DEFAULT 'reserved' CHECK(state IN ('reserved','settled','uncertain')),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS coding_family_calls_owner_idx ON coding_family_calls(user_id,created_at);
+      CREATE INDEX IF NOT EXISTS coding_family_calls_parent_idx ON coding_family_calls(parent_task_id,task_id,state);
+    `
+  },
+  {
+    version: 90,
+    name: 'durable_native_video_batches',
+    sql: `
+      CREATE TABLE IF NOT EXISTS provider_media_batches (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        request_key TEXT NOT NULL UNIQUE,
+        request_hash TEXT NOT NULL,
+        request_ciphertext JSONB NOT NULL,
+        status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','uploading','file_uploaded','submitting','submission_uncertain','pending','delivering','completed','failed','cancelled')),
+        input_file_id TEXT,provider_batch_id TEXT,error_ciphertext JSONB,
+        provider_status TEXT,cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,cancel_sent BOOLEAN NOT NULL DEFAULT FALSE,
+        total INTEGER NOT NULL CHECK (total>=1 AND total<=100),
+        completed INTEGER NOT NULL DEFAULT 0 CHECK (completed>=0 AND completed<=100),
+        failed INTEGER NOT NULL DEFAULT 0 CHECK (failed>=0 AND failed<=100),
+        reservation_usd DOUBLE PRECISION NOT NULL CHECK (reservation_usd>0 AND reservation_usd<=1000000),
+        watching BOOLEAN NOT NULL DEFAULT TRUE,
+        lease_owner TEXT,lease_expires_at TIMESTAMPTZ,next_poll_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      ALTER TABLE provider_media_jobs ADD COLUMN IF NOT EXISTS batch_id UUID REFERENCES provider_media_batches(id) ON DELETE CASCADE;
+      CREATE INDEX IF NOT EXISTS provider_media_batches_pending_idx ON provider_media_batches(next_poll_at,id) WHERE watching;
+      CREATE INDEX IF NOT EXISTS provider_media_batches_task_idx ON provider_media_batches(user_id,task_id,created_at DESC);
+      CREATE INDEX IF NOT EXISTS provider_media_jobs_batch_idx ON provider_media_jobs(batch_id) WHERE batch_id IS NOT NULL;
+    `
+  },
+  {
+    version: 91,
+    name: 'device_bound_browser_authorization',
+    sql: `
+      CREATE TABLE IF NOT EXISTS native_authorizations (
+        id UUID PRIMARY KEY,
+        purpose TEXT NOT NULL CHECK (purpose IN ('sign_in','step_up')),
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','denied','consumed')),
+        server_origin TEXT NOT NULL,
+        native_origin TEXT NOT NULL,
+        challenge TEXT NOT NULL,
+        device_public_key TEXT NOT NULL,
+        device_label TEXT NOT NULL,
+        user_code TEXT NOT NULL,
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        target_session_hash TEXT,
+        approving_session_hash TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        expires_at TIMESTAMPTZ NOT NULL,
+        consumed_at TIMESTAMPTZ,
+        CHECK ((purpose='sign_in' AND target_session_hash IS NULL) OR
+               (purpose='step_up' AND target_session_hash IS NOT NULL AND user_id IS NOT NULL))
+      );
+      CREATE INDEX IF NOT EXISTS native_authorizations_expiry_idx ON native_authorizations(expires_at);
+    `
+  },
+  {
+    version: 92,
+    name: 'durable_media_delivery_outbox',
+    sql: `
+      CREATE TABLE IF NOT EXISTS provider_media_delivery_outbox (
+        job_id UUID PRIMARY KEY REFERENCES provider_media_jobs(id) ON DELETE CASCADE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        lease_owner TEXT, lease_expires_at TIMESTAMPTZ,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        delivered_at TIMESTAMPTZ,
+        notification_state TEXT NOT NULL DEFAULT 'pending' CHECK(notification_state IN ('pending','sent','suppressed_limit'))
+      );
+      CREATE INDEX IF NOT EXISTS provider_media_delivery_pending_idx ON provider_media_delivery_outbox(next_attempt_at,job_id) WHERE delivered_at IS NULL;
+    `
+  },
+  {
+    version: 93,
+    name: 'bounded_owner_live_voice',
+    sql: `
+ALTER TABLE task_message_queue DROP CONSTRAINT IF EXISTS task_message_queue_max_compute_credits_check;
+ALTER TABLE task_message_queue ADD CONSTRAINT task_message_queue_max_compute_credits_check CHECK(max_compute_credits>=0);
+CREATE TABLE IF NOT EXISTS voice_sessions (
+ id UUID PRIMARY KEY,user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ task_id UUID REFERENCES tasks(id) ON DELETE SET NULL,original_task_id UUID NOT NULL,workspace_id UUID NOT NULL,
+ request_key TEXT NOT NULL,request_hash TEXT NOT NULL,auth_hash TEXT NOT NULL,
+ ticket_hash TEXT,ticket_expires_at TIMESTAMPTZ NOT NULL,deadline_at TIMESTAMPTZ NOT NULL,
+ details JSONB NOT NULL,configuration JSONB NOT NULL,connection JSONB NOT NULL,
+ status TEXT NOT NULL DEFAULT 'preparing' CHECK(status IN ('preparing','connecting','listening','responding','stopping','ended','expired','lost','usage_uncertain')),
+ controller_id TEXT,lease_expires_at TIMESTAMPTZ,connected_at TIMESTAMPTZ,ended_at TIMESTAMPTZ,
+ settled_usd DOUBLE PRECISION NOT NULL DEFAULT 0 CHECK(settled_usd>=0),pending_usd DOUBLE PRECISION NOT NULL DEFAULT 0 CHECK(pending_usd>=0),
+ input_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,output_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,
+ current_response_id UUID,cleanup_pending BOOLEAN NOT NULL DEFAULT FALSE,error_code TEXT,note TEXT,
+ created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(user_id,request_key)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS voice_owner_active_idx ON voice_sessions(user_id) WHERE status IN ('preparing','connecting','listening','responding','stopping');
+CREATE INDEX IF NOT EXISTS voice_task_idx ON voice_sessions(user_id,original_task_id,created_at DESC);
+CREATE TABLE IF NOT EXISTS voice_responses (
+ id UUID PRIMARY KEY,session_id UUID NOT NULL REFERENCES voice_sessions(id) ON DELETE CASCADE,user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ reservation_key TEXT NOT NULL UNIQUE,provider_response_id TEXT,reserved_usd DOUBLE PRECISION NOT NULL CHECK(reserved_usd>0),
+ state TEXT NOT NULL DEFAULT 'reserved' CHECK(state IN ('reserved','settled','released')),cost_usd DOUBLE PRECISION,receipt JSONB,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(session_id,provider_response_id)
+);
+CREATE INDEX IF NOT EXISTS voice_response_session_idx ON voice_responses(session_id,state);
+CREATE TABLE IF NOT EXISTS voice_proposals (
+ id UUID PRIMARY KEY,session_id UUID NOT NULL REFERENCES voice_sessions(id) ON DELETE CASCADE,user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ provider_call_id TEXT NOT NULL,digest TEXT NOT NULL,ciphertext JSONB NOT NULL,status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','confirmed','rejected','expired')),
+ message_id UUID,expires_at TIMESTAMPTZ NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(session_id,provider_call_id)
+);
+`
   }
 ] as const;

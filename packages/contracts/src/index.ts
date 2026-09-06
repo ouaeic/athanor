@@ -1,4 +1,17 @@
 import { z } from 'zod';
+import { TaskOutputIntents } from './output-intent.js';
+export * from './output-intent.js';
+export * from './delivery-state.js';
+import { ReasoningOptions, TaskReasoningEffort } from './reasoning.js';
+export * from './reasoning.js';
+import { MediaCapabilities, MediaPriceLine } from './media.js';
+export * from './media.js';
+export * from './presentation.js';
+export * from './browser-lifecycle.js';
+export * from './code-intelligence.js';
+export * from './computation.js';
+export * from './coding-missions.js';
+export * from './native-authorization.js';
 
 /**
  * Which computer answers a web search, and what that discloses to whom. It lives in its own file
@@ -536,6 +549,7 @@ export const Task = z.object({
   id: Id,
   workspaceId: Id,
   parentTaskId: Id.nullable().optional(),
+  parentMissionId: Id.nullable().optional(),
   branchedFromEventId: Id.nullable().optional(),
   forkKind: z.enum(['branch', 'edit', 'retry']).nullable().optional(),
   /**
@@ -550,6 +564,9 @@ export const Task = z.object({
   title: z.string().min(1).max(160),
   status: TaskStatus,
   modelId: z.string(),
+  reasoningEffort: TaskReasoningEffort.optional(),
+  deliveryStatus: z.enum(['pending', 'ready', 'incomplete']).nullable().optional(),
+  pendingDeliveryCount: z.number().int().nonnegative().optional(),
   privacyRoute: PrivacyRoute,
   securityMode: SecurityMode.default('balanced'),
   maxComputeCredits: z.number().nonnegative(),
@@ -783,12 +800,14 @@ export const TaskPlan = z.object({
   parentVersion: z.number().int().positive().nullable(),
   branchName: z.string().min(1).max(80),
   steps: z.array(TaskPlanStep).min(1).max(30),
+  outputs: TaskOutputIntents.optional(),
   createdBy: z.enum(['agent', 'user']),
   createdAt: IsoDate
 });
 export type TaskPlan = z.infer<typeof TaskPlan>;
 
 export const UpdateTaskPlanRequest = z.object({
+  outputs: TaskOutputIntents.optional(),
   expectedVersion: z.number().int().nonnegative(),
   parentVersion: z.number().int().positive().optional(),
   branchName: z.string().trim().min(1).max(80).default('Main'),
@@ -977,6 +996,13 @@ export const ModelRelease = z.object({
   contextTokens: z.number().int().positive(),
   modalities: z.array(z.enum(['text', 'image', 'audio', 'video'])),
   capabilities: z.array(z.enum(['chat', 'vision', 'tools', 'reasoning', 'embedding'])),
+  reasoning: ReasoningOptions.optional(),
+  nativeInputPricing: z
+    .object({
+      audioUsdPerMillionTokens: z.number().nonnegative().nullable(),
+      videoUsdPerMillionTokens: z.number().nonnegative().nullable()
+    })
+    .optional(),
   usageClass: z.enum(['light', 'medium', 'high', 'extra_high']),
   recommendationTags: z.array(z.string()),
   measuredQuality: z.number().min(0).max(1).nullable(),
@@ -997,33 +1023,13 @@ export const ModelRelease = z.object({
 });
 export type ModelRelease = z.infer<typeof ModelRelease>;
 
-/**
- * The kinds of media the owner's provider can be asked to make, and the one it can be asked to
- * read.
- *
- * Transcription runs the other way round from the rest - a file goes out and text comes back - but
- * it is the same account, the same private routing and the same question for the owner: which model
- * does this, and what does it cost. Giving it its own picker rather than its own mechanism is what
- * keeps that one question in one place.
- *
- * Video is in the enum because the owner asks about it and the answer has to be addressable, not
- * because anything generates one. There is no video route on this computer: the only video code
- * that has ever existed here is the sentence that refuses, and a modality with a picker and no
- * endpoint behind it would be an offer athanor cannot keep.
- */
+/** Provider-discovered media modalities supported by the gateway. */
 export const MediaModality = z.enum(['image', 'audio', 'transcription', 'video']);
 export type MediaModality = z.infer<typeof MediaModality>;
 
-/**
- * Why video is not on offer, said once.
- *
- * The worker refuses the tool call with it and Settings prints it where the picker would be. It is
- * one string in one place because the alternative is two copies of a policy, and the audit's own
- * finding on approvals is that when policy is duplicated across layers it is the stale copy that
- * wins.
- */
+/** Guidance for a video request without an owner-selected route. */
 export const MEDIA_VIDEO_UNAVAILABLE_REASON =
-  'athanor has no video generation route. The provider it builds a media catalogue from states that asynchronous video generation is not eligible for zero-data-retention, so one was never built and there is nothing yet to point a choice at.';
+  'Choose a video model in Settings. Each video job requires approval for temporary provider retention.';
 
 /**
  * One media model the owner may choose, with what it costs stated in the unit its provider bills.
@@ -1047,6 +1053,15 @@ export const MediaModelOption = z.object({
   usdPerMillionCharacters: z.number().nonnegative().nullable(),
   /** Charged per minute of recording, which is how transcription is billed. */
   usdPerMinute: z.number().nonnegative().nullable().default(null),
+  usdPerSecond: z.number().nonnegative().nullable().optional(),
+  capabilities: MediaCapabilities.optional(),
+  pricing: z.array(MediaPriceLine).max(128).optional(),
+  apiProtocol: z.enum(['openrouter', 'openai']).optional(),
+  providerEndpointTag: z.string().min(1).max(200).optional(),
+  /** A persisted endpoint pin must match its live capability and price metadata. */
+  metadataVerifiedAt: IsoDate.optional(),
+  requiresRetentionApproval: z.boolean().optional(),
+  retirementAt: IsoDate.optional(),
   /**
    * `provider` when the figure came off the provider's own feed, `measured` when it is a price
    * athanor recorded from real generations on this route, `unknown` when nobody has said.
@@ -1081,7 +1096,8 @@ export type MediaModelChoice = z.infer<typeof MediaModelChoice>;
 export const MediaModelSelection = z.object({
   image: MediaModelChoice.optional(),
   audio: MediaModelChoice.optional(),
-  transcription: MediaModelChoice.optional()
+  transcription: MediaModelChoice.optional(),
+  video: MediaModelChoice.optional()
 });
 export type MediaModelSelection = z.infer<typeof MediaModelSelection>;
 
@@ -1443,6 +1459,7 @@ export const CreateTaskRequest = z.object({
   prompt: z.string().min(1).max(200_000),
   title: z.string().min(1).max(160).optional(),
   modelId: z.string().optional(),
+  reasoningEffort: TaskReasoningEffort.optional(),
   privacyRoute: PrivacyRoute.default('provider_zdr'),
   maxComputeCredits: z.number().min(0.01).max(10_000).default(1),
   /** Omitted means "use the account default", not "unlimited". */
@@ -1454,6 +1471,7 @@ export type CreateTaskRequest = z.input<typeof CreateTaskRequest>;
 export const ContinueTaskRequest = z.object({
   prompt: z.string().trim().min(1).max(200_000),
   modelId: z.string().optional(),
+  reasoningEffort: TaskReasoningEffort.optional(),
   privacyRoute: PrivacyRoute.optional(),
   maxComputeCredits: z.number().min(0.01).max(10_000).default(1),
   maxSpendUsd: TaskSpendUsd.optional(),
@@ -1939,6 +1957,14 @@ export const SaveDraftRequest = z.object({
   workspaceId: Id,
   taskId: Id.nullish(),
   body: z.string().max(200_000),
+  controls: z
+    .object({
+      modelId: z.string().max(300),
+      reasoningEffort: TaskReasoningEffort,
+      privacyRoute: PrivacyRoute,
+      spendCap: z.string().max(32)
+    })
+    .optional(),
   /**
    * The files already uploaded against this half-written message.
    *
@@ -2069,3 +2095,7 @@ export const MemoryItemBody = z.object({
   readable: z.boolean()
 });
 export type MemoryItemBody = z.infer<typeof MemoryItemBody>;
+
+export * from './debugger.js';
+export * from './dictation.js';
+export * from './voice.js';

@@ -1,0 +1,66 @@
+import { ComputationSessionSchema } from '@athanor/contracts';
+import type { TaskRecord } from '@athanor/data';
+import type { ModelToolCall } from '@athanor/model-gateway';
+import type { AgentApprovalRequirement } from './approval-state.js';
+import type { AgentRunnerClient } from './runner-client.js';
+import { approvalRequirement, type ApprovalContext } from './approval-policy.js';
+import { computationRequest } from './tools/computation.js';
+
+export async function computationApproval(
+  runner: AgentRunnerClient,
+  task: TaskRecord,
+  call: ModelToolCall,
+  context: ApprovalContext
+): Promise<AgentApprovalRequirement | null> {
+  const body = computationRequest(call.arguments);
+  if (['list', 'status'].includes(body.action)) return null;
+  if (body.action === 'start')
+    return {
+      sideEffect: context.taintSources?.length ? 'external_consequential' : 'external_reversible',
+      action: `Start ${body.language ?? 'native'} computation`,
+      preview: `Start a task-scoped ${body.language ?? 'unspecified'} interpreter in ${body.cwd}. Lifetime: ${body.lifetimeSeconds ?? 3600}s, bounded by this computer’s configured ceiling. Filesystem confined and network disabled. Values remain in this process until stopped or expired; restart loses memory and never replays cells.`
+    };
+  if (!body.sessionId) throw Error('Computation action requires sessionId');
+  const stored = ComputationSessionSchema.parse(
+    await runner.call(
+      task.workspaceId,
+      task.id,
+      'files.read',
+      `/v1/workspaces/${task.workspaceId}/computation`,
+      { action: 'status', sessionId: body.sessionId }
+    )
+  );
+  if (stored.taskId !== task.id || stored.workspaceId !== task.workspaceId)
+    throw Error('Computation session ownership mismatch');
+  if (['interrupt', 'stop'].includes(body.action))
+    return {
+      sideEffect: 'external_reversible',
+      action: `${body.action === 'stop' ? 'Stop' : 'Interrupt'} ${stored.name}`,
+      preview: `${body.action === 'stop' ? 'Discard the retained values and stop this interpreter.' : 'Interrupt the current cell; state is preserved only if the interpreter acknowledges it.'} Session ${stored.sessionId}, ${stored.language}, ${stored.cwd}.`
+    };
+  const classified =
+    body.action === 'cell'
+      ? approvalRequirement(
+          'shell',
+          {
+            executable: stored.language === 'python' ? 'python3' : 'node',
+            args: [stored.language === 'python' ? '-c' : '-e', body.code ?? ''],
+            cwd: stored.cwd,
+            network: false
+          },
+          task.securityMode,
+          context
+        )
+      : null;
+  return {
+    sideEffect:
+      classified?.sideEffect === 'external_consequential' || context.taintSources?.length
+        ? 'external_consequential'
+        : 'external_reversible',
+    action:
+      body.action === 'cell'
+        ? `Run a ${stored.language} cell in ${stored.name}`
+        : `${body.action === 'checkpoint' ? 'Save' : 'Restore'} a JSON computation checkpoint`,
+    preview: `${classified?.preview ?? (body.action === 'cell' ? body.code : JSON.stringify({ path: body.path, variables: body.variables }))}\nStored session: ${stored.sessionId}, ${stored.language}, cwd ${stored.cwd}. Filesystem confined; network disabled. Deadline ${stored.deadlineAt}. Each stable cellId executes at most once.`
+  };
+}

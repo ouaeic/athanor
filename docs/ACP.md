@@ -1,7 +1,7 @@
-# Talking to athanor from somebody else's client
+# Talking to garden from somebody else's client
 
-athanor speaks the **Agent Client Protocol**. An editor, a desktop app or a front end somebody wrote
-themselves can drive this box without athanor shipping, writing or maintaining any of them.
+garden speaks the **Agent Client Protocol**. An editor, a desktop app or a front end somebody wrote
+themselves can drive this box without garden shipping, writing or maintaining any of them.
 
 ```bash
 sudo athanor acp --workspace WORKSPACE_ID [--model ID] [--credits N] [--spend-usd N]
@@ -13,7 +13,7 @@ JSON-RPC 2.0 down its stdin and stdout, and the process ends when the pipe close
 `athanor task`, it is a command an operator configures rather than a tool the agent can see: the
 tool catalogue is the same byte for byte with it and without it, and it adds no field to any model
 request. It calls the same HTTP API `athanor task` calls, with the same bearer token, and every turn
-it runs is an ordinary athanor task under the ordinary approval floor.
+it runs is an ordinary garden task under the ordinary approval floor.
 
 ## Which specification this is, and how it was read
 
@@ -30,41 +30,41 @@ The version story is worth knowing before anyone builds on this:
 - **v2 exists and is not finished.** `schema/v2` is in the project's `main` branch with three
   pre-releases published, `schema-v2.0.0-alpha.1` through `alpha.3`. It removes `fs/*`,
   `terminal/*` and `session/load`, and renames `authenticate` to `auth/login`. **None of those are
-  surfaces athanor uses**, so moving to 2 is a version bump in one constant here rather than a
+  surfaces garden uses**, so moving to 2 is a version bump in one constant here rather than a
   rewrite. Until it leaves alpha this answers 1.
 - Version negotiation is the protocol's own protection: an agent that cannot speak the client's
   version "MUST respond with the latest version it supports", and the client then decides whether to
   continue. A client that outgrows this agent finds out at `initialize` rather than mid-turn.
 
 This was **not** declined, and it is worth saying why, because three things in this programme have
-been. The protocol is small, the parts athanor needs are the parts that have not moved, the mandatory
+been. The protocol is small, the parts garden needs are the parts that have not moved, the mandatory
 agent surface is four methods, and the one genuine hazard in it - the permission call - is optional
 for an agent to make. The gap it closes is real: multiple independent projects adopted ACP without
 being paid to, and it is the cheapest interop surface a self-hosted agent has.
 
-## What the protocol requires, and what athanor answers
+## What the protocol requires, and what garden answers
 
 An agent must handle `initialize`, `authenticate`, `session/new` and `session/prompt`, must send
 `session/update` notifications as it works, and must return the `cancelled` stop reason after a
 `session/cancel`. Everything else is optional on one side or the other.
 
-| Method                       | athanor                                                               |
+| Method                       | garden                                                                |
 | ---------------------------- | --------------------------------------------------------------------- |
 | `initialize`                 | Answers version 1. No auth methods, no MCP, no session loading.       |
 | `authenticate`               | Refused. There is no auth method to authenticate against - see below. |
 | `session/new`                | Opens a session. Refuses a non-empty `mcpServers`.                    |
-| `session/prompt`             | Creates an athanor task, or continues the one this session opened.    |
+| `session/prompt`             | Creates an garden task, or continues the one this session opened.     |
 | `session/cancel`             | Cancels the task. The turn then answers `cancelled`.                  |
 | `session/load`               | Refused. `initialize` advertises `loadSession: false`.                |
 | `session/set_mode`           | **Refused.** See the approval floor below.                            |
 | `session/set_config_option`  | **Refused.** Same reason.                                             |
 | `session/request_permission` | Sent only under `--approvals relay`, and never with a standing yes.   |
 
-One ACP session is one athanor task. The first `session/prompt` creates it; every later prompt in
+One ACP session is one garden task. The first `session/prompt` creates it; every later prompt in
 that session continues the same conversation, so what the client is saying and what the owner sees
-in athanor are the same thread.
+in garden are the same thread.
 
-`cwd` is recorded and otherwise unused. athanor's unit of work is a workspace on the box, not a
+`cwd` is recorded and otherwise unused. garden's unit of work is a workspace on the box, not a
 directory on the client's machine, and treating a client's path as a workspace would be a lie about
 where the work happens. The workspace comes from `--workspace` and from nowhere else.
 
@@ -104,24 +104,24 @@ client that spawned it never sees the credential.
 holds `tasks:write`.** Such a client can set the task it was just told about in `_meta.athanor.taskId`
 to `autonomous` with one HTTP call that does not go through this protocol at all, and
 `SECURITY_MODE_FLOOR` in `apps/worker/src/approval-policy.ts` then stops asking before reaching the
-internet and before installing software. That is a property of an athanor API token and is the same
+internet and before installing software. That is a property of an garden API token and is the same
 for `athanor task`; ACP does not create it and cannot close it. If that matters for a given client,
 run the bridge on the box under `sudo` so the token stays in `/etc/athanor/api-token`.
 
 ### A client is not asked to answer cards, unless the operator says so
 
 **`--approvals park` is the default.** The bridge never calls `session/request_permission`. When
-athanor cards an action the task parks, the turn ends, and the client is told in words what was asked
-and where to answer it. The decision stays with the owner at athanor's own surface.
+garden cards an action the task parks, the turn ends, and the client is told in words what was asked
+and where to answer it. The decision stays with the owner at garden's own surface.
 
 **`--approvals relay` is opt-in.** The bridge asks the client, and hands the answer to
-`POST /v1/approvals/:id/{approve,deny}` - athanor's own approval route, the same one
+`POST /v1/approvals/:id/{approve,deny}` - garden's own approval route, the same one
 `athanor task approve` uses. It is a mapping onto that mechanism and not a replacement for it: every
-card athanor raises is still raised, because the security mode decides what gets carded and this path
+card garden raises is still raised, because the security mode decides what gets carded and this path
 never touches it. Relay changes only _where the question is displayed_.
 
 Relay offers exactly two of ACP's four `PermissionOptionKind` values: `allow_once` and `reject_once`.
-**`allow_always` and `reject_always` are never offered**, because athanor has nowhere to keep a
+**`allow_always` and `reject_always` are never offered**, because garden has nowhere to keep a
 standing decision - `POST /v1/approvals/:id/:decision` resolves one approval and consults no rule
 table - and a client handed `allow_always` would reasonably stop asking its user. From that moment a
 toggle in somebody's editor would be answering every card instead of the owner. The cost, plainly: a
@@ -162,9 +162,9 @@ prevent."
 
 ## How a turn ends
 
-The result of `session/prompt` is a `stopReason`, with the athanor detail beside it under `_meta`.
+The result of `session/prompt` is a `stopReason`, with the garden detail beside it under `_meta`.
 
-| athanor status                       | stopReason                          | `_meta.athanor.parked` |
+| garden status                        | stopReason                          | `_meta.athanor.parked` |
 | ------------------------------------ | ----------------------------------- | ---------------------- |
 | `completed`                          | `end_turn`                          | -                      |
 | `cancelled`                          | `cancelled`                         | -                      |
@@ -180,7 +180,7 @@ broke", and this repository has been bitten twice by a wrapper that returned suc
 died. There must be no success field a client can read and believe the work was done.
 
 **A parked task reports `refusal`, not `end_turn`.** ACP v1 has five stop reasons and none of them
-means "parked, waiting on a decision nobody has made yet", which is what athanor's `awaiting_user`,
+means "parked, waiting on a decision nobody has made yet", which is what garden's `awaiting_user`,
 `paused` and `awaiting_resource` all are. Neither available answer is right:
 
 - `end_turn` means the turn ended successfully. A parked task reported that way looks _finished_ to
@@ -188,7 +188,7 @@ means "parked, waiting on a decision nobody has made yet", which is what athanor
 - `refusal` is documented as meaning the prompt "won't be included in the next prompt, so this should
   be reflected in the UI", so a client may drop the turn from its own display.
 
-The second is cosmetic here and only here, because athanor owns the transcript: the task keeps its
+The second is cosmetic here and only here, because garden owns the transcript: the task keeps its
 full context on the box, and the next `session/prompt` continues it whatever the client chose to
 show. The first costs money and lets a live task go unwatched. So `refusal` it is, and the turn also
 says in words what happened. **If you are writing a client, read `_meta.athanor` - it carries the
@@ -253,17 +253,17 @@ another machine, drop the `sudo`, set `ATHANOR_API` to the server's address and 
   be uploaded through `/v1/workspaces/:id/file` first - which needs `files:write`, a scope this
   bridge never asks for. Advertising the capability would promise a path that does not exist.
 - **It does not use the client's filesystem or terminal.** ACP lets an agent read and write files
-  through the client and run commands in the client's terminal. athanor does neither: work happens in
+  through the client and run commands in the client's terminal. garden does neither: work happens in
   a workspace on the box, and nothing here touches the machine the client runs on.
 - **It does not accept MCP servers from a client.** `session/new` refuses a non-empty `mcpServers`.
   Running whatever a client names would be third-party code arriving on the owner's box through a
   protocol field - a plugin marketplace with a specification on it, which this repository declined.
-  athanor's connectors are configured by its owner.
+  garden's connectors are configured by its owner.
 - **It does not implement `session/load`, `session/list`, `session/delete` or `session/resume`.** A
-  client that reconnects starts a new session; the athanor task it opened is still there and
+  client that reconnects starts a new session; the garden task it opened is still there and
   `athanor task show` reads it.
 - **It does not resume a parked task.** `POST /v1/tasks/:taskId/resume` is the call.
-- **It does not report cost.** ACP has a `usage_update` for it. athanor's `cost` events are not
+- **It does not report cost.** ACP has a `usage_update` for it. garden's `cost` events are not
   mapped onto it, so a client sees no running spend; `athanor task show` does, and the spend ceiling
   is enforced server-side regardless of what any client displays.
 

@@ -1,12 +1,12 @@
 # Capability and design audit
 
-This is an engineering audit of what athanor actually does, written against the source rather than
+This is an engineering audit of what garden actually does, written against the source rather than
 against intentions. It records the deliberate boundaries too, because a boundary that is not written
 down gets mistaken for an oversight — or for a promise.
 
 ## Scope
 
-athanor is built for one owner and one computer. It covers chat, a persistent Linux machine,
+garden is built for one owner and one computer. It covers chat, a persistent Linux machine,
 terminal, browser, web search, GUI applications, human takeover, files, rich artifacts, durable
 history, reviewed memory, skills, schedules, model selection, coding-specialist handoff, previews,
 device clients, the owner's own mailbox and calendar over open protocols, MCP, and a single approval
@@ -21,7 +21,7 @@ model-provider account and pays it directly. Four ceilings bound a run, and none
 allowance:
 
 - the **pre-flight price ceiling** (`sudo athanor price-ceiling`), a maximum rate in dollars per
-  million tokens that athanor will not select a model above. It is the only one that acts before
+  million tokens that garden will not select a model above. It is the only one that acts before
   any money is spent, and the only one that works while the owner is asleep; a model the owner
   names explicitly is never constrained by it;
 - the **daily, monthly and per-task spending caps** in Settings, which watch what a task has
@@ -43,7 +43,7 @@ stopped one would have left behind.
 
 ### Reviewed memory rather than automatic capture
 
-Automatic fact extraction preserves wrong and sensitive claims with equal confidence. athanor lets
+Automatic fact extraction preserves wrong and sensitive claims with equal confidence. garden lets
 the agent propose a compact memory, and pauses for review where review is worth having: every
 replacement and every removal, because both destroy something the owner already approved; and an
 addition that would reach user memory, that carries anything the credential scanner recognises, that
@@ -234,7 +234,7 @@ on that tab and that host, and nowhere else — the rest of the browser keeps wo
 told to carry on with the rest of the task, and the owner is told about the one page, with taking
 control a single button that brings that tab to the front. Handing the browser back clears the stop.
 
-CAPTCHAs, identity checks, credentials, and payments always transfer to the owner. athanor does not
+CAPTCHAs, identity checks, credentials, and payments always transfer to the owner. garden does not
 claim to bypass site controls, and does not ship proxy or fingerprint-rotation services.
 
 ### No channel or plugin sprawl

@@ -9,6 +9,15 @@ import type {
   ProviderModel
 } from './protocol.js';
 import { isProviderWallStatus } from './retry.js';
+import { assertReasoningEffort, readReasoningOptions, type ReasoningOptions } from './reasoning.js';
+import { describeNativeOpenAIInput } from './openai-native-input-catalog.js';
+import { isNativeOpenAIEndpoint } from './openai-media-catalog.js';
+import {
+  nativeInputBlocks,
+  NATIVE_INPUT_MAX_BYTES,
+  NATIVE_INPUT_MAX_PARTS,
+  type NativeInputBlock
+} from './native-input.js';
 import {
   MAX_CACHE_BREAKPOINTS,
   promptCacheStyle,
@@ -122,6 +131,7 @@ interface CompletionBody {
 
 /** Content blocks are only used when a message needs a cache breakpoint or carries images. */
 type ContentBlock =
+  | NativeInputBlock
   | { type: 'text'; text: string; cache_control?: { type: 'ephemeral' } }
   | { type: 'image_url'; image_url: { url: string } };
 
@@ -526,11 +536,8 @@ const transportDetail = (error: unknown): string => {
 };
 
 /**
- * What a configured OpenAI-compatible endpoint declared about one of its models, and what it did
- * not. `metadataSource` is `declared` when the endpoint published anything usable and `unknown`
- * when it published nothing at all - and an `unknown` route is selectable by name and never by
- * automatic ranking, because inventing a score for a route we know nothing about is what let a
- * local 7B outrank every measured model in the catalogue.
+ * Provider declarations from discovery or exact official documentation. Unknown routes require
+ * explicit selection because absent metadata cannot establish a meaningful automatic ranking.
  */
 export interface ConfiguredModelDescription {
   readonly id: string;
@@ -541,7 +548,13 @@ export interface ConfiguredModelDescription {
   readonly outputUsdPerMillionTokens: number | null;
   readonly supportsTools: boolean | null;
   readonly supportsReasoningEffort: boolean | null;
-  /** Fields the owner has to supply because the endpoint did not. */
+  readonly reasoning?: ReasoningOptions;
+  readonly inputModalities?: Array<'text' | 'image' | 'audio' | 'video'>;
+  readonly nativeInputPricing?: {
+    audioUsdPerMillionTokens: number | null;
+    videoUsdPerMillionTokens: number | null;
+  };
+  /** Fields absent from both discovery and supported official documentation. */
   readonly unknownFields: readonly string[];
   readonly metadataSource: 'declared' | 'unknown';
 }
@@ -625,12 +638,27 @@ const describeConfiguredModel = (entry: Record<string, unknown>): ConfiguredMode
   return {
     id,
     displayName: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : id,
+    ...(isRecord(entry.architecture) && Array.isArray(entry.architecture.input_modalities)
+      ? {
+          inputModalities: entry.architecture.input_modalities.filter(
+            (kind): kind is 'text' | 'image' | 'audio' | 'video' =>
+              typeof kind === 'string' && ['text', 'image', 'audio', 'video'].includes(kind)
+          )
+        }
+      : {}),
+    nativeInputPricing: {
+      audioUsdPerMillionTokens: pricePerMillionFrom(pricing, ['audio']),
+      videoUsdPerMillionTokens: null
+    },
     contextTokens,
     maxOutputTokens,
     inputUsdPerMillionTokens,
     outputUsdPerMillionTokens,
     supportsTools: parameters === null ? null : parameters.includes('tools'),
     supportsReasoningEffort: parameters === null ? null : parameters.includes('reasoning_effort'),
+    ...(readReasoningOptions(entry.reasoning)
+      ? { reasoning: readReasoningOptions(entry.reasoning)! }
+      : {}),
     unknownFields,
     metadataSource: unknownFields.length === 5 ? 'unknown' : 'declared'
   };
@@ -760,20 +788,11 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
     }));
   }
 
-  /**
-   * What the configured endpoint says about itself.
-   *
-   * A directly configured provider used to be written into the catalogue with invented metadata - a
-   * 128K window nobody checked, a "medium" usage class, no price - and those inventions then
-   * outranked models that had actually been benchmarked. The endpoint usually publishes some of
-   * this: vLLM reports `max_model_len`, LiteLLM reports a context window and a completion limit,
-   * gateways that front OpenRouter report prices. Whatever it does not publish is returned in
-   * `unknown` so the owner can be asked once, at the screen where they paste the key, instead of
-   * having a number made up for them.
-   */
+  /** Discovery is the authority for account availability, including documented native models. */
   async describe(signal?: AbortSignal): Promise<ConfiguredModelDescription[]> {
     const response = await this.#fetch(`${this.#baseUrl}/models`, {
       headers: this.#headers(),
+      ...(isNativeOpenAIEndpoint(this.#baseUrl) ? { redirect: 'error' as const } : {}),
       ...(signal ? { signal } : {})
     });
     if (!response.ok)
@@ -783,7 +802,9 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
       );
     const body = (await response.json()) as { data?: unknown };
     const entries = Array.isArray(body.data) ? body.data : [];
-    return entries.filter(isRecord).map((entry) => describeConfiguredModel(entry));
+    return entries
+      .filter(isRecord)
+      .map((entry) => describeNativeOpenAIInput(this.#baseUrl, describeConfiguredModel(entry)));
   }
 
   /**
@@ -802,7 +823,8 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
       if (
         message.cacheBreakpoint &&
         BLOCK_CONTENT_ROLES.has(message.role) &&
-        !message.images?.length
+        !message.images?.length &&
+        !message.nativeInputs?.length
       )
         eligible.push(index);
     });
@@ -882,15 +904,43 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
   }
 
   async chat(input: ModelRequest): Promise<ModelResponse> {
+    assertReasoningEffort(input.reasoningEffort, input.reasoningOptions);
+    const nativeParts = input.messages.flatMap((message) => message.nativeInputs ?? []);
+    if (
+      nativeParts.length > NATIVE_INPUT_MAX_PARTS ||
+      nativeParts.reduce((sum, part) => sum + Buffer.byteLength(part.data, 'base64'), 0) >
+        NATIVE_INPUT_MAX_BYTES
+    )
+      throw new AthanorError(
+        'native_input_too_large',
+        'Native media exceeds the combined request limit',
+        413
+      );
+    const nativeBlocks = new Map<number, NativeInputBlock[]>();
+    for (const [index, message] of input.messages.entries()) {
+      if (!message.nativeInputs?.length) continue;
+      if (message.role !== 'user')
+        throw new AthanorError(
+          'native_input_role_invalid',
+          'Native media is only accepted as user input data',
+          400
+        );
+      nativeBlocks.set(
+        index,
+        nativeInputBlocks(message.nativeInputs, this.provider, input.inputModalities)
+      );
+    }
     const started = performance.now();
     const serverTools = this.#serverToolPayload(input);
     const cacheBreakpoints = this.#cacheBreakpointIndexes(input);
     // Only consulted where it can change the outcome: the demand that every parameter be honoured
     // is sent under zero data retention and nowhere else, so nowhere else can a declared-parameter
     // list turn a live model into a 404.
-    const declared = this.#enforceZeroDataRetention
-      ? await this.#zeroRetentionParameters(input.model)
-      : null;
+    const nativeOpenAI = isNativeOpenAIEndpoint(this.#baseUrl);
+    const declared =
+      this.#enforceZeroDataRetention && !nativeOpenAI
+        ? await this.#zeroRetentionParameters(input.model)
+        : null;
     const sends = (parameter: string): boolean => !declared || declared.has(parameter);
     /**
      * The same cap under whichever name the route declared. A route that takes only
@@ -907,9 +957,21 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
     const payload = (withReasoningDetails: boolean, shedImages: ReadonlySet<number>): string =>
       JSON.stringify({
         model: input.model,
+        ...(nativeOpenAI && nativeParts.length
+          ? { modalities: ['text'], store: false, service_tier: 'default' }
+          : {}),
         messages: input.messages.map((message, index) => ({
           role: message.role,
           content: ((): string | ContentBlock[] => {
+            const media = nativeBlocks.get(index);
+            if (media)
+              return [
+                { type: 'text', text: message.content },
+                ...media,
+                ...(message.images ?? []).map(
+                  (url): ContentBlock => ({ type: 'image_url', image_url: { url } })
+                )
+              ];
             // Shed first, and as plain text with no marker: only a message that carries images can
             // be in this set, and `#cacheBreakpointIndexes` never marks one of those - so this
             // message had no breakpoint to keep, exactly as it had none when its images were still
@@ -950,19 +1012,27 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
           ...serverTools
         ],
         ...(sends('temperature') ? { temperature: input.temperature } : {}),
-        ...(input.reasoningEffort && input.supportsReasoningEffort !== false && sends('reasoning')
-          ? { reasoning: { effort: input.reasoningEffort } }
+        ...(input.reasoningEffort &&
+        input.supportsReasoningEffort !== false &&
+        sends(this.provider === 'openrouter' ? 'reasoning' : 'reasoning_effort')
+          ? this.provider === 'openrouter'
+            ? { reasoning: { effort: input.reasoningEffort } }
+            : { reasoning_effort: input.reasoningEffort }
           : {}),
-        ...(input.sessionId ? { session_id: input.sessionId } : {}),
+        ...(input.sessionId && !nativeOpenAI ? { session_id: input.sessionId } : {}),
         ...outputCap,
         ...(input.onTextDelta ? { stream: true, stream_options: { include_usage: true } } : {}),
-        ...(this.#enforceZeroDataRetention
+        ...((this.#enforceZeroDataRetention && !nativeOpenAI) ||
+        (nativeParts.length && this.provider === 'openrouter')
           ? {
               provider: {
-                zdr: true,
-                data_collection: 'deny',
-                require_parameters: true,
-                allow_fallbacks: true
+                ...(this.#enforceZeroDataRetention
+                  ? { zdr: true, data_collection: 'deny', require_parameters: true }
+                  : {}),
+                allow_fallbacks: nativeParts.length ? false : true,
+                ...(nativeParts.length && input.nativeInputMaxPrice
+                  ? { max_price: input.nativeInputMaxPrice }
+                  : {})
               }
             }
           : {})
@@ -989,7 +1059,7 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
      */
     const assemble = (withReasoningDetails: boolean): { body: string; bytes: number } => {
       const attachments = input.messages.flatMap((message, index) =>
-        message.images?.length ? [index] : []
+        message.images?.length && !message.nativeInputs?.length ? [index] : []
       );
       const shed = new Set<number>();
       for (;;) {
@@ -999,7 +1069,7 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
         const oldest = attachments.find((index) => !shed.has(index));
         if (oldest === undefined)
           throw new AthanorError(
-            'provider_context_overflow',
+            nativeParts.length ? 'native_input_too_large' : 'provider_context_overflow',
             `${this.provider} was not sent this request: the assembled body is ${bytes} bytes, past the ${this.#maxRequestBytes}-byte ceiling this side holds, and there is nothing left to leave out`,
             413,
             { requestBytes: bytes, maxRequestBytes: this.#maxRequestBytes }
@@ -1037,7 +1107,11 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
     // The one repair is to stop replaying the signed material. It is dropped from this request
     // only, never from the stored trajectory - editing that would poison every future turn.
     // Not gated on provider name: OpenRouter proxies the upstream's wording verbatim.
-    if (response.status === 400 && (await this.#isSignedReasoningRefusal(response))) {
+    if (
+      !nativeParts.length &&
+      response.status === 400 &&
+      (await this.#isSignedReasoningRefusal(response))
+    ) {
       response = await send(false);
     }
     if (!response.ok) {

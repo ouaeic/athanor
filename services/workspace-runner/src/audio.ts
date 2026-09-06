@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
-import { constants } from 'node:fs';
-import { open } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { constants, type BigIntStats } from 'node:fs';
+import { open, type FileHandle } from 'node:fs/promises';
 import { AUDIO_READ_MAX_SECONDS } from '@athanor/contracts';
 import { hostSearchPath } from './execution.js';
 import { resolveExecutable } from './command-policy.js';
@@ -29,6 +30,86 @@ const PROBE_TIMEOUT_MS = 30_000;
 /** Generous: a ninety-minute window is re-encoded far faster than real time, but not instantly. */
 const ENCODE_TIMEOUT_MS = 15 * 60_000;
 
+export const AUDIO_SOURCE_MAX_BYTES = 8 * 1024 * 1024 * 1024;
+export const AUDIO_SOURCE_HASH_TIMEOUT_MS = 60_000;
+
+/** Only the inherited recording may be read, including by demuxers that follow references. */
+export const audioInputOptions = (): string[] => ['-protocol_whitelist', 'fd', '-fd', '3'];
+
+export interface AudioSourceReceipt {
+  sourceSha256: string;
+  sourceBytes: number;
+}
+
+const sameSource = (before: BigIntStats, after: BigIntStats): boolean =>
+  before.dev === after.dev &&
+  before.ino === after.ino &&
+  before.size === after.size &&
+  before.mtimeNs === after.mtimeNs &&
+  before.ctimeNs === after.ctimeNs;
+
+const sourceChanged = () =>
+  new WorkspaceFileError('The recording changed after inspection; review its source again', 409);
+
+/** Hash the held original, never a re-encoded container whose metadata can vary between runs. */
+const hashAudioSource = async (
+  handle: FileHandle,
+  signal?: AbortSignal
+): Promise<{ receipt: AudioSourceReceipt; identity: BigIntStats }> => {
+  signal?.throwIfAborted();
+  const identity = await handle.stat({ bigint: true });
+  if (!identity.isFile()) throw new WorkspaceFileError('That path is not a regular file', 400);
+  if (identity.size <= 0n || identity.size > BigInt(AUDIO_SOURCE_MAX_BYTES))
+    throw new WorkspaceFileError(
+      'Choose a nonempty recording within the source inspection limit; create a local clip of a larger source',
+      413
+    );
+  const started = performance.now();
+  const hash = createHash('sha256');
+  const buffer = Buffer.allocUnsafe(1024 * 1024);
+  const size = Number(identity.size);
+  let position = 0;
+  while (position < size) {
+    signal?.throwIfAborted();
+    if (performance.now() - started >= AUDIO_SOURCE_HASH_TIMEOUT_MS)
+      throw new WorkspaceFileError('Source inspection timed out; create a smaller local clip', 408);
+    const { bytesRead } = await handle.read(
+      buffer,
+      0,
+      Math.min(buffer.length, size - position),
+      position
+    );
+    if (!bytesRead) throw sourceChanged();
+    hash.update(buffer.subarray(0, bytesRead));
+    position += bytesRead;
+  }
+  signal?.throwIfAborted();
+  if (performance.now() - started >= AUDIO_SOURCE_HASH_TIMEOUT_MS)
+    throw new WorkspaceFileError('Source inspection timed out; create a smaller local clip', 408);
+  if (!sameSource(identity, await handle.stat({ bigint: true }))) throw sourceChanged();
+  return { receipt: { sourceSha256: hash.digest('hex'), sourceBytes: size }, identity };
+};
+
+export const inspectAudioSource = async (
+  root: string,
+  requested: string,
+  signal?: AbortSignal
+): Promise<AudioSourceReceipt> => {
+  const target = resolveInside(root, requested);
+  const handle = await open(
+    target,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK
+  );
+  try {
+    await assertOpenedInPlace(root, target, handle);
+    const { receipt } = await hashAudioSource(handle, signal);
+    await assertOpenedInPlace(root, target, handle);
+    return receipt;
+  } finally {
+    await handle.close();
+  }
+};
+
 export interface AudioSource {
   /** Absent when the container declares no duration, which a stream-copied recording can do. */
   durationSeconds: number | null;
@@ -50,6 +131,7 @@ export interface PreparedAudio {
   preparedSeconds: number;
   /** True when the recording continues past this window, so the caller can say where to resume. */
   more: boolean;
+  sourceReceipt?: AudioSourceReceipt;
 }
 
 /**
@@ -125,18 +207,15 @@ export const audioWindow = (
  * with an explicit audio map is what makes the audio track of a screen recording work: the video is
  * simply not read.
  */
-export const encodeArguments = (input: {
-  file: string;
-  startSeconds: number;
-  seconds: number;
-}): string[] => [
+export const encodeArguments = (input: { startSeconds: number; seconds: number }): string[] => [
   '-nostdin',
   '-v',
   'error',
   '-ss',
   String(input.startSeconds),
+  ...audioInputOptions(),
   '-i',
-  input.file,
+  'fd:',
   '-t',
   String(input.seconds),
   '-vn',
@@ -165,8 +244,8 @@ interface RunResult {
  * One child, reading the recording through an inherited descriptor rather than through its name.
  *
  * The descriptor is opened here with `O_NOFOLLOW` and proved to be the file the path named before
- * anything is spawned, and the child is then given that descriptor as `/dev/fd/3`. Handing ffmpeg
- * the path instead would reopen it, minutes later on a long encode, in a tree the agent's own shell
+ * anything is spawned, and the child receives that descriptor through the fd protocol. A pathname
+ * would be reopened minutes later on a long encode, in a tree the agent's own shell
  * can write - which is the swap `assertOpenedInPlace` exists to refuse everywhere else.
  */
 const run = async (
@@ -174,13 +253,20 @@ const run = async (
   args: string[],
   file: number,
   timeoutMs: number,
-  maxBytes: number
+  maxBytes: number,
+  signal?: AbortSignal
 ): Promise<RunResult> => {
+  signal?.throwIfAborted();
   const child = spawn(executable, args, {
     stdio: ['ignore', 'pipe', 'pipe', file],
     shell: false,
-    detached: true
+    detached: true,
+    cwd: '/',
+    env: { PATH: hostSearchPath, LANG: 'C', LC_ALL: 'C' }
   });
+  const abort = () => killProcessTree(child, 'SIGKILL');
+  signal?.addEventListener('abort', abort, { once: true });
+  if (signal?.aborted) abort();
   const chunks: Buffer[] = [];
   let total = 0;
   let overflowed = false;
@@ -205,7 +291,9 @@ const run = async (
     ({ exitCode } = await awaitChildExit(child));
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
   }
+  signal?.throwIfAborted();
   if (overflowed)
     throw new WorkspaceFileError(
       'The prepared audio grew past the upload limit before the recording ended',
@@ -220,6 +308,14 @@ const missing = (name: string): WorkspaceFileError =>
     503
   );
 
+const unsupportedSourceIsolation = (stderr: string) => {
+  if (/Option not found|Protocol not found|Unrecognized option/u.test(stderr))
+    throw new WorkspaceFileError(
+      'The installed FFmpeg cannot confine recording reads to a held file descriptor. Install a current FFmpeg build with the fd protocol.',
+      503
+    );
+};
+
 /**
  * A recording in the workspace, measured and cut to one uploadable window.
  *
@@ -231,38 +327,64 @@ const missing = (name: string): WorkspaceFileError =>
 export const prepareAudio = async (
   root: string,
   requested: string,
-  window: { startSeconds?: number | undefined; endSeconds?: number | undefined },
+  window: {
+    startSeconds?: number | undefined;
+    endSeconds?: number | undefined;
+    expectedSourceSha256?: string | undefined;
+  },
   // The system directories and no others, because both binaries below are spawned by the runner's
   // own account rather than through the sandbox: resolving them the way an agent command resolves
   // its own would let a file the agent wrote called `ffprobe` be executed unconfined. Overridable
   // for the same reason `findRenderTools` hands its result to its caller - so the round trip can be
   // measured against a real encoder that is somewhere else, which on a developer's laptop it always
   // is. The route in `server.ts` passes three arguments, so nothing off the wire reaches this.
-  searchPath: string = hostSearchPath
+  searchPath: string = hostSearchPath,
+  signal?: AbortSignal
 ): Promise<PreparedAudio> => {
+  signal?.throwIfAborted();
   const [ffprobe, ffmpeg] = await Promise.all([
     resolveExecutable('ffprobe', searchPath, root),
     resolveExecutable('ffmpeg', searchPath, root)
   ]);
+  signal?.throwIfAborted();
   if (!ffprobe || !ffmpeg) throw missing(ffprobe ? 'ffmpeg' : 'ffprobe');
   const target = resolveInside(root, requested);
-  const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const handle = await open(
+    target,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK
+  );
   try {
     await assertOpenedInPlace(root, target, handle);
-    if (!(await handle.stat()).isFile())
-      throw new WorkspaceFileError('That path is not a regular file', 400);
+    const identity = await handle.stat({ bigint: true });
+    if (!identity.isFile()) throw new WorkspaceFileError('That path is not a regular file', 400);
+    const inspected =
+      window.expectedSourceSha256 === undefined ? null : await hashAudioSource(handle, signal);
+    if (inspected && inspected.receipt.sourceSha256 !== window.expectedSourceSha256)
+      throw sourceChanged();
     const probed = await run(
       ffprobe,
-      ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', '/dev/fd/3'],
+      [
+        '-v',
+        'error',
+        ...audioInputOptions(),
+        '-print_format',
+        'json',
+        '-show_format',
+        '-show_streams',
+        'fd:'
+      ],
       handle.fd,
       PROBE_TIMEOUT_MS,
-      4 * 1024 * 1024
+      4 * 1024 * 1024,
+      signal
     );
-    if (probed.exitCode !== 0)
+    if (probed.exitCode !== 0) {
+      unsupportedSourceIsolation(probed.stderr);
       throw new WorkspaceFileError(
         `That file could not be read as a recording: ${probed.stderr.split('\n')[0] || 'the container was not recognised'}`,
         415
       );
+    }
     const source = parseAudioProbe(probed.stdout.toString('utf8'));
     if (!source.hasAudio)
       throw new WorkspaceFileError(
@@ -270,30 +392,55 @@ export const prepareAudio = async (
         415
       );
     const cut = audioWindow(window, source.durationSeconds);
-    const encoded = await run(
-      ffmpeg,
-      encodeArguments({ file: '/dev/fd/3', ...cut }),
-      handle.fd,
-      ENCODE_TIMEOUT_MS,
-      MAX_PREPARED_BYTES
+    // The fd protocol shares its cursor with the inherited descriptor. Encoding needs a fresh
+    // cursor after probing, with the reopened descriptor proved against the held original.
+    const encodingSource = await open(
+      target,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK
     );
-    if (encoded.exitCode !== 0 || !encoded.stdout.length)
+    let encoded: RunResult;
+    try {
+      await assertOpenedInPlace(root, target, encodingSource);
+      if (!sameSource(inspected?.identity ?? identity, await encodingSource.stat({ bigint: true })))
+        throw sourceChanged();
+      encoded = await run(
+        ffmpeg,
+        encodeArguments(cut),
+        encodingSource.fd,
+        ENCODE_TIMEOUT_MS,
+        MAX_PREPARED_BYTES,
+        signal
+      );
+      if (!sameSource(inspected?.identity ?? identity, await encodingSource.stat({ bigint: true })))
+        throw sourceChanged();
+    } finally {
+      await encodingSource.close();
+    }
+    if (encoded.exitCode !== 0 || !encoded.stdout.length) {
+      unsupportedSourceIsolation(encoded.stderr);
       throw new WorkspaceFileError(
         `That recording could not be converted for reading: ${encoded.stderr.split('\n')[0] || 'the encoder produced nothing'}`,
         415
       );
+    }
     // What the file holds, not what was asked for: a window that runs past the end of a recording
     // produces a shorter encode, and the caller is billed for - and told about - the shorter one.
     const preparedSeconds =
       source.durationSeconds === null
         ? cut.seconds
         : Math.max(0, Math.min(cut.seconds, source.durationSeconds - cut.startSeconds));
+    if (inspected) {
+      if (!sameSource(inspected.identity, await handle.stat({ bigint: true })))
+        throw sourceChanged();
+      await assertOpenedInPlace(root, target, handle);
+    }
     return {
       bytes: encoded.stdout,
       format: 'ogg',
       source,
       startSeconds: cut.startSeconds,
       preparedSeconds,
+      ...(inspected ? { sourceReceipt: inspected.receipt } : {}),
       more:
         source.durationSeconds !== null &&
         source.durationSeconds > cut.startSeconds + preparedSeconds + 1

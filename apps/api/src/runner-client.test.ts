@@ -7,6 +7,30 @@ const secret = 'runner-secret-with-at-least-32-characters';
 afterEach(() => vi.unstubAllGlobals());
 
 describe('runner capability requests', () => {
+  it('propagates browser cancellation without imposing a short lifetime on a large download', async () => {
+    let observed: AbortSignal | undefined;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_input: unknown, init?: RequestInit) => {
+        observed = init?.signal ?? undefined;
+        return new Response('stream');
+      })
+    );
+    const controller = new AbortController();
+    const runner = new RunnerClient('http://runner.test', secret);
+    await runner.raw({
+      workspaceId: 'workspace',
+      userId: 'owner',
+      role: 'user',
+      scopes: ['files.read'],
+      path: '/download',
+      signal: controller.signal
+    });
+    expect(observed).toBeInstanceOf(AbortSignal);
+    expect(observed?.aborted).toBe(false);
+    controller.abort();
+    expect(observed?.aborted).toBe(true);
+  });
   it('binds the token it sends to the request it sends it with', async () => {
     let authorization = '';
     vi.stubGlobal(

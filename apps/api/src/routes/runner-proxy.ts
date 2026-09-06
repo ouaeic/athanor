@@ -8,6 +8,7 @@
 
 import {
   BrowserAction,
+  BrowserTabRetentionRequest,
   DesktopAction,
   DesktopHolder,
   DesktopLaunchRequest
@@ -19,6 +20,38 @@ import type { RouteContext } from '../http/server-context.js';
 
 export const registerRunnerProxyRoutes = (context: RouteContext): void => {
   const { app, store, runner, config, idempotent } = context;
+  app.post<{ Params: { workspaceId: string; tab: string } }>(
+    '/v1/workspaces/:workspaceId/browser/tabs/:tab/retention',
+    async (request, reply) => {
+      const user = requireUser(request.user);
+      if (request.apiToken)
+        throw new AthanorError(
+          'session_required',
+          'Manage browser tabs from a signed-in device',
+          403
+        );
+      return idempotent(request, reply, user, async () => {
+        const workspace = await store.getWorkspace(user.id, request.params.workspaceId);
+        if (!workspace) throw new AthanorError('workspace_not_found', 'Workspace not found');
+        const tab = z
+          .string()
+          .regex(/^tab-[1-9]\d*$/)
+          .max(32)
+          .parse(request.params.tab);
+        const body = BrowserTabRetentionRequest.parse(request.body);
+        return runner.request({
+          workspaceId: workspace.id,
+          userId: user.id,
+          role: 'user',
+          scopes: ['browser.control'],
+          path: `/v1/workspaces/${workspace.id}/browser/tabs/${tab}/retention`,
+          method: 'POST',
+          body: JSON.stringify(body),
+          contentType: 'application/json'
+        });
+      });
+    }
+  );
   app.post<{ Params: { workspaceId: string } }>(
     '/v1/workspaces/:workspaceId/browser/snapshot',
     async (request) => {
@@ -317,6 +350,36 @@ export const registerRunnerProxyRoutes = (context: RouteContext): void => {
    * column here, and the UUID guard above would answer 404 for every real one. Re-encoded on the way
    * out so a segment carrying `%2F` cannot walk out of this route and into another of the runner's.
    */
+  app.post<{ Params: { workspaceId: string; session: string } }>(
+    '/v1/workspaces/:workspaceId/processes/:session/resume',
+    async (request) => {
+      const user = requireUser(request.user);
+      if (request.apiToken)
+        throw new AthanorError(
+          'session_required',
+          'Resume finite jobs from a signed-in device',
+          403
+        );
+      const workspace = await store.getWorkspace(user.id, request.params.workspaceId);
+      if (!workspace) throw new AthanorError('workspace_not_found', 'Workspace not found');
+      const session = z
+        .string()
+        .regex(/^job_[0-9a-f-]+$/)
+        .parse(request.params.session);
+      return runner.request({
+        workspaceId: workspace.id,
+        userId: user.id,
+        role: 'user',
+        scopes: ['exec'],
+        method: 'POST',
+        path: `/v1/workspaces/${workspace.id}/processes/${encodeURIComponent(session)}/resume`,
+        contentType: 'application/json',
+        body: '{}',
+        timeoutMs: 15_000
+      });
+    }
+  );
+
   app.post<{ Params: { workspaceId: string; session: string }; Body: { action?: string } }>(
     '/v1/workspaces/:workspaceId/processes/:session',
     async (request) => {

@@ -298,7 +298,7 @@ describe('a service the computer keeps running', () => {
       expect(persisted).toMatchObject({ name: 'mark writer', workspaceId: 'workspace-1' });
 
       // A runner restart: this manager stops everything, and a fresh one resumes from the file.
-      manager.close();
+      await manager.close();
       const resumedManager = new ProcessManager(50, HEALTHY_POLICY);
       const resumed = await resumedManager.resumeWorkspace(root, 'workspace-1', false);
       expect(resumed).toBe(1);
@@ -311,7 +311,7 @@ describe('a service the computer keeps running', () => {
           timeout: 10_000
         })
         .toBeGreaterThanOrEqual(4);
-      resumedManager.close();
+      await resumedManager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -349,7 +349,7 @@ describe('a service the computer keeps running', () => {
       expect(
         manager.action('workspace-1', 'task-1', started.sessionId, { action: 'log' }).stderr
       ).toContain('broken');
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -383,8 +383,8 @@ describe('a service the computer keeps running', () => {
       await expect.poll(() => readRecords(root), { interval: 20, timeout: 5_000 }).toEqual([]);
       const resumedManager = new ProcessManager(50, FAST_POLICY);
       expect(await resumedManager.resumeWorkspace(root, 'workspace-1', false)).toBe(0);
-      manager.close();
-      resumedManager.close();
+      await manager.close();
+      await resumedManager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -405,7 +405,7 @@ describe('a service the computer keeps running', () => {
         )
       ).rejects.toThrow('cannot run as background processes');
       await expect(readRecords(root)).rejects.toThrow();
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -457,7 +457,7 @@ describe('a service the computer keeps running', () => {
       // Still alive after the SIGTERM, because nothing was really signalled - so the escalation the
       // record promises is the one that runs.
       expect(signals).toEqual(['SIGTERM', 'SIGKILL']);
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -482,7 +482,7 @@ describe('a service the computer keeps running', () => {
       );
       const pid = (await readRecords(root))[0]?.pid as number;
       expect(pid).toBeGreaterThan(0);
-      manager.close();
+      await manager.close();
       // The record stays - that is what brings it back - but the process does not.
       expect(await readRecords(root)).toHaveLength(1);
       await expect
@@ -525,7 +525,7 @@ describe('a service the computer keeps running', () => {
       );
       manager.stopWorkspace('workspace-1', { forget: true });
       await expect.poll(() => readRecords(root), { interval: 20, timeout: 5_000 }).toEqual([]);
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -553,7 +553,7 @@ describe('a service the computer keeps running', () => {
         5,
         false
       );
-      manager.close();
+      await manager.close();
 
       const booted = new ProcessManager(50, HEALTHY_POLICY);
       expect(await booted.resume(workspaceRoot, false)).toBe(1);
@@ -562,7 +562,7 @@ describe('a service the computer keeps running', () => {
         // A resume is a restart, and the record says so rather than pretending it never stopped.
         restarts: 1
       });
-      booted.close();
+      await booted.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -600,7 +600,7 @@ describe('a service the computer keeps running', () => {
       const view = manager.action('workspace-1', 'task-1', started.sessionId, { action: 'poll' });
       expect(view.status).toBe('running');
       expect(view.service).toMatchObject({ state: 'running', restarts: 0 });
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -643,7 +643,7 @@ describe('a service the computer keeps running', () => {
       expect(() =>
         manager.action('workspace-1', 'task-1', started.sessionId, { action: 'write', data: 'x' })
       ).not.toThrow();
-      manager.close();
+      await manager.close();
     },
     TEST_TIMEOUT_MS
   );
@@ -681,7 +681,7 @@ describe('a service the computer keeps running', () => {
         .toBe('crash_looped');
       const abandoned = manager.list('workspace-1', 'task-1')[0]?.service?.restarts ?? 0;
       expect(abandoned).toBe(FAST_POLICY.maxRapidFailures - 1);
-      manager.close();
+      await manager.close();
 
       const booted = new ProcessManager(50, FAST_POLICY);
       // Counted as taken back under supervision, which is not the same as up: it goes round its
@@ -695,7 +695,7 @@ describe('a service the computer keeps running', () => {
         .toBe('crash_looped');
       // The point: it was actually tried again rather than left where the last runner abandoned it.
       expect(booted.listWorkspace('workspace-1')[0]?.service?.restarts).toBeGreaterThan(abandoned);
-      booted.close();
+      await booted.close();
     },
     TEST_TIMEOUT_MS
   );

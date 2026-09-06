@@ -40,6 +40,16 @@ beforeEach(() => {
 afterEach(() => vi.useRealTimers());
 
 describe('native task transition notices', () => {
+  it('waits for media delivery before announcing completed work', async () => {
+    const notifier = createTaskNotifier();
+    await notifier.update([task('video', 'running')]);
+    await notifier.update([{ ...task('video', 'completed'), deliveryStatus: 'pending' }]);
+    expect(notify).not.toHaveBeenCalled();
+    await notifier.update([{ ...task('video', 'completed'), deliveryStatus: 'ready' }]);
+    expect(notify.mock.calls).toEqual([['Work complete', 'Work video']]);
+    await notifier.update([{ ...task('video', 'completed'), deliveryStatus: 'ready' }]);
+    expect(notify).toHaveBeenCalledTimes(1);
+  });
   it('reads saved category preferences and suppresses disabled categories', async () => {
     load.mockImplementation(async (path) =>
       path === '/v1/notifications/settings'

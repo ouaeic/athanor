@@ -167,7 +167,8 @@ export const configuredModelCatalog = (
       commercialUse: true,
       privacyRoute: options.privacyRoute,
       contextTokens: model.contextTokens ?? options.contextTokens,
-      modalities: options.modalities,
+      modalities: model.inputModalities ?? options.modalities,
+      ...(model.nativeInputPricing ? { nativeInputPricing: model.nativeInputPricing } : {}),
       // Only ever narrowed on an explicit denial. `supportsTools` is null when the endpoint listed
       // no parameters at all, and reading silence as "cannot call tools" would take every model on
       // a quiet endpoint out of agent work, which is all of them on most.
@@ -188,6 +189,7 @@ export const configuredModelCatalog = (
       ...(model.supportsReasoningEffort === null
         ? {}
         : { supportsReasoningEffort: model.supportsReasoningEffort }),
+      ...(model.reasoning ? { reasoning: model.reasoning } : {}),
       metadataSource: model.metadataSource,
       updatedAt
     }));
@@ -251,7 +253,9 @@ const comparablePrice = (option: MediaModelOption): number | null =>
     ? option.usdPerMillionCharacters
     : option.modality === 'transcription'
       ? option.usdPerMinute
-      : option.usdPerImage;
+      : option.modality === 'video'
+        ? (option.usdPerSecond ?? null)
+        : option.usdPerImage;
 
 /**
  * The order the three automatic modes read the catalogue in, and the whole of the evidence behind

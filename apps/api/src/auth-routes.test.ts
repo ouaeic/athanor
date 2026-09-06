@@ -17,9 +17,9 @@ describe('the name a session is listed under', () => {
     expect(deviceLabel({ 'user-agent': SAFARI_MACOS })).toBe('Safari on macOS');
     expect(
       deviceLabel({ 'user-agent': SAFARI_MACOS, 'x-athanor-client': 'athanor-macos/0.1.1' })
-    ).toBe('athanor app on macOS');
+    ).toBe('garden app on macOS');
     expect(deviceLabel({ 'x-athanor-client': 'athanor-android/0.1.1' })).toBe(
-      'athanor app on Android'
+      'garden app on Android'
     );
   });
 

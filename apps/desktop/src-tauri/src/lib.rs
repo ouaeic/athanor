@@ -1,4 +1,5 @@
 mod connection;
+mod native_ipc;
 mod proxy;
 mod ssh_install;
 
@@ -11,6 +12,7 @@ use std::{
 };
 use tauri::{Manager, State};
 use tauri_plugin_deep_link::DeepLinkExt;
+use tauri_plugin_opener::OpenerExt;
 use url::Url;
 use uuid::Uuid;
 
@@ -44,6 +46,7 @@ struct NativeEntry {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NativeCapabilities {
+    browser_authorization: bool,
     folder_picker: bool,
     notifications: bool,
     downloads: bool,
@@ -53,14 +56,8 @@ struct NativeCapabilities {
 #[tauri::command]
 fn native_capabilities() -> NativeCapabilities {
     NativeCapabilities {
+        browser_authorization: cfg!(mobile),
         folder_picker: cfg!(desktop),
-        /*
-         * True on all five targets, and it is the capability manifests that make it so: the window
-         * is loaded from http://localhost:<port>, so only a capability with a `remote` block
-         * reaches it, and only `loopback-notifications{,-desktop}.json` have one. Between them
-         * they name every platform - which is asserted by a test in this file rather than trusted,
-         * because the mobile-only half of that pair is exactly how this came to be false.
-         */
         notifications: true,
         /*
          * Where a download can be received at all. `on_download` below covers the three desktop
@@ -79,6 +76,30 @@ fn native_capabilities() -> NativeCapabilities {
          */
         deep_link_events: false,
     }
+}
+
+#[tauri::command]
+async fn open_authorization_browser(
+    app: tauri::AppHandle,
+    client: State<'_, Arc<proxy::ClientState>>,
+    url: String,
+) -> Result<(), String> {
+    let destination = client.authorization_browser_url(&url).await?;
+    app.opener()
+        .open_url(destination, None::<&str>)
+        .map_err(|_| "The system browser could not be opened".into())
+}
+
+#[tauri::command]
+async fn open_preview_browser(
+    app: tauri::AppHandle,
+    client: State<'_, Arc<proxy::ClientState>>,
+    url: String,
+) -> Result<(), String> {
+    let destination = client.preview_browser_url(&url).await?;
+    app.opener()
+        .open_url(destination, None::<&str>)
+        .map_err(|_| "The system browser could not be opened".into())
 }
 
 fn relative_path(value: &str) -> Result<PathBuf, String> {
@@ -281,14 +302,14 @@ fn download_destination(downloads: Option<&Path>, suggested: &Path) -> Option<Pa
 }
 
 fn deep_link_destination(raw: &str, local_origin: &str) -> Result<Option<Url>, String> {
-    let link = Url::parse(raw).map_err(|_| "This is not an athanor link")?;
-    if link.scheme() != "athanor"
+    let link = Url::parse(raw).map_err(|_| "This is not a garden link")?;
+    if !matches!(link.scheme(), "garden" | "athanor")
         || !link.username().is_empty()
         || link.password().is_some()
         || link.query().is_some()
         || link.fragment().is_some()
     {
-        return Err("This is not an athanor link".into());
+        return Err("This is not a garden link".into());
     }
     let Some(kind @ ("task" | "workspace")) = link.host_str() else {
         return Ok(None);
@@ -298,7 +319,7 @@ fn deep_link_destination(raw: &str, local_origin: &str) -> Result<Option<Url>, S
         .map(|parts| parts.filter(|part| !part.is_empty()).collect::<Vec<_>>())
         .unwrap_or_default();
     if segments.len() != 1 || Uuid::parse_str(segments[0]).is_err() {
-        return Err("This athanor link does not contain a valid destination".into());
+        return Err("This garden link does not contain a valid destination".into());
     }
     let mut destination =
         Url::parse(local_origin).map_err(|_| "The private client address is invalid")?;
@@ -318,21 +339,27 @@ pub fn run() {
         }
     }));
     builder
+        .invoke_system(native_ipc::initialization_script(std::env::consts::OS))
         .manage(FolderGrants::default())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_deep_link::init())
         .setup(|app| {
             let profile_path = app.path().app_data_dir()?.join("server-profile.json");
             let pending_pairing_path = app.path().app_cache_dir()?.join("pending-pairing.json");
             let client = proxy::ClientState::load(profile_path, pending_pairing_path)?;
+            app.manage(client.clone());
             let origin = tauri::async_runtime::block_on(proxy::start(client.clone()))?;
+            let capabilities =
+                native_ipc::scoped_capabilities(&origin).map_err(std::io::Error::other)?;
+            app.add_capability(serde_json::to_string(&capabilities)?)?;
             let mut window_config = app
                 .config()
                 .app
                 .windows
                 .iter()
                 .find(|window| window.label == "main")
-                .ok_or("The athanor main window configuration is unavailable")?
+                .ok_or("The garden main window configuration is unavailable")?
                 .clone();
             window_config.url = tauri::WebviewUrl::External(origin.parse()?);
             /*
@@ -353,7 +380,7 @@ pub fn run() {
                     tauri::webview::DownloadEvent::Requested { url, destination } => {
                         let Some(chosen) = download_destination(downloads.as_deref(), destination)
                         else {
-                            eprintln!("athanor has nowhere to save downloads on this platform");
+                            eprintln!("garden has nowhere to save downloads on this platform");
                             return false;
                         };
                         if let Ok(mut record) = record.lock() {
@@ -421,6 +448,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            open_authorization_browser,
+            open_preview_browser,
             native_capabilities,
             choose_folder,
             revoke_folder,
@@ -428,7 +457,7 @@ pub fn run() {
             read_local_file
         ])
         .run(tauri::generate_context!())
-        .expect("athanor native shell failed");
+        .expect("garden native shell failed");
 }
 
 #[cfg(test)]
@@ -446,6 +475,18 @@ mod tests {
     fn maps_valid_task_and_workspace_links_to_the_private_gateway() {
         let task_id = Uuid::new_v4();
         let workspace_id = Uuid::new_v4();
+        assert_eq!(
+            deep_link_destination(
+                &format!("garden://task/{task_id}"),
+                "http://localhost:49876"
+            )
+            .unwrap(),
+            deep_link_destination(
+                &format!("athanor://task/{task_id}"),
+                "http://localhost:49876"
+            )
+            .unwrap()
+        );
         assert_eq!(
             deep_link_destination(
                 &format!("athanor://task/{task_id}"),
@@ -474,48 +515,6 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-    }
-
-    /*
-     * The whole of G1 in one assertion.
-     *
-     * `loopback-notifications.json` carried `"platforms": ["android","iOS"]`, and a capability that
-     * names any platform applies to no other - so on macOS, Windows and Linux the only grant that
-     * could reach a window loaded from `http://localhost:<port>` was filtered out at ACL resolve
-     * time (`tauri-utils`, `resolved.rs`: `capabilities.filter(|c| c.is_active(&target))`), every
-     * notification invoke was denied, and `native.ts` swallowed the rejection and returned false.
-     * Nothing in the build failed. So the union is asserted here instead.
-     */
-    #[test]
-    fn every_platform_is_granted_notifications_by_exactly_one_capability() {
-        let files = [
-            include_str!("../capabilities/loopback-notifications.json"),
-            include_str!("../capabilities/loopback-notifications-desktop.json"),
-        ];
-        let mut covered = Vec::new();
-        for raw in files {
-            let capability: serde_json::Value = serde_json::from_str(raw).unwrap();
-            // A capability without a `remote` block applies to local app URLs only, and this window
-            // never loads one.
-            assert_eq!(
-                capability["remote"]["urls"],
-                serde_json::json!(["http://localhost:*/*"])
-            );
-            assert_eq!(capability["local"], serde_json::json!(false));
-            assert_eq!(
-                capability["permissions"],
-                serde_json::json!(["notification:default"])
-            );
-            for platform in capability["platforms"].as_array().unwrap() {
-                covered.push(platform.as_str().unwrap().to_owned());
-            }
-        }
-        covered.sort();
-        let mut expected = vec!["android", "iOS", "linux", "macOS", "windows"];
-        expected.sort();
-        assert_eq!(covered, expected);
-        // And the page is told so, from the same fact.
-        assert!(native_capabilities().notifications);
     }
 
     #[test]
@@ -549,69 +548,6 @@ mod tests {
         // Nowhere to write is declined rather than guessed at, which is what iOS and Android get.
         assert_eq!(download_destination(None, Path::new("export.zip")), None);
         fs::remove_dir_all(downloads).unwrap();
-    }
-
-    /*
-     * The same resolver `tauri-build` runs, asked the question that was never asked.
-     *
-     * The union test above pins what the manifests say; this one pins what the ACL does with them.
-     * `Resolved::resolve` filters capabilities by `is_active(&target)` before anything else, which
-     * is the single line that made the packaged desktop clients silent - and it is compile-time
-     * work no test covered, on a file no build step reads back. The manifest set is the one
-     * generated for this host, so the mobile rows here prove the capability filter rather than the
-     * mobile plugin surface; the filter is the thing that was wrong.
-     */
-    #[test]
-    fn the_notification_commands_resolve_for_the_loopback_window_on_every_target() {
-        use std::collections::BTreeMap;
-        use tauri::utils::acl::{
-            capability::Capability, manifest::Manifest, resolved::Resolved, ExecutionContext,
-        };
-        use tauri::utils::platform::Target;
-
-        let acl: BTreeMap<String, Manifest> =
-            serde_json::from_str(include_str!("../gen/schemas/acl-manifests.json")).unwrap();
-        let capabilities: BTreeMap<String, Capability> = [
-            include_str!("../capabilities/default.json"),
-            include_str!("../capabilities/loopback-native.json"),
-            include_str!("../capabilities/loopback-notifications.json"),
-            include_str!("../capabilities/loopback-notifications-desktop.json"),
-        ]
-        .into_iter()
-        .map(|raw| {
-            let capability: Capability = serde_json::from_str(raw).unwrap();
-            (capability.identifier.clone(), capability)
-        })
-        .collect();
-
-        for target in [
-            Target::MacOS,
-            Target::Windows,
-            Target::Linux,
-            Target::Android,
-            Target::Ios,
-        ] {
-            let resolved = Resolved::resolve(&acl, capabilities.clone(), target).unwrap();
-            for command in [
-                "plugin:notification|is_permission_granted",
-                "plugin:notification|request_permission",
-                "plugin:notification|notify",
-            ] {
-                let allowed = resolved
-                    .allowed_commands
-                    .get(command)
-                    .unwrap_or_else(|| panic!("{command} is not allowed at all on {target:?}"));
-                // The window is loaded from http://localhost:<port>, so a Local grant never
-                // applies to it however many capabilities carry the permission.
-                assert!(
-                    allowed.iter().any(|entry| matches!(
-                        &entry.context,
-                        ExecutionContext::Remote { url } if url.as_str().contains("localhost")
-                    )),
-                    "{command} reaches no loopback window on {target:?}"
-                );
-            }
-        }
     }
 
     #[cfg(unix)]

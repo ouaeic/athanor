@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { AthanorError, isMemoryToken } from '@athanor/core';
 import type { ConversationNameIndex, EncryptedEnvelope } from '@athanor/core';
-import { TaskEventKind, TaskStatus } from '@athanor/contracts';
+import { TaskEventKind, TaskStatus, PENDING_MEDIA_DELIVERY } from '@athanor/contracts';
+import { taskDeliveryCountsSql } from '../task-delivery.js';
 import type { Database } from '../database.js';
 import type {
   TaskEventRecord,
@@ -419,6 +420,7 @@ export class TaskStore {
     /** Built by `buildConversationNameIndex`; the only way this conversation's name is findable. */
     nameIndex: ConversationNameIndex;
     modelId: string;
+    reasoningEffort?: TaskRecord['reasoningEffort'];
     privacyRoute: string;
     maxComputeCredits: number;
     maxSpendUsd?: number | null;
@@ -429,8 +431,8 @@ export class TaskStore {
     const result = await this.database.query(
       `INSERT INTO tasks(
         id,user_id,workspace_id,title,status,model_id,privacy_route,max_compute_credits,
-        prompt_ciphertext,security_mode,max_spend_usd,name_tsv
-       ) VALUES ($1,$2,$3,$4,'queued',$5,$6,$7,$8::jsonb,$9,$10,${taskNameTsv(11, 12, 13)})
+        prompt_ciphertext,security_mode,max_spend_usd,name_tsv,reasoning_effort
+       ) VALUES ($1,$2,$3,$4,'queued',$5,$6,$7,$8::jsonb,$9,$10,${taskNameTsv(11, 12, 13)},$14)
        RETURNING *`,
       [
         id,
@@ -443,7 +445,8 @@ export class TaskStore {
         JSON.stringify(input.promptCiphertext),
         input.securityMode ?? 'balanced',
         input.maxSpendUsd ?? null,
-        ...taskNameTokens(input.nameIndex)
+        ...taskNameTokens(input.nameIndex),
+        input.reasoningEffort ?? 'auto'
       ]
     );
     const task = mapTask(result.rows[0]!);
@@ -461,6 +464,7 @@ export class TaskStore {
     titleCiphertext: EncryptedEnvelope;
     nameIndex: ConversationNameIndex;
     modelId: string;
+    reasoningEffort?: TaskRecord['reasoningEffort'];
     privacyRoute: string;
     promptCiphertext: EncryptedEnvelope;
     agentStateCiphertext: EncryptedEnvelope | null;
@@ -478,10 +482,10 @@ export class TaskStore {
       `INSERT INTO tasks(
         id,user_id,workspace_id,parent_task_id,branched_from_event_id,title,status,model_id,
         privacy_route,max_compute_credits,prompt_ciphertext,agent_state_ciphertext,completed_at,
-        fork_kind,security_mode,max_spend_usd,rewind_scope,restored_checkpoint_id,name_tsv
+        fork_kind,security_mode,max_spend_usd,rewind_scope,restored_checkpoint_id,name_tsv,reasoning_effort
        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,
         CASE WHEN $7='completed' THEN NOW() ELSE NULL END,$13,$14,$15,$16,$17,
-        ${taskNameTsv(18, 19, 20)})
+        ${taskNameTsv(18, 19, 20)},COALESCE($21,(SELECT reasoning_effort FROM tasks WHERE id=$4 AND user_id=$2),'auto'))
        RETURNING *`,
       [
         id,
@@ -501,7 +505,8 @@ export class TaskStore {
         input.maxSpendUsd ?? null,
         input.rewindScope ?? 'conversation',
         input.restoredCheckpointId ?? null,
-        ...taskNameTokens(input.nameIndex)
+        ...taskNameTokens(input.nameIndex),
+        input.reasoningEffort ?? null
       ]
     );
     const fork = mapTask(result.rows[0]!);
@@ -513,6 +518,7 @@ export class TaskStore {
     id: string;
     userId: string;
     modelId: string;
+    reasoningEffort?: TaskRecord['reasoningEffort'];
     privacyRoute: string;
     additionalComputeCredits: number;
     /** Extra real currency this follow-up may spend, on top of what the task already spent. */
@@ -521,6 +527,7 @@ export class TaskStore {
     reservationKey: string;
     resourceClass: string;
     userMessageCiphertext: EncryptedEnvelope;
+    userMessageId?: string;
   }): Promise<TaskRecord | null> {
     const resumed = await this.database.transaction(async (tx) => {
       const updated = await tx.query(
@@ -528,7 +535,7 @@ export class TaskStore {
         // ceiling is anchored to what the task has already spent rather than to zero - otherwise
         // asking for "$2 more" on a task that spent $5 would read as an instantly-breached cap.
         `UPDATE tasks t SET
-           status='queued', model_id=$3, privacy_route=$4,
+           status='queued', model_id=$3, privacy_route=$4, reasoning_effort=COALESCE($8,reasoning_effort),
            max_compute_credits=max_compute_credits+$5,
            max_spend_usd=CASE WHEN $7::double precision IS NULL THEN max_spend_usd ELSE
              COALESCE(max_spend_usd, (SELECT COALESCE(SUM(u.cost_usd),0) FROM usage_entries u
@@ -539,7 +546,7 @@ export class TaskStore {
            -- standing would mean their message was accepted and then silently never leased.
            attempt=0,
            lease_owner=NULL, lease_expires_at=NULL, completed_at=NULL, updated_at=NOW()
-         WHERE t.id=$1 AND t.user_id=$2
+         WHERE t.id=$1 AND t.user_id=$2 AND t.parent_mission_id IS NULL
            AND t.status IN ('completed','failed','awaiting_resource','cancelled')
            AND t.lease_owner IS NULL
          RETURNING t.*,${TASK_LIVE_COUNTS}`,
@@ -550,7 +557,8 @@ export class TaskStore {
           input.privacyRoute,
           input.additionalComputeCredits,
           JSON.stringify(input.agentStateCiphertext),
-          input.additionalSpendUsd ?? null
+          input.additionalSpendUsd ?? null,
+          input.reasoningEffort ?? null
         ]
       );
       if (!updated.rows[0]) return null;
@@ -574,7 +582,7 @@ export class TaskStore {
         `INSERT INTO task_events(id,task_id,sequence,kind,summary,payload_ciphertext)
          SELECT $1,$2,COALESCE(MAX(sequence),0)+1,'user_message','User message',$3::jsonb
          FROM task_events WHERE task_id=$2`,
-        [randomUUID(), input.id, JSON.stringify(input.userMessageCiphertext)]
+        [input.userMessageId ?? randomUUID(), input.id, JSON.stringify(input.userMessageCiphertext)]
       );
       return mapTask(updated.rows[0]);
     });
@@ -590,6 +598,7 @@ export class TaskStore {
     taskId: string;
     userId: string;
     modelId: string;
+    reasoningEffort?: TaskRecord['reasoningEffort'];
     privacyRoute: string;
     maxComputeCredits: number;
     maxSpendUsd?: number | null;
@@ -597,6 +606,7 @@ export class TaskStore {
     reservationKey: string;
     promptCiphertext: EncryptedEnvelope;
     queuedEventCiphertext: EncryptedEnvelope;
+    queuedEventId?: string;
     /** Apply this to the turn already running rather than waiting for it to finish. */
     interrupt?: boolean;
   }): Promise<TaskRecord | null> {
@@ -609,14 +619,15 @@ export class TaskStore {
       const row = taskResult.rows[0];
       if (
         !row ||
+        row.parent_mission_id ||
         !['queued', 'planning', 'running', 'awaiting_user', 'paused'].includes(String(row.status))
       )
         return null;
       await tx.query(
         `INSERT INTO task_message_queue(
            id,task_id,user_id,prompt_ciphertext,model_id,privacy_route,max_compute_credits,
-           resource_class,reservation_key,max_spend_usd,interrupt
-         ) VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9,$10,$11)`,
+           resource_class,reservation_key,max_spend_usd,interrupt,reasoning_effort
+         ) VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9,$10,$11,$12)`,
         [
           input.id,
           input.taskId,
@@ -628,7 +639,8 @@ export class TaskStore {
           input.resourceClass,
           input.reservationKey,
           input.maxSpendUsd ?? null,
-          input.interrupt ?? false
+          input.interrupt ?? false,
+          input.reasoningEffort ?? optionalText(row.reasoning_effort) ?? 'auto'
         ]
       );
       await tx.query(
@@ -651,7 +663,11 @@ export class TaskStore {
         `INSERT INTO task_events(id,task_id,sequence,kind,summary,payload_ciphertext)
          SELECT $1,$2,COALESCE(MAX(sequence),0)+1,'queued_message','Follow-up queued',$3::jsonb
          FROM task_events WHERE task_id=$2`,
-        [randomUUID(), input.taskId, JSON.stringify(input.queuedEventCiphertext)]
+        [
+          input.queuedEventId ?? randomUUID(),
+          input.taskId,
+          JSON.stringify(input.queuedEventCiphertext)
+        ]
       );
       return mapTask({
         ...row,
@@ -771,7 +787,7 @@ export class TaskStore {
       if (stranded.rowCount)
         await tx.query(
           `UPDATE usage_entries SET state='released'
-           WHERE state='reserved' AND idempotency_key = ANY($1::text[])`,
+           WHERE state='reserved' AND kind='task_compute' AND idempotency_key = ANY($1::text[])`,
           [stranded.rows.map((row) => String(row.reservation_key))]
         );
       await releasePromotedMessageReservations(tx, taskId);
@@ -804,7 +820,7 @@ export class TaskStore {
       );
       if (!locked.rows[0]) return false;
       const queued = await tx.query(
-        `SELECT id FROM task_message_queue
+        `SELECT id,reasoning_effort FROM task_message_queue
          WHERE id=$1 AND task_id=$2 AND status='queued' FOR UPDATE`,
         [input.messageId, input.taskId]
       );
@@ -816,6 +832,7 @@ export class TaskStore {
       await tx.query(
         `UPDATE tasks SET
            max_compute_credits=max_compute_credits+$3,
+           reasoning_effort=$5,
            max_spend_usd=CASE WHEN $4::double precision IS NULL THEN max_spend_usd ELSE
              COALESCE(max_spend_usd, (SELECT COALESCE(SUM(u.cost_usd),0) FROM usage_entries u
                WHERE u.task_id=tasks.id AND u.state='settled')) + $4::double precision END,
@@ -825,7 +842,8 @@ export class TaskStore {
           input.taskId,
           input.workerId,
           input.additionalComputeCredits,
-          input.additionalSpendUsd ?? null
+          input.additionalSpendUsd ?? null,
+          queued.rows[0].reasoning_effort ?? 'auto'
         ]
       );
       await tx.query(
@@ -859,7 +877,7 @@ export class TaskStore {
       );
       if (!locked.rows[0]) return null;
       const queued = await tx.query(
-        `SELECT id FROM task_message_queue
+        `SELECT id,reasoning_effort FROM task_message_queue
          WHERE id=$1 AND task_id=$2 AND status='queued' FOR UPDATE`,
         [input.messageId, input.taskId]
       );
@@ -872,7 +890,7 @@ export class TaskStore {
       );
       const updated = await tx.query(
         `UPDATE tasks SET
-           status='queued',model_id=$3,privacy_route=$4,
+           status='queued',model_id=$3,privacy_route=$4,reasoning_effort=$8,
            max_compute_credits=max_compute_credits+$5,
            max_spend_usd=CASE WHEN $7::double precision IS NULL THEN max_spend_usd ELSE
              COALESCE(max_spend_usd, (SELECT COALESCE(SUM(u.cost_usd),0) FROM usage_entries u
@@ -891,7 +909,8 @@ export class TaskStore {
           input.privacyRoute,
           input.additionalComputeCredits,
           JSON.stringify(input.agentStateCiphertext),
-          input.additionalSpendUsd ?? null
+          input.additionalSpendUsd ?? null,
+          queued.rows[0].reasoning_effort ?? 'auto'
         ]
       );
       if (!updated.rows[0]) throw new Error('queued_message_promotion_conflict');
@@ -955,7 +974,7 @@ export class TaskStore {
       );
       if (queued.rows[0]) return null;
       const result = await tx.query(
-        `UPDATE tasks SET status='completed',actual_compute_credits=$3,
+        `UPDATE tasks SET status='completed',actual_compute_credits=CASE WHEN has_coding_family THEN GREATEST(actual_compute_credits,$3) ELSE $3 END,
            agent_state_ciphertext=$4::jsonb,lease_owner=NULL,lease_expires_at=NULL,
            completed_at=NOW(),updated_at=NOW()
          WHERE id=$1 AND lease_owner=$2`,
@@ -1095,7 +1114,7 @@ export class TaskStore {
            ORDER BY r.created_at DESC
            OFFSET COALESCE($9::int, 1) - 1 LIMIT 1
          ) oldest ON TRUE
-       )
+       ), task_page AS MATERIALIZED (
        SELECT t.*,
          GREATEST(t.updated_at, t.created_at)::text AS activity_at,
          c.runs AS schedule_run_count,${TASK_LIVE_COUNTS}
@@ -1107,7 +1126,7 @@ export class TaskStore {
        -- by reading and sorting every conversation the owner has ever had. The migration that
        -- added the index said the first page never sorts the whole table; it always did. The CTE
        -- above has always asked it this way, and tasks.user_id is NOT NULL.
-       WHERE t.user_id=$1
+       WHERE t.user_id=$1 AND t.parent_mission_id IS NULL
          AND ($2::uuid IS NULL OR t.workspace_id=$2)
          AND ($3::text = 'all'
               OR ($3::text = 'active' AND t.archived_at IS NULL)
@@ -1121,7 +1140,14 @@ export class TaskStore {
               (t.pinned, GREATEST(t.updated_at, t.created_at), t.id)
                 < ($4::boolean, $5::timestamptz, $6::uuid))
        ORDER BY t.pinned DESC, GREATEST(t.updated_at, t.created_at) DESC, t.id DESC
-       LIMIT $7`,
+       LIMIT $7
+       ), delivery AS (${taskDeliveryCountsSql('SELECT id FROM task_page', '$10')})
+       SELECT task_page.*,
+         CASE WHEN delivery.task_id IS NULL THEN NULL WHEN delivery.failed>0 THEN 'incomplete'
+           WHEN delivery.pending>0 THEN 'pending' ELSE 'ready' END AS delivery_status,
+         COALESCE(delivery.pending,0)::int AS pending_delivery_count
+       FROM task_page LEFT JOIN delivery ON delivery.task_id=task_page.id
+       ORDER BY task_page.pinned DESC,GREATEST(task_page.updated_at,task_page.created_at) DESC,task_page.id DESC`,
       [
         userId,
         options.workspaceId ?? null,
@@ -1133,7 +1159,8 @@ export class TaskStore {
         scheduleId,
         // Asking for one schedule is asking for its runs, so the thing that keeps runs out of the
         // owner's list is exactly what that caller wants lifted.
-        scheduleId ? null : SCHEDULE_RUNS_PER_PAGE
+        scheduleId ? null : SCHEDULE_RUNS_PER_PAGE,
+        [...PENDING_MEDIA_DELIVERY]
       ]
     );
     // One row past the page is what proves there is more without a second count query.
@@ -1414,7 +1441,10 @@ export class TaskStore {
        attempt = CASE WHEN $3 = 'queued' THEN 0 ELSE tasks.attempt END,
        completed_at = CASE WHEN $3 IN ('completed','failed','cancelled') THEN NOW() ELSE tasks.completed_at END
        ${HELD_LEASE_JOIN}
-       WHERE tasks.id=held.held_id AND EXISTS (
+       WHERE tasks.id=held.held_id AND ($3<>'queued' OR tasks.parent_mission_id IS NULL OR EXISTS(
+         SELECT 1 FROM coding_missions m JOIN tasks p ON p.id=m.parent_task_id
+         WHERE m.child_task_id=tasks.id AND m.phase='active' AND NOT m.runner_sealed AND p.status NOT IN ('failed','cancelled')
+       )) AND EXISTS (
          SELECT 1 FROM workspaces w
          WHERE w.id=tasks.workspace_id AND w.user_id=$2
        )
@@ -1457,9 +1487,39 @@ export class TaskStore {
       );
       await tx.query(
         `UPDATE usage_entries SET state='released'
-         WHERE task_id=$1 AND state='reserved'`,
+         WHERE task_id=$1 AND state='reserved' AND kind='task_compute'`,
         [id]
       );
+      const children = await tx.query(
+        `UPDATE tasks child SET status='cancelled',lease_owner=NULL,lease_expires_at=NULL,completed_at=NOW(),updated_at=NOW()
+        WHERE child.parent_task_id=$1 AND child.parent_mission_id IS NOT NULL AND child.status NOT IN ('completed','failed','cancelled') RETURNING child.id`,
+        [id]
+      );
+      const childIds = children.rows.map((row) => String(row.id));
+      await tx.query(
+        `UPDATE coding_missions SET phase='cancelled',generation=generation+1,updated_at=NOW()
+        WHERE parent_task_id=$1 AND phase NOT IN ('integrated','integrating','cancelled')`,
+        [id]
+      );
+      await tx.query(
+        `UPDATE coding_missions SET phase='cancelled',generation=generation+1,updated_at=NOW()
+        WHERE child_task_id=$1 AND phase NOT IN ('integrated','integrating','cancelled')`,
+        [id]
+      );
+      if (childIds.length) {
+        await tx.query(
+          "UPDATE approvals SET status='denied',resolved_at=NOW() WHERE task_id=ANY($1::uuid[]) AND status='pending'",
+          [childIds]
+        );
+        await tx.query(
+          "UPDATE task_message_queue SET status='cancelled' WHERE task_id=ANY($1::uuid[]) AND status='queued'",
+          [childIds]
+        );
+        await tx.query(
+          "UPDATE usage_entries SET state='released' WHERE task_id=ANY($1::uuid[]) AND kind='task_compute' AND state='reserved'",
+          [childIds]
+        );
+      }
       return { wasHeld: changed.rows[0]?.was_held === true };
     });
     if (!cancelled) return false;
@@ -1521,6 +1581,7 @@ export class TaskStore {
          SELECT t.id, t.workspace_id FROM tasks t
          JOIN workspaces w ON w.id = t.workspace_id
          WHERE t.status IN ${COMMITTED_TASK_STATUSES}
+           AND w.status<>'deleting'
            AND (t.lease_expires_at IS NULL OR t.lease_expires_at < NOW())
            AND t.attempt < $3
            AND ${WORKSPACE_IS_FREE_FOR('t.id')}
@@ -1600,7 +1661,7 @@ export class TaskStore {
       const undelivered = new Map<string, number>();
       for (const row of failed.rows) {
         await tx.query(
-          `UPDATE usage_entries SET state='released' WHERE task_id=$1 AND state='reserved'`,
+          `UPDATE usage_entries SET state='released' WHERE task_id=$1 AND state='reserved' AND kind='task_compute'`,
           [String(row.id)]
         );
         // The worker that was carrying these tasks died without writing a word, so nothing else has
@@ -1724,7 +1785,7 @@ export class TaskStore {
       `UPDATE tasks SET
          status = $2,
          agent_state_ciphertext = COALESCE($3::jsonb, tasks.agent_state_ciphertext),
-         actual_compute_credits = COALESCE($4, tasks.actual_compute_credits),
+         actual_compute_credits = CASE WHEN tasks.has_coding_family THEN GREATEST(COALESCE($4::double precision,0),tasks.actual_compute_credits) ELSE COALESCE($4::double precision, tasks.actual_compute_credits) END,
          lease_owner = CASE WHEN ${letGo} THEN NULL ELSE tasks.lease_owner END,
          lease_expires_at = CASE WHEN ${letGo} THEN NULL ELSE tasks.lease_expires_at END,
          spend_paused_at = CASE WHEN $8 THEN $7::timestamptz ELSE tasks.spend_paused_at END,
@@ -1843,10 +1904,18 @@ export class TaskStore {
    * the route that chooses between them, not here, because only the route knows which of the two
    * questions it is asking.
    */
-  async listTaskEvents(taskId: string, after = 0): Promise<TaskEventRecord[]> {
+  async listTaskEvents(
+    taskId: string,
+    after = 0,
+    selection?: { kind: TaskEventRecord['kind']; limit: number }
+  ): Promise<TaskEventRecord[]> {
     const result = await this.database.query(
-      `SELECT * FROM task_events WHERE task_id = $1 AND sequence > $2 ORDER BY sequence`,
-      [taskId, after]
+      selection
+        ? `SELECT * FROM (SELECT * FROM task_events WHERE task_id=$1 AND sequence>$2 AND kind=$3 ORDER BY sequence DESC LIMIT $4) recent ORDER BY sequence ASC`
+        : `SELECT * FROM task_events WHERE task_id = $1 AND sequence > $2 ORDER BY sequence`,
+      selection
+        ? [taskId, after, selection.kind, Math.max(1, Math.min(1_000, Math.trunc(selection.limit)))]
+        : [taskId, after]
     );
     return result.rows.map(mapTaskEvent);
   }

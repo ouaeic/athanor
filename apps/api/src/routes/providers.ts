@@ -203,7 +203,7 @@ export const registerProviderRoutes = (context: RouteContext): void => {
         provider: input.provider === 'openrouter' ? 'openrouter' : 'custom',
         privacyRoute: input.enforceZeroDataRetention ? 'provider_zdr' : 'external',
         appUrl: config.PUBLIC_APP_URL,
-        appTitle: 'athanor',
+        appTitle: 'garden',
         enforceZeroDataRetention: input.provider === 'openrouter' && input.enforceZeroDataRetention
       });
       if (input.provider === 'openrouter') {
@@ -292,18 +292,10 @@ export const registerProviderRoutes = (context: RouteContext): void => {
         enforceZeroDataRetention: input.enforceZeroDataRetention,
         ...(mediaModels ? { mediaModels } : {})
       };
-      /*
-       * Resolved against the credential as it is about to be stored, not as it was: a save that
-       * switches on private routes only, or moves to another account, changes which media routes
-       * exist, and the worker reads the answer rather than working it out again.
-       *
-       * Only when there is a choice to resolve. Resolving costs the same two provider requests the
-       * chat catalogue above just made, and an owner who has never opened the media section has
-       * nothing to resolve - they get the reviewed routes, which is what they had before any of
-       * this existed. Connecting a provider is already the slowest thing this screen does; it does
-       * not also get to pay for a question nobody asked.
-       */
-      const mediaRoutes = mediaModels ? await mediaRoutesFor(saved, mediaModels) : undefined;
+      // Seal account-specific routes once; the worker never borrows another provider's defaults.
+      const mediaRoutes = mediaModels
+        ? await mediaRoutesFor(saved, mediaModels)
+        : await mediaRoutesFor(saved, undefined).catch(() => ({}));
       await store.upsertManagedProviderCredential({
         userId: user.id,
         provider: 'inference',

@@ -167,7 +167,7 @@ export function NotificationSettings() {
       {nativeNotifications && (
         <Section
           title="Native app notifications"
-          description="Allow this computer’s operating system to show notices from athanor."
+          description="Allow this computer’s operating system to show notices from garden."
         >
           <Button
             disabled={nativeGranted}
@@ -178,7 +178,7 @@ export function NotificationSettings() {
                 setNativeGranted(granted);
                 if (!granted)
                   throw new Error(
-                    'Notifications were not allowed. Enable athanor in your operating system’s notification settings.'
+                    'Notifications were not allowed. Enable garden in your operating system’s notification settings.'
                   );
               }, 'Native notifications allowed')
             }

@@ -23,6 +23,7 @@ import {
 } from './turn-bounds.js';
 import {
   baseSystemPrompt,
+  BASE_PROMPT_MARKER,
   compactionTargetTail,
   modelInputBudget,
   RUNTIME_CONTEXT_MARKER
@@ -183,6 +184,7 @@ const probeStore = (task: () => TaskRecord): StoreProbe => {
     listWorkspaceMemories: async () => [],
     curateWorkspaceSkills: async () => undefined,
     listWorkspaceSkills: async () => [],
+    listMediaJobs: async () => [],
     getLatestTaskPlan: async () => null,
     // The worker treats a version conflict as "a newer plan exists", which keeps this probe out of
     // the plan-encryption path without changing any branch the tests care about.
@@ -555,19 +557,32 @@ const installFetch = (
       // Generation is an ordinary request to the configured provider, so it arrives here too. It
       // is answered from its own stub: routing it to the inference frames would hand a media call
       // an SSE body and make the next model step read someone else's turn.
-      if (url.endsWith('/images') || url.endsWith('/audio/speech')) {
+      if (
+        url.endsWith('/images') ||
+        url.endsWith('/images/generations') ||
+        url.endsWith('/audio/speech')
+      ) {
         if (typeof init?.body === 'string')
           log.mediaRequests?.push(JSON.parse(init.body) as Record<string, unknown>);
         return (
           runner.media ??
           (() =>
-            new Response(
-              JSON.stringify({
-                data: [{ b64_json: Buffer.from('generated').toString('base64') }],
-                usage: { cost: 0.0102 }
-              }),
-              { headers: { 'content-type': 'application/json' } }
-            ))
+            url.endsWith('/audio/speech')
+              ? new Response(Buffer.from('ID3speech'), {
+                  headers: { 'content-type': 'audio/mpeg' }
+                })
+              : new Response(
+                  JSON.stringify({
+                    data: [
+                      {
+                        b64_json:
+                          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6bQAAAABJRU5ErkJggg=='
+                      }
+                    ],
+                    usage: { cost: 0.0102 }
+                  }),
+                  { headers: { 'content-type': 'application/json' } }
+                ))
         )();
       }
       if (typeof init?.body === 'string')
@@ -1591,7 +1606,7 @@ describe('what actually reaches the provider', () => {
       turnToolResults: {}
     };
     const { systemText } = await firstRequest(doubled);
-    expect(systemText.split('# athanor operating contract')).toHaveLength(2);
+    expect(systemText.split(BASE_PROMPT_MARKER)).toHaveLength(2);
   });
 
   it('does not open with a plan the request never needed', async () => {
@@ -1608,7 +1623,7 @@ describe('what actually reaches the provider', () => {
 
   it('prices the opening step at full reasoning effort', async () => {
     const { request } = await firstRequest();
-    expect((request.reasoning as { effort?: string } | undefined)?.effort).toBe('high');
+    expect(request.reasoning_effort).toBe('high');
   });
 });
 
@@ -3419,9 +3434,11 @@ describe('spending the owner’s money on generated media', () => {
                 : null
           }
         : {}),
+      parkTaskForApproval: async () => true,
       mediaSpendForTask: async () => options.spentUsd ?? 0,
       recordUsage: async (input: Record<string, unknown>) => {
-        if (String(input.resourceClass).startsWith('media:')) billed.push(input);
+        if (String(input.resourceClass).startsWith('media:') && input.state === 'settled')
+          billed.push(input);
       },
       spendGuard: async (input: Record<string, unknown>) => {
         // Every step of the loop asks the same question about its own next model call, priced at
@@ -3565,9 +3582,8 @@ describe('spending the owner’s money on generated media', () => {
       }
     });
     expect(probe.generated[0]).toMatchObject({ model: 'someone/painter-xl' });
-    // The chosen route's own base, and the same megapixel surcharge every image carries: 1024x1024
-    // is 0.048576 of a megapixel over the flat rate, at $0.001 each.
-    expect(probe.guarded[0]).toMatchObject({ estimateUsd: 0.14 + 0.000_048_576 });
+    // This route publishes a flat per-image price.
+    expect(probe.guarded[0]).toMatchObject({ estimateUsd: 0.14 });
     expect(probe.billed[0]).toMatchObject({
       providerRef: 'openai-compatible:someone/painter-xl'
     });
@@ -3575,7 +3591,7 @@ describe('spending the owner’s money on generated media', () => {
     expect(probe.generated[0]?.model).not.toBe(managedMediaCatalog.image.modelId);
   });
 
-  it('falls back to the reviewed route when the sealed choice names no model at all', async () => {
+  it('refuses a malformed sealed route before calling a different model', async () => {
     // Nothing on this side validates the sealed blob: it is decrypted and cast, because the screen
     // that wrote it is the thing that parsed it. A route that resolved to a blank id would go to
     // the provider as a request with no model on it, and what happens then is the owner's bill.
@@ -3596,10 +3612,11 @@ describe('spending the owner’s money on generated media', () => {
         updatedAt: new Date().toISOString()
       }
     });
-    expect(probe.generated[0]).toMatchObject({ model: managedMediaCatalog.image.modelId });
-    expect(probe.guarded[0]).toMatchObject({
-      estimateUsd: managedMediaCatalog.image.estimate({ width: 1024, height: 1024 })
-    });
+    expect(probe.generated).toHaveLength(0);
+    expect(probe.guarded).toHaveLength(0);
+    expect(probe.messages.find((message) => message.toolCallId === 'call-m')?.content).toContain(
+      'available route'
+    );
   });
 
   it('spends nothing and says so when the provider will not serve the chosen route', async () => {
@@ -3730,13 +3747,11 @@ describe('spending the owner’s money on generated media', () => {
     expect(probe.events.some((entry) => entry.kind === 'error')).toBe(true);
   });
 
-  it('refuses video outright rather than starting a generation that cannot finish', async () => {
+  it('requires per-job retention approval before submitting video', async () => {
     const probe = await generate({ arguments: { kind: 'video' } });
     expect(probe.generated).toHaveLength(0);
     expect(probe.guarded).toHaveLength(0);
-    expect(probe.messages.find((message) => message.toolCallId === 'call-m')?.content).toContain(
-      'zero-data-retention'
-    );
+    expect(probe.events.some((event) => event.kind === 'approval_requested')).toBe(true);
   });
 });
 
@@ -6757,9 +6772,15 @@ describe('reads proposed together', () => {
     const approvals: Array<Record<string, unknown>> = [];
     const store = {
       ...probe.store,
-      createApproval: async (input: Record<string, unknown>) => {
+      parkTaskForApproval: async (input: Record<string, unknown>) => {
         approvals.push(input);
-        return 'approval-1';
+        await probe.store.updateTask({
+          ...input,
+          id: input.taskId,
+          status: 'awaiting_user',
+          clearLease: true
+        } as Parameters<DataStore['updateTask']>[0]);
+        return true;
       }
     } as unknown as DataStore;
     const log: FetchLog = { calls: [], modelRequests: [] };
@@ -7882,9 +7903,15 @@ describe('what athanor answered itself, and what the computer answered', () => {
     const probe = probeStore(() => task);
     const raised: Array<Record<string, unknown>> = [];
     Object.assign(probe.store, {
-      createApproval: async (input: Record<string, unknown>) => {
+      parkTaskForApproval: async (input: Record<string, unknown>) => {
         raised.push(input);
-        return 'approval-1';
+        await probe.store.updateTask({
+          ...input,
+          id: input.taskId,
+          status: 'awaiting_user',
+          clearLease: true
+        } as Parameters<DataStore['updateTask']>[0]);
+        return true;
       }
     });
     const log: FetchLog = { calls: [], modelRequests: [] };
@@ -7929,9 +7956,15 @@ describe('what athanor answered itself, and what the computer answered', () => {
     const probe = probeStore(() => task);
     const raised: Array<Record<string, unknown>> = [];
     Object.assign(probe.store, {
-      createApproval: async (input: Record<string, unknown>) => {
+      parkTaskForApproval: async (input: Record<string, unknown>) => {
         raised.push(input);
-        return 'approval-1';
+        await probe.store.updateTask({
+          ...input,
+          id: input.taskId,
+          status: 'awaiting_user',
+          clearLease: true
+        } as Parameters<DataStore['updateTask']>[0]);
+        return true;
       }
     });
     const log: FetchLog = { calls: [], modelRequests: [] };
@@ -7989,9 +8022,15 @@ describe('what athanor answered itself, and what the computer answered', () => {
     const probe = probeStore(() => task);
     const raised: Array<Record<string, unknown>> = [];
     Object.assign(probe.store, {
-      createApproval: async (input: Record<string, unknown>) => {
+      parkTaskForApproval: async (input: Record<string, unknown>) => {
         raised.push(input);
-        return 'approval-1';
+        await probe.store.updateTask({
+          ...input,
+          id: input.taskId,
+          status: 'awaiting_user',
+          clearLease: true
+        } as Parameters<DataStore['updateTask']>[0]);
+        return true;
       }
     });
     const log: FetchLog = { calls: [], modelRequests: [] };
@@ -8577,9 +8616,7 @@ describe('dormant rules on a real turn', () => {
 describe('the contract the run actually sends', () => {
   const contractOf = (log: FetchLog): string => {
     const messages = (log.modelRequests[0]?.messages ?? []) as { content: string }[];
-    const head = messages.find((message) =>
-      message.content.startsWith('# athanor operating contract')
-    );
+    const head = messages.find((message) => message.content.startsWith(BASE_PROMPT_MARKER));
     if (!head) throw new Error('no operating contract on the request');
     return head.content;
   };
@@ -8754,9 +8791,15 @@ describe('diagnosing a repository whose build somebody else wrote', () => {
     const probe = probeStore(() => task);
     const raised: Array<Record<string, unknown>> = [];
     Object.assign(probe.store, {
-      createApproval: async (input: Record<string, unknown>) => {
+      parkTaskForApproval: async (input: Record<string, unknown>) => {
         raised.push(input);
-        return 'approval-1';
+        await probe.store.updateTask({
+          ...input,
+          id: input.taskId,
+          status: 'awaiting_user',
+          clearLease: true
+        } as Parameters<DataStore['updateTask']>[0]);
+        return true;
       }
     });
     const log: FetchLog = { calls: [], modelRequests: [] };
@@ -8827,4 +8870,29 @@ describe('diagnosing a repository whose build somebody else wrote', () => {
     expect(ran, 'the type check never reached the runner').toBe(true);
     expect(probe.undoPoints).toHaveLength(1);
   });
+});
+
+describe('owner effort reaches the paid request', () => {
+  it.each(['low', 'max'] as const)(
+    'keeps %s on the normal step and its closing handoff',
+    async (effort) => {
+      const task = { ...makeTask(), reasoningEffort: effort };
+      const probe = probeStore(() => task);
+      vi.spyOn(probe.store, 'listModels').mockResolvedValue([
+        { ...model, reasoning: { mandatory: true, supportedEfforts: ['low', 'high', 'max'] } }
+      ]);
+      const log: FetchLog = { calls: [], modelRequests: [] };
+      installFetch(
+        [textFrame('Working through the notes.'), textFrame('The turn stopped at its step limit.')],
+        log
+      );
+      const worker = new AgentWorker(probe.store, config(), masterKey, runnerSecret);
+      await worker.run(task);
+      expect(log.modelRequests).toHaveLength(2);
+      for (const request of log.modelRequests) expect(request.reasoning_effort).toBe(effort);
+      const states = decryptCheckpoints(probe.checkpoints);
+      expect(states.length).toBeGreaterThan(0);
+      expect(states.at(-1)).toMatchObject({ ownerReasoningEffort: effort });
+    }
+  );
 });

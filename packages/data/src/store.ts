@@ -1,6 +1,7 @@
 import type { Database } from './database.js';
 import { IdentityStore } from './store/identity.js';
 import { BillingStore } from './store/billing.js';
+import { DictationStore } from './store/dictation.js';
 import { ConnectorStore } from './store/connectors.js';
 import { NotificationStore } from './store/notifications.js';
 import { MemoryStore } from './store/memory.js';
@@ -9,6 +10,15 @@ import { ScheduleStore } from './store/schedules.js';
 import { WorkspaceStore } from './store/workspaces.js';
 import { MaintenanceStore } from './store/maintenance.js';
 import { ShareStore } from './store/shares.js';
+import { MediaJobStore } from './store/media-jobs.js';
+import { MediaDeliveryStore } from './store/media-delivery.js';
+import { MediaAssetStore } from './store/media-assets.js';
+import { CodingMissionStore } from './store/coding-missions.js';
+export type { CodingMissionRecord } from './store/coding-missions.js';
+import { MediaBatchStore } from './store/media-batches.js';
+export type { MediaBatchRecord, MediaBatchStatus } from './store/media-batches.js';
+export type { MediaAssetRecord } from './store/media-assets.js';
+export type { MediaJobRecord } from './store/media-jobs.js';
 
 /**
  * Re-exported for one release. `MEMORY_SOURCE_SEARCH_PER_TASK` moved to `store/sql/memory.ts`
@@ -83,6 +93,7 @@ export class DataStore {
    */
   readonly #identity: IdentityStore;
   readonly #billing: BillingStore;
+  readonly #dictation: DictationStore;
   readonly #connectors: ConnectorStore;
   readonly #notifications: NotificationStore;
   readonly #memory: MemoryStore;
@@ -92,23 +103,101 @@ export class DataStore {
   readonly #schedules: ScheduleStore;
   readonly #maintenance: MaintenanceStore;
   readonly #shares: ShareStore;
+  readonly #mediaJobs: MediaJobStore;
+  readonly #mediaDelivery: MediaDeliveryStore;
+  readonly #mediaAssets: MediaAssetStore;
+  readonly #codingMissions: CodingMissionStore;
+  readonly #mediaBatches: MediaBatchStore;
 
   constructor(database: Database) {
     this.#identity = new IdentityStore(database);
     this.#billing = new BillingStore(database);
-    this.#connectors = new ConnectorStore(database);
+    this.#dictation = new DictationStore(database);
+    this.#mediaJobs = new MediaJobStore(database, this.#billing);
+    this.#mediaAssets = new MediaAssetStore(database);
+    this.#mediaBatches = new MediaBatchStore(database);
     this.#notifications = new NotificationStore(database);
     this.#memory = new MemoryStore(database);
     this.#workspaces = new WorkspaceStore(database);
     // One emitter and one LISTEN connection per process, shared by the two domains that write rows
     // worth waking somebody for. Two of these would mean two connections and two deliveries.
     this.#taskSignals = new TaskSignals(database);
+    this.#mediaDelivery = new MediaDeliveryStore(database, this.#notifications, this.#taskSignals);
+    this.#connectors = new ConnectorStore(database, this.#taskSignals);
     this.#tasks = new TaskStore(database, this.#taskSignals);
     // The billing store itself, not a copy of its statements: `materializeTaskSchedule` runs the
     // spend guard on the same transaction handle that inserts the task it authorises.
     this.#schedules = new ScheduleStore(database, this.#billing, this.#taskSignals);
     this.#maintenance = new MaintenanceStore(database);
     this.#shares = new ShareStore(database);
+    this.#codingMissions = new CodingMissionStore(
+      database,
+      this.#tasks,
+      this.#workspaces,
+      this.#taskSignals
+    );
+  }
+
+  createCodingMission(...args: Parameters<CodingMissionStore['createCodingMission']>) {
+    return this.#codingMissions.createCodingMission(...args);
+  }
+  getCodingMission(...args: Parameters<CodingMissionStore['getCodingMission']>) {
+    return this.#codingMissions.getCodingMission(...args);
+  }
+  listCodingMissions(...args: Parameters<CodingMissionStore['listCodingMissions']>) {
+    return this.#codingMissions.listCodingMissions(...args);
+  }
+  codingMissionForTask(...args: Parameters<CodingMissionStore['codingMissionForTask']>) {
+    return this.#codingMissions.codingMissionForTask(...args);
+  }
+  reserveCodingInference(...args: Parameters<CodingMissionStore['reserveCodingInference']>) {
+    return this.#codingMissions.reserveCodingInference(...args);
+  }
+  settleCodingInference(...args: Parameters<CodingMissionStore['settleCodingInference']>) {
+    return this.#codingMissions.settleCodingInference(...args);
+  }
+  activateCodingMission(...args: Parameters<CodingMissionStore['activateCodingMission']>) {
+    return this.#codingMissions.activateCodingMission(...args);
+  }
+  cancelCodingMission(...args: Parameters<CodingMissionStore['cancelCodingMission']>) {
+    return this.#codingMissions.cancelCodingMission(...args);
+  }
+  recordCodingMissionReview(...args: Parameters<CodingMissionStore['recordCodingMissionReview']>) {
+    return this.#codingMissions.recordCodingMissionReview(...args);
+  }
+
+  beginCodingMissionIntegration(
+    ...args: Parameters<CodingMissionStore['beginCodingMissionIntegration']>
+  ) {
+    return this.#codingMissions.beginCodingMissionIntegration(...args);
+  }
+
+  finishCodingMissionIntegration(
+    ...args: Parameters<CodingMissionStore['finishCodingMissionIntegration']>
+  ) {
+    return this.#codingMissions.finishCodingMissionIntegration(...args);
+  }
+
+  acknowledgeCodingMissionRunner(
+    ...args: Parameters<CodingMissionStore['acknowledgeCodingMissionRunner']>
+  ) {
+    return this.#codingMissions.acknowledgeCodingMissionRunner(...args);
+  }
+
+  codingMissionsNeedingSync(...args: Parameters<CodingMissionStore['codingMissionsNeedingSync']>) {
+    return this.#codingMissions.codingMissionsNeedingSync(...args);
+  }
+
+  replyToCodingMission(...args: Parameters<CodingMissionStore['replyToCodingMission']>) {
+    return this.#codingMissions.replyToCodingMission(...args);
+  }
+
+  parkForCodingMissions(...args: Parameters<CodingMissionStore['parkForCodingMissions']>) {
+    return this.#codingMissions.parkForCodingMissions(...args);
+  }
+
+  wakeCodingMissionParents(...args: Parameters<CodingMissionStore['wakeCodingMissionParents']>) {
+    return this.#codingMissions.wakeCodingMissionParents(...args);
   }
 
   onTaskEvent(...args: Parameters<TaskSignals['onTaskEvent']>) {
@@ -121,6 +210,97 @@ export class DataStore {
 
   waitForAnsweredTask(...args: Parameters<TaskSignals['waitForAnsweredTask']>) {
     return this.#taskSignals.waitForAnsweredTask(...args);
+  }
+
+  listTaskMediaAssets(...args: Parameters<MediaAssetStore['listTaskMediaAssets']>) {
+    return this.#mediaAssets.listTaskMediaAssets(...args);
+  }
+  reconcileMediaAsset(...args: Parameters<MediaAssetStore['reconcileMediaAsset']>) {
+    return this.#mediaAssets.reconcileMediaAsset(...args);
+  }
+  createMediaAsset(...args: Parameters<MediaAssetStore['createMediaAsset']>) {
+    return this.#mediaAssets.createMediaAsset(...args);
+  }
+  getMediaAsset(...args: Parameters<MediaAssetStore['getMediaAsset']>) {
+    return this.#mediaAssets.getMediaAsset(...args);
+  }
+  listMediaAssets(...args: Parameters<MediaAssetStore['listMediaAssets']>) {
+    return this.#mediaAssets.listMediaAssets(...args);
+  }
+  finishMediaAsset(...args: Parameters<MediaAssetStore['finishMediaAsset']>) {
+    return this.#mediaAssets.finishMediaAsset(...args);
+  }
+  requestMediaBatchCancel(...args: Parameters<MediaBatchStore['requestMediaBatchCancel']>) {
+    return this.#mediaBatches.requestMediaBatchCancel(...args);
+  }
+  markMediaBatchCancelSent(...args: Parameters<MediaBatchStore['markMediaBatchCancelSent']>) {
+    return this.#mediaBatches.markMediaBatchCancelSent(...args);
+  }
+  createMediaBatch(...args: Parameters<MediaBatchStore['createMediaBatch']>) {
+    return this.#mediaBatches.createMediaBatch(...args);
+  }
+  getMediaBatch(...args: Parameters<MediaBatchStore['getMediaBatch']>) {
+    return this.#mediaBatches.getMediaBatch(...args);
+  }
+  listMediaBatches(...args: Parameters<MediaBatchStore['listMediaBatches']>) {
+    return this.#mediaBatches.listMediaBatches(...args);
+  }
+  leaseMediaBatch(...args: Parameters<MediaBatchStore['leaseMediaBatch']>) {
+    return this.#mediaBatches.leaseMediaBatch(...args);
+  }
+  updateMediaBatch(...args: Parameters<MediaBatchStore['updateMediaBatch']>) {
+    return this.#mediaBatches.updateMediaBatch(...args);
+  }
+  assignMediaBatchResults(...args: Parameters<MediaBatchStore['assignMediaBatchResults']>) {
+    return this.#mediaBatches.assignMediaBatchResults(...args);
+  }
+  reconcileMediaBatch(...args: Parameters<MediaBatchStore['reconcileMediaBatch']>) {
+    return this.#mediaBatches.reconcileMediaBatch(...args);
+  }
+  setMediaBatchWatching(...args: Parameters<MediaBatchStore['setMediaBatchWatching']>) {
+    return this.#mediaBatches.setMediaBatchWatching(...args);
+  }
+  listMediaBatchJobs(...args: Parameters<MediaJobStore['listMediaBatchJobs']>) {
+    return this.#mediaJobs.listMediaBatchJobs(...args);
+  }
+  createMediaJob(...args: Parameters<MediaJobStore['createMediaJob']>) {
+    return this.#mediaJobs.createMediaJob(...args);
+  }
+  getMediaJob(...args: Parameters<MediaJobStore['getMediaJob']>) {
+    return this.#mediaJobs.getMediaJob(...args);
+  }
+  listMediaJobs(...args: Parameters<MediaJobStore['listMediaJobs']>) {
+    return this.#mediaJobs.listMediaJobs(...args);
+  }
+  listDictationReceipts(...args: Parameters<DictationStore['listDictationReceipts']>) {
+    return this.#dictation.listDictationReceipts(...args);
+  }
+  reconcileDictationReceipt(...args: Parameters<DictationStore['reconcileDictationReceipt']>) {
+    return this.#dictation.reconcileDictationReceipt(...args);
+  }
+  leaseMediaJob(...args: Parameters<MediaJobStore['leaseMediaJob']>) {
+    return this.#mediaJobs.leaseMediaJob(...args);
+  }
+  updateMediaJob(...args: Parameters<MediaJobStore['updateMediaJob']>) {
+    return this.#mediaJobs.updateMediaJob(...args);
+  }
+  setMediaJobWatching(...args: Parameters<MediaJobStore['setMediaJobWatching']>) {
+    return this.#mediaJobs.setMediaJobWatching(...args);
+  }
+  reconcileMediaJob(...args: Parameters<MediaJobStore['reconcileMediaJob']>) {
+    return this.#mediaJobs.reconcileMediaJob(...args);
+  }
+  leaseMediaDelivery(...args: Parameters<MediaDeliveryStore['leaseMediaDelivery']>) {
+    return this.#mediaDelivery.leaseMediaDelivery(...args);
+  }
+  publishMediaDelivery(...args: Parameters<MediaDeliveryStore['publishMediaDelivery']>) {
+    return this.#mediaDelivery.publishMediaDelivery(...args);
+  }
+  deferMediaDelivery(...args: Parameters<MediaDeliveryStore['deferMediaDelivery']>) {
+    return this.#mediaDelivery.deferMediaDelivery(...args);
+  }
+  completeMediaJob(...args: Parameters<MediaJobStore['completeMediaJob']>) {
+    return this.#mediaJobs.completeMediaJob(...args);
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -918,6 +1098,9 @@ export class DataStore {
   transitionUsage(...args: Parameters<BillingStore['transitionUsage']>) {
     return this.#billing.transitionUsage(...args);
   }
+  settleNativeInputUsage(...args: Parameters<BillingStore['settleNativeInputUsage']>) {
+    return this.#billing.settleNativeInputUsage(...args);
+  }
 
   mediaSpendForTask(...args: Parameters<BillingStore['mediaSpendForTask']>) {
     return this.#billing.mediaSpendForTask(...args);
@@ -985,8 +1168,16 @@ export class DataStore {
     return this.#connectors.createApproval(...args);
   }
 
+  parkTaskForApproval(...args: Parameters<ConnectorStore['parkTaskForApproval']>) {
+    return this.#connectors.parkTaskForApproval(...args);
+  }
+
   listApprovals(...args: Parameters<ConnectorStore['listApprovals']>) {
     return this.#connectors.listApprovals(...args);
+  }
+
+  hasPendingApproval(...args: Parameters<ConnectorStore['hasPendingApproval']>) {
+    return this.#connectors.hasPendingApproval(...args);
   }
 
   resolveApproval(...args: Parameters<ConnectorStore['resolveApproval']>) {

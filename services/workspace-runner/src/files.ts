@@ -230,7 +230,7 @@ const RUNNER_ONLY_MODE = 0o700;
  * or O_CREAT before the descriptor identity check runs. Other hosts retain the checked-path
  * development behavior because their descriptor filesystem does not support directory traversal.
  */
-const withWorkspaceDirectory = async <T>(
+export const withWorkspaceDirectory = async <T>(
   root: string,
   directory: string,
   create: boolean,

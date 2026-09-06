@@ -123,6 +123,7 @@ export const taskResponse = (
   id: task.id,
   workspaceId: task.workspaceId,
   parentTaskId: task.parentTaskId,
+  parentMissionId: task.parentMissionId ?? null,
   branchedFromEventId: task.branchedFromEventId,
   forkKind: task.forkKind,
   // What lets a client fold ninety-six watcher runs into one line instead of listing them beside
@@ -134,6 +135,11 @@ export const taskResponse = (
   status: task.status as TaskStatus,
   resumable: (resumableTaskStatuses as readonly string[]).includes(task.status),
   modelId: task.modelId,
+  reasoningEffort: task.reasoningEffort ?? 'auto',
+  ...(task.deliveryStatus === undefined ? {} : { deliveryStatus: task.deliveryStatus }),
+  ...(task.pendingDeliveryCount === undefined
+    ? {}
+    : { pendingDeliveryCount: task.pendingDeliveryCount }),
   privacyRoute: task.privacyRoute as TaskPage['tasks'][number]['privacyRoute'],
   securityMode: task.securityMode,
   maxComputeCredits: task.maxComputeCredits,
@@ -275,56 +281,6 @@ export const TRANSCRIPTION_FORMATS = ['wav', 'mp3', 'flac', 'm4a', 'ogg', 'webm'
 export type TranscriptionFormat = (typeof TRANSCRIPTION_FORMATS)[number];
 
 /**
- * How few bytes a second of speech can arrive as in each container, which is how a payload is read
- * back as a duration.
- *
- * Transcription is quoted and billed by the minute and this route holds bytes, so the length of the
- * recording has to be inferred before it can be priced. The floor rather than a typical rate, in
- * every row: the figure is only ever used to decide whether a recording fits under a cap before it
- * is sent, and the ledger row written afterwards carries what the provider actually charged.
- * Overstating a voice note costs an owner sitting exactly on their ceiling one dictation.
- * Understating it is how a month of dictation walks past that ceiling a minute at a time, which is
- * the defect this exists to close.
- */
-const TRANSCRIPTION_FLOOR_BYTES_PER_SECOND: Record<TranscriptionFormat, number> = {
-  // PCM and its lossless compression. 8 kHz 8-bit mono is the slowest speech either is written at,
-  // and FLAC takes roughly half of it.
-  wav: 8_000,
-  flac: 4_000,
-  // Lossy speech codecs at the lowest bitrate each stays intelligible at: 32 kbps for MP3, 24 for
-  // AAC in either of its containers, 16 for the Opus that browsers record voice notes as.
-  mp3: 4_000,
-  m4a: 3_000,
-  aac: 3_000,
-  ogg: 2_000,
-  webm: 2_000
-};
-
-/** How many past readings a measured per-minute price is averaged over. */
-export const TRANSCRIPTION_RATE_SAMPLES = 20;
-
-/**
- * How long a recording is, on the most pessimistic reading of the bytes that carry it.
- *
- * Base64 is four characters to three bytes; padding is worth less than a millisecond of audio and
- * is not worth the arithmetic.
- */
-export const transcriptionSecondsFromPayload = (
-  base64: string,
-  format: TranscriptionFormat
-): number => (base64.length * 3) / 4 / TRANSCRIPTION_FLOOR_BYTES_PER_SECOND[format];
-
-/**
- * What a reading of this length costs at a stated per-minute price, rounded up to the minute
- * because that is how duration billing is quoted. `null` means nobody has stated one, and the
- * answer is then zero - a true lower bound on a cost this box has no evidence about, rather than a
- * claim that it is free. The guard is still asked the question with it, which is what makes a cap
- * that has already been reached stop dictation as well as everything else.
- */
-export const transcriptionEstimateUsd = (seconds: number, usdPerMinute: number | null): number =>
-  Math.ceil(Math.max(0, seconds) / 60) * (usdPerMinute ?? 0);
-
-/**
  * Binary uploads reach here as a Buffer of up to the 50 MB body limit; serialising one through
  * `JSON.stringify` would expand it into a multi-hundred-megabyte string on every request, so raw
  * bytes are digested directly and tagged so they cannot collide with a JSON body.
@@ -380,6 +336,7 @@ export interface InferenceSecret {
     image?: MediaModelOption;
     audio?: MediaModelOption;
     transcription?: MediaModelOption;
+    video?: MediaModelOption;
   };
 }
 
@@ -502,9 +459,13 @@ export const clockToMinutes = (value: string): number => {
 export const minutesToClock = (value: number): string =>
   `${String(Math.floor(value / 60)).padStart(2, '0')}:${String(value % 60).padStart(2, '0')}`;
 
-/** Where an agent computer keeps the standing brief, and the name it used to keep it under. */
-export const workspaceBriefPath = 'workspace/ATHANOR.md';
-export const legacyWorkspaceBriefPath = 'workspace/OPEN_CLOUD.md';
+/** The preferred standing brief and supported compatibility names, in precedence order. */
+export const workspaceBriefPath = 'workspace/GARDEN.md';
+export const legacyWorkspaceBriefPaths = [
+  'workspace/ATHANOR.md',
+  'workspace/OPEN_CLOUD.md',
+  'workspace/AGENTS.md'
+] as const;
 
 /**
  * The three files `GET /v1/instance/diagnostics` reads off the box, as functions of the state
@@ -681,6 +642,7 @@ export const createApiContext = async (config: ApiConfig, overrides: ApiOverride
       localHost: config.RELAY_LOCAL_HOST,
       localPort: config.RELAY_LOCAL_PORT,
       localHttpPort: config.RELAY_LOCAL_HTTP_PORT,
+      localPreviewPort: config.RELAY_LOCAL_PREVIEW_PORT,
       log
     });
   // Reading the file is what makes the relay survive a restart; a box whose owner turned it on
@@ -908,10 +870,11 @@ export const createApiContext = async (config: ApiConfig, overrides: ApiOverride
     if (plan.stepsCiphertext.aad !== `task-plan:${plan.taskId}`)
       throw new AthanorError('encrypted_plan_context', 'Task plan encryption context is invalid');
     const key = unwrapDataKey(workspace.wrappedKey!, masterKey, workspace.id);
-    const content = decryptJson<{ steps: TaskPlanStep[]; branchName?: string }>(
-      plan.stepsCiphertext,
-      key
-    );
+    const content = decryptJson<{
+      steps: TaskPlanStep[];
+      branchName?: string;
+      outputs?: TaskPlan['outputs'];
+    }>(plan.stepsCiphertext, key);
     return {
       id: plan.id,
       taskId: plan.taskId,
@@ -919,6 +882,7 @@ export const createApiContext = async (config: ApiConfig, overrides: ApiOverride
       parentVersion: plan.parentVersion,
       branchName: content.branchName ?? plan.branchName,
       steps: content.steps,
+      ...(content.outputs === undefined ? {} : { outputs: content.outputs }),
       createdBy: plan.createdBy,
       createdAt: plan.createdAt
     };

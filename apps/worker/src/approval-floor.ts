@@ -1,3 +1,6 @@
+import { debuggerApproval } from './debugger-approval.js';
+import { codingMissionApproval } from './coding-mission-approval.js';
+import { prepareNativeInputApproval } from './native-input.js';
 /**
  * The approval floor: what a tool call has to be asked about before it runs, and the three lookups
  * a card needs before it can name what it is asking about.
@@ -9,21 +12,26 @@
  * second evaluation went.
  */
 import { createHmac } from 'node:crypto';
-import { unwrapDataKey } from '@athanor/core';
+import { AthanorError, unwrapDataKey } from '@athanor/core';
 import type { DataStore, TaskRecord } from '@athanor/data';
-import type { ModelToolCall } from '@athanor/model-gateway';
+import { isNativeOpenAIEndpoint, type ModelToolCall } from '@athanor/model-gateway';
 import type { AgentState, InferenceCredential } from './agent-state.js';
 import type { AgentApprovalRequirement } from './approval-state.js';
 import type { DestinationContext } from './egress.js';
 import {
   resolvedMediaModel,
   resolvedTranscriptionRoute,
-  transcriptionRouteWithMeasuredRate,
   type ResolvedMediaModel
 } from './media.js';
 import type { AgentRunnerClient } from './runner-client.js';
 import { approvalRequirement, surfaceActionRequest, type ApprovalContext } from './tools.js';
 import { textValue } from './values.js';
+import { computationApproval } from './computation-approval.js';
+import { jobRecoveryApproval } from './job-recovery-approval.js';
+import {
+  currentTranscriptionCredential,
+  pinTranscriptionApproval
+} from './transcription-approval.js';
 
 /** What the floor needs from the worker that owns the turn. */
 export interface ApprovalFloorDeps {
@@ -156,6 +164,46 @@ export const approvalForCall = async (
   call: ModelToolCall,
   state?: AgentState
 ): Promise<AgentApprovalRequirement | null> => {
+  if (task.parentMissionId && task.parentTaskId) {
+    const parent = await deps.store.getTask(task.userId, task.parentTaskId);
+    if (parent && task.privacyRoute !== parent.privacyRoute)
+      throw new Error(
+        'The parent privacy route changed; stop this coding mission before sending or executing more work'
+      );
+    if (!parent || ['failed', 'cancelled'].includes(parent.status))
+      throw new Error('The parent coding task no longer grants execution authority');
+    const strength = { review: 0, balanced: 1, autonomous: 2 };
+    if (strength[parent.securityMode] < strength[task.securityMode])
+      task.securityMode = parent.securityMode;
+  }
+  if (
+    call.name === 'coding_agent' &&
+    call.arguments.agent === 'garden' &&
+    call.arguments.action === 'integrate'
+  )
+    return codingMissionApproval(deps, task, call, state, {
+      ...(state?.taint ? { taintSources: state.taint.sources } : {}),
+      ...undoPointFor(state),
+      ...deps.destinationContext(state)
+    });
+  if (call.name === 'process' && call.arguments.action === 'debug')
+    return debuggerApproval(deps.runner, task, call, {
+      ...(state?.taint ? { taintSources: state.taint.sources } : {}),
+      ...undoPointFor(state),
+      ...deps.destinationContext(state)
+    });
+  if (call.name === 'process' && call.arguments.action === 'compute')
+    return computationApproval(deps.runner, task, call, {
+      ...(state?.taint ? { taintSources: state.taint.sources } : {}),
+      ...undoPointFor(state),
+      ...deps.destinationContext(state)
+    });
+  if (call.name === 'process' && call.arguments.action === 'resume')
+    return jobRecoveryApproval(deps.runner, task, call, {
+      ...(state?.taint ? { taintSources: state.taint.sources } : {}),
+      ...undoPointFor(state),
+      ...deps.destinationContext(state)
+    });
   // What this task has already put on the provider bill for media. One generation is a cent or
   // two at the reviewed prices, so a per-call ceiling could never fire and the card would have
   // been a branch that never runs; a run that keeps re-rolling is the thing worth stopping, and
@@ -179,6 +227,15 @@ export const approvalForCall = async (
    * lookup at all: every `code_diagnostics` call takes the turn's undo point, whatever it resolves
    * to.
    */
+  const transcription =
+    call.name === 'audio_read' &&
+    !(
+      call.arguments.options &&
+      typeof call.arguments.options === 'object' &&
+      'action' in call.arguments.options
+    )
+      ? await transcriptionModelForCall(deps, task)
+      : undefined;
   const declared = approvalRequirement(call.name, call.arguments, task.securityMode, {
     ...(call.name === 'generate_media'
       ? {
@@ -194,17 +251,49 @@ export const approvalForCall = async (
     // card. The duration is what it is priced on, and the only honest number available before the
     // encode is what the model asked for - which is why the card says "up to" and the ledger is
     // settled afterwards from what the provider actually billed.
-    ...(call.name === 'audio_read'
+    ...(transcription
       ? {
           mediaCommittedUsd: await mediaCommittedUsd(deps, task),
-          ...(await transcriptionModelForCall(deps, task, state))
+          ...(transcription.mediaModel ? { mediaModel: transcription.mediaModel } : {})
         }
+      : {}),
+    ...(call.name === 'audio_read' &&
+    call.arguments.options &&
+    typeof call.arguments.options === 'object' &&
+    'action' in call.arguments.options &&
+    call.arguments.options.action === 'native'
+      ? await prepareNativeInputApproval(deps, task, state, call)
       : {}),
     ...(existingSkill ? { existingSkill } : {}),
     ...(state?.taint ? { taintSources: state.taint.sources } : {}),
     ...undoPointFor(state),
     ...deps.destinationContext(state)
   });
+  if (declared && transcription?.credential) {
+    if (!state)
+      throw new AthanorError(
+        'transcription_approval_required',
+        'Recording approval needs durable task state',
+        409
+      );
+    const workspace = await deps.store.getWorkspaceById(task.workspaceId);
+    if (!workspace?.wrappedKey)
+      throw new AthanorError(
+        'transcription_approval_required',
+        'Recording workspace is unavailable',
+        409
+      );
+    const key = unwrapDataKey(workspace.wrappedKey, deps.masterKey, workspace.id);
+    const proof = await pinTranscriptionApproval(
+      { runner: deps.runner, key, task, state },
+      call,
+      transcription.credential
+    );
+    return {
+      ...declared,
+      preview: `${declared.preview}\n\nDestination: ${new URL(transcription.credential.baseUrl).origin}. Source SHA-256: ${proof.sourceSha256} (${proof.sourceBytes} bytes). The source, credential, route and price must still match when this approval runs.`
+    };
+  }
   if (!['browser_action', 'desktop_action'].includes(call.name)) return declared;
   const surface = call.name === 'browser_action' ? 'browser' : 'desktop';
   try {
@@ -284,35 +373,21 @@ export const mediaModelForCall = async (
   task: TaskRecord,
   kind: string
 ): Promise<{ mediaModel?: ResolvedMediaModel }> => {
-  if (kind !== 'image' && kind !== 'audio') return {};
+  if (kind !== 'image' && kind !== 'audio' && kind !== 'video') return {};
   const secret = await deps.inferenceCredential(task).catch(() => undefined);
   return { mediaModel: resolvedMediaModel(kind, secret?.mediaRoutes) };
 };
 
-/**
- * The route a reading will take, for the card that asks about it.
- *
- * Absent where the owner has pinned nothing: the model is then whatever their provider offers,
- * discovered a moment later in the dispatch arm, and a card that named one before it was chosen
- * would be naming a guess. Absent also prices nothing, which is what makes the card ask on every
- * reading until a route with a published per-minute price is chosen - the same treatment an
- * unpriced image route already gets, for the same reason.
- *
- * A route this task has already been billed for is no longer one of unknown price, so the rate
- * measured from the provider's own first invoice is carried onto it here. Without that the card
- * would go on saying the cost cannot be known while the dispatch arm below priced the very same
- * reading from a figure it was holding.
- */
+/** Price evidence is resolved from the selected credential, never from a previous invoice. */
 export const transcriptionModelForCall = async (
   deps: ApprovalFloorDeps,
-  task: TaskRecord,
-  state?: AgentState
-): Promise<{ mediaModel?: ResolvedMediaModel }> => {
-  const secret = await deps.inferenceCredential(task).catch(() => undefined);
-  const chosen = resolvedTranscriptionRoute(secret?.mediaRoutes);
-  const route = transcriptionRouteWithMeasuredRate(
-    chosen,
-    chosen ? state?.transcriptionRates?.[chosen.modelId] : null
+  task: TaskRecord
+): Promise<{ mediaModel?: ResolvedMediaModel; credential?: InferenceCredential }> => {
+  const stored = await deps.inferenceCredential(task).catch(() => undefined);
+  const secret = stored ? await currentTranscriptionCredential(stored) : undefined;
+  const route = resolvedTranscriptionRoute(
+    secret?.mediaRoutes,
+    Boolean(secret && secret.provider !== 'openrouter' && isNativeOpenAIEndpoint(secret.baseUrl))
   );
-  return route ? { mediaModel: route } : {};
+  return route && secret ? { mediaModel: route, credential: secret } : {};
 };

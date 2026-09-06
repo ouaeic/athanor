@@ -129,7 +129,7 @@ describe('the window one reading takes in', () => {
 
 describe('the encode a reading sends', () => {
   it('seeks before it decodes, drops the video, and lands on mono speech', () => {
-    const args = encodeArguments({ file: '/dev/fd/3', startSeconds: 90, seconds: 120 });
+    const args = encodeArguments({ startSeconds: 90, seconds: 120 });
     // Before -i, or an hour-long file is decoded and thrown away to reach the mark.
     expect(args.indexOf('-ss')).toBeLessThan(args.indexOf('-i'));
     expect(args).toEqual(

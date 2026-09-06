@@ -107,7 +107,7 @@ export const EDIT_ARM = 'quoted-edit';
 export const ARMS: readonly Arm[] = [
   {
     id: ROOT_ARM,
-    asks: 'What athanor sends today: 41 tools, the skill index, the whole contract.',
+    asks: 'The current full tool catalogue, skill index and operating contract.',
     inherits: null,
     change: {},
     ships: 'Shipped. It is the comparison, not a candidate.'

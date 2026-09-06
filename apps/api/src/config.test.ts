@@ -21,6 +21,14 @@ const productionEnvironment = () => {
 afterEach(() => vi.unstubAllEnvs());
 
 describe('production configuration', () => {
+  it('requires a separate preview origin and accepts an isolated TLS port on the same host', () => {
+    productionEnvironment();
+    vi.stubEnv('PREVIEW_BASE_URL', 'https://ai.acme.com/__athanor/preview');
+    expect(() => loadConfig()).toThrow('separate HTTPS origin');
+    vi.stubEnv('PREVIEW_BASE_URL', 'https://ai.acme.com:8443/__athanor/preview');
+    expect(loadConfig().PREVIEW_BASE_URL).toBe('https://ai.acme.com:8443/__athanor/preview');
+    expect(loadConfig().RESERVED_PREVIEW_PORTS.split(',')).toContain('8443');
+  });
   it('requires one HTTPS WebAuthn boundary and a first-owner pairing token', () => {
     productionEnvironment();
     expect(loadConfig()).toMatchObject({

@@ -29,10 +29,11 @@ import {
   type EncryptedEnvelope,
   type MailSocketFactory
 } from '@athanor/core';
-import { agentNotificationAad } from '@athanor/data';
+import { agentNotificationAad, MAX_APPROVAL_PAGE } from '@athanor/data';
 import { seedModels } from '@athanor/model-gateway';
 import type { ApiConfig } from './config.js';
-import { createLogger } from './log.js';
+import { createLogger, silentLogger } from './log.js';
+import { RelaySupervisor } from './relay.js';
 import { buildServer, idempotencyRequestHash, UNREADABLE_AGENT_MESSAGE } from './server.js';
 
 const disposers: Array<() => Promise<void>> = [];
@@ -52,10 +53,20 @@ describe('API production boundaries', () => {
       vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
         const requestUrl = input instanceof Request ? input.url : input.toString();
         if (requestUrl.includes('/models?output_modalities=transcription')) {
-          return new Response(JSON.stringify({ data: [{ id: 'test/transcription-model' }] }), {
-            status: 200,
-            headers: { 'content-type': 'application/json' }
-          });
+          return new Response(
+            JSON.stringify({
+              data: [
+                {
+                  id: 'test/transcription-model',
+                  architecture: { output_modalities: ['transcription'] }
+                }
+              ]
+            }),
+            {
+              status: 200,
+              headers: { 'content-type': 'application/json' }
+            }
+          );
         }
         if (requestUrl.endsWith('/audio/transcriptions')) {
           if (typeof init?.body !== 'string') {
@@ -65,7 +76,7 @@ describe('API production boundaries', () => {
           return new Response(
             JSON.stringify({
               text: 'A private voice note',
-              usage: { seconds: 1.25, total_tokens: 12 }
+              usage: { seconds: 1.25, total_tokens: 12, cost: 0.001 }
             }),
             { status: 200, headers: { 'content-type': 'application/json' } }
           );
@@ -86,10 +97,13 @@ describe('API production boundaries', () => {
         if (requestUrl.endsWith('/endpoints/zdr')) {
           return new Response(
             JSON.stringify({
-              data: seedModels().map((model) => ({
-                model_id: model.providerModelId,
-                status: 0
-              }))
+              data: [
+                ...seedModels().map((model) => ({
+                  model_id: model.providerModelId,
+                  status: 0
+                })),
+                { model_id: 'test/transcription-model', status: 0 }
+              ]
             }),
             { status: 200, headers: { 'content-type': 'application/json' } }
           );
@@ -150,6 +164,7 @@ describe('API production boundaries', () => {
       RELAY_LOCAL_HOST: '127.0.0.1',
       RELAY_LOCAL_PORT: 443,
       RELAY_LOCAL_HTTP_PORT: 80,
+      RELAY_LOCAL_PREVIEW_PORT: 8443,
       REGISTRATION_BOOTSTRAP_TOKEN: 'test-pairing-token-with-at-least-20-characters',
       REGISTRATION_BOOTSTRAP_EXPIRES_AT: Math.floor(Date.now() / 1000) + 86_400,
       PUBLIC_APP_URL: 'http://localhost:5173',
@@ -315,23 +330,14 @@ describe('API production boundaries', () => {
     const transcription = await app.inject({
       method: 'POST',
       url: '/v1/audio/transcriptions',
-      headers: { cookie: cookie! },
-      payload: { data: Buffer.from('test voice bytes').toString('base64'), format: 'webm' }
+      headers: { cookie: cookie!, 'idempotency-key': 'private-dictation-1' },
+      payload: { data: dictationWav(1.25), format: 'wav', maxCostUsd: 0.05 }
     });
-    expect(transcription.statusCode, transcription.body).toBe(200);
+    expect(transcription.statusCode, transcription.body).toBe(409);
     expect(transcription.json()).toMatchObject({
-      text: 'A private voice note',
-      model: 'test/transcription-model',
-      privacyRoute: 'provider_zdr'
+      error: { code: 'transcription_route_unavailable' }
     });
-    expect(transcriptionRequest).toMatchObject({
-      model: 'test/transcription-model',
-      provider: {
-        zdr: true,
-        data_collection: 'deny',
-        require_parameters: true
-      }
-    });
+    expect(transcriptionRequest).toBeNull();
 
     const nativeLoginOptions = await app.inject({
       method: 'POST',
@@ -1079,6 +1085,7 @@ describe('API production boundaries', () => {
       payload: {
         expectedVersion: 0,
         branchName: 'Team plan',
+        outputs: [{ kind: 'document', title: 'Confidential report', files: ['report.pdf'] }],
         steps: [
           { title: 'Read the private inputs', status: 'in_progress' },
           { title: 'Prepare the confidential result', status: 'pending' }
@@ -1108,6 +1115,22 @@ describe('API production boundaries', () => {
         version: 1,
         steps: [{ title: 'Read the private inputs' }, { title: 'Prepare the confidential result' }]
       }
+    ]);
+    const advancedPlan = await app.inject({
+      method: 'POST',
+      url: `/v1/tasks/${taskId}/plan`,
+      headers: { cookie: cookie! },
+      payload: {
+        expectedVersion: 1,
+        steps: [
+          { title: 'Read the private inputs', status: 'completed' },
+          { title: 'Prepare the confidential result', status: 'in_progress' }
+        ]
+      }
+    });
+    expect(advancedPlan.statusCode, advancedPlan.body).toBe(200);
+    expect(advancedPlan.json<{ outputs: unknown[] }>().outputs).toEqual([
+      { kind: 'document', title: 'Confidential report', files: ['report.pdf'] }
     ]);
     const stalePlan = await app.inject({
       method: 'POST',
@@ -1448,6 +1471,7 @@ const isolatedConfig = (directory: string): ApiConfig => ({
   RELAY_LOCAL_HOST: '127.0.0.1',
   RELAY_LOCAL_PORT: 443,
   RELAY_LOCAL_HTTP_PORT: 80,
+  RELAY_LOCAL_PREVIEW_PORT: 8443,
   PUBLIC_APP_URL: 'http://localhost:5173',
   PREVIEW_BASE_URL: 'http://preview.localhost:4400',
   API_HOST: '127.0.0.1',
@@ -1497,6 +1521,153 @@ const sessionCookie = (response: { headers: Record<string, unknown> }): string =
   return value.split(';', 1)[0]!;
 };
 
+describe('isolated preview discovery', () => {
+  test('rebases historical private links and task results onto the current configured origin', async () => {
+    stubProviderAndRunner();
+    const directory = await mkdtemp(join(tmpdir(), 'garden-preview-origin-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const beforeConfig = {
+      ...isolatedConfig(directory),
+      PREVIEW_BASE_URL: 'http://localhost:5173/__athanor/preview'
+    };
+    let server = await buildServer(beforeConfig, { masterKey });
+    disposers.push(() => server.app.close());
+    const { cookie, workspaceId, taskId } = await seedOwnerWithTask(
+      server.app,
+      'preview-origin',
+      'Build a private app'
+    );
+    const created = await server.app.inject({
+      method: 'POST',
+      url: `/v1/workspaces/${workspaceId}/previews`,
+      headers: { cookie, 'idempotency-key': 'preview-origin-create' },
+      payload: { port: 3000, label: 'Private app', entryPath: 'game/index.html' }
+    });
+    expect(created.statusCode, created.body).toBe(201);
+    const historical = created.json<{ id: string; url: string }>();
+    const historicalUrl = new URL(historical.url);
+    expect(historicalUrl.origin).toBe('http://localhost:5173');
+    const workspace = (await server.store.getWorkspaceById(workspaceId))!;
+    const key = unwrapDataKey(workspace.wrappedKey!, masterKey, workspace.id);
+    await server.store.appendTaskEvent({
+      taskId,
+      kind: 'preview',
+      summary: 'Encrypted preview event',
+      payloadCiphertext: encryptJson(
+        {
+          __athanorEventVersion: 1,
+          summary: 'Private app is available',
+          payload: { previewId: historical.id, url: historical.url }
+        },
+        key,
+        `task-event:${taskId}`
+      )
+    });
+    await server.app.close();
+    const currentBase = 'https://localhost:8443/__athanor/preview';
+    let relayOnline = true;
+    const relay = new RelaySupervisor({
+      directory: join(directory, 'relay'),
+      localHost: '127.0.0.1',
+      localPort: 443,
+      localHttpPort: 80,
+      localPreviewPort: 8443,
+      log: silentLogger,
+      redeemToken: async () => ({ label: 'enrolled', pinnedRelaySpkiSha256: 'fixture-pin' }),
+      createLink: async () => ({
+        get status() {
+          return {
+            state: relayOnline ? ('online' as const) : ('waiting' as const),
+            label: 'enrolled',
+            hostname: 'enrolled.relay.example',
+            openStreams: 0,
+            usedBytes: 0,
+            quota: null,
+            previewPort: 9443,
+            lastError: null,
+            nextAttemptAtMs: null
+          };
+        },
+        start: () => undefined,
+        stop: () => undefined
+      })
+    });
+    server = await buildServer(
+      { ...beforeConfig, PREVIEW_BASE_URL: currentBase },
+      { masterKey, relay }
+    );
+    await relay.enroll({ host: 'relay.example', token: 'synthetic-enrollment' });
+
+    const bootstrap = await server.app.inject({
+      method: 'GET',
+      url: '/v1/bootstrap',
+      headers: { cookie }
+    });
+    expect(bootstrap.statusCode, bootstrap.body).toBe(200);
+    expect(bootstrap.headers['x-athanor-preview-base-url']).toBe(currentBase);
+    expect(bootstrap.headers['x-athanor-relay-preview-origin']).toBe(
+      'https://enrolled.relay.example:9443'
+    );
+    relayOnline = false;
+    const offline = await server.app.inject({
+      method: 'GET',
+      url: '/v1/bootstrap',
+      headers: { cookie }
+    });
+    expect(offline.statusCode, offline.body).toBe(200);
+    expect(offline.headers['x-athanor-relay-preview-origin']).toBeUndefined();
+    const anonymous = await server.app.inject({ method: 'GET', url: '/v1/bootstrap' });
+    expect(anonymous.statusCode).toBe(401);
+    expect(anonymous.headers['x-athanor-preview-base-url']).toBeUndefined();
+    expect(anonymous.headers['x-athanor-relay-preview-origin']).toBeUndefined();
+
+    const listed = await server.app.inject({
+      method: 'GET',
+      url: `/v1/workspaces/${workspaceId}/previews`,
+      headers: { cookie }
+    });
+    expect(listed.statusCode, listed.body).toBe(200);
+    const current = listed.json<Array<{ id: string; url: string }>>();
+    expect(current).toHaveLength(1);
+    expect(current[0]?.id).toBe(historical.id);
+    const currentUrl = new URL(current[0]!.url);
+    expect(currentUrl.origin).toBe('https://localhost:8443');
+    expect(currentUrl.pathname).toBe(historicalUrl.pathname);
+    const access = await server.app.inject({
+      method: 'POST',
+      url: `/v1/previews/${historical.id}/access`,
+      headers: { cookie, 'idempotency-key': 'preview-origin-access' },
+      payload: {}
+    });
+    expect(access.statusCode, access.body).toBe(200);
+    const accessUrl = new URL(access.json<{ url: string }>().url);
+    expect(accessUrl.origin).toBe(currentUrl.origin);
+    expect(accessUrl.pathname).toBe(currentUrl.pathname);
+    expect(accessUrl.searchParams.get('access')).toMatch(/^g1\./);
+    const presentation = await server.app.inject({
+      method: 'GET',
+      url: `/v1/tasks/${taskId}/presentation`,
+      headers: { cookie }
+    });
+    expect(presentation.statusCode, presentation.body).toBe(200);
+    expect(presentation.json<{ results: unknown[] }>().results).toEqual([
+      expect.objectContaining({
+        kind: 'preview',
+        previewId: historical.id,
+        status: 'ready',
+        url: current[0]!.url
+      })
+    ]);
+    const legacyAccess = await server.previewApp.inject({
+      method: 'GET',
+      url: `${historicalUrl.pathname}${historicalUrl.search}`,
+      headers: { host: 'localhost:8443', 'x-forwarded-proto': 'https' }
+    });
+    expect(legacyAccess.statusCode, legacyAccess.body).toBe(303);
+    expect(legacyAccess.headers.location).toBe(currentUrl.pathname);
+  }, 30_000);
+});
+
 describe('workspace authorization boundaries', () => {
   test("keeps a second account away from every route on the owner's computer", async () => {
     const artifactBytes = Buffer.from('# Private report\n');
@@ -1523,7 +1694,7 @@ describe('workspace authorization boundaries', () => {
             headers: { 'content-type': 'application/gzip' }
           });
         }
-        if (requestUrl.includes('/file?path=')) {
+        if (requestUrl.includes('/file?path=') || requestUrl.includes('/download?path=')) {
           if (method === 'DELETE') {
             runnerDeletes.push(decodeURIComponent(requestUrl.split('/file?path=')[1]!));
             return new Response(JSON.stringify({ deleted: true }), {
@@ -3120,6 +3291,34 @@ describe('unattended recovery', () => {
       previewHash: 'not-a-real-binding-hash',
       expiresAt: new Date(Date.now() + 60 * 60_000)
     });
+    // A different task's newer cards must not hide this task's pending decision from Send.
+    const currentTask = (await store.getTask(workspace.userId, taskId))!;
+    const otherTask = await store.createTask({
+      userId: workspace.userId,
+      workspaceId,
+      titleCiphertext: encryptJson('Other task', key),
+      nameIndex: { nameTokens: '', openingTokens: '' },
+      modelId: currentTask.modelId,
+      privacyRoute: currentTask.privacyRoute,
+      maxComputeCredits: 1,
+      promptCiphertext: encryptJson('Other task', key)
+    });
+    await database.query(
+      `INSERT INTO approvals(id,user_id,task_id,action,side_effect,preview_ciphertext,
+         preview_hash,expires_at,created_at)
+       SELECT gen_random_uuid(),$1,$2,'shell','external_consequential',$3::jsonb,
+         'fixture',NOW()+INTERVAL '1 hour',NOW()+INTERVAL '1 second'
+       FROM generate_series(1,$4::int)`,
+      [
+        workspace.userId,
+        otherTask.id,
+        JSON.stringify(encryptJson({ action: 'Fixture' }, key)),
+        MAX_APPROVAL_PAGE + 1
+      ]
+    );
+    const firstPage = await store.listApprovals(workspace.userId);
+    expect(firstPage).toHaveLength(MAX_APPROVAL_PAGE);
+    expect(firstPage.some((card) => card.taskId === taskId)).toBe(false);
     const aside = await app.inject({
       method: 'POST',
       url: `/v1/tasks/${taskId}/messages`,
@@ -4411,7 +4610,7 @@ describe('authentication posture', () => {
     expect(created.statusCode, created.body).toBe(200);
     const ticket = JSON.parse(
       Buffer.from(
-        created.json<{ uri: string }>().uri.replace('athanor://pair/', ''),
+        created.json<{ uri: string }>().uri.replace(/^(?:garden|athanor):\/\/pair\//, ''),
         'base64url'
       ).toString('utf8')
     ) as { pairingCode: string };
@@ -6055,6 +6254,12 @@ describe('a half-typed message', () => {
       payload: {
         workspaceId,
         body: 'a sentence begun on another device',
+        controls: {
+          modelId: 'test/model',
+          reasoningEffort: 'high',
+          privacyRoute: 'provider_zdr',
+          spendCap: '2.50'
+        },
         // A message that is mostly its files used to sync as an empty draft: the tray lived in one
         // composer's memory, so the other device saw the sentence and none of the attachments.
         attachments: [
@@ -6084,6 +6289,12 @@ describe('a half-typed message', () => {
       workspaceId,
       taskId: null,
       body: 'a sentence begun on another device',
+      controls: {
+        modelId: 'test/model',
+        reasoningEffort: 'high',
+        privacyRoute: 'provider_zdr',
+        spendCap: '2.50'
+      },
       attachments: [
         {
           path: 'workspace/uploads/abc-report.pdf',
@@ -7923,7 +8134,7 @@ describe('the routes nothing had ever asked', () => {
     expect(accessOf(before)).not.toBeNull();
     const rotated = await app.inject({
       method: 'POST',
-      url: `/v1/previews/${before.id}/access`,
+      url: `/v1/previews/${before.id}/rotate-access`,
       headers: { cookie, 'idempotency-key': 'untested-preview-rotate' },
       payload: {}
     });
@@ -8879,17 +9090,51 @@ describe('control-plane gates', () => {
   });
 });
 
-/**
- * The one spend path that had no accounting at all.
- *
- * Every other provider call on this box asks the caps before it spends and writes a ledger row
- * after: a task, a follow-up, a conversation title, the agent reading a recording. Dictation into
- * the composer did neither. `GET /v1/spend` and `GET /v1/usage` reported task inference and nothing
- * else, so an owner dictating long notes all month watched a cap that could never fire against a
- * provider bill it could not explain.
- */
+function dictationWav(seconds: number): string {
+  const pcm = Buffer.alloc(Math.floor(seconds * 32_000)),
+    header = Buffer.alloc(44);
+  header.write('RIFF');
+  header.writeUInt32LE(pcm.length + 36, 4);
+  header.write('WAVEfmt ', 8);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(16_000, 24);
+  header.writeUInt32LE(32_000, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]).toString('base64');
+}
+
+describe('live voice server assembly', () => {
+  test('registers owner voice discovery and recovery behind the production authentication hooks', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'garden-api-voice-assembly-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app } = await buildServer(isolatedConfig(directory));
+    disposers.push(() => app.close());
+    const paths = ['/v1/voice/models', '/v1/voice-sessions'];
+    expect(paths.length).toBeGreaterThan(0);
+    for (const url of paths) expect((await app.inject({ url })).statusCode).toBe(401);
+    const cookie = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'owner' } })
+    );
+    const models = await app.inject({ url: paths[0]!, headers: { cookie } });
+    expect(models.statusCode, models.body).toBe(200);
+    const discovered = models.json<{ options: unknown[]; reason: string }>();
+    expect(discovered.options).toEqual([]);
+    expect(typeof discovered.reason).toBe('string');
+    expect(discovered.reason.length).toBeGreaterThan(0);
+    const history = await app.inject({ url: paths[1]!, headers: { cookie } });
+    expect(history.statusCode, history.body).toBe(200);
+    expect(history.json()).toEqual([]);
+  });
+});
+
 describe('what dictation costs', () => {
-  test('prices a voice note before sending it and records what it cost', async () => {
+  test('reserves a duration-priced voice note and records the provider receipt', async () => {
     let transcriptionCalls = 0;
     let dictationReachedProvider = 0;
     vi.stubGlobal(
@@ -8903,27 +9148,37 @@ describe('what dictation costs', () => {
           });
         if (requestUrl.includes('output_modalities=transcription')) {
           dictationReachedProvider += 1;
-          return json({ data: [{ id: 'test/ears' }] });
+          return json({
+            data: [{ id: 'test/ears', architecture: { output_modalities: ['transcription'] } }]
+          });
         }
         if (requestUrl.endsWith('/audio/transcriptions')) {
           transcriptionCalls += 1;
           dictationReachedProvider += 1;
-          // Two minutes of speech at thirty cents a minute, stated by the provider - which is the
-          // only figure this box may call a price rather than a guess.
-          return json({ text: 'A private voice note', usage: { seconds: 120, cost: 0.6 } });
+          return json({
+            text: 'A private voice note',
+            usage: { seconds: 2, cost: transcriptionCalls === 1 ? 0.006 : 0.002 }
+          });
         }
         if (requestUrl.endsWith('/models'))
           return json({
-            data: seedModels().map((model) => ({
-              id: model.providerModelId,
-              context_length: model.contextTokens,
-              architecture: { input_modalities: model.modalities },
-              supported_parameters: ['tools', 'reasoning']
-            }))
+            data: [
+              { id: 'whisper-1' },
+              { id: 'gpt-4.1-mini' },
+              ...seedModels().map((model) => ({
+                id: model.providerModelId,
+                context_length: model.contextTokens,
+                architecture: { input_modalities: model.modalities },
+                supported_parameters: ['tools', 'reasoning']
+              }))
+            ]
           });
         if (requestUrl.endsWith('/endpoints/zdr'))
           return json({
-            data: seedModels().map((model) => ({ model_id: model.providerModelId, status: 0 }))
+            data: [
+              ...seedModels().map((model) => ({ model_id: model.providerModelId, status: 0 })),
+              { model_id: 'whisper-1', status: 0 }
+            ]
           });
         if (requestUrl.includes('/benchmarks?')) return json({ data: [] });
         return json({ ok: true, storageBytes: 0 });
@@ -8943,7 +9198,13 @@ describe('what dictation costs', () => {
           method: 'PUT',
           url: '/v1/providers',
           headers: { cookie, 'idempotency-key': 'dictation-provider' },
-          payload: { provider: 'openrouter', apiKey: 'test-key', enforceZeroDataRetention: true }
+          payload: {
+            provider: 'openai-compatible',
+            baseUrl: 'https://api.openai.com/v1',
+            modelId: 'gpt-4.1-mini',
+            apiKey: 'test-key',
+            enforceZeroDataRetention: true
+          }
         })
       ).statusCode
     ).toBe(200);
@@ -8951,19 +9212,19 @@ describe('what dictation costs', () => {
       method: 'PUT',
       url: '/v1/spend-limits',
       headers: { cookie, 'idempotency-key': 'dictation-cap' },
-      payload: { dailyCapUsd: 1 }
+      payload: { dailyCapUsd: 0.016 }
     });
     expect(capped.statusCode, capped.body).toBe(200);
 
-    const shortNote = Buffer.from('test voice bytes').toString('base64');
+    const shortNote = dictationWav(2);
     const first = await app.inject({
       method: 'POST',
       url: '/v1/audio/transcriptions',
-      headers: { cookie },
-      payload: { data: shortNote, format: 'webm' }
+      headers: { cookie, 'idempotency-key': 'dictation-first' },
+      payload: { data: shortNote, format: 'wav', maxCostUsd: 0.6 }
     });
     expect(first.statusCode, first.body).toBe(200);
-    expect(first.json()).toMatchObject({ text: 'A private voice note', model: 'test/ears' });
+    expect(first.json()).toMatchObject({ text: 'A private voice note', model: 'whisper-1' });
 
     const userId = (await database.query('SELECT id FROM users')).rows[0]!.id as string;
     const ledger = await database.query(
@@ -8972,13 +9233,13 @@ describe('what dictation costs', () => {
     );
     expect(ledger.rows).toHaveLength(1);
     expect(ledger.rows[0]).toMatchObject({
-      idempotency_key: `audio:${userId}:${sha256(shortNote)}:transcription`,
+      idempotency_key: `dictation:${userId}:${sha256('dictation-first')}`,
       kind: 'model_inference',
       resource_class: 'media:transcription',
-      quantity: 120,
+      quantity: 2,
       unit: 'second',
-      cost_usd: 0.6,
-      model_id: 'test/ears',
+      cost_usd: 0.006,
+      model_id: 'whisper-1',
       state: 'settled'
     });
 
@@ -8989,24 +9250,17 @@ describe('what dictation costs', () => {
       spend
         .json<{ windows: Array<{ name: string; spentUsd: number }> }>()
         .windows.find((window) => window.name === 'daily')
-    ).toMatchObject({ spentUsd: 0.6 });
+    ).toMatchObject({ spentUsd: 0.006 });
 
-    /*
-     * A long recording is refused before a byte of it leaves the box.
-     *
-     * Sixty-five seconds of Opus at the floor rate is two billing minutes, and two minutes at the
-     * thirty cents the provider has already charged on this route is sixty cents on top of the
-     * sixty already spent - past a one-dollar day. Duration billing means the money is gone the
-     * moment the request is accepted, so a guard that ran afterwards would be a report.
-     */
+    // A second explicit reservation cannot promise capacity already spent by this owner.
     const callsBefore = transcriptionCalls;
     const reachedBefore = dictationReachedProvider;
-    const longNote = Buffer.alloc(130_000, 7).toString('base64');
+    const longNote = dictationWav(65);
     const refused = await app.inject({
       method: 'POST',
       url: '/v1/audio/transcriptions',
-      headers: { cookie },
-      payload: { data: longNote, format: 'webm' }
+      headers: { cookie, 'idempotency-key': 'dictation-refused' },
+      payload: { data: longNote, format: 'wav', maxCostUsd: 0.6 }
     });
     expect(refused.statusCode, refused.body).toBe(402);
     expect(refused.json<{ error: { code: string } }>().error.code).toBe('spend_cap_reached');
@@ -9015,13 +9269,12 @@ describe('what dictation costs', () => {
     expect(transcriptionCalls).toBe(callsBefore);
     expect(dictationReachedProvider).toBe(reachedBefore);
 
-    // The same cap, the same instant, a note short enough to fit: the refusal above is the
-    // estimate doing its job and not the cap having simply closed.
+    // A smaller explicit reservation still fits the remaining capacity.
     const stillAllowed = await app.inject({
       method: 'POST',
       url: '/v1/audio/transcriptions',
-      headers: { cookie },
-      payload: { data: Buffer.from('a second short note').toString('base64'), format: 'webm' }
+      headers: { cookie, 'idempotency-key': 'dictation-next' },
+      payload: { data: dictationWav(2), format: 'wav', maxCostUsd: 0.3 }
     });
     expect(stillAllowed.statusCode, stillAllowed.body).toBe(200);
     expect(transcriptionCalls).toBe(callsBefore + 1);

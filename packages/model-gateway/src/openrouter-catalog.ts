@@ -1,4 +1,4 @@
-import type { MediaModelOption, ModelRelease } from '@athanor/contracts';
+import type { ModelRelease } from '@athanor/contracts';
 import {
   AthanorError,
   RETIREMENT_HORIZON_DAYS,
@@ -6,10 +6,10 @@ import {
   type ModelPriceTier,
   type RoutableModel
 } from '@athanor/core';
-import { seedMediaModels } from './catalog.js';
 import { currentCommercialLicenseReview } from './license-manifest.js';
 import { readOpenRouterModels } from './openrouter-shape.js';
 import { promptCacheStyleFor, type PromptCacheStyle } from './prompt-cache.js';
+import type { ReasoningOptions } from './reasoning.js';
 
 /**
  * How much of the provider's catalogue the owner is offered.
@@ -60,6 +60,8 @@ interface OpenRouterPriceTier {
 }
 
 interface OpenRouterPricing {
+  audio: string | undefined;
+  image_token: string | undefined;
   prompt: string | undefined;
   completion: string | undefined;
   input_cache_read: string | undefined;
@@ -93,7 +95,7 @@ interface OpenRouterModel {
   expiration_date: string | null;
   /** Set on the `~vendor/model-latest` entries, which carry no benchmarks of their own. */
   alias_target: { slug: string | undefined; name: string | undefined } | null;
-  reasoning: { mandatory: boolean } | null;
+  reasoning: ReasoningOptions | null;
   benchmarks: {
     artificial_analysis: ArtificialAnalysisBenchmark | null;
     design_arena: DesignArenaEntry[];
@@ -705,14 +707,23 @@ export const refreshOpenRouterCatalog = async (
       contextTokens,
       expiresAt,
       shared: {
-        // Text and pictures, whatever else the provider says the model can be fed. The gateway
-        // builds one kind of non-text part and it is an image, so a model listed here as taking
-        // video was an offer the owner could see in the picker and nothing on this computer could
-        // keep. The seed catalogue already held this line; the live feed was overwriting it.
         modalities: [
           'text' as const,
-          ...(inputModalities.has('image') ? (['image'] as const) : [])
+          ...(['image', 'audio', 'video'] as const).filter((kind) => inputModalities.has(kind))
         ],
+        nativeInputPricing: {
+          audioUsdPerMillionTokens: perMillion(live?.pricing?.audio),
+          videoUsdPerMillionTokens:
+            inputModalities.has('video') &&
+            inputUsdPerMillionTokens !== null &&
+            (!inputModalities.has('audio') || perMillion(live?.pricing?.audio) !== null)
+              ? Math.max(
+                  inputUsdPerMillionTokens,
+                  perMillion(live?.pricing?.audio) ?? 0,
+                  perMillion(live?.pricing?.image_token) ?? 0
+                )
+              : null
+        },
         capabilities: [
           'chat' as const,
           ...(supported.has('tools') ? (['tools'] as const) : []),
@@ -745,6 +756,7 @@ export const refreshOpenRouterCatalog = async (
           catalogued: live !== undefined
         }) satisfies PromptCacheStyle,
         supportsReasoningEffort: supported.has('reasoning_effort'),
+        ...(live?.reasoning ? { reasoning: live.reasoning } : {}),
         maxOutputTokens: credibleOutputTokens(
           live?.top_provider?.max_completion_tokens,
           contextTokens
@@ -895,171 +907,7 @@ export const refreshOpenRouterCatalog = async (
   return [...reviewedEntries, ...liveEntries];
 };
 
-/**
- * What the feed says about a media route's price, in the unit that route is actually billed in.
- *
- * The pricing block was thrown away wholesale on this path, and the tag that stood in for it said
- * "Price not published" about every live entry - which the importer had no grounds for, having never
- * looked. Looking settles it: `prompt` and `completion` are the only price fields parsed here and
- * both are dollars per token, which is what the chat catalogue reads them as. An image is billed per
- * image, speech per character and a reading per minute of recording, so none of the three converts,
- * and nothing here sets a price.
- *
- * What the tags now carry is the difference between the two facts that zero used to cover. A route
- * this provider prices nowhere is one thing; a route it prices in a unit athanor cannot turn into
- * dollars per minute is another, and an owner deciding which model to point their recordings at is
- * entitled to know which of the two they are looking at.
- */
-const mediaPriceTags = (
-  modality: 'image' | 'audio' | 'transcription',
-  pricing: OpenRouterPricing | undefined
-): string[] => {
-  const unit =
-    modality === 'image' ? 'per-image' : modality === 'audio' ? 'per-character' : 'per-minute';
-  /*
-   * Asked of the raw fields rather than through `perMillion`, because the question here is only
-   * whether the provider priced this route at all. `perMillion` now refuses a rate too large to
-   * believe, and reading that refusal as "published nothing" would put this path back where it
-   * started - claiming the provider had said nothing on the strength of not having looked.
-   */
-  const pricedPerToken = [pricing?.prompt, pricing?.completion].some((value) => {
-    if (value === undefined) return false;
-    const parsed = Number(value);
-    return Number.isFinite(parsed) && parsed >= 0;
-  });
-  return [
-    `No ${unit} price published`,
-    ...(pricedPerToken ? ['Provider prices this route per token'] : [])
-  ];
-};
-
-/**
- * The generators the owner's provider account can reach, which the chat refresh above throws away.
- *
- * `refreshOpenRouterCatalog` skips every model whose output is not text - correctly, they cannot
- * answer a turn - and until now that was the end of them. So the image and speech models the owner
- * is paying for existed nowhere in this software except as two ids compiled into a manifest, which
- * is exactly the complaint: there was no control because there was no catalogue to control.
- *
- * What this cannot do is price them. The chat side reads `pricing.prompt` and `pricing.completion`
- * off the same feed and those are the only price fields this repository has ever confirmed; both
- * are dollars per token, and no media route is billed in tokens - see `mediaPriceTags`, which is
- * where that block is now read rather than discarded. Guessing at a conversion would put a number
- * under a control the owner is about to trust. So a live entry's price is reported as `unknown`,
- * the reviewed seeds keep their measured figures, and the worker's approval card asks every single
- * time for a model whose cost nobody has stated - but the reading itself no longer treats that
- * unknown as free: `transcriptionWindow` in the worker measures a route's per-minute cost from the
- * provider's own first invoice rather than waiting for this feed to publish one.
- */
-export const refreshOpenRouterMediaCatalog = async (options: {
-  baseUrl: string;
-  apiKey: string;
-  fetch?: typeof fetch;
-  now?: Date;
-  /** When true, a model with no zero-retention endpoint is listed but cannot be chosen. */
-  requireZeroDataRetention?: boolean;
-}): Promise<MediaModelOption[]> => {
-  const request = options.fetch ?? globalThis.fetch;
-  const baseUrl = options.baseUrl.replace(/\/$/, '');
-  const headers = { authorization: `Bearer ${options.apiKey}` };
-  const now = options.now ?? new Date();
-  const updatedAt = now.toISOString();
-  const [modelsResult, zdrResult] = await Promise.allSettled([
-    request(`${baseUrl}/models`, { headers, signal: AbortSignal.timeout(15_000) }).then(
-      (response) => checkedJson<unknown>(response, 'OpenRouter models')
-    ),
-    request(`${baseUrl}/endpoints/zdr`, { headers, signal: AbortSignal.timeout(15_000) }).then(
-      (response) => checkedJson<{ data?: unknown }>(response, 'OpenRouter ZDR endpoints')
-    )
-  ]);
-  if (modelsResult.status === 'rejected') throw modelsResult.reason;
-  /*
-   * The same narrowing as the chat refresh, for the same reason: this path walks the same document
-   * and would throw the same TypeErrors out of it.
-   *
-   * It does NOT journal the rows it could not read, and that is a gap rather than a saving. The
-   * claim that stood here - that the chat refresh runs against the same feed on the same box and
-   * has already named them - is not true of every entry into this function: `mediaCatalogFor` in
-   * apps/api/src/routes/support.ts calls it directly when the Settings media picker is opened,
-   * behind its own five-minute cache, with no chat refresh anywhere on that path. So a reshaped row
-   * can be dropped from the media picker here with nothing said, which is the exact silence
-   * `journalDrops` was written to end. Closing it means moving the journal below both entry points;
-   * that is a larger change than this one and it has not been made.
-   */
-  const listed: OpenRouterModel[] = readOpenRouterModels(modelsResult.value).models;
-  if (listed.length === 0)
-    throw new AthanorError(
-      'provider_catalog_empty',
-      'The provider answered but listed no models, so the media catalogue was left as it was',
-      502
-    );
-  const zdrBody = zdrResult.status === 'fulfilled' ? zdrResult.value : null;
-  /** The same guard as the chat refresh above, against the same measured crash. */
-  const zdrRows = (Array.isArray(zdrBody?.data) ? zdrBody.data : []) as Array<ZdrEndpoint | null>;
-  const zdrModelIds = new Set(
-    zdrRows
-      .filter((endpoint) => endpoint?.status === undefined || endpoint.status === 0)
-      .flatMap((endpoint) =>
-        typeof endpoint?.model_id === 'string' && endpoint.model_id !== ''
-          ? [endpoint.model_id]
-          : []
-      )
-  );
-  const listedIds = new Set(listed.map((model) => model.id));
-  const seeds = seedMediaModels(now).map((seed) => ({
-    ...seed,
-    ...(zdrBody ? { zeroDataRetentionAvailable: zdrModelIds.has(seed.providerModelId) } : {}),
-    // The reviewed route is always offered, but it is not always there: an account that cannot
-    // reach it says so here rather than at the moment a generation fails.
-    ...(listedIds.has(seed.providerModelId)
-      ? {}
-      : { unavailableReason: 'this provider account does not list it' })
-  }));
-  const seeded = new Set(seeds.map((seed) => seed.providerModelId));
-  const live: MediaModelOption[] = [];
-  for (const model of listed) {
-    if (seeded.has(model.id)) continue;
-    const outputs = model.architecture?.output_modalities ?? [];
-    // A model that can answer with text is a chat model, whatever else it can also emit; it belongs
-    // in the picker the composer reads and not in a list of things that make files. A transcription
-    // route is the exception the feed itself draws: it declares `transcription` rather than `text`,
-    // which is what separates a model that reads a recording from one that merely accepts audio in
-    // a conversation.
-    if (!outputs.length || outputs.includes('text')) continue;
-    const modality = outputs.includes('image')
-      ? ('image' as const)
-      : outputs.includes('audio')
-        ? ('audio' as const)
-        : outputs.includes('transcription')
-          ? ('transcription' as const)
-          : null;
-    if (!modality) continue;
-    live.push({
-      id: `openrouter/${model.id}`,
-      providerModelId: model.id,
-      displayName: displayNameFor(model),
-      provider: 'openrouter',
-      modality,
-      usdPerImage: null,
-      usdPerMillionCharacters: null,
-      usdPerMinute: null,
-      priceSource: 'unknown' as const,
-      defaultVoice: null,
-      recommendationTags: mediaPriceTags(modality, model.pricing),
-      updatedAt,
-      // Undefined rather than false when the endpoint feed could not be read, so an outage on one
-      // of two requests cannot silently withdraw every private media route the owner has.
-      ...(zdrBody ? { zeroDataRetentionAvailable: zdrModelIds.has(model.id) } : {})
-    });
-  }
-  const all = [...seeds, ...live];
-  if (!options.requireZeroDataRetention) return all;
-  return all.map((option) =>
-    option.unavailableReason || option.zeroDataRetentionAvailable !== false
-      ? option
-      : { ...option, unavailableReason: 'no verified private route' }
-  );
-};
+export { refreshOpenRouterMediaCatalog } from './media-catalog.js';
 
 /** Projects shared live endpoint metadata into one owner's current privacy policy. */
 export const applyOpenRouterPrivacyPolicy = <T extends ModelRelease>(

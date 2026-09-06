@@ -13,6 +13,8 @@ import { loadConfig } from './config.js';
 import { failureFields } from './failure-record.js';
 import { runLeaseLoops, type WorkerCounters } from './lease.js';
 import { workerLogger } from './log.js';
+import { runMediaJobLoop } from './media-jobs.js';
+import { runCodingMissionLoop } from './coding-mission-loop.js';
 
 const config = loadConfig();
 const database = createDatabase({
@@ -33,6 +35,27 @@ const worker = new AgentWorker(
   workerLogger
 );
 let running = true;
+const mediaShutdown = new AbortController();
+const codingMissionShutdown = new AbortController();
+const codingMissionLoop = runCodingMissionLoop({
+  store,
+  runnerBaseUrl: config.WORKSPACE_RUNNER_URL,
+  runnerSecret:
+    config.RUNNER_SHARED_SECRET ?? deriveServiceSecret(keyRelease.key, 'runner-capabilities'),
+  signal: codingMissionShutdown.signal,
+  onError: (error) =>
+    workerLogger.error('worker.coding_mission_recovery_failed', failureFields(error))
+});
+const mediaLoop = runMediaJobLoop({
+  store,
+  masterKey: keyRelease.key,
+  runnerBaseUrl: config.WORKSPACE_RUNNER_URL,
+  runnerSecret:
+    config.RUNNER_SHARED_SECRET ?? deriveServiceSecret(keyRelease.key, 'runner-capabilities'),
+  workerId: config.WORKER_ID,
+  signal: mediaShutdown.signal,
+  onError: (error) => workerLogger.error('worker.media_poll_failed', failureFields(error))
+});
 const counters: WorkerCounters = { active: 0, completed: 0, failed: 0, leaseErrors: 0 };
 const health = createServer((request, response) => {
   if (request.url === '/metrics') {
@@ -49,6 +72,8 @@ health.listen(config.WORKER_HEALTH_PORT, config.WORKER_HEALTH_HOST);
 
 const shutdown = () => {
   running = false;
+  mediaShutdown.abort();
+  codingMissionShutdown.abort();
 };
 process.once('SIGINT', shutdown);
 process.once('SIGTERM', shutdown);
@@ -121,5 +146,7 @@ await runLeaseLoops({
   idle: (milliseconds) => store.waitForQueuedTask(milliseconds)
 });
 
+mediaShutdown.abort();
+await Promise.all([mediaLoop, codingMissionLoop]);
 await new Promise<void>((resolve) => health.close(() => resolve()));
 await database.close();

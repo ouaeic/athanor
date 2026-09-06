@@ -85,6 +85,7 @@ describe('capability routing', () => {
       displayName: 'Hears',
       provider: 'vendor',
       modality: 'transcription',
+      apiProtocol: 'openai',
       usdPerImage: null,
       usdPerMillionCharacters: null,
       usdPerMinute: 0.01,
@@ -119,7 +120,14 @@ describe('capability routing', () => {
      * check that can only refuse is the tool removed rather than the recording protected.
      */
     it('allows a chosen route that does offer one', () => {
-      expect(transcriptionRouteAllowed(route(), 'provider_zdr')).toBe(true);
+      expect(transcriptionRouteAllowed(route(), 'provider_zdr', true)).toBe(true);
+    });
+
+    it('refuses generic ZDR metadata without verified native connection authority', () => {
+      expect(transcriptionRouteAllowed(route(), 'provider_zdr')).toBe(false);
+      expect(
+        transcriptionRouteAllowed(route({ apiProtocol: 'openrouter' }), 'provider_zdr', true)
+      ).toBe(false);
     });
 
     it('leaves an ordinary task the route it already had', () => {

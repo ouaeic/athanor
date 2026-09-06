@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
+import { readBoundedMediaBody } from '@athanor/model-gateway';
 import { AthanorError, capabilityAudience, signCapabilityToken } from '@athanor/core';
 
 /**
@@ -11,6 +12,9 @@ import { AthanorError, capabilityAudience, signCapabilityToken } from '@athanor/
  * storage gives every request the signal belonging to its own task and nothing else.
  */
 const abortScope = new AsyncLocalStorage<AbortSignal>();
+
+/** The same task cancellation boundary also guards external provider submission. */
+export const currentRunnerAbortSignal = (): AbortSignal | undefined => abortScope.getStore();
 
 /** Binds `signal` to every runner request made while `operation` runs. */
 export const withRunnerAbort = <T>(signal: AbortSignal, operation: () => Promise<T>): Promise<T> =>
@@ -618,8 +622,11 @@ export class AgentRunnerClient {
   async readBytes(
     workspaceId: string,
     taskId: string,
-    requestedPath: string
+    requestedPath: string,
+    maxBytes?: number
   ): Promise<{ mimeType: string; bytes: Buffer }> {
+    if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes <= 0))
+      throw new AthanorError('file_size_limit_invalid', 'Choose a positive file byte limit', 400);
     const token = signCapabilityToken(
       {
         sub: this.subjectFor(taskId),
@@ -641,11 +648,96 @@ export class AgentRunnerClient {
       FILE_REQUEST_TIMEOUT_MS
     );
     if (!response.ok) throw await runnerFailure(response);
+    let bytes: Buffer;
+    if (maxBytes === undefined) bytes = Buffer.from(await response.arrayBuffer());
+    else {
+      const tooLarge = () =>
+        new AthanorError(
+          'file_too_large',
+          'The workspace file exceeds this operation’s byte limit',
+          413
+        );
+      if (Number(response.headers.get('content-length')) > maxBytes) {
+        await response.body?.cancel();
+        throw tooLarge();
+      }
+      if (!response.body)
+        throw new AthanorError('file_empty', 'The workspace file has no bytes', 400);
+      const reader = response.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      try {
+        for (;;) {
+          const next = await reader.read();
+          if (next.done) break;
+          size += next.value.byteLength;
+          if (size > maxBytes) throw tooLarge();
+          chunks.push(next.value);
+        }
+      } catch (error) {
+        await reader.cancel().catch(() => undefined);
+        throw error;
+      } finally {
+        reader.releaseLock();
+      }
+      bytes = Buffer.concat(chunks, size);
+    }
     return {
       mimeType:
         response.headers.get('content-type')?.split(';', 1)[0] ?? 'application/octet-stream',
-      bytes: Buffer.from(await response.arrayBuffer())
+      bytes
     };
+  }
+
+  /** Inspect the original recording without decoding or sending its contents to a provider. */
+  async inspectAudioSource(
+    workspaceId: string,
+    taskId: string,
+    requestedPath: string
+  ): Promise<{ sourceSha256: string; sourceBytes: number }> {
+    const path = `/v1/workspaces/${workspaceId}/audio/source`;
+    const token = signCapabilityToken(
+      {
+        sub: this.subjectFor(taskId),
+        workspaceId,
+        role: 'agent',
+        scopes: ['files.read'],
+        aud: capabilityAudience('POST', path),
+        nonce: randomUUID()
+      },
+      this.secret,
+      90
+    );
+    const timeoutMs = 75_000;
+    const response = await runnerFetch(
+      `${this.baseUrl}${path}`,
+      {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        signal: requestSignal(timeoutMs),
+        body: JSON.stringify({ path: requestedPath })
+      },
+      timeoutMs
+    );
+    if (!response.ok) throw await runnerFailure(response);
+    const raw: unknown = JSON.parse((await readBoundedMediaBody(response, 2048)).toString('utf8'));
+    if (
+      !raw ||
+      typeof raw !== 'object' ||
+      !('sourceSha256' in raw) ||
+      typeof raw.sourceSha256 !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(raw.sourceSha256) ||
+      !('sourceBytes' in raw) ||
+      typeof raw.sourceBytes !== 'number' ||
+      !Number.isSafeInteger(raw.sourceBytes) ||
+      raw.sourceBytes <= 0
+    )
+      throw new AthanorError(
+        'audio_source_receipt_invalid',
+        'The runner returned no valid recording source receipt',
+        502
+      );
+    return { sourceSha256: raw.sourceSha256, sourceBytes: raw.sourceBytes };
   }
 
   /**
@@ -659,7 +751,12 @@ export class AgentRunnerClient {
   async prepareAudio(
     workspaceId: string,
     taskId: string,
-    request: { path: string; startSeconds?: number; endSeconds?: number }
+    request: {
+      path: string;
+      startSeconds?: number;
+      endSeconds?: number;
+      expectedSourceSha256?: string;
+    }
   ): Promise<{
     bytes: Buffer;
     format: 'ogg';
@@ -669,6 +766,8 @@ export class AgentRunnerClient {
     container: string | null;
     codec: string | null;
     more: boolean;
+    sourceSha256?: string;
+    sourceBytes?: number;
   }> {
     const token = signCapabilityToken(
       {
@@ -703,15 +802,39 @@ export class AgentRunnerClient {
       const parsed = Number(raw);
       return Number.isFinite(parsed) ? parsed : null;
     };
+    const sourceSha256 = response.headers.get('x-audio-source-sha256');
+    const sourceBytes = header('x-audio-source-bytes');
+    if (
+      request.expectedSourceSha256 !== undefined &&
+      (sourceSha256 !== request.expectedSourceSha256 ||
+        !/^[a-f0-9]{64}$/.test(sourceSha256 ?? '') ||
+        sourceBytes === null ||
+        !Number.isSafeInteger(sourceBytes) ||
+        sourceBytes <= 0)
+    ) {
+      await response.body?.cancel();
+      throw new AthanorError(
+        'audio_source_receipt_invalid',
+        'The prepared recording does not match its approved source',
+        409
+      );
+    }
     return {
-      bytes: Buffer.from(await response.arrayBuffer()),
+      bytes: await readBoundedMediaBody(response, 25 * 1024 * 1024),
       format: 'ogg',
       startSeconds: header('x-audio-start-seconds') ?? 0,
       preparedSeconds: header('x-audio-prepared-seconds') ?? 0,
       durationSeconds: header('x-audio-duration-seconds'),
       container: response.headers.get('x-audio-container'),
       codec: response.headers.get('x-audio-codec'),
-      more: response.headers.get('x-audio-more') === 'true'
+      more: response.headers.get('x-audio-more') === 'true',
+      ...(sourceSha256 &&
+      /^[a-f0-9]{64}$/.test(sourceSha256) &&
+      sourceBytes !== null &&
+      Number.isSafeInteger(sourceBytes) &&
+      sourceBytes > 0
+        ? { sourceSha256, sourceBytes }
+        : {})
     };
   }
 

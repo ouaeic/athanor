@@ -817,7 +817,7 @@ else
  * point of keeping the arm.
  */
 const usageOffered = new Set(
-  (/'Usage: athanor \{([^']*)\}'/.exec(dispatch)?.[1] ?? '')
+  (/'Usage: garden \{([^']*)\}'/.exec(dispatch)?.[1] ?? '')
     // The nested `[api|worker|...]` groups are arguments to a command, not commands.
     .replaceAll(/\[[^\]]*\]/g, ' ')
     .split('|')
@@ -882,6 +882,35 @@ else say(`API token scopes: all ${enforcedScopes.length} enforced scopes are sel
  * may place more, as it does for the relay directory - and the exceptions are named rather than
  * inferred, because "the update does not place this" has to be a decision somebody made.
  */
+// The source contract pairs the fresh installer and required update activation with the same
+// migration. The executable proxy drill owns HTTP behavior; the update drill owns rollback.
+const nativePreviewRuntime = read('scripts/athanor-native-runtime');
+const nativeInstaller = read('scripts/install-native.sh');
+const previewSite = read('infra/native/nginx.conf');
+const previewCsp = read('infra/native/nginx-app-csp.conf');
+const previewActivation = nativeInstaller.indexOf(
+  '"$athanor_root/scripts/athanor-native-runtime" preview-origin'
+);
+const previewNginxCheck = nativeInstaller.indexOf('\nnginx -t\n');
+if (
+  previewActivation < 0 ||
+  previewNginxCheck < previewActivation ||
+  !/install_policy\s+configure_preview_origin/.test(nativePreviewRuntime) ||
+  !nativePreviewRuntime.includes("atomic(snippets / 'athanor-preview-origin.conf'")
+)
+  fail(
+    'Preview deployment must generate isolated origin configuration during fresh install and required update activation before nginx starts.'
+  );
+if (
+  !previewSite.includes('listen 8443 ssl;') ||
+  !previewSite.includes('return 308 $athanor_preview_origin$request_uri;') ||
+  !previewSite.includes('proxy_set_header Host $http_host;') ||
+  !previewCsp.includes("frame-src 'self' $athanor_preview_origin;")
+)
+  fail(
+    'Preview deployment must preserve redirect paths, forwarded origin and the exact configured frame origin.'
+  );
+
 const installerSource = read('scripts/install-native.sh').replace(/\\\n\s*/g, ' ');
 const installerPlaces = new Set();
 for (const line of installerSource.split('\n')) {
@@ -1098,6 +1127,38 @@ const keysAtTopLevel = (body) =>
     .join(',');
 
 const copiedConstants = [
+  {
+    what: 'the provider audio receipt reference bound',
+    owner: 'packages/contracts/src/dictation.ts',
+    copy: 'apps/web/src/AudioReceipts.tsx',
+    find: /AUDIO_RECEIPT_REFERENCE_MAX_LENGTH = ([\d_]+)/
+  },
+  {
+    what: 'the maximum dictation reservation',
+    owner: 'packages/contracts/src/dictation.ts',
+    copy: 'apps/web/src/dictation-preflight.ts',
+    find: /DICTATION_MAX_COST_USD = ([\d_]+)/
+  },
+  ...[
+    'VOICE_SAMPLE_RATE',
+    'VOICE_FRAME_HEADER_BYTES',
+    'VOICE_MAX_FRAME_SAMPLES',
+    'VOICE_MAX_SESSION_SECONDS',
+    'VOICE_MAX_SPEND_USD',
+    'VOICE_PLAYBACK_BUFFER_SECONDS'
+  ].map((name) => ({
+    what: `the browser voice protocol ${name}`,
+    owner: 'packages/contracts/src/voice.ts',
+    copy: 'apps/web/src/voice/audio-constants.ts',
+    find: new RegExp(`${name} = ([\\d_]+)`)
+  })),
+  ...['BYTES', 'SECONDS'].map((unit) => ({
+    what: `the browser dictation ${unit.toLowerCase()} bound`,
+    owner: 'packages/contracts/src/dictation.ts',
+    copy: 'apps/web/src/composer-operations.ts',
+    find: new RegExp(`DICTATION_MAX_${unit} = ([\\d_]+)`),
+    findInCopy: new RegExp(`MAX_DICTATION_${unit} = ([\\d_]+)`)
+  })),
   {
     what: 'the encrypted share size bounds',
     owner: 'packages/contracts/src/index.ts',

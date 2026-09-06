@@ -38,6 +38,10 @@ make_fake() {
   chmod 0755 "$fake_bin/$name"
 }
 
+# fcntl exercises the same inherited-descriptor kernel lock on this non-Linux test host.
+make_fake flock '
+exec python3 -c "import fcntl,sys; fcntl.flock(int(sys.argv[-1]), fcntl.LOCK_EX | fcntl.LOCK_NB)" "$@"'
+
 make_fake id '
 if [ "${1:-}" = "-u" ]; then printf "0\n"; else printf "root\n"; fi'
 make_fake systemctl '
@@ -131,7 +135,9 @@ exec /usr/bin/shasum -a 256 "$@"'
 make_fake runuser '
 case "$*" in
   *"pg_dump"*) cat "$ATHANOR_TEST_DATABASE" ;;
-  *"pg_restore"*) cat >"$ATHANOR_TEST_DATABASE" ;;
+  *"pg_restore"*)
+    [ "${ATHANOR_TEST_RESTORE_FAIL:-0}" != 1 ] || exit 43
+    cat >"$ATHANOR_TEST_DATABASE" ;;
   *"dropdb"*|*"createdb"*) : >"$ATHANOR_TEST_DATABASE" ;;
   *"schema_migrations"*)
     if [ -f "$ATHANOR_TEST_CHECKOUT/FAIL_MIGRATION" ]; then printf "6\n"; else printf "7\n"; fi
@@ -145,7 +151,7 @@ esac
 exit 0'
 make_fake pnpm '
 printf "pnpm %s at %s\n" "$*" "$PWD" >>"$ATHANOR_TEST_COMMAND_LOG"
-if [ "$1" = "-r" ] && [ "${2:-}" = "build" ] && [ -f "$PWD/FAIL_BUILD" ]; then
+if [ "$1" = "-r" ] && [ "${2:-}" = "build" ] && { [ -f "$PWD/FAIL_BUILD" ] || [ "${ATHANOR_TEST_REVERSE_BUILD_FAIL:-0}" = 1 ]; }; then
   printf "intentional synthetic build failure\n" >&2
   exit 42
 fi'
@@ -157,6 +163,7 @@ exec "$ATHANOR_TEST_REAL_GIT" "$@"'
 cp "$repository_root/scripts/athanor" \
   "$repository_root/scripts/athanor-package-helper" \
   "$repository_root/scripts/athanor-sandbox" \
+  "$repository_root/scripts/mission-supervisor.py" \
   "$repository_root/scripts/athanor-system-packages" \
   "$repository_root/scripts/athanor-service" \
   "$repository_root/scripts/athanor-network-refresh" \
@@ -169,6 +176,12 @@ cp "$repository_root/scripts/athanor" \
   "$repository_root/scripts/athanor-document-proof" \
   "$repository_root/scripts/athanor-snapshot" \
   "$seed/scripts/"
+cat >"$seed/scripts/athanor-native-runtime" <<'NATIVE_FIXTURE'
+#!/bin/sh
+set -eu
+printf 'native activation %s\n' "$*" >>"$ATHANOR_TEST_COMMAND_LOG"
+if [ -f "$ATHANOR_ROOT/FAIL_NATIVE" ]; then exit 29; fi
+NATIVE_FIXTURE
 cp "$repository_root/infra/native/start-desktop-session.sh" \
   "$repository_root/infra/native/athanor-desktop-bridge.py" \
   "$repository_root/infra/native/athanor@.service" \
@@ -206,6 +219,31 @@ printf '#!/bin/sh\nprintf "the installer ran\\n" >>"$ATHANOR_TEST_COMMAND_LOG"\n
   >"$seed/scripts/install-native.sh"
 chmod 0755 "$seed/scripts/install-native.sh"
 
+fixture_maintenance_path() {
+  sed 's#^  maintenance_lock_directory=/run/athanor-maintenance$#  maintenance_lock_directory="${ATHANOR_STATE}/maintenance-lock"#' \
+    "$seed/scripts/athanor" >"$seed/scripts/athanor.next"
+  mv "$seed/scripts/athanor.next" "$seed/scripts/athanor"
+  chmod 0755 "$seed/scripts/athanor"
+}
+fixture_maintenance_path
+# A previous revision's proxy is intentionally distinct from the incoming listener.
+printf '# previous proxy revision\n' >"$seed/infra/native/nginx.conf"
+sed '/^  install -D -m 0755 scripts\/athanor .*\/usr\/local\/bin\/garden/d' "$seed/scripts/athanor" >"$test_root/previous-cli"
+mv "$test_root/previous-cli" "$seed/scripts/athanor"
+chmod 0755 "$seed/scripts/athanor"
+awk '
+  /^  install .*scripts\/mission-supervisor.py / { getline; next }
+  /^install_runtime_files\(\) \{$/ {
+    print
+    print "  printf '\''previous runtime activation\\n'\'' >>\"$ATHANOR_TEST_COMMAND_LOG\""
+    next
+  }
+  { print }
+' "$seed/scripts/athanor" >"$test_root/previous-cli"
+mv "$test_root/previous-cli" "$seed/scripts/athanor"
+chmod 0755 "$seed/scripts/athanor"
+rm "$seed/scripts/mission-supervisor.py"
+
 "$real_git" init --bare "$remote" >/dev/null
 "$real_git" -C "$seed" init -b main >/dev/null
 "$real_git" -C "$seed" config user.name "Athanor update drill"
@@ -219,7 +257,8 @@ chmod 0755 "$seed/scripts/install-native.sh"
 
 printf 'postgres://athanor:synthetic-password@127.0.0.1:5432/athanor\n' |
   sed 's|^|DATABASE_URL=|' >"$config/control.env"
-printf 'runner=true\n' >"$config/runner.env"
+printf 'runner=true\nISOLATE_AGENT_NETWORK=false\n' >"$config/runner.env"
+printf 'PUBLIC_APP_URL=https://preview-box.example\nPREVIEW_BASE_URL=https://preview-box.example/__athanor/preview\n' >>"$config/control.env"
 printf 'data-before-update\n' >"$home/persistent.txt"
 printf 'database-before-update\n' >"$database_file"
 
@@ -339,7 +378,7 @@ run_athanor() {
     ATHANOR_TEST_OFF_HOST="$off_host" \
     ATHANOR_READY_TIMEOUT_SECONDS=3 \
     ATHANOR_RUNTIME_PREFIX="$runtime" \
-    "$checkout/scripts/athanor" "$@"
+    "${ATHANOR_TEST_CLI:-$checkout/scripts/athanor}" "$@"
 }
 
 run_update() {
@@ -347,6 +386,7 @@ run_update() {
 }
 
 publish_fixture() {
+  fixture_maintenance_path
   # Distinct seconds, because a backup directory is named for the second it was taken in.
   sleep 1
   "$real_git" -C "$seed" add -A
@@ -357,6 +397,47 @@ publish_fixture() {
 backup_count() {
   find "$backups" -mindepth 1 -maxdepth 1 -type d -name '????????T??????Z' | wc -l | tr -d ' '
 }
+
+# A staged incoming updater must reverse-install the previous source and private configuration
+# even when required activation changed the preview origin and then failed before service start.
+cp "$repository_root/infra/native/nginx.conf" "$seed/infra/native/nginx.conf"
+cp "$repository_root/scripts/athanor" "$seed/scripts/athanor"
+cp "$repository_root/scripts/mission-supervisor.py" "$seed/scripts/mission-supervisor.py"
+fixture_maintenance_path
+cp "$repository_root/scripts/athanor-native-runtime" "$seed/scripts/preview-activation.sh"
+cat >>"$seed/scripts/athanor-native-runtime" <<'PREVIEW_FIXTURE'
+/bin/sh "$ATHANOR_ROOT/scripts/preview-activation.sh" preview-origin
+if [ -f "$ATHANOR_ROOT/FAIL_AFTER_PREVIEW" ]; then exit 31; fi
+PREVIEW_FIXTURE
+cp "$seed/scripts/athanor" "$test_root/staged-updater"
+chmod 0700 "$test_root/staged-updater"
+cp "$config/control.env" "$test_root/before-preview-control"
+cp "$config/runner.env" "$test_root/before-preview-runner"
+previous_preview_revision=$("$real_git" -C "$checkout" rev-parse HEAD)
+: >"$seed/FAIL_AFTER_PREVIEW"
+publish_fixture preview-activation-interrupted
+if preview_failure=$(ATHANOR_TEST_CLI="$test_root/staged-updater" run_update 2>&1); then
+  printf 'an interrupted preview migration was accepted\n' >&2; exit 1
+fi
+grep -q 'failed with exit 31' <<EOF
+$preview_failure
+EOF
+grep -q 'Rollback completed' <<EOF
+$preview_failure
+EOF
+grep -q '^previous runtime activation$' "$command_log" || {
+  printf 'assertion failed: staged rollback did not execute the previous runtime installer\n' >&2; exit 1;
+}
+cmp "$config/control.env" "$test_root/before-preview-control" || {
+  printf 'assertion failed: pre-start rollback did not restore private preview configuration\n' >&2; exit 1;
+}
+cmp "$config/runner.env" "$test_root/before-preview-runner"
+test "$("$real_git" -C "$checkout" rev-parse HEAD)" = "$previous_preview_revision"
+grep -q '^# previous proxy revision$' "$runtime/etc/nginx/sites-available/athanor" || {
+  printf 'assertion failed: staged updater did not install the previous proxy source\n' >&2; exit 1;
+}
+rm "$seed/FAIL_AFTER_PREVIEW"
+printf 'ok  staged updater restores configuration and previous runtime after interrupted preview activation\n'
 
 printf '\n# fixture-version=v2\n' >>"$seed/scripts/athanor-service"
 # What an installation from before the helper was moved looks like, so the update is asked to
@@ -377,13 +458,18 @@ printf 'binary\n' >"$home/.cache/ms-playwright/chromium-1228/chrome-linux/chrome
 publish_fixture v2
 expected_revision=$("$real_git" -C "$seed" rev-parse HEAD)
 
-success_output=$(run_update 2>&1)
+success_output=$(run_update 2>&1) || { printf 'assertion failed: transactional update must install a usable runtime\n%s\n' "$success_output" >&2; exit 1; }
 test "$("$real_git" -C "$checkout" rev-parse HEAD)" = "$expected_revision"
 grep -q 'fixture-version=v2' "$runtime/usr/local/lib/athanor/athanor-service"
 grep -q 'Update complete' <<EOF
 $success_output
 EOF
 test "$(cat "$home/persistent.txt")" = "data-before-update"
+grep -q '^PREVIEW_BASE_URL=https://preview-box.example:8443/__athanor/preview$' "$config/control.env" || {
+  printf 'assertion failed: update did not activate the isolated preview origin\n' >&2; exit 1;
+}
+grep -q 'https://preview-box.example:8443' "$runtime/etc/nginx/snippets/athanor-preview-origin.conf"
+grep -q '^ISOLATE_AGENT_NETWORK=false$' "$config/runner.env"
 printf 'ok  transactional update success path\n'
 
 # The package helper reaches root with no capability scope and no approval card of its own. On
@@ -401,11 +487,22 @@ printf 'ok  root helpers are installed off the agent PATH\n'
 # or on a box older than they are, running nothing. The nginx snippets are included by the site file
 # the update replaces, so the policy and the site that expects it moved apart at every release.
 test -x "$runtime/usr/local/bin/athanor-office-convert"
+test -x "$runtime/usr/local/bin/garden" || { printf 'assertion failed: garden command was not installed\n' >&2; exit 1; }
+cmp -s "$runtime/usr/local/bin/garden" "$runtime/usr/local/bin/athanor"
 test -x "$runtime/usr/local/bin/athanor-pdf-tables"
 test -x "$runtime/usr/local/lib/athanor/athanor-document-proof"
 test -f "$runtime/etc/nginx/snippets/athanor-security-headers.conf"
 test -f "$runtime/etc/nginx/snippets/athanor-app-csp.conf"
 printf 'ok  the update places every runtime file the installer does\n'
+mkdir -p "$runtime/etc/nginx/conf.d"
+printf 'previous conf.d proxy\n' >"$runtime/etc/nginx/conf.d/athanor.conf"
+run_athanor update install-runtime-files >/dev/null 2>&1
+cmp "$checkout/infra/native/nginx.conf" "$runtime/etc/nginx/conf.d/athanor.conf" || {
+  printf 'assertion failed: existing conf.d proxy did not receive the new listener\n' >&2; exit 1;
+}
+rm "$runtime/etc/nginx/conf.d/athanor.conf"
+printf 'ok  runtime activation refreshes the existing conf.d proxy layout\n'
+
 
 # The relay identity key is this server's address on every relay it has enrolled with: replacing it
 # would silently change the hostname every paired client holds. An update has to leave what is in
@@ -488,6 +585,24 @@ grep -q 'schema version 6 but this release expects 7' <<EOF
 $stale_schema_output
 EOF
 printf 'ok  a release whose migrations did not apply is rolled back\n'
+
+rm -f "$seed/FAIL_MIGRATION"
+: >"$seed/FAIL_NATIVE"
+publish_fixture native-capability-unavailable
+if native_failure=$(run_update 2>&1); then
+  printf 'a release missing its native runtime was accepted\n' >&2
+  exit 1
+fi
+test "$("$real_git" -C "$checkout" rev-parse HEAD)" = "$expected_revision"
+grep -q "activating native tools.*failed with exit 29" <<EOF
+$native_failure
+EOF
+grep -q 'Rollback completed; the failed update was not activated' <<EOF
+$native_failure
+EOF
+cmp "$checkout/scripts/mission-supervisor.py" "$runtime/usr/local/lib/athanor/mission-supervisor.py"
+rm "$seed/FAIL_NATIVE"
+printf 'ok  missing native capabilities roll back before the new release starts\n'
 
 # Four updates have now been taken, each leaving a full copy of the database and every workspace.
 rm -f "$seed/FAIL_MIGRATION"
@@ -823,7 +938,7 @@ test "$(sed -n 's/^WEBAUTHN_ORIGIN=//p' "$config/control.env" | sed -n '1p')" = 
 test "$(sed -n 's/^WEBAUTHN_RP_ID=//p' "$config/control.env" | sed -n '1p')" = "203.0.113.9"
 test "$(sed -n 's/^PUBLIC_RUNNER_URL=//p' "$config/control.env" | sed -n '1p')" = "wss://203.0.113.9/runner"
 test "$(sed -n 's/^PREVIEW_BASE_URL=//p' "$config/control.env" | sed -n '1p')" = \
-  "https://203.0.113.9/__athanor/preview"
+  "https://203.0.113.9:8443/__athanor/preview"
 grep -q 'network refresh' "$command_log"
 # The data still came back; re-deriving the origin is an addition to the restore, not a detour
 # around it.
@@ -1048,6 +1163,7 @@ printf 'files-before-the-rollback\n' >"$home/persistent.txt"
 run_athanor backup >/dev/null 2>&1
 printf 'row-after-the-rollback\n' >"$database_file"
 printf 'files-after-the-rollback\n' >"$home/persistent.txt"
+: >"$command_log"
 rollback_output=$(run_athanor rollback 2>&1)
 test "$(cat "$database_file")" = "row-before-the-rollback"
 test "$(cat "$home/persistent.txt")" = "files-before-the-rollback"
@@ -1055,6 +1171,40 @@ grep -q 'Rollback complete' <<EOF
 $rollback_output
 EOF
 printf 'ok  rollback with no argument consumes the newest backup and puts both halves back\n'
+
+rollback_stop_line=$(sed -n '/systemctl stop athanor.target/=' "$command_log" | sed -n '1p')
+rollback_build_line=$(sed -n '/pnpm -r build/=' "$command_log" | sed -n '1p')
+test -n "$rollback_stop_line" && test -n "$rollback_build_line"
+test "$rollback_stop_line" -lt "$rollback_build_line"
+rollback_reference=$(find "$backups" -mindepth 1 -maxdepth 1 -type d -name '????????T??????Z' | sort -r | sed -n '1p')
+test -n "$rollback_reference"
+cp -R "$rollback_reference" "$test_root/invalid-rollback"
+printf 'corruption\n' >>"$test_root/invalid-rollback/database.dump"
+: >"$command_log"
+if run_athanor rollback "$test_root/invalid-rollback" >/dev/null 2>&1; then
+  printf 'a corrupt rollback archive was accepted\n' >&2; exit 1
+fi
+test ! -s "$command_log"
+: >"$command_log"
+if ATHANOR_TEST_REVERSE_BUILD_FAIL=1 run_athanor rollback "$rollback_reference" >/dev/null 2>&1; then
+  printf 'a failed reverse build was accepted\n' >&2; exit 1
+fi
+unset ATHANOR_TEST_REVERSE_BUILD_FAIL
+grep -q 'systemctl stop athanor.target' "$command_log"
+if grep -q 'systemctl start athanor.target' "$command_log"; then
+  printf 'a failed reverse build started the server\n' >&2; exit 1
+fi
+test -f "$rollback_reference/SHA256SUMS"
+: >"$command_log"
+if ATHANOR_TEST_RESTORE_FAIL=1 run_athanor restore "$rollback_reference" --yes >/dev/null 2>&1; then
+  printf 'a failed data restore was accepted\n' >&2; exit 1
+fi
+unset ATHANOR_TEST_RESTORE_FAIL
+if grep -q 'systemctl start athanor.target' "$command_log"; then
+  printf 'a failed data restore started the server\n' >&2; exit 1
+fi
+run_athanor restore "$rollback_reference" --yes >/dev/null 2>&1
+printf 'ok  rollback validates before stopping, stops before build and keeps failures stopped\n'
 
 # What a release carries besides its code, and whether an update delivers any of it.
 #
@@ -1568,3 +1718,238 @@ for removed in \
   fi
 done
 printf 'ok  uninstall disables the backup timer and removes what it installed\n'
+
+# Exercise the native activation entry point against an existing installation. The package/network
+# fixtures stand in only for acquisition; real filesystem links, version checks, policy staging and
+# subprocess failure propagation run unchanged.
+fail_case() { printf 'FAIL %s\n' "$1" >&2; exit 1; }
+native_case="$test_root/native-runtime"
+native_source="$native_case/source"
+native_runtime="$native_case/runtime"
+native_bin="$native_case/bin"
+native_lib="$native_runtime/usr/local/lib/athanor"
+mkdir -p "$native_source/scripts" "$native_source/infra/native" "$native_bin" \
+  "$native_source/services/workspace-runner/node_modules" "$native_lib/python/bin" \
+  "$native_runtime/etc/sudoers.d"
+cp "$repository_root/scripts/athanor-native-runtime" "$native_source/scripts/"
+cp "$repository_root/infra/native/athanor-python-requirements.txt" \
+  "$repository_root/infra/native/athanor-packages.sudoers" "$native_source/infra/native/"
+cp "$repository_root/scripts/mission-supervisor.py" "$native_lib/"
+cp "$repository_root/services/workspace-runner/package.json" "$native_source/services/workspace-runner/"
+node - "$native_source/services/workspace-runner/package.json" <<'JS'
+const fs=require('node:fs'), path=require('node:path');
+const manifest=JSON.parse(fs.readFileSync(process.argv[2]));
+for (const [name, entry] of [['typescript-native','bin/tsc'],['pyright','langserver.index.js']]) {
+ const dir=path.join(path.dirname(process.argv[2]),'node_modules',name);
+ fs.mkdirSync(path.dirname(path.join(dir,entry)),{recursive:true});
+ fs.writeFileSync(path.join(dir,'package.json'),JSON.stringify({name,version:manifest.dependencies[name].replace(/^npm:[^@]+@/,'')}));
+ fs.writeFileSync(path.join(dir,entry),'console.log("native server fixture");');
+}
+JS
+mkdir -p "$native_case/config"
+printf 'PUBLIC_APP_URL=https://native-box.example\nPREVIEW_BASE_URL=https://native-box.example/__athanor/preview\n' >"$native_case/config/control.env"
+printf 'ISOLATE_AGENT_NETWORK=false\nRESERVED_PREVIEW_PORTS=4100,4400,9999\n' >"$native_case/config/runner.env"
+printf 'old policy\n' >"$native_runtime/etc/sudoers.d/athanor-packages"
+printf 'original Python\n' >"$native_lib/python/owner-marker"
+native_real_python=$(command -v python3)
+export NATIVE_REAL_PYTHON="$native_real_python" NATIVE_CASE="$native_case"
+cat >"$native_bin/python3" <<'PYTHON'
+#!/bin/sh
+set -eu
+if [ "${1:-}" = -m ] && [ "${2:-}" = venv ]; then
+  for target in "$@"; do :; done
+  mkdir -p "$target/bin"
+  cp "$NATIVE_CASE/python-fixture" "$target/bin/python3"
+  chmod 0755 "$target/bin/python3"
+  exit 0
+fi
+exec "$NATIVE_REAL_PYTHON" "$@"
+PYTHON
+cat >"$native_case/python-fixture" <<'PYTHON'
+#!/bin/sh
+set -eu
+if [ "${1:-}" = -m ]; then
+  printf '%s\n' "$*" >>"$NATIVE_CASE/pip-arguments"
+  test ! -f "$NATIVE_CASE/fail-pip"
+fi
+PYTHON
+cat >"$native_bin/curl" <<'CURL'
+#!/bin/sh
+set -eu
+printf 'download\n' >>"$NATIVE_CASE/downloads"
+if [ -f "$NATIVE_CASE/interrupt-download" ]; then kill -TERM "$PPID"; exit 143; fi
+for argument in "$@"; do destination="$argument"; done
+mkdir -p "$NATIVE_CASE/archive/js-debug/src"
+printf 'console.log("debugger fixture");\n' >"$NATIVE_CASE/archive/js-debug/src/dapDebugServer.js"
+tar -czf "$destination" -C "$NATIVE_CASE/archive" js-debug
+CURL
+cat >"$native_bin/sha256sum" <<'HASH'
+#!/bin/sh
+set -eu
+if [ "${1:-}" = --check ]; then
+  cat >"$NATIVE_CASE/hash-check"
+  test ! -f "$NATIVE_CASE/fail-hash"
+else
+  exec /usr/bin/shasum -a 256 "$@"
+fi
+HASH
+cat >"$native_bin/visudo" <<'POLICY'
+#!/bin/sh
+set -eu
+for argument in "$@"; do policy="$argument"; done
+if [ -f "$NATIVE_CASE/fail-policy" ]; then exit 1; fi
+grep -q '^Cmnd_Alias ATHANOR_MISSION_STATUS = ' "$policy"
+grep -q '^Defaults!ATHANOR_SANDBOX_RUN !use_pty$' "$policy"
+POLICY
+chmod 0755 "$native_bin/"*
+run_native() {
+  PATH="$native_bin:$fake_bin:$PATH" ATHANOR_ROOT="$native_source" \
+    ATHANOR_RUNTIME_PREFIX="$native_runtime" ATHANOR_CONFIG="$native_case/config" \
+    /bin/sh "$native_source/scripts/athanor-native-runtime" "$@"
+}
+assert_original_native() {
+  test ! -L "$native_lib/python"
+  test "$(cat "$native_lib/python/owner-marker")" = 'original Python'
+  test "$(cat "$native_runtime/etc/sudoers.d/athanor-packages")" = 'old policy'
+}
+: >"$native_case/fail-pip"
+if run_native all >/dev/null 2>&1; then fail_case 'failed Python install was accepted'; fi
+assert_original_native
+rm "$native_case/fail-pip"
+: >"$native_case/interrupt-download"
+if run_native all >/dev/null 2>&1; then fail_case 'interrupted native download was accepted'; fi
+assert_original_native
+rm "$native_case/interrupt-download"
+: >"$native_case/fail-hash"
+if run_native all >/dev/null 2>&1; then fail_case 'invalid debugger hash was accepted'; fi
+assert_original_native
+rm "$native_case/fail-hash"
+printf 'ok  failed and interrupted native acquisition preserves active tools and policy\n'
+
+run_native all >"$native_case/activated.log" 2>&1
+for installed in python/bin/python3 js-debug/src/dapDebugServer.js mission-supervisor.py; do
+  test -f "$native_lib/$installed" || fail_case "native activation omitted $installed"
+done
+test -L "$native_lib/python"
+test -L "$native_lib/js-debug"
+test "$(cat "$native_lib/python-before-managed/owner-marker")" = 'original Python'
+grep -q -- '--require-hashes --no-deps --only-binary=:all:' "$native_case/pip-arguments" ||
+  fail_case 'native Python wheels were not hash-verified'
+grep -q '^ad8d04ede9d4b75cc290fd5438a65047a06f786d04f604b6112485b36f090772 ' "$native_case/hash-check"
+grep -q '^Cmnd_Alias ATHANOR_MISSION_STATUS = ' "$native_runtime/etc/sudoers.d/athanor-packages"
+cp "$native_runtime/etc/sudoers.d/athanor-packages" "$native_case/verified-policy"
+: >"$native_case/fail-policy"
+if run_native policy >/dev/null 2>&1; then fail_case 'invalid sudo policy was activated'; fi
+cmp "$native_case/verified-policy" "$native_runtime/etc/sudoers.d/athanor-packages"
+rm "$native_case/fail-policy"
+: >"$native_case/fail-pip"
+: >"$native_case/interrupt-download"
+run_native all >/dev/null 2>&1
+grep -q '^PREVIEW_BASE_URL=https://native-box.example:8443/__athanor/preview$' "$native_case/config/control.env"
+grep -q '^RESERVED_PREVIEW_PORTS=4100,4400,9999,443,8443$' "$native_case/config/runner.env"
+grep -q '^ISOLATE_AGENT_NETWORK=false$' "$native_case/config/runner.env"
+printf 'ok  native activation verifies pins, retains rollback tools and reuses its cache offline\n'
+# The generated frame policy follows an explicitly configured isolated origin, including a
+# custom gateway path. No reactivation rewrites the operator's route or networking preference.
+printf 'PUBLIC_APP_URL=https://native-box.example\nPREVIEW_BASE_URL=https://private-apps.example:9443/custom/preview\nRESERVED_PREVIEW_PORTS=5555\n' >"$native_case/config/control.env"
+run_native preview-origin
+cp "$native_case/config/control.env" "$native_case/custom-control"
+run_native preview-origin
+cmp "$native_case/config/control.env" "$native_case/custom-control"
+grep -q '^PREVIEW_BASE_URL=https://private-apps.example:9443/custom/preview$' "$native_case/config/control.env"
+grep -Fq 'set $athanor_preview_origin "https://private-apps.example:9443";' "$native_runtime/etc/nginx/snippets/athanor-preview-origin.conf"
+grep -q '^RESERVED_PREVIEW_PORTS=5555,443,8443$' "$native_case/config/control.env"
+printf 'PUBLIC_APP_URL=https://[2001:db8::1]\nPREVIEW_BASE_URL=https://[2001:db8::1]/__athanor/preview\n' >"$native_case/config/control.env"
+run_native preview-origin
+grep -Fq 'PREVIEW_BASE_URL=https://[2001:db8::1]:8443/__athanor/preview' "$native_case/config/control.env"
+printf 'PUBLIC_APP_URL=https://native-box.example\nPREVIEW_BASE_URL=https://native-box.example/unsafe-path\n' >"$native_case/config/control.env"
+cp "$native_case/config/control.env" "$native_case/refused-control"
+cp "$native_runtime/etc/nginx/snippets/athanor-preview-origin.conf" "$native_case/refused-snippet"
+if run_native preview-origin >/dev/null 2>&1; then fail_case 'same-origin custom preview configuration was accepted'; fi
+cmp "$native_case/config/control.env" "$native_case/refused-control"
+cmp "$native_runtime/etc/nginx/snippets/athanor-preview-origin.conf" "$native_case/refused-snippet"
+printf 'PUBLIC_APP_URL=https://native-box.example\n' >"$native_case/config/control.env"
+run_native preview-origin
+grep -q '^PREVIEW_BASE_URL=https://native-box.example:8443/__athanor/preview$' "$native_case/config/control.env"
+printf 'ok  preview activation preserves custom origins, refuses unsafe sharing and derives IPv6/fresh origins\n'
+
+for server in typescript-native pyright; do
+  server_dir="$native_source/services/workspace-runner/node_modules/$server"
+  mv "$server_dir" "$server_dir.away"
+  if run_native all >/dev/null 2>&1; then fail_case "native activation accepted missing $server"; fi
+  mv "$server_dir.away" "$server_dir"
+done
+mv "$native_lib/mission-supervisor.py" "$native_lib/mission-supervisor.py.away"
+if run_native all >/dev/null 2>&1; then fail_case 'native activation accepted missing supervisor'; fi
+mv "$native_lib/mission-supervisor.py.away" "$native_lib/mission-supervisor.py"
+printf 'ok  native activation refuses a missing language server or supervisor\n'
+
+mkdir -p "$native_lib/python-owner" "$native_case/outside"
+printf 'owner data\n' >"$native_lib/python-owner/keep"
+printf 'external data\n' >"$native_case/outside/keep"
+ln -s "$native_case/outside" "$native_lib/js-debug-999.0.0"
+run_native remove
+for removed in python js-debug; do test ! -e "$native_lib/$removed"; done
+test "$(cat "$native_lib/python-owner/keep")" = 'owner data'
+test "$(cat "$native_case/outside/keep")" = 'external data'
+test "$(cat "$native_lib/python-before-managed/owner-marker")" = 'original Python'
+printf 'ok  uninstall removes only receipt-owned native caches and keeps owner paths\n'
+
+# Competing entry points run against one real kernel lock; only its root-owned path is substituted
+# in this unprivileged fixture. Environment booleans cannot claim an acquired descriptor.
+lock_holder="$test_root/maintenance-holder.sh"
+cat >"$lock_holder" <<'HOLDER'
+#!/bin/sh
+set -eu
+set -- help
+. "$ATHANOR_ROOT/scripts/athanor" >/dev/null
+need_root backup
+acquire_maintenance_lock
+printf '%s\n' "$$" >"$ATHANOR_TEST_LOCK_PID"
+case "$ATHANOR_TEST_LOCK_MODE" in
+  hold) exec sleep 30 ;;
+  fail) exit 71 ;;
+  probe) exit 0 ;;
+  child) /bin/sh "$ATHANOR_ROOT/scripts/athanor" update install-runtime-files ;;
+esac
+HOLDER
+run_lock_holder() {
+  PATH="$fake_bin:$PATH" ATHANOR_ROOT="$checkout" ATHANOR_STATE="$state" \
+    ATHANOR_CONFIG="$config" ATHANOR_RUNTIME_PREFIX="$runtime" \
+    ATHANOR_TEST_COMMAND_LOG="$command_log" ATHANOR_TEST_LOCK_MODE="$1" \
+    ATHANOR_TEST_LOCK_PID="$test_root/lock-holder-pid" \
+    /bin/sh "$lock_holder"
+}
+rm -f "$test_root/lock-holder-pid"
+run_lock_holder hold >"$test_root/lock-holder.log" 2>&1 &
+lock_holder_job=$!
+lock_wait=0
+while [ ! -s "$test_root/lock-holder-pid" ] && [ "$lock_wait" -lt 100 ]; do
+  sleep 0.02
+  lock_wait=$((lock_wait + 1))
+done
+test -s "$test_root/lock-holder-pid"
+lock_reference="$test_root/lock-reference"
+mkdir -p "$lock_reference"
+for entry in database.dump workspaces.tar.gz configuration.tar.gz SHA256SUMS; do
+  : >"$lock_reference/$entry"
+done
+commands_before_lock=$(wc -l <"$command_log" | tr -d ' ')
+for operation in backup update rollback restore; do
+  set -- "$operation"
+  [ "$operation" != restore ] || set -- "$operation" "$lock_reference" --yes
+  if lock_refusal=$(maintenance_lock_acquired=1 ATHANOR_MAINTENANCE_LOCKED=1 \
+    run_athanor "$@" 2>&1); then
+    kill -TERM "$(cat "$test_root/lock-holder-pid")"
+    fail_case "$operation overlapped the active maintenance operation"
+  fi
+  printf '%s\n' "$lock_refusal" | grep -q 'holds the maintenance lock'
+done
+test "$(wc -l <"$command_log" | tr -d ' ')" = "$commands_before_lock"
+kill -TERM "$(cat "$test_root/lock-holder-pid")"
+wait "$lock_holder_job" || true
+run_lock_holder probe
+if run_lock_holder fail; then fail_case 'failure fixture succeeded'; fi
+run_lock_holder probe
+run_lock_holder child >"$test_root/lock-child.log" 2>&1
+printf 'ok  maintenance entries exclude each other, reuse nested descriptors and release after failure or TERM\n'

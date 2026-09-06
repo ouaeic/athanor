@@ -10,7 +10,7 @@ configs:
 settingGroups:
   app:
     base:
-      PRODUCT_NAME: athanor
+      PRODUCT_NAME: garden
       PRODUCT_BUNDLE_IDENTIFIER: org.athanor.ai
 targetTemplates:
   app:

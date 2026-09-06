@@ -186,8 +186,8 @@ function ShareViewer() {
   return (
     <div className="share-page">
       <header className="share-masthead">
-        <a className="share-wordmark" href="/" aria-label="athanor home">
-          athanor<span aria-hidden="true">✳</span>
+        <a className="share-wordmark" href="/" aria-label="garden home">
+          garden
         </a>
         <span>Shared work</span>
       </header>

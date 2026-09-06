@@ -52,7 +52,7 @@ export function assertNoMacSensitiveContent(label, bytes) {
 
 export function validateMacInfo(info, expectedVersion) {
   invariant(info.CFBundleIdentifier === 'org.athanor.ai', 'macOS bundle identifier changed');
-  invariant(info.CFBundleName === 'athanor', 'macOS bundle name changed');
+  invariant(info.CFBundleName === 'garden', 'macOS bundle name changed');
   invariant(
     info.CFBundleShortVersionString === expectedVersion,
     'macOS and Tauri versions do not match'
@@ -71,7 +71,7 @@ export function validateMacInfo(info, expectedVersion) {
   );
   const schemes = (info.CFBundleURLTypes ?? []).flatMap((entry) => entry.CFBundleURLSchemes ?? []);
   invariant(
-    schemes.length === 1 && schemes[0] === 'athanor',
+    schemes.length === 2 && schemes.includes('garden') && schemes.includes('athanor'),
     'macOS pairing deep-link boundary changed'
   );
   const transport = info.NSAppTransportSecurity ?? {};

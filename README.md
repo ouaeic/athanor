@@ -1,23 +1,26 @@
-# athanor
+# garden
 
 **One private AI computer, available from every device.**
 
-athanor is free, open-source software that turns a Linux computer into a persistent AI
-agent. The user works in a polished chat interface; the agent can use the machine’s files, terminal,
+garden is free, open-source software that turns a Linux computer into a persistent AI
+agent. The owner works with task results, recorded progress, and direct controls; the agent can use the machine’s files, terminal,
 browser, installed GUI applications, long-running processes, and hosted previews. The computer view
 stays out of the way until the user or agent needs it.
 
-athanor has no hosted account, paid tier, VPS marketplace, telemetry service, model server, or local
+garden has no hosted account, paid tier, VPS marketplace, telemetry service, model server, or local
 inference fallback. Model access belongs to the owner: use OpenRouter, Ollama Cloud, another
 OpenAI-compatible endpoint, Codex with a ChatGPT subscription, Claude Code with a Claude
 subscription, or OpenCode with a publisher login it officially supports.
+
+The app and command are named `garden`. Existing `athanor` commands, installation paths,
+and device identities remain supported, so an update preserves the same computer and access.
 
 ## Install
 
 On a fresh Debian, Ubuntu, Fedora, RHEL, Rocky, AlmaLinux, Arch or openSUSE computer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ouaeic/athanor/v0.1.1/install.sh | sudo env ATHANOR_REF=v0.1.1 sh
+curl -fsSL https://raw.githubusercontent.com/ouaeic/athanor/v0.2.0/install.sh | sudo env ATHANOR_REF=v0.2.0 sh
 ```
 
 The command is pinned to a tag rather than a branch. The install action in the native client goes
@@ -32,11 +35,11 @@ will create a passkey on a page whose certificate it does not trust, and clickin
 does not change that. If a domain already points at the server, ask for both during the install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ouaeic/athanor/v0.1.1/install.sh | sudo env ATHANOR_REF=v0.1.1 ATHANOR_HOSTNAME=your.domain ATHANOR_ACME_EMAIL=you@example.com sh
+curl -fsSL https://raw.githubusercontent.com/ouaeic/athanor/v0.2.0/install.sh | sudo env ATHANOR_REF=v0.2.0 ATHANOR_HOSTNAME=your.domain ATHANOR_ACME_EMAIL=you@example.com sh
 ```
 
 `ATHANOR_ACME_EMAIL` is the contact address the certificate authority is given, and supplying it is
-how the subscriber agreement is accepted — athanor will not accept it on the operator’s behalf, so
+how the subscriber agreement is accepted — garden will not accept it on the operator’s behalf, so
 without that variable no certificate is requested. Install without them and nothing is lost: the
 installer ends by saying that browser sign-in does not work yet, and prints whichever of
 `sudo athanor set-hostname` and `sudo athanor certificate enable` that server still needs. Both do
@@ -54,19 +57,19 @@ so a machine that cannot finish is told before packages are installed rather tha
 The native client also has a quiet **Install on a cloud server** action on the sign-in
 screen. It connects directly from the client to SSH, shows the server’s SHA-256 host-key fingerprint
 for confirmation, keeps the password or key passphrase only in client memory, runs the same fixed
-installer, and imports the returned connection ticket. No Athanor website or relay receives the SSH
+installer, and imports the returned connection ticket. No garden website or relay receives the SSH
 secret. Browsers cannot safely open raw SSH, so the PWA shows the command instead.
 
 The installer gathers the computer’s usable addresses, installs its dependencies as ordinary host
 packages — plus the three pinned pieces no distribution carries at these versions: the `typst` typesetter against a
 recorded SHA-256, a hash-locked document Python environment, and Chromium at the revision the
-lockfile’s Playwright carries — builds athanor, creates isolated service accounts and keys, starts
+lockfile’s Playwright carries — builds garden, creates isolated service accounts and keys, starts
 systemd services, opens the existing HTTPS gateway on ports 80/443, and prints the address of the
 computer, a QR code that opens it on a phone, and an expiring, single-use owner code. It does not
 ask for a domain, unpack a machine image, start a container, create a VM, or install a VPN.
 
 SSH is needed only to run the install command and for recovery. Normal clients connect directly to
-athanor over HTTPS.
+garden over HTTPS.
 
 ## Connect
 
@@ -89,7 +92,7 @@ stable provider hostname or dynamic-DNS name. There is no protocol trick that le
 off-site client discover an unknown new public IP without some stable name or rendezvous service.
 If every saved route fails, the native client asks once whether the address might be dynamic. It can
 remember that the address is fixed and never ask again, or show a short dynamic-DNS recovery path.
-athanor does not silently add a relay, VPN, or tracking directory; see
+garden does not silently add a relay, VPN, or tracking directory; see
 [Deployment](docs/DEPLOYMENT.md#dynamic-addresses).
 
 ## What is built in
@@ -111,7 +114,7 @@ athanor does not silently add a relay, VPN, or tracking directory; see
 - Human takeover for login, CAPTCHA, secure input, ambiguous controls, or any action the agent should
   not complete alone.
 - Files, screenshots, images, audio, video, documents, code, tables, Markdown, and private app
-  previews returned directly in chat.
+  previews delivered on the task surface with browser links and scoped downloads.
 - Private, bounded extraction and source-linked BM25 search for PDF, Word, PowerPoint, spreadsheet,
   OpenDocument, HTML, CSV, and text collections already on the computer—with phrase, title,
   coverage, and result-diversity ranking, without uploading or duplicating them into a vector
@@ -119,7 +122,8 @@ athanor does not silently add a relay, VPN, or tracking directory; see
 
 ### Agent behavior
 
-- Compact live plans and activity that collapse to a result after completion.
+- Task-specific progress built from plans, tool receipts, checks and real outputs, with no
+  additional model calls to narrate or decorate the work.
 - Prompt editing as a new trajectory, retry, branches, replay-safe events, cancellation, and
   reconnection across devices.
 - Review, Balanced, and Autonomous security modes with a non-bypassable safety floor.
@@ -151,10 +155,10 @@ athanor does not silently add a relay, VPN, or tracking directory; see
 ### Models and specialist tools
 
 - Every chat model the owner's own provider account can reach, so a model released after this build
-  appears without an athanor update. `MODEL_CATALOG_SCOPE=reviewed_open_weight` narrows selection to
+  appears without a garden update. `MODEL_CATALOG_SCOPE=reviewed_open_weight` narrows selection to
   models carrying an independent open-weight licence review.
-- Provider prompt caching, so the operating contract, tool catalogue, and trajectory that an agent
-  turn re-sends on every step are billed once rather than on each step.
+- Stable prompt prefixes use provider caching where available, with actual cached usage reported
+  by the provider.
 - Bounded retry with backoff on transient provider failures, and a request deadline, so one 429 or a
   hung provider does not end a long task.
 - Live OpenRouter model metadata, modalities, context windows, price estimates, route privacy, and
@@ -162,12 +166,22 @@ athanor does not silently add a relay, VPN, or tracking directory; see
 - Ollama Cloud and generic OpenAI-compatible provider support without local model hosting.
 - Codex CLI, Claude Code, and OpenCode as bounded coding specialists using the owner’s publisher
   login. Publisher sessions persist in the same backed-up agent home.
+- Integrated writable coding specialists use isolated working copies, bounded allocations and
+  conflict-checked owner review before integration. Native language servers, persistent Python and
+  JavaScript computation, and [debugging](docs/NATIVE_DEBUGGING.md) share the workspace and approval
+  boundaries.
 - Zero-retention provider mode fails closed for model inference and voice transcription; publisher
   CLI retention remains a separate policy and is never mislabeled as the provider’s ZDR route.
-- Provider-backed image and speech generation. Video is refused: the asynchronous route that would
-  produce it keeps the output at the provider for retrieval, so there is no zero-retention way to
-  make one, and the catalogue says so rather than offering a job that fails at the end.
-- Voice-note transcription through a current OpenRouter transcription route with ZDR required.
+- Provider-backed image, speech, transcription and asynchronous video routes are discovered from
+  the connected account. Compatible editing, references, provider libraries and batch controls
+  appear with their advertised capabilities. Retained provider work requires explicit approval;
+  uncertain submissions remain recoverable without automatic resubmission.
+- Native audio and video input can be submitted to an eligible selected model through the
+  approval floor, with exact source identity and bounded spending. Unsupported formats, models or
+  prices are refused before uploading.
+- [Dictation](docs/VOICE_AND_DICTATION.md) reviews its model, cost and retention before recording.
+  [Live voice](docs/LIVE_VOICE.md) uses a supported native provider account, with owner-confirmed
+  task proposals and durable charge recovery.
 - Scoped GitHub and WebDAV connections, the owner’s own mailbox over IMAP with SMTP submission, and
   their own calendar over CalDAV — open protocols against their own server, with reading, marking
   and sending as separate scopes and every send stopping for approval.
@@ -213,7 +227,7 @@ until the release that added the other half; the old name still answers and tell
 It refuses to pick a model priced above the rates you name, which is the half that works while you
 are asleep. Both rates are dollars per million tokens - `sudo athanor price-ceiling set 2 10` means
 "at most $2 per million in and $10 per million out" - and either may be the word `none`. A model you
-choose by name is never constrained by it: the ceiling governs what athanor picks for you, not what
+choose by name is never constrained by it: the ceiling governs what garden picks for you, not what
 you pick for yourself.
 
 `spend-cap` is the running half: what a day and a month may cost you in dollars, which is what
@@ -224,7 +238,7 @@ says which caps are in force every time it runs.
 
 `certificate` requests a publicly trusted certificate for the existing server identity key, so the
 pinned client identity is unchanged. It is a separate command rather than part of install because
-issuing one accepts a certificate authority's subscriber agreement, which athanor will not do on
+issuing one accepts a certificate authority's subscriber agreement, which garden will not do on
 the operator's behalf without being asked. `ddns` keeps a chosen hostname pointed at a changing
 public address, and `set-hostname` moves the public origin onto a name that is already published.
 
@@ -234,12 +248,12 @@ and is only for a server no inbound connection can reach. Enrolling with one hap
 because only the running server can redeem an enrollment token. See
 [Operations](docs/OPERATIONS.md) for the full surface.
 
-`uninstall` disables athanor but preserves `/home/athanor`, `/etc/athanor`, PostgreSQL data, and
+`uninstall` disables garden but preserves `/home/athanor`, `/etc/athanor`, PostgreSQL data, and
 backups. See [Deployment](docs/DEPLOYMENT.md) and [Operations](docs/OPERATIONS.md).
 
 Backups contain the database encryption keys, server identity, browser profile, publisher logins,
 and user files. They also record the additional packages the owner approved, so a clean host can
-reinstall them. Store backups in an operator-provided encrypted destination and copy them off-host; Athanor
+reinstall them. Store backups in an operator-provided encrypted destination and copy them off-host; garden
 never uploads them.
 
 ## Architecture
@@ -265,7 +279,7 @@ authenticated, is never exposed directly, and does not contain an inference serv
 
 ## Privacy
 
-athanor does not intentionally put prompts, replies, screenshots, browser text, terminal output, file
+garden does not intentionally put prompts, replies, screenshots, browser text, terminal output, file
 contents, credentials, or generated assets in application logs. That is not the same as zero
 observation: the machine host, model provider, destination websites, connected tools, certificate
 authority, DNS, and network operators receive the content or metadata required to provide their
@@ -311,7 +325,7 @@ platform artifact passes its post-build audit. No release is claimed as publishe
 
 ## Independent implementation
 
-athanor is an independent implementation. Its code, prompts, and interface are its own, and it is
+garden is an independent implementation. Its code, prompts, and interface are its own, and it is
 not affiliated with or endorsed by any provider it can connect to. Product names appear only to
 identify services the owner may choose to use. See
 [Third-party notices](THIRD_PARTY_NOTICES.md).

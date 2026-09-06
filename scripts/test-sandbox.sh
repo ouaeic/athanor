@@ -88,6 +88,20 @@ while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
 shift
 exec "$@"'
 
+# This records the mission handoff only. A real Linux canary proves kernel teardown.
+cat >"$fake_bin/mission-supervisor.py" <<'PYTHON'
+import json, os, sys
+fd, gate = int(sys.argv[1]), int(sys.argv[2])
+record = json.loads(os.read(fd, 8192))
+if record["phase"] != "prepared" or os.read(gate, 16) != b"go":
+    raise RuntimeError("Mission was not authorized to launch")
+os.close(fd)
+os.close(gate)
+with open(os.environ["ATHANOR_TEST_RECORDS"] + "/mission", "w") as stream:
+    stream.write("closed-private-fds")
+os.execv(sys.argv[4], sys.argv[4:])
+PYTHON
+
 # The helper calls these by absolute path so that a search path it does not control cannot
 # choose them. The copy under test has those paths pointed at the recorders instead.
 #
@@ -102,6 +116,7 @@ mkdir -p "$workspaces/$workspace_id/workspace"
 sed \
   -e "s|/usr/bin/setpriv|$fake_bin/setpriv|g" \
   -e "s|/usr/bin/unshare|$fake_bin/unshare|g" \
+  -e "s|/usr/local/lib/athanor/mission-supervisor.py|$fake_bin/mission-supervisor.py|g" \
   -e "s|^workspace_parent=\"/home/athanor\"$|workspace_parent=\"$workspaces\"|" \
   "$repository_root/scripts/athanor-sandbox" >"$sandbox"
 chmod 0755 "$sandbox"
@@ -137,6 +152,10 @@ run_sandbox() {
     run_root=$4
     shift 4
     write_spec "$@"
+    if [ "$run_confinement" = mission ]; then
+      printf '{"phase":"prepared"}' >"${spec%.spec}.lease"
+      printf go >"${spec%.spec}.gate"
+    fi
     set -- run "$run_network" "$run_confinement" "$run_root" --spec "$spec"
   fi
   PATH="$fake_bin:$PATH" ATHANOR_TEST_RECORDS="$records" SUDO_UID="$runner_uid" "$sandbox" "$@"
@@ -405,7 +424,15 @@ if grep -q -- '--landlock' "$records/setpriv"; then
 fi
 printf 'ok  the interactive shell is dropped to the same account and is not confined\n'
 
+output=$(run_sandbox run network mission "$workspaces/$workspace_id" /bin/sh -c 'printf mission')
+test "$output" = mission
+test "$(cat "$records/mission")" = closed-private-fds
+grep -q -- '--landlock-access fs' "$records/setpriv"
+printf 'ok  mission commands retain confinement and pass private lease and launch-gate descriptors\n'
+
 report=$(run_sandbox check)
+test "$(printf '%s' "$report" | sed -n 's/^process-isolation=//p')" = no
+printf 'ok  a recorder without PID namespaces cannot advertise process isolation\n'
 test "$(printf '%s' "$report" | sed -n 's/^user=//p')" = "$(id -un)"
 # The third line of the ladder, asserted as the OUTCOME the installer reads rather than as the flags
 # the probe carried.

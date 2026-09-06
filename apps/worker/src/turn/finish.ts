@@ -34,6 +34,7 @@
  */
 import type { ModelToolCall } from '@athanor/model-gateway';
 import type { TaskRecord } from '@athanor/data';
+import { deliveryFilePath, mediaDeliveryState } from '@athanor/contracts';
 import type { MemoryDeadEndCheck } from '@athanor/core';
 import {
   acceptanceFailureMessage,
@@ -63,9 +64,12 @@ import {
   MAX_FINISH_REJECTIONS
 } from '../turn-bounds.js';
 import { textValue } from '../values.js';
+import { declaredTaskOutputs, resolveDelivery } from '../delivery.js';
+import type { AgentRunnerClient } from '../runner-client.js';
 
 /** What completing a turn needs from the worker that owns it. */
 export interface TurnFinishDeps {
+  readonly runner: AgentRunnerClient;
   readonly store: DataStore;
   readonly config: AgentWorkerConfig;
   outstandingPlanSteps(task: TaskRecord, key: Uint8Array): Promise<string[]>;
@@ -482,6 +486,59 @@ export const handleFinishCall = async (
     await event(deps.store, task, key, 'status', 'Asked for the answer itself', {});
     return 'held';
   }
+  const outputs = state.mode === 'plan' ? [] : await declaredTaskOutputs(deps.store, task.id, key);
+  const mediaJobs = await deps.store.listMediaJobs(task.userId, task.id, 100);
+  const mediaDelivery = mediaDeliveryState(mediaJobs);
+  const delivery = await resolveDelivery(deps, task, key, state, call.arguments.deliverables, {
+    outputs,
+    passedCheckIds: new Set(verifiedCommands.map((check) => check.id)),
+    deferredFiles: new Set(
+      [...mediaDelivery.pending, ...mediaDelivery.failed]
+        .map((job) => deliveryFilePath(job.outputPath))
+        .filter((path): path is string => path !== null)
+    )
+  });
+  if (delivery.unavailable.length && !state.deliveryNagged) {
+    state.deliveryNagged = true;
+    state.repairStep = true;
+    state.messages.push({
+      role: 'tool',
+      toolCallId: call.id,
+      content: `Finish held: these declared outputs are not accessible: ${delivery.unavailable.slice(0, 8).join('; ')}. Repair the file or published preview, use a recorded artifact name, or remove an incorrect reference and explain the missing output. Then finish again.`
+    });
+    await event(deps.store, task, key, 'status', 'Declared outputs need delivery', {
+      unavailable: delivery.unavailable
+    });
+    return 'held';
+  }
+  if (mediaDelivery.failed.length)
+    delivery.unavailable.push(
+      'A requested media output failed or its provider submission is unresolved. Inspect its recorded job status.'
+    );
+  if (delivery.unavailable.length) {
+    const caveat = 'Some declared outputs could not be opened. The result needs review.';
+    acceptanceEvidence = [caveat, ...acceptanceEvidence];
+    verification = {
+      ...verification,
+      status: 'delivery_incomplete',
+      remainingRisks: [
+        caveat,
+        ...delivery.unavailable.map((value) => `Unavailable output: ${value}`),
+        ...verification.remainingRisks
+      ].slice(0, 20)
+    };
+  } else if (mediaDelivery.pending.length) {
+    const caveat =
+      'Media delivery is pending. The recorded provider jobs continue independently and their files will appear when ready.';
+    verification = {
+      ...verification,
+      status:
+        verification.status === 'verified' || verification.status === 'not_applicable'
+          ? 'delivery_pending'
+          : verification.status,
+      remainingRisks: [caveat, ...verification.remainingRisks].slice(0, 20)
+    };
+  }
   state.messages.push({
     role: 'tool',
     toolCallId: call.id,
@@ -497,7 +554,7 @@ export const handleFinishCall = async (
     state,
     {
       summary,
-      deliverables: Array.isArray(call.arguments.deliverables) ? call.arguments.deliverables : [],
+      deliverables: delivery.deliverables,
       verification,
       ...(acceptanceEvidence.length ? { acceptance: acceptanceEvidence } : {}),
       ...(verifiedCommands.length ? { verifiedCommands } : {})

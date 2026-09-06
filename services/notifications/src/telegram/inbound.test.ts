@@ -202,7 +202,7 @@ describe('a tap on an approval card', () => {
     expect(recorded.securityEvents[0]?.metadata).toMatchObject({ reason: 'foreign_approval' });
   });
 
-  it('approves through exactly the three calls the API route makes, then writes the outcome onto the card', async () => {
+  it('settles approval through the shared store without a separate task-state write', async () => {
     const { input, recorded } = harness();
     expect(await handleUpdate(input, tap('y'))).toBe('decided');
     const decision = recorded.calls.filter(
@@ -210,8 +210,7 @@ describe('a tap on an approval card', () => {
     );
     expect(decision).toEqual([
       ['getApproval', approvalId],
-      ['resolveApproval', 'owner', approvalId, 'approved'],
-      ['setTaskStatusForUser', 'owner', 'task-1', 'queued']
+      ['resolveApproval', 'owner', approvalId, 'approved']
     ]);
     // The card: buttons gone, the decision on it, the ledger row closed.
     const edit = recorded.api.find(([method]) => method === 'editMessageText');
@@ -230,7 +229,7 @@ describe('a tap on an approval card', () => {
     const { input, recorded } = harness();
     expect(await handleUpdate(input, tap('n'))).toBe('decided');
     expect(recorded.calls).toContainEqual(['resolveApproval', 'owner', approvalId, 'denied']);
-    expect(recorded.calls).toContainEqual(['setTaskStatusForUser', 'owner', 'task-1', 'queued']);
+    expect(storeCalls(recorded)).not.toContain('setTaskStatusForUser');
   });
 
   it('answers a second tap "Already decided" and writes nothing to the task', async () => {

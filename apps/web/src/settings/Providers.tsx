@@ -13,6 +13,8 @@ import {
   useResource
 } from '../management.js';
 import { money } from '../model.js';
+import { mediaRouteIsRetired, mediaRetirementDate } from '../media-state.js';
+import AudioReceipts from '../AudioReceipts';
 
 interface Provider {
   configured: boolean;
@@ -40,9 +42,11 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
   });
   const [choice, setChoice] = useState('');
   const [query, setQuery] = useState('');
+  const [mediaSelections, setMediaSelections] = useState<Record<string, string>>({});
   const selected = choice || provider.value?.provider || 'openrouter';
   return (
     <>
+      <AudioReceipts />
       <Section
         title="Model connection"
         description="Bring your own provider. Your computer uses your credentials directly."
@@ -258,7 +262,7 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
         )}
       </Section>
       <Section
-        title="Images, voice and transcription"
+        title="Images, video, voice and transcription"
         description="Choose from the generation routes your provider makes available."
       >
         <ResourceState resource={media} />
@@ -268,65 +272,142 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
             onSubmit={(event) => {
               event.preventDefault();
               const form = new FormData(event.currentTarget);
-              const choices = Object.fromEntries(
-                media
-                  .value!.modalities.filter((item) => item.available && item.modality !== 'video')
-                  .map((item) => [
-                    item.modality,
-                    {
-                      automatic: fieldValue(form, `${item.modality}-model`) === '',
-                      preference: fieldValue(form, `${item.modality}-preference`),
-                      modelId: fieldValue(form, `${item.modality}-model`)
-                    }
-                  ])
-              );
-              void action.run(() => put('/v1/media/models', choices), 'Generation choices saved');
+              void action.run(async () => {
+                const choices = Object.fromEntries(
+                  media
+                    .value!.modalities.filter((item) => item.available)
+                    .flatMap((item) => {
+                      const modelId =
+                        mediaSelections[item.modality] ??
+                        (item.choice.automatic ? '' : item.choice.modelId);
+                      const option = item.options.find((candidate) => candidate.id === modelId);
+                      if (mediaRouteIsRetired(option) || option?.unavailableReason) {
+                        if (!item.choice.automatic && modelId === item.choice.modelId) return [];
+                        throw new Error(
+                          option?.unavailableReason ??
+                            'This generation route has retired. Choose an available model.'
+                        );
+                      }
+                      return [
+                        [
+                          item.modality,
+                          {
+                            automatic: modelId === '',
+                            preference: fieldValue(form, `${item.modality}-preference`),
+                            modelId
+                          }
+                        ]
+                      ];
+                    })
+                );
+                await put('/v1/media/models', choices);
+                setMediaSelections({});
+              }, 'Generation choices saved');
             }}
           >
             <div className="stack">
-              {media.value.modalities.map((item) => (
-                <div key={item.modality}>
-                  <h4>{item.modality[0]!.toUpperCase() + item.modality.slice(1)}</h4>
-                  {!item.available ? (
-                    <p className="muted">{item.reason ?? 'No compatible route is available.'}</p>
-                  ) : (
-                    <div className="management-grid">
-                      <Field label={`${item.modality} model`}>
-                        <select
-                          name={`${item.modality}-model`}
-                          defaultValue={item.choice.automatic ? '' : item.choice.modelId}
-                        >
-                          <option value="">Automatic</option>
-                          {item.options.map((option) => (
-                            <option
-                              value={option.id}
-                              key={option.id}
-                              disabled={Boolean(option.unavailableReason)}
-                            >
-                              {option.displayName}
-                            </option>
-                          ))}
-                        </select>
-                      </Field>
-                      <Field label={`${item.modality} preference`}>
-                        <select
-                          name={`${item.modality}-preference`}
-                          defaultValue={item.choice.preference}
-                        >
-                          <option value="balanced">Balanced</option>
-                          <option value="fast">Faster</option>
-                          <option value="best">Higher quality</option>
-                        </select>
-                      </Field>
-                      <p className="muted span-all">
-                        {item.effective
-                          ? `Currently ${item.effective.displayName}. ${item.effective.usdPerImage !== null ? `${money(item.effective.usdPerImage)} per image.` : item.effective.usdPerMinute !== null ? `${money(item.effective.usdPerMinute)} per minute.` : item.effective.usdPerMillionCharacters !== null ? `${money(item.effective.usdPerMillionCharacters)} per million characters.` : 'Price is not published.'}`
-                          : 'No effective route selected.'}
+              {media.value.modalities.map((item) => {
+                const modelId =
+                  mediaSelections[item.modality] ??
+                  (item.choice.automatic ? '' : item.choice.modelId);
+                const selectedOption = modelId
+                  ? item.options.find((option) => option.id === modelId)
+                  : item.effective;
+                return (
+                  <div key={item.modality}>
+                    <h4>{item.modality[0]!.toUpperCase() + item.modality.slice(1)}</h4>
+                    {selectedOption?.retirementAt && (
+                      <p className="muted span-all" role="status">
+                        {mediaRouteIsRetired(selectedOption) ? 'Retired' : 'Scheduled to retire'} on{' '}
+                        {mediaRetirementDate(selectedOption.retirementAt)} (UTC). Existing job
+                        records and recovery controls remain available. No replacement is selected
+                        automatically.
                       </p>
-                    </div>
-                  )}
-                </div>
-              ))}
+                    )}
+                    {selectedOption?.unavailableReason && (
+                      <p className="muted span-all">{selectedOption.unavailableReason}</p>
+                    )}
+
+                    {!item.available ? (
+                      <p className="muted">{item.reason ?? 'No compatible route is available.'}</p>
+                    ) : (
+                      <div className="management-grid">
+                        <Field label={`${item.modality} model`}>
+                          <select
+                            name={`${item.modality}-model`}
+                            value={modelId}
+                            onChange={(event) =>
+                              setMediaSelections((values) => ({
+                                ...values,
+                                [item.modality]: event.target.value
+                              }))
+                            }
+                          >
+                            <option value="">
+                              {item.modality === 'video' ? 'No video model selected' : 'Automatic'}
+                            </option>
+                            {item.options.map((option) => (
+                              <option
+                                value={option.id}
+                                key={option.id}
+                                disabled={
+                                  Boolean(option.unavailableReason) || mediaRouteIsRetired(option)
+                                }
+                              >
+                                {option.displayName}
+                                {mediaRouteIsRetired(option) ? ' · retired' : ''}
+                              </option>
+                            ))}
+                          </select>
+                        </Field>
+                        <Field label={`${item.modality} preference`}>
+                          <select
+                            name={`${item.modality}-preference`}
+                            defaultValue={item.choice.preference}
+                          >
+                            <option value="balanced">Balanced</option>
+                            <option value="fast">Faster</option>
+                            <option value="best">Higher quality</option>
+                          </select>
+                        </Field>
+                        <p className="muted span-all">
+                          {selectedOption
+                            ? `${selectedOption.displayName}. ${selectedOption.usdPerImage !== null ? `${money(selectedOption.usdPerImage)} per image.` : selectedOption.usdPerSecond != null ? `From ${money(selectedOption.usdPerSecond)} per second.` : selectedOption.usdPerMinute !== null ? `${money(selectedOption.usdPerMinute)} per minute.` : selectedOption.usdPerMillionCharacters !== null ? `${money(selectedOption.usdPerMillionCharacters)} per million characters.` : 'Pricing depends on the request.'}`
+                            : 'No effective route selected.'}
+                        </p>
+                        {selectedOption?.requiresRetentionApproval && (
+                          <p className="muted span-all">
+                            Each video job asks before temporary retention at the provider, and
+                            shows the quoted cost before generation.
+                          </p>
+                        )}
+                        {selectedOption?.capabilities &&
+                          Object.keys(selectedOption.capabilities.parameters).length > 0 && (
+                            <details className="span-all">
+                              <summary>Available controls for {selectedOption.displayName}</summary>
+                              <dl className="garden-provider-controls">
+                                {Object.entries(selectedOption.capabilities.parameters).map(
+                                  ([name, parameter]) => (
+                                    <div key={name}>
+                                      <dt>{name.replaceAll('_', ' ')}</dt>
+                                      <dd>
+                                        {parameter.type === 'enum'
+                                          ? parameter.values.join(' · ')
+                                          : parameter.type === 'range'
+                                            ? `${parameter.min}–${parameter.max}`
+                                            : 'On / off'}
+                                      </dd>
+                                    </div>
+                                  )
+                                )}
+                              </dl>
+                            </details>
+                          )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
             <p className="muted">
               Further generation asks for approval after the conversation reaches{' '}
@@ -353,6 +434,7 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
               <tr>
                 <th>Model</th>
                 <th>Availability</th>
+                <th>Inputs</th>
                 <th>Context</th>
                 <th>Input / output per million</th>
               </tr>
@@ -375,6 +457,25 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
                       </span>
                     </td>
                     <td>{model.availability}</td>
+                    <td>
+                      {(model.modalities ?? ['text']).join(' · ')}
+                      {(['audio', 'video'] as const)
+                        .filter((kind) => model.modalities?.includes(kind))
+                        .map((kind) => {
+                          const price =
+                            kind === 'audio'
+                              ? model.nativeInputPricing?.audioUsdPerMillionTokens
+                              : model.nativeInputPricing?.videoUsdPerMillionTokens;
+                          return (
+                            <small className="muted" key={kind} style={{ display: 'block' }}>
+                              {kind === 'audio' ? 'Audio' : 'Video'}:{' '}
+                              {price == null
+                                ? 'native input price unavailable'
+                                : `${money(price)} per million input tokens`}
+                            </small>
+                          );
+                        })}
+                    </td>
                     <td>{model.contextTokens.toLocaleString()}</td>
                     <td>
                       {model.inputUsdPerMillionTokens == null

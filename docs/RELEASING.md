@@ -1,4 +1,4 @@
-# Releasing athanor clients
+# Releasing garden clients
 
 This document covers client artifacts. The Linux server is installed from reviewed source; it is not
 distributed as an image, container, or virtual machine.
@@ -41,7 +41,7 @@ platform build leaves the release in draft and prevents checksum completion.
 4. Review the exact committed tree and create an annotated tag:
 
    ```bash
-   git tag -a vX.Y.Z -m "athanor vX.Y.Z"
+   git tag -a vX.Y.Z -m "garden vX.Y.Z"
    git push origin main vX.Y.Z
    ```
 
@@ -53,6 +53,9 @@ Do not reuse or move a release tag.
 - Install each package on a clean supported operating system.
 - Pair against a server whose URL was not compiled into the client.
 - Complete first-owner registration and create a passkey.
+- On mobile, complete system-browser authorization against a hostname with trusted HTTPS; confirm
+  the matching code, fresh passkey ceremony, separate app session, enrollment, recovery, and
+  sensitive-action verification. Refuse an unrelated browser URL and a reused authorization.
 - Restart the client and prove session persistence without retaining the one-time owner code.
 - Change the server's reachable address and prove pinned-identity reconnect.
 - Exercise task streaming, file download, media display, preview, browser/desktop takeover, and a
@@ -90,7 +93,7 @@ Local Android builds may be unsigned and local macOS builds may be ad-hoc for te
 explicitly rejected by the protected release path. Store submission and review remain operator
 actions outside the source repository.
 
-Client updates deliberately use checksum-verified, platform-signed manual downloads. Athanor does
+Client updates deliberately use checksum-verified, platform-signed manual downloads. garden does
 not ship a mutable updater feed or an additional updater signing root. This keeps the first public
 release independent of a hosted control service; a future release may change that boundary only
 through an explicit, reviewed threat-model and migration decision.
@@ -154,7 +157,7 @@ Windows 7 and later, the default `webviewInstallMode` bootstraps the WebView2 ru
 installer, `minimumWebview2Version` is unset, and no store rule applies to a direct download.
 
 **`targetSdk` matters here for what the operating system does, not for what a store permits.**
-athanor is distributed as a direct download and is not submitted to any store, so the target-API
+garden is distributed as a direct download and is not submitted to any store, so the target-API
 rule that forces most projects to move is not what is pushing on this number. What is: Android reads
 `targetSdk` as a declaration of which behaviour changes the app has been written for, and runs an
 app that declares less under the older, laxer defaults. Every one of those defaults that matters

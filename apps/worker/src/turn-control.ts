@@ -64,6 +64,8 @@ export const drainCorrection = async (
     userMessageCiphertext: encryptJson({ markdown: correction }, key, `task-event:${task.id}`)
   });
   if (!consumed) return false;
+  state.ownerReasoningEffort = queued.reasoningEffort ?? task.reasoningEffort ?? 'auto';
+  task.reasoningEffort = state.ownerReasoningEffort;
   // The same primitive pause, cancel and a worker restart use: a tool call with no result is a
   // malformed window, and the correction arrives between a call and its answer.
   sealUnansweredToolCalls(state.messages, 'the user redirected the task before this call ran');

@@ -1,11 +1,14 @@
 import type { ServerToolUse, WebCitation } from '@athanor/contracts';
 import { z } from 'zod';
 import type { GenerationCutoff } from './generation-budget.js';
+import { ReasoningEffort, ReasoningOptions } from './reasoning.js';
+import { NativeInputPart } from './native-input.js';
 
 export const ModelMessage = z.object({
   role: z.enum(['system', 'user', 'assistant', 'tool']),
   content: z.string(),
   images: z.array(z.string()).optional(),
+  nativeInputs: z.array(NativeInputPart).max(4).optional(),
   reasoning: z.string().optional(),
   reasoningDetails: z.array(z.unknown()).optional(),
   toolCallId: z.string().optional(),
@@ -80,6 +83,17 @@ export type ModelServerTool = z.infer<typeof ModelServerTool>;
 
 export const ModelRequest = z.object({
   model: z.string(),
+  inputModalities: z.array(z.enum(['text', 'image', 'audio', 'video'])).optional(),
+  nativeInputRequestId: z.string().max(200).optional(),
+  nativeInputCredentialBinding: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional(),
+  nativeInputMaxPrice: z
+    .object({ prompt: z.number().nonnegative(), completion: z.number().nonnegative() })
+    .optional(),
+  nativeInputCreditLimit: z.number().nonnegative().optional(),
+  nativeInputApprovedCostUsd: z.number().finite().nonnegative().optional(),
   messages: z.array(ModelMessage).min(1),
   tools: z.array(ModelTool).default([]),
   /**
@@ -94,7 +108,8 @@ export const ModelRequest = z.object({
    * rather than sent past it, because a route that rejects the number answers nothing at all.
    */
   maxOutputTokens: z.number().int().positive().optional(),
-  reasoningEffort: z.enum(['low', 'medium', 'high']).optional(),
+  reasoningEffort: ReasoningEffort.optional(),
+  reasoningOptions: ReasoningOptions.optional(),
   /**
    * Whether the route accepts a reasoning effort. Left unset the effort is sent, which is what every
    * caller has always done; an explicit `false` withholds it, so a route that does not understand
@@ -145,6 +160,10 @@ export interface ModelToolCall {
 }
 
 export interface ModelResponse {
+  /** Native spend is already settled or held durably; the step must not create a second charge. */
+  nativeInputUsageRecorded?: boolean;
+  /** Local accounting receipt; never sent to a provider or accepted from model output. */
+  codingReservationId?: string;
   /**
    * The answer, and only the answer.
    *

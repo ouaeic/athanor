@@ -1,3 +1,12 @@
+import { DebuggerManager } from './debugger.js';
+import { registerDebuggerRoutes } from './debugger-routes.js';
+import { NativeCodingMissions, registerCodingMissionRoutes } from './coding-missions.js';
+import {
+  freezeMissionWorkspace,
+  managedWorkspaceBusy,
+  quiesceManagedChildren,
+  recoverMissionProcesses
+} from './mission-processes.js';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { rm } from 'node:fs/promises';
@@ -13,6 +22,7 @@ import pty from '@homebridge/node-pty-prebuilt-multiarch';
 import { z } from 'zod';
 import {
   BrowserAction,
+  BrowserTabRetentionRequest,
   DesktopAction,
   DesktopHolder,
   DesktopLaunchRequest,
@@ -25,9 +35,14 @@ import {
   verifyCapabilityToken,
   type CapabilityTokenClaims
 } from '@athanor/core';
-import { prepareAudio } from './audio.js';
+import { inspectAudioSource, prepareAudio } from './audio.js';
 import { authenticateRunnerRequest, requireScope } from './auth.js';
 import { BotWallError, BrowserManager, type BrowserStreamState } from './browser.js';
+import { registerFileDownloadRoutes } from './file-downloads.js';
+import { ComputationManager } from './computation.js';
+import { registerComputationRoutes } from './computation-routes.js';
+import { CodeIntelligenceManager } from './code-intelligence.js';
+import { registerCodeIntelligenceRoutes } from './code-intelligence-routes.js';
 import { CheckpointRefusedError, WorkspaceCheckpoints } from './checkpoints.js';
 import type { RunnerConfig } from './config.js';
 import { DesktopManager, type DesktopStreamState } from './desktop.js';
@@ -45,6 +60,7 @@ import { runnerLogger } from './log.js';
 import { ProcessManager } from './processes.js';
 import { findRenderTools, proveRender, RENDER_SOURCE_MAX_BYTES } from './render-proof.js';
 import {
+  probeNativeIsolation,
   resolveAgentSandbox,
   sandboxSpecDirectory,
   sandboxedInvocation,
@@ -179,7 +195,11 @@ const RenderProofRequest = z.object({
 const PrepareAudioRequest = z.object({
   path: WorkspaceRelativePath,
   startSeconds: z.number().min(0).max(86_400).optional(),
-  endSeconds: z.number().min(0).max(86_400).optional()
+  endSeconds: z.number().min(0).max(86_400).optional(),
+  expectedSourceSha256: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional()
 });
 const ReadElementsRequest = z.object({
   /** Scopes the read to one form or panel; omitted, it reads the whole page as a snapshot would. */
@@ -269,6 +289,11 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     sandboxSpecDirectory(config.WORKSPACE_ROOT),
     config.CONFINE_AGENT_FILESYSTEM
   );
+  if (sandbox) {
+    Object.assign(sandbox, await probeNativeIsolation(sandbox));
+    if (!(await recoverMissionProcesses(sandbox))) sandbox.processIsolation = false;
+  }
+  const terminals = new Map<object, string>();
   const privilegedHelpers = [config.SYSTEM_PACKAGE_HELPER, sandbox?.helper];
   const probeHostStorage = options.hostStorage ?? hostStorage;
   const desktop =
@@ -356,6 +381,61 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     systemPackageHelper: config.SYSTEM_PACKAGE_HELPER,
     hostStorage: probeHostStorage
   };
+  const codeIntelligence = new CodeIntelligenceManager({
+    isolateNetwork: config.ISOLATE_AGENT_NETWORK,
+    sandbox,
+    limits,
+    limiter,
+    systemPackages: { mode: 'refused', helper: config.SYSTEM_PACKAGE_HELPER }
+  });
+  const computations = new ComputationManager(
+    config.WORKSPACE_ROOT,
+    {
+      isolateNetwork: config.ISOLATE_AGENT_NETWORK,
+      sandbox,
+      limits,
+      limiter,
+      systemPackages: { mode: 'refused', helper: config.SYSTEM_PACKAGE_HELPER }
+    },
+    config.MAX_BACKGROUND_SECONDS
+  );
+  await computations.restore();
+  const debuggers = new DebuggerManager(config.WORKSPACE_ROOT, {
+    isolateNetwork: config.ISOLATE_AGENT_NETWORK,
+    sandbox,
+    limits,
+    limiter,
+    systemPackages: { mode: 'refused', helper: config.SYSTEM_PACKAGE_HELPER }
+  });
+  await debuggers.restore();
+  const missions = new NativeCodingMissions(
+    config.WORKSPACE_ROOT,
+    Boolean(sandbox?.confineFilesystem && sandbox.processIsolation && sandbox.networkIsolation),
+    {
+      quiesceWorkspace: async (id) => {
+        const root = workspacePath(config.WORKSPACE_ROOT, id);
+        freezeMissionWorkspace(root);
+        await Promise.all([
+          processes.quiesceWorkspace(id),
+          computations.quiesceWorkspace(id),
+          debuggers.quiesceWorkspace(root),
+          codeIntelligence.quiesceWorkspace(root)
+        ]);
+        await quiesceManagedChildren(root);
+      },
+      isWorkspaceBusy: (id) => {
+        const root = workspacePath(config.WORKSPACE_ROOT, id);
+        return (
+          [...terminals.values()].includes(id) ||
+          processes.isWorkspaceBusy(id) ||
+          computations.isWorkspaceBusy(id) ||
+          debuggers.isWorkspaceBusy(root) ||
+          codeIntelligence.isWorkspaceBusy(root) ||
+          managedWorkspaceBusy(root)
+        );
+      }
+    }
+  );
   const reservedPorts = reservedPreviewPorts({
     ports: [config.RUNNER_PORT, ...config.RESERVED_PREVIEW_PORTS]
   });
@@ -502,6 +582,8 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
   // control plane that tells the owner an agent shell is confined - has to be able to check.
   app.get('/healthz', async () => {
     const backgroundWork = processes.backgroundWork();
+    const computationWork = computations.backgroundWork();
+    const debuggerWork = debuggers.backgroundWork();
     return {
       ok: true,
       service: 'workspace-runner',
@@ -537,8 +619,20 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
        * nothing is running, and is what lets an update say "the longest has about 6 hours left",
        * which is the sentence that makes an operator wait where a bare count does not.
        */
-      backgroundCommands: backgroundWork.commands,
-      backgroundLongestRemainingMs: backgroundWork.longestRemainingMs
+      missionProcessIsolation: sandbox?.processIsolation === true,
+      nativeNetworkIsolation: sandbox?.networkIsolation === true,
+      backgroundCommands:
+        backgroundWork.commands + computationWork.commands + debuggerWork.commands,
+      backgroundLongestRemainingMs:
+        backgroundWork.longestRemainingMs === null &&
+        computationWork.longestRemainingMs === null &&
+        debuggerWork.longestRemainingMs === null
+          ? null
+          : Math.max(
+              backgroundWork.longestRemainingMs ?? 0,
+              computationWork.longestRemainingMs ?? 0,
+              debuggerWork.longestRemainingMs ?? 0
+            )
     };
   });
 
@@ -546,6 +640,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     if (request.routeOptions.url === '/healthz') return;
     await authenticate(request);
   });
+  registerCodingMissionRoutes(app, missions);
 
   app.put<{ Params: { workspaceId: string } }>('/v1/workspaces/:workspaceId', async (request) => {
     requireScope(request, 'workspace.manage');
@@ -601,7 +696,15 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
       await desktop.close(request.params.workspaceId);
       // `forget` because the workspace is going: a service must not be restarted into a tree that
       // no longer exists, and the record itself goes with the `.athanor` directory below.
+      await computations.stopWorkspace(request.params.workspaceId);
+      await debuggers.stopWorkspace(
+        workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId)
+      );
+      codeIntelligence.stopWorkspace(
+        workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId)
+      );
       processes.stopWorkspace(request.params.workspaceId, { forget: true });
+      await processes.flush();
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
       await clearAgentOwnedFiles(root);
       await rm(root, { recursive: true, force: true });
@@ -617,7 +720,15 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
       requireScope(request, 'workspace.manage');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
       await ensureWorkspace(root);
+      await computations.stopWorkspace(request.params.workspaceId);
+      await debuggers.stopWorkspace(
+        workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId)
+      );
+      codeIntelligence.stopWorkspace(
+        workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId)
+      );
       processes.stopWorkspace(request.params.workspaceId);
+      await processes.flush();
       await browser.close(request.params.workspaceId);
       await desktop.close(request.params.workspaceId);
       try {
@@ -653,7 +764,15 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
       requireScope(request, 'workspace.manage');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
       await ensureWorkspace(root);
+      await computations.stopWorkspace(request.params.workspaceId);
+      await debuggers.stopWorkspace(
+        workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId)
+      );
+      codeIntelligence.stopWorkspace(
+        workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId)
+      );
       processes.stopWorkspace(request.params.workspaceId);
+      await processes.flush();
       await browser.close(request.params.workspaceId);
       await desktop.close(request.params.workspaceId);
       // In a `finally`, like the snapshot and checkpoint routes above and below: a restore that
@@ -713,7 +832,15 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
       // Long-running commands are stopped because a build writing into the tree mid-restore would
       // leave a mixture of both states. The browser and the desktop are deliberately left running:
       // their profiles are outside what a checkpoint covers, so a rewind cannot disturb them.
+      await computations.stopWorkspace(request.params.workspaceId);
+      await debuggers.stopWorkspace(
+        workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId)
+      );
+      codeIntelligence.stopWorkspace(
+        workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId)
+      );
       processes.stopWorkspace(request.params.workspaceId);
+      await processes.flush();
       try {
         return await checkpoints.restore(
           request.params.workspaceId,
@@ -857,12 +984,42 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     '/v1/workspaces/:workspaceId/processes/stop-owner',
     async (request) => {
       requireScope(request, 'exec');
+      const computationOwner =
+        request.capability.role === 'agent'
+          ? request.capability.sub
+          : z.object({ owner: z.string().min(1) }).parse(request.body).owner;
+      await computations.stopOwner(request.params.workspaceId, computationOwner);
+      await debuggers.stopOwner(request.params.workspaceId, computationOwner);
       return processes.stopOwner(
         request.params.workspaceId,
         // The same split the list and action routes make: an agent may only ever stop what its own
         // task started, and the person driving the computer names the task they mean.
         request.capability.role === 'agent' ? request.capability.sub : null,
         request.body
+      );
+    }
+  );
+
+  app.get<{ Params: { workspaceId: string; sessionId: string } }>(
+    '/v1/workspaces/:workspaceId/processes/:sessionId/recovery',
+    async (request) => {
+      requireScope(request, 'exec');
+      return processes.recoveryPlan(
+        request.params.workspaceId,
+        request.capability.role === 'agent' ? request.capability.sub : null,
+        request.params.sessionId
+      );
+    }
+  );
+
+  app.post<{ Params: { workspaceId: string; sessionId: string } }>(
+    '/v1/workspaces/:workspaceId/processes/:sessionId/resume',
+    async (request) => {
+      requireScope(request, 'exec');
+      return processes.resumeJob(
+        request.params.workspaceId,
+        request.capability.role === 'agent' ? request.capability.sub : null,
+        request.params.sessionId
       );
     }
   );
@@ -882,6 +1039,11 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
       );
     }
   );
+
+  registerFileDownloadRoutes(app, config);
+  registerCodeIntelligenceRoutes(app, config.WORKSPACE_ROOT, codeIntelligence);
+  registerComputationRoutes(app, computations);
+  registerDebuggerRoutes(app, debuggers);
 
   app.get<{ Params: { workspaceId: string }; Querystring: { path?: string } }>(
     '/v1/workspaces/:workspaceId/files',
@@ -1166,6 +1328,34 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     }
   );
 
+  app.post<{ Params: { workspaceId: string } }>(
+    '/v1/workspaces/:workspaceId/audio/source',
+    async (request, reply) => {
+      requireScope(request, 'files.read');
+      const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
+      await ensureWorkspace(root);
+      const asked = z.object({ path: WorkspaceRelativePath }).strict().parse(request.body);
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      const closed = () => {
+        if (!reply.raw.writableEnded) abort();
+      };
+      request.raw.once('aborted', abort);
+      reply.raw.once('close', closed);
+      if (request.raw.aborted || reply.raw.destroyed) abort();
+      try {
+        return await inspectAudioSource(
+          root,
+          assertUserDataPath(root, asked.path),
+          controller.signal
+        );
+      } finally {
+        request.raw.removeListener('aborted', abort);
+        reply.raw.removeListener('close', closed);
+      }
+    }
+  );
+
   /**
    * One window of a recording, measured and re-encoded small enough to be transcribed.
    *
@@ -1181,19 +1371,44 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
       await ensureWorkspace(root);
       const asked = PrepareAudioRequest.parse(request.body);
-      const prepared = await prepareAudio(root, assertUserDataPath(root, asked.path), asked);
-      reply.headers({
-        'x-audio-format': prepared.format,
-        'x-audio-start-seconds': String(prepared.startSeconds),
-        'x-audio-prepared-seconds': String(Math.round(prepared.preparedSeconds)),
-        'x-audio-more': String(prepared.more),
-        ...(prepared.source.durationSeconds === null
-          ? {}
-          : { 'x-audio-duration-seconds': String(Math.round(prepared.source.durationSeconds)) }),
-        ...(prepared.source.container ? { 'x-audio-container': prepared.source.container } : {}),
-        ...(prepared.source.codec ? { 'x-audio-codec': prepared.source.codec } : {})
-      });
-      return reply.type('audio/ogg').send(prepared.bytes);
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      const closed = () => {
+        if (!reply.raw.writableEnded) abort();
+      };
+      request.raw.once('aborted', abort);
+      reply.raw.once('close', closed);
+      if (request.raw.aborted || reply.raw.destroyed) abort();
+      try {
+        const prepared = await prepareAudio(
+          root,
+          assertUserDataPath(root, asked.path),
+          asked,
+          undefined,
+          controller.signal
+        );
+        reply.headers({
+          'x-audio-format': prepared.format,
+          ...(prepared.sourceReceipt
+            ? {
+                'x-audio-source-sha256': prepared.sourceReceipt.sourceSha256,
+                'x-audio-source-bytes': String(prepared.sourceReceipt.sourceBytes)
+              }
+            : {}),
+          'x-audio-start-seconds': String(prepared.startSeconds),
+          'x-audio-prepared-seconds': String(Math.round(prepared.preparedSeconds)),
+          'x-audio-more': String(prepared.more),
+          ...(prepared.source.durationSeconds === null
+            ? {}
+            : { 'x-audio-duration-seconds': String(Math.round(prepared.source.durationSeconds)) }),
+          ...(prepared.source.container ? { 'x-audio-container': prepared.source.container } : {}),
+          ...(prepared.source.codec ? { 'x-audio-codec': prepared.source.codec } : {})
+        });
+        return reply.type('audio/ogg').send(prepared.bytes);
+      } finally {
+        request.raw.removeListener('aborted', abort);
+        reply.raw.removeListener('close', closed);
+      }
     }
   );
 
@@ -1547,7 +1762,8 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
         root,
         action,
         request.capability.role === 'user' ? 'user' : 'agent',
-        request.capability.scopes.includes('browser.consequential')
+        request.capability.scopes.includes('browser.consequential'),
+        request.capability.role === 'agent' ? request.capability.sub : null
       );
     }
   );
@@ -1560,6 +1776,25 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
     return browser.setHolder(request.params.workspaceId, root, request.body.holder);
   });
+
+  app.post<{ Params: { workspaceId: string; tabId: string } }>(
+    '/v1/workspaces/:workspaceId/browser/tabs/:tabId/retention',
+    async (request) => {
+      requireScope(request, 'browser.control');
+      if (request.capability.role !== 'user')
+        throw new Error('Only the owner can retain browser tabs');
+      const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
+      const input = BrowserTabRetentionRequest.parse(request.body);
+      return {
+        tabs: await browser.retainTab(
+          request.params.workspaceId,
+          root,
+          request.params.tabId,
+          input.pinned
+        )
+      };
+    }
+  );
 
   app.get('/v1/workspaces/:workspaceId/browser/stream', { websocket: true }, (socket, request) => {
     requireScope(request, 'browser.read');
@@ -1824,7 +2059,15 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
       // and the panel that reports what is running was reading the control plane's word for it - so
       // the box carried on serving while every screen said nothing was there. Without `forget`: the
       // records stay on disk, and `/resume` below puts them back.
+      await computations.stopWorkspace(request.params.workspaceId);
+      await debuggers.stopWorkspace(
+        workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId)
+      );
+      codeIntelligence.stopWorkspace(
+        workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId)
+      );
       processes.stopWorkspace(request.params.workspaceId);
+      await processes.flush();
       await browser.close(request.params.workspaceId);
       await desktop.close(request.params.workspaceId);
       return { id: request.params.workspaceId, state: 'hibernated' };
@@ -1861,6 +2104,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     requireScope(request, 'terminal');
     const { workspaceId } = request.params as { workspaceId: string };
     const root = workspacePath(config.WORKSPACE_ROOT, workspaceId);
+    terminals.set(socket, workspaceId);
     // A terminal is a shell on the box, so it may not outlive the capability that opened it. The
     // browser and desktop streams have always closed on expiry; without the same timer here a
     // sixty-second token bought a session that ran until one side hung up, with nothing able to
@@ -1967,6 +2211,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
       hungUp = true;
       clearTimeout(expiry);
       terminal?.kill();
+      if (!terminal) terminals.delete(socket);
     });
     void ensureWorkspace(root)
       .then(() => {
@@ -1996,6 +2241,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
         });
         terminal.onData((data) => socket.send(JSON.stringify({ type: 'data', data })));
         terminal.onExit(({ exitCode, signal }) => {
+          terminals.delete(socket);
           socket.send(JSON.stringify({ type: 'exit', exitCode, signal }));
           socket.close();
         });
@@ -2008,12 +2254,16 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
         // The workspace could not be prepared, so there will be no shell. Said out loud rather
         // than left as a socket that is open, accepting keystrokes and answering nothing: the
         // pane turns this into its closed state with a way back.
+        terminals.delete(socket);
         socket.close(1011, 'Workspace unavailable');
       });
   });
 
-  app.addHook('onClose', () => {
-    processes.close();
+  app.addHook('onClose', async () => {
+    await computations.close();
+    await debuggers.close();
+    codeIntelligence.close();
+    await processes.close();
   });
   return app;
 };

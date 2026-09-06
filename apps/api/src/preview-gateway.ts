@@ -11,6 +11,13 @@ import type { DataStore, WorkspacePreviewRecord } from '@athanor/data';
 import type { ApiConfig } from './config.js';
 import type { RunnerClient } from './runner-client.js';
 import { HOST_SESSION_COOKIE, SESSION_COOKIE } from './session.js';
+import { previewAccessExpiry, verifyPreviewAccess } from './preview-access.js';
+import {
+  PREVIEW_OPAQUE_SANDBOX,
+  previewRequestOrigin,
+  previewOriginFor,
+  previewScopeFor
+} from './preview-origin.js';
 
 /**
  * `__Secure-`, not `__Host-`, because this cookie is deliberately scoped to one preview's path.
@@ -32,9 +39,8 @@ const productionAccessCookie = '__Secure-athanor-preview-access';
 const legacyProductionAccessCookie = '__Host-athanor-preview-access';
 const developmentAccessCookie = 'athanor-preview-access';
 /**
- * The shipped layout serves previews from the same origin as the authenticated app, so the browser
- * attaches every athanor cookie to preview traffic. An agent-authored preview application must
- * neither read the operator's session nor set a cookie athanor would later trust.
+ * Cookies are not port-scoped. A separate preview origin on this hostname still receives the
+ * owner's cookies, so generated applications must not receive or replace control-plane credentials.
  */
 const athanorCookieNames = new Set(
   [
@@ -112,6 +118,7 @@ export const buildPreviewGateway = async (
   config: ApiConfig,
   runner: RunnerClient
 ) => {
+  const accessKey = Buffer.from(config.DATA_MASTER_KEY ?? '', 'base64');
   const app = Fastify({ logger: false, bodyLimit: 50 * 1024 * 1024 });
   const previewBase = new URL(config.PREVIEW_BASE_URL);
   const previewPath = previewBase.pathname.replace(/\/+$/, '');
@@ -148,6 +155,18 @@ export const buildPreviewGateway = async (
     const slug = hostname.slice(0, -suffix.length);
     return /^[0-9a-f]{32}$/.test(slug) ? slug : null;
   };
+
+  app.addHook('onRequest', async (request, reply) => {
+    const actual = previewRequestOrigin(request);
+    const expected = previewOriginFor(previewBase, slugFor(request));
+    const isolated = actual === expected && actual !== appOrigin;
+    reply.header(
+      'content-security-policy',
+      `${isolated ? '' : `${PREVIEW_OPAQUE_SANDBOX}; `}frame-ancestors ${appOrigin}`
+    );
+    if (actual !== expected)
+      return reply.status(421).type('text/plain').send('Use the configured preview address.');
+  });
 
   const previewFor = async (request: FastifyRequest): Promise<WorkspacePreviewRecord> => {
     // The slug in the path is the only way in. A preview could once also be reached by a custom
@@ -197,7 +216,10 @@ export const buildPreviewGateway = async (
     );
     const token =
       queryToken ?? request.cookies[accessCookie] ?? request.cookies[legacyProductionAccessCookie];
-    return Boolean(token && safeEqual(token, preview.accessTokenHash));
+    return Boolean(
+      token &&
+      (safeEqual(token, preview.accessTokenHash) || verifyPreviewAccess(token, preview, accessKey))
+    );
   };
 
   const runnerPath = (request: FastifyRequest, preview: WorkspacePreviewRecord): string => {
@@ -216,7 +238,7 @@ export const buildPreviewGateway = async (
    * The browser's copy of the preview's idle deadline. Scoped to this preview's own path so two
    * previews on the same origin cannot read each other's token.
    */
-  const accessCookieOptions = (preview: WorkspacePreviewRecord) => ({
+  const accessCookieOptions = (preview: WorkspacePreviewRecord, token: string) => ({
     path: previewPath ? `${previewPath}/${preview.slug}/` : '/',
     httpOnly: true,
     secure,
@@ -224,7 +246,10 @@ export const buildPreviewGateway = async (
     maxAge: Math.max(
       1,
       Math.floor(
-        ((preview.expiresAt ? new Date(preview.expiresAt).getTime() : Date.now() + 86_400_000) -
+        (Math.min(
+          preview.expiresAt ? new Date(preview.expiresAt).getTime() : Date.now() + 86_400_000,
+          previewAccessExpiry(token) ?? Infinity
+        ) -
           Date.now()) /
           1000
       )
@@ -257,7 +282,7 @@ export const buildPreviewGateway = async (
     const queryToken = incoming.searchParams.get('access');
     if (preview.visibility === 'private' && queryToken) {
       incoming.searchParams.delete('access');
-      reply.setCookie(accessCookie, queryToken, accessCookieOptions(preview));
+      reply.setCookie(accessCookie, queryToken, accessCookieOptions(preview, queryToken));
       return reply.redirect(`${incoming.pathname}${incoming.search}`, 303);
     }
     // The row's idle deadline moves forward on every visit, and the cookie carrying the token has
@@ -266,7 +291,7 @@ export const buildPreviewGateway = async (
     const cookieToken =
       request.cookies[accessCookie] ?? request.cookies[legacyProductionAccessCookie];
     if (preview.visibility === 'private' && cookieToken)
-      reply.setCookie(accessCookie, cookieToken, accessCookieOptions(preview));
+      reply.setCookie(accessCookie, cookieToken, accessCookieOptions(preview, cookieToken));
     const headers = previewHeaders(request);
     headers['x-forwarded-host'] = request.hostname;
     headers['x-forwarded-proto'] = previewBase.protocol.slice(0, -1);
@@ -289,6 +314,7 @@ export const buildPreviewGateway = async (
       'content-length',
       'content-security-policy',
       'set-cookie',
+      'service-worker-allowed',
       'transfer-encoding',
       'x-frame-options'
     ]);
@@ -321,7 +347,7 @@ export const buildPreviewGateway = async (
       reply.header('location', rewritten.toString());
     }
     reply
-      .header('content-security-policy', `frame-ancestors ${appOrigin}`)
+      .header('service-worker-allowed', previewScopeFor(previewBase, preview.slug))
       .header('referrer-policy', 'no-referrer')
       .header('x-content-type-options', 'nosniff')
       .header('cross-origin-resource-policy', 'cross-origin');

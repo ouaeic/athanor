@@ -323,6 +323,8 @@ export const resumeParkedTurn = async (
       });
       return true;
     }
+    state.ownerReasoningEffort = waiting?.reasoningEffort ?? task.reasoningEffort ?? 'auto';
+    task.reasoningEffort = state.ownerReasoningEffort;
     delete state.question;
     // Their words, unaltered and in their own role: the answer is owner speech everywhere it
     // matters - the taint model, the compaction rule that never paraphrases what the user said,

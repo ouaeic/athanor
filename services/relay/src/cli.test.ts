@@ -64,6 +64,21 @@ describe('config defaults', () => {
   });
 });
 
+describe('preview listener config', () => {
+  it('allows disabling previews and separate ephemeral listeners', () => {
+    expect(parseRelayConfig({ ...baseConfig, previewPort: null }).previewPort).toBeNull();
+    expect(parseRelayConfig({ ...baseConfig, httpsPort: 0, previewPort: 0 }).previewPort).toBe(0);
+  });
+  it.each(['httpsPort', 'controlPort', 'httpPort', 'metricsPort'])(
+    'refuses sharing preview and %s',
+    (key) => {
+      expect(() =>
+        parseRelayConfig({ ...baseConfig, previewPort: baseConfig[key as keyof typeof baseConfig] })
+      ).toThrow(/conflict/i);
+    }
+  );
+});
+
 describe('parseDuration', () => {
   it('accepts the suffixes the CLI documents', () => {
     expect(parseDuration('500ms')).toBe(500);

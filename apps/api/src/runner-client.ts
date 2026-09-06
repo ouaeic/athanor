@@ -64,6 +64,7 @@ export class RunnerClient {
     acceptAnyStatus?: boolean;
     redirect?: RequestRedirect;
     timeoutMs?: number;
+    signal?: AbortSignal;
   }): Promise<T> {
     const response = await this.raw(input);
     const contentType = response.headers.get('content-type') ?? '';
@@ -93,8 +94,13 @@ export class RunnerClient {
     acceptAnyStatus?: boolean;
     redirect?: RequestRedirect;
     timeoutMs?: number;
+    signal?: AbortSignal;
   }): Promise<Response> {
     const method = input.method ?? 'GET';
+    const signals = [
+      input.signal,
+      input.timeoutMs === undefined ? undefined : AbortSignal.timeout(input.timeoutMs)
+    ].filter((signal): signal is AbortSignal => signal !== undefined);
     const response = await fetch(`${this.baseUrl}${input.path}`, {
       method,
       headers: {
@@ -104,7 +110,7 @@ export class RunnerClient {
       },
       ...(input.body !== undefined ? { body: input.body } : {}),
       ...(input.redirect ? { redirect: input.redirect } : {}),
-      ...(input.timeoutMs === undefined ? {} : { signal: AbortSignal.timeout(input.timeoutMs) })
+      ...(signals.length ? { signal: AbortSignal.any(signals) } : {})
     });
     if (!response.ok && !input.acceptAnyStatus) {
       // The upstream body is quoted because it is usually the only description of what went wrong,

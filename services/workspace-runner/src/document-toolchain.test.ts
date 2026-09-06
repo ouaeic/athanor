@@ -163,10 +163,6 @@ describe('what the skills ask for is what the drill refuses to ship without', ()
   });
 
   it('installs everything the toolchain names, on every host athanor supports', async () => {
-    const installer = await readFile(
-      path.join(repositoryRoot, 'scripts', 'install-native.sh'),
-      'utf8'
-    );
     // The names moved out of the installer and into one table read by the installer, the toolchain
     // probe and `athanor doctor` alike. Asserting against the table rather than the apt list is the
     // stronger claim: it holds for every family at once, so a capability the document skills name
@@ -208,26 +204,24 @@ describe('what the skills ask for is what the drill refuses to ship without', ()
         new RegExp(`\\t${packageName}(\\t|$)`, 'm').test(hostTable),
         `${packageName} is named by the toolchain but is in no host's package table`
       ).toBe(true);
-    // The pinned half: a version and a hash for anything not coming from the distribution, into
-    // the one environment the skills name.
-    expect(installer.includes('--require-hashes'), 'the pinned wheels are not hash-verified').toBe(
-      true
-    );
-    const venv = ATHANOR_PYTHON.replace(/\/bin\/python3$/, '');
-    expect(venv).not.toBe(ATHANOR_PYTHON);
-    expect(
-      installer.includes(`athanor_python=${venv}`),
-      `the installer does not create the environment at ${venv}`
-    ).toBe(true);
+    // Native activation and wheel verification run in scripts/test-update.sh. This manifest
+    // contract requires an exact version and at least one allowed wheel hash per dependency.
     const requirements = await readFile(
       path.join(repositoryRoot, 'infra', 'native', 'athanor-python-requirements.txt'),
       'utf8'
     );
-    for (const line of requirements.split('\n').filter((entry) => /^[a-z]/i.test(entry)))
-      expect(line, 'every pinned requirement is an exact version').toMatch(/==\d/);
-    expect(requirements.match(/--hash=sha256:[0-9a-f]{64}/g)?.length).toBe(
-      requirements.match(/^[a-z][^\s]*==/gim)?.length
+    const pinnedRequirements = requirements
+      .replace(/\\\r?\n\s*/g, ' ')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith('#'));
+    expect(pinnedRequirements.length, 'the pinned requirement manifest is empty').toBeGreaterThan(
+      0
     );
+    for (const requirement of pinnedRequirements)
+      expect(requirement, 'each exact dependency needs its own verified wheel hashes').toMatch(
+        /^[a-z][a-z0-9_.-]*==[0-9][a-z0-9_.+-]*(?:\s+--hash=sha256:[0-9a-f]{64})+$/i
+      );
     // Every module the toolchain names has to come from somewhere. apt covers most of them; the
     // ones it does not are pinned here, and python-pptx is the one that proves the rule - Ubuntu
     // packaged it up to 24.04 and stopped, so a box installed on 26.04 could not build a deck at
@@ -378,7 +372,12 @@ describe('documents this computer produces, measured', () => {
   it('actually ran something, rather than skipping its way to a pass', () => {
     // A machine with no document toolchain at all is a machine where this suite is meaningless,
     // and silence is how that goes unnoticed.
-    expect(report.passed.length + report.failed.length).toBeGreaterThan(0);
+    expect(
+      report.passed.length + report.failed.length,
+      `${python} ran no document jobs: ${report.jobs
+        .map((job) => `${job.id}: ${(job.missing ?? []).join(', ')}`)
+        .join('; ')}. Set ATHANOR_DOCUMENT_PYTHON to an environment with document libraries.`
+    ).toBeGreaterThan(0);
     // On a laptop "something" is the honest floor: LibreOffice is a gigabyte nobody should have to
     // install to fix a typo. On the runner the floor is everything. This assertion used to read
     // `> 0` there too, and three of the six jobs - cv, report, tables - skipped themselves on

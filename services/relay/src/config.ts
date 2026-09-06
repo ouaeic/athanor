@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
+import { PREVIEW_HTTPS_PORT } from './protocol.js';
 
 const GIB = 1024 * 1024 * 1024;
 
@@ -66,72 +67,97 @@ const PeerQuotaOverrides = z
   })
   .partial();
 
-export const RelayConfigSchema = z.object({
-  /** Apex the relay owns. Labels live at `<label>.<relayDomain>`. */
-  relayDomain: z.string().min(1).max(253),
-  /** SNI a box uses for its control connection. Defaults to `relayDomain`. */
-  controlHost: z.string().min(1).max(253).optional(),
-  listenHost: z.string().default('0.0.0.0'),
-  httpsPort: z.coerce.number().int().min(0).max(65535).default(443),
-  /**
-   * Where boxes dial in. Defaulting to the same port as client traffic is deliberate: the tunnel is
-   * then indistinguishable from ordinary HTTPS to a hostile network or a CGNAT operator. Set it
-   * differently only if something in the path cannot cope with the demultiplexing.
-   */
-  controlPort: z.coerce.number().int().min(0).max(65535).default(443),
-  /** Exists only for ACME HTTP-01 fallback and HTTP->HTTPS redirects. `null` disables it. */
-  httpPort: z.coerce.number().int().min(0).max(65535).nullable().default(80),
-  metricsPort: z.coerce.number().int().min(0).max(65535).nullable().default(9095),
-  /** Metrics must not be reachable from the internet; they leak per-label traffic volumes. */
-  metricsHost: z.string().default('127.0.0.1'),
-  tlsCertPath: z.string().min(1),
-  tlsKeyPath: z.string().min(1),
-  registryPath: z.string().min(1).default('/var/lib/athanor-relay/registry.json'),
-  /** When false, `/v1/enroll` is refused outright even with a valid invite token. */
-  registrationEnabled: z.boolean().default(true),
-  /**
-   * Client IPs are not logged by default. Turning this on is for abuse investigations and it
-   * changes what the operator retains about their users; say so before flipping it.
-   */
-  logClientIps: z.boolean().default(false),
-  logLevel: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
-  parkTarget: z.coerce.number().int().min(1).max(64).default(8),
-  /** 3s: long enough for a bad mobile link to complete, short enough to drop junk quickly. */
-  handshakeTimeoutMs: z.coerce.number().int().min(500).max(30_000).default(3000),
-  /** How long an authenticated but unregistered peer may hold a session to enroll. */
-  enrollTimeoutMs: z.coerce.number().int().min(1000).max(120_000).default(10_000),
-  /** CGNAT mappings expire at 60-120s and sometimes less, so ping well under that. */
-  pingIntervalMs: z.coerce.number().int().min(1000).default(20_000),
-  pingTimeoutMs: z.coerce.number().int().min(500).default(10_000),
-  /** Upper bound on the jittered reconnect delay handed out in a shutdown GOAWAY. */
-  goawayJitterMs: z.coerce.number().int().min(0).default(30_000),
-  /**
-   * How long a half-closed relayed connection may linger before the relay tears it down.
-   *
-   * Half-close has to be preserved - it is ordinary TCP, and ACME HTTP-01 over :80 depends on it -
-   * but a client that simply vanishes leaves the relay holding a socket and one of the peer's
-   * concurrent-stream slots until the box happens to notice. Boxes are not trusted to notice.
-   */
-  halfCloseLingerMs: z.coerce.number().int().min(1000).default(120_000),
-  invite: z
-    .object({
-      defaultTtlMs: z.coerce
-        .number()
-        .int()
-        .min(60_000)
-        .default(24 * 3600 * 1000)
-    })
-    .prefault({}),
-  limits: z
-    .object({
-      perPeer: PerPeerLimits.prefault({}),
-      global: GlobalLimits.prefault({}),
-      perSourceIp: PerSourceIpLimits.prefault({})
-    })
-    .prefault({}),
-  /** Applied to newly enrolled peers; existing peers keep whatever the registry recorded. */
-  defaultPeerQuota: PeerQuotaOverrides.prefault({})
-});
+export const RelayConfigSchema = z
+  .object({
+    /** Apex the relay owns. Labels live at `<label>.<relayDomain>`. */
+    relayDomain: z.string().min(1).max(253),
+    /** SNI a box uses for its control connection. Defaults to `relayDomain`. */
+    controlHost: z.string().min(1).max(253).optional(),
+    listenHost: z.string().default('0.0.0.0'),
+    httpsPort: z.coerce.number().int().min(0).max(65535).default(443),
+    /**
+     * Where boxes dial in. Defaulting to the same port as client traffic is deliberate: the tunnel is
+     * then indistinguishable from ordinary HTTPS to a hostile network or a CGNAT operator. Set it
+     * differently only if something in the path cannot cope with the demultiplexing.
+     */
+    controlPort: z.coerce.number().int().min(0).max(65535).default(443),
+    /** Exists only for ACME HTTP-01 fallback and HTTP->HTTPS redirects. `null` disables it. */
+    httpPort: z.coerce.number().int().min(0).max(65535).nullable().default(80),
+    /** Separate TLS listener for generated apps. Null disables preview forwarding. */
+    previewPort: z.coerce.number().int().min(0).max(65535).nullable().default(PREVIEW_HTTPS_PORT),
+    metricsPort: z.coerce.number().int().min(0).max(65535).nullable().default(9095),
+    /** Metrics must not be reachable from the internet; they leak per-label traffic volumes. */
+    metricsHost: z.string().default('127.0.0.1'),
+    tlsCertPath: z.string().min(1),
+    tlsKeyPath: z.string().min(1),
+    registryPath: z.string().min(1).default('/var/lib/athanor-relay/registry.json'),
+    /** When false, `/v1/enroll` is refused outright even with a valid invite token. */
+    registrationEnabled: z.boolean().default(true),
+    /**
+     * Client IPs are not logged by default. Turning this on is for abuse investigations and it
+     * changes what the operator retains about their users; say so before flipping it.
+     */
+    logClientIps: z.boolean().default(false),
+    logLevel: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+    parkTarget: z.coerce.number().int().min(1).max(64).default(8),
+    /** 3s: long enough for a bad mobile link to complete, short enough to drop junk quickly. */
+    handshakeTimeoutMs: z.coerce.number().int().min(500).max(30_000).default(3000),
+    /** How long an authenticated but unregistered peer may hold a session to enroll. */
+    enrollTimeoutMs: z.coerce.number().int().min(1000).max(120_000).default(10_000),
+    /** CGNAT mappings expire at 60-120s and sometimes less, so ping well under that. */
+    pingIntervalMs: z.coerce.number().int().min(1000).default(20_000),
+    pingTimeoutMs: z.coerce.number().int().min(500).default(10_000),
+    /** Upper bound on the jittered reconnect delay handed out in a shutdown GOAWAY. */
+    goawayJitterMs: z.coerce.number().int().min(0).default(30_000),
+    /**
+     * How long a half-closed relayed connection may linger before the relay tears it down.
+     *
+     * Half-close has to be preserved - it is ordinary TCP, and ACME HTTP-01 over :80 depends on it -
+     * but a client that simply vanishes leaves the relay holding a socket and one of the peer's
+     * concurrent-stream slots until the box happens to notice. Boxes are not trusted to notice.
+     */
+    halfCloseLingerMs: z.coerce.number().int().min(1000).default(120_000),
+    invite: z
+      .object({
+        defaultTtlMs: z.coerce
+          .number()
+          .int()
+          .min(60_000)
+          .default(24 * 3600 * 1000)
+      })
+      .prefault({}),
+    limits: z
+      .object({
+        perPeer: PerPeerLimits.prefault({}),
+        global: GlobalLimits.prefault({}),
+        perSourceIp: PerSourceIpLimits.prefault({})
+      })
+      .prefault({}),
+    /** Applied to newly enrolled peers; existing peers keep whatever the registry recorded. */
+    defaultPeerQuota: PeerQuotaOverrides.prefault({})
+  })
+  .superRefine((config, context) => {
+    const listeners = [
+      'httpsPort',
+      'controlPort',
+      'httpPort',
+      'previewPort',
+      'metricsPort'
+    ] as const;
+    for (const [index, key] of listeners.entries()) {
+      const port = config[key];
+      if (!port) continue;
+      for (const previous of listeners.slice(0, index)) {
+        if (key === 'controlPort' && previous === 'httpsPort') continue;
+        if (config[previous] === port)
+          context.addIssue({
+            code: 'custom',
+            path: [key],
+            message: `Listener conflicts with ${previous}.`
+          });
+      }
+    }
+  });
 
 export type RelayConfig = z.infer<typeof RelayConfigSchema>;
 export type PerPeerLimitConfig = z.infer<typeof PerPeerLimits>;

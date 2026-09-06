@@ -18,6 +18,12 @@ export interface RequestOptions extends RequestInit {
 }
 
 let nativeGateway = false;
+let nativeServer: string | null = null;
+let nativePreview: { remote: string; local: string } | null = null;
+
+export const nativeServerOrigin = (): string | null => nativeServer;
+export const nativePreviewOrigins = (): Readonly<{ remote: string; local: string }> | null =>
+  nativePreview;
 
 export const isNativeClient = (): boolean =>
   nativeGateway || (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window);
@@ -101,7 +107,48 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
       }
       throw new ApiError('connection_failed', 'The connection was interrupted. Try again.', 0);
     }
-    if (response.headers.get('x-athanor-native-client') === '1') nativeGateway = true;
+    const local = typeof window === 'undefined' ? undefined : window.location;
+    if (
+      response.headers.get('x-athanor-native-client') === '1' &&
+      local?.protocol === 'http:' &&
+      local.hostname === 'localhost'
+    ) {
+      nativeGateway = true;
+      nativeServer = null;
+      nativePreview = null;
+      try {
+        const value = response.headers.get('x-athanor-server-origin') ?? '';
+        const origin = new URL(value);
+        if (
+          origin.protocol === 'https:' &&
+          origin.origin === value &&
+          !origin.username &&
+          !origin.password
+        )
+          nativeServer = value;
+        const remoteValue = response.headers.get('x-athanor-preview-origin') ?? '';
+        const localValue = response.headers.get('x-athanor-preview-local-origin') ?? '';
+        const remotePreview = new URL(remoteValue);
+        const localPreview = new URL(localValue);
+        if (
+          nativeServer &&
+          remotePreview.protocol === 'https:' &&
+          remotePreview.origin === remoteValue &&
+          remoteValue !== nativeServer &&
+          !remotePreview.username &&
+          !remotePreview.password &&
+          localPreview.protocol === 'http:' &&
+          localPreview.hostname === 'localhost' &&
+          localPreview.origin === localValue &&
+          localValue !== local.origin &&
+          !localPreview.username &&
+          !localPreview.password
+        )
+          nativePreview = { remote: remoteValue, local: localValue };
+      } catch {
+        // Missing or invalid connection metadata cannot authorize a preview origin rewrite.
+      }
+    }
     if (!response.ok) {
       const error = await responseError(response);
       const transient =

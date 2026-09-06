@@ -1650,13 +1650,26 @@ describe('DataStore', () => {
       userId: user.id,
       workspaceId: workspace.id,
       taskId: task.id,
-      kind: 'compute',
+      kind: 'task_compute',
       resourceClass: 'medium',
       quantity: 1,
       unit: 'credit',
       credits: 4,
       state: 'reserved',
       idempotencyKey: `task:${task.id}:reservation`
+    });
+    await store.recordUsage({
+      userId: user.id,
+      workspaceId: workspace.id,
+      taskId: task.id,
+      kind: 'model_inference',
+      resourceClass: 'media:video',
+      quantity: 1,
+      unit: 'job',
+      credits: 4,
+      costUsd: 4,
+      state: 'reserved',
+      idempotencyKey: `provider-media:${task.id}`
     });
     await database.query(
       `UPDATE tasks SET status='running', attempt=$2, lease_owner='worker-1',
@@ -1681,7 +1694,7 @@ describe('DataStore', () => {
       }
     ]);
     expect((await store.getTask(user.id, task.id))?.status).toBe('failed');
-    await expect(billing.reservedUsageForTask(task.id)).resolves.toBe(0);
+    await expect(billing.reservedUsageForTask(task.id)).resolves.toBe(4);
     // Exactly once, so the owner is told once: the statement that finds the rows is the statement
     // that moves them out of the statuses it looks at.
     await expect(store.failTasksAtAttemptLimit()).resolves.toEqual([]);

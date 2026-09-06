@@ -123,7 +123,9 @@ const finish = async (
     // The timeline is not what this file is about, but the holds await their own event write
     // without catching it, so the stub has to answer.
     store: {
-      appendTaskEvent: async () => ({ id: 'event-1' })
+      appendTaskEvent: async () => ({ id: 'event-1' }),
+      getLatestTaskPlan: async () => null,
+      listMediaJobs: async () => []
     } as unknown as TurnFinishDeps['store'],
     config: {} as TurnFinishDeps['config'],
     outstandingPlanSteps: async () => [...outstanding],

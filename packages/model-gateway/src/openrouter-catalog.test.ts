@@ -445,13 +445,6 @@ describe('OpenRouter live catalog', () => {
     });
   });
 
-  /*
-   * The provider describes what a model can be fed. Athanor describes what it can send it, and
-   * those are not the same list: the only non-text part any request carries is one image part. A
-   * model recorded here as taking video put a modality in front of the owner that nothing on this
-   * computer could ever construct - an offer the product could not keep, on a screen whose whole
-   * job is to show what the computer is actually doing.
-   */
   it('records only the modalities it can actually put in front of a model', async () => {
     const omniFetch = vi.fn(async (input: string | URL | Request) => {
       const url = input instanceof Request ? input.url : input.toString();
@@ -481,7 +474,11 @@ describe('OpenRouter live catalog', () => {
     });
 
     const omni = result.find((model) => model.providerModelId === 'qwen/qwen3.6-omni');
-    expect(omni?.modalities).toEqual(['text', 'image']);
+    expect(omni?.modalities).toEqual(['text', 'image', 'audio', 'video']);
+    expect(omni?.nativeInputPricing).toEqual({
+      audioUsdPerMillionTokens: null,
+      videoUsdPerMillionTokens: null
+    });
     // The picture half is not collateral damage: a model that takes images still says so.
     expect(omni?.capabilities).toContain('vision');
   });
@@ -1022,13 +1019,14 @@ describe('the media catalogue the chat refresh throws away', () => {
     // The feed's own word for a model that reads a recording, which is what separates it from a
     // chat model that merely accepts audio in a conversation.
     expect(hears?.modality).toBe('transcription');
-    // Per token is not per minute, so nothing is converted and nothing is claimed.
-    expect(hears).toMatchObject({ priceSource: 'unknown', usdPerMinute: null });
-    expect(hears?.recommendationTags).toEqual([
-      'No per-minute price published',
-      'Provider prices this route per token'
-    ]);
-    // ...and a route the provider prices nowhere at all says only the first of those two things.
+    // Raw prompt/completion fields carry no billing-unit discriminator for STT.
+    expect(hears).toMatchObject({
+      priceSource: 'unknown',
+      usdPerMinute: null,
+      zeroDataRetentionAvailable: false,
+      requiresRetentionApproval: true
+    });
+    expect(hears?.recommendationTags).toEqual(['External transcription requires approval']);
     const draws = options.find((entry) => entry.providerModelId === 'vendor/draws-1');
     expect(draws?.recommendationTags).toEqual(['No per-image price published']);
   });
@@ -1289,7 +1287,7 @@ describe('shapes the feed is allowed to grow', () => {
     supported_parameters: ['tools', 'reasoning']
   };
 
-  it('accepts an input modality this build has never heard of', async () => {
+  it('preserves supported native input modalities from the feed', async () => {
     const { byId, journal } = await refresh([
       {
         ...grown,
@@ -1299,10 +1297,7 @@ describe('shapes the feed is allowed to grow', () => {
         }
       }
     ]);
-    // The same entry it produces today. The gateway builds one kind of non-text part and it is an
-    // image, so `video` is read, carried through the narrowing, and declined by the projection that
-    // has always declined it - not by the parser, and not with a line in the journal.
-    expect(byId.get('vendor/grown')?.modalities).toEqual(['text', 'image']);
+    expect(byId.get('vendor/grown')?.modalities).toEqual(['text', 'image', 'video']);
     expect(byId.get('vendor/grown')?.capabilities).toEqual([
       'chat',
       'tools',

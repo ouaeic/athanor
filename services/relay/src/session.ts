@@ -9,6 +9,8 @@ import { METRIC_NAMES, type Metrics } from './metrics.js';
 import { NdjsonReader } from './ndjson.js';
 import {
   PARK_READY_MARKER,
+  PREVIEW_HTTPS_CAPABILITY,
+  PREVIEW_HTTPS_PORT,
   PROTOCOL_VERSION,
   type BindFrame,
   type GoawayReason,
@@ -27,9 +29,11 @@ export interface TunnelSessionDeps {
   /** True while the relay as a whole is over its shaping threshold. */
   readonly globalShaping: () => boolean;
   readonly globalBlocked: () => boolean;
+  readonly previewPort: () => number | null;
 }
 
 export type BindFailure =
+  | 'unsupported-port'
   | 'closed'
   | 'quota-blocked'
   | 'stream-limit'
@@ -41,7 +45,7 @@ export interface BindRequest {
   /** Bytes already consumed from the client while peeking; the box's stack needs them. */
   readonly initial: Buffer;
   readonly sni: string;
-  readonly port: 443 | 80;
+  readonly port: 443 | 80 | typeof PREVIEW_HTTPS_PORT;
 }
 
 export type BindResult = { ok: true; cid: string } | { ok: false; reason: BindFailure };
@@ -73,6 +77,7 @@ export class TunnelSession {
   private pendingBytes = 0;
   private quotaState: QuotaState = 'ok';
   private closed = false;
+  private previewSupported = false;
   private pingTimer: NodeJS.Timeout | null = null;
   private quotaTimer: NodeJS.Timeout | null = null;
   private helloTimer: NodeJS.Timeout | null = null;
@@ -156,13 +161,15 @@ export class TunnelSession {
   }
 
   private onHello(stream: ServerHttp2Stream, message: unknown): void {
-    const hello = message as { t?: unknown; proto?: unknown };
+    const hello = message as { t?: unknown; proto?: unknown; caps?: unknown };
     if (hello.t !== 'hello' || hello.proto !== PROTOCOL_VERSION) {
       this.logger.warn('unsupported control hello', { proto: String(hello.proto) });
       stream.respond({ ':status': 400 }, { endStream: true });
       this.close('protocol', true);
       return;
     }
+    this.previewSupported =
+      Array.isArray(hello.caps) && hello.caps.includes(PREVIEW_HTTPS_CAPABILITY);
     if (this.helloTimer !== null) {
       clearTimeout(this.helloTimer);
       this.helloTimer = null;
@@ -172,6 +179,8 @@ export class TunnelSession {
     this.refreshQuota(true);
     this.send({
       t: 'welcome',
+      caps: this.deps.previewPort() === null ? [] : [PREVIEW_HTTPS_CAPABILITY],
+      previewPort: this.deps.previewPort(),
       label: this.label,
       serverTimeMs: Date.now(),
       parkTarget: this.deps.config.parkTarget,
@@ -227,6 +236,12 @@ export class TunnelSession {
    */
   bind(request: BindRequest): BindResult {
     if (this.closed || this.controlStream === null) return { ok: false, reason: 'closed' };
+    if (
+      request.port !== 80 &&
+      request.port !== 443 &&
+      (request.port !== PREVIEW_HTTPS_PORT || !this.previewSupported)
+    )
+      return { ok: false, reason: 'unsupported-port' };
     // Re-evaluated per inbound connection, not only on the timer: a burst inside one tick would
     // otherwise sail past a quota the peer has already blown.
     this.refreshQuota();

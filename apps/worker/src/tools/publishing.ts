@@ -216,7 +216,7 @@ export async function executePublishingTool(
       if (!check.available)
         throw new AthanorError(
           'preview_port_unavailable',
-          `No service is listening on port ${port} of this computer. Bind the app to 0.0.0.0 and try again.`
+          `No service is listening on port ${port} of this computer. Bind the app to 127.0.0.1 and try again.`
         );
       const accessToken = randomBytes(32).toString('base64url');
       const slug = randomBytes(16).toString('hex');

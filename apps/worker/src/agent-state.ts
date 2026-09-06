@@ -14,14 +14,22 @@
  * Lifted out of `agent.ts` unchanged by Wave 7.1; `agent.ts` re-exports the names it exported
  * before, so nothing outside this package moved on the same commit.
  */
-import type { TaskMode, WebToolMode } from '@athanor/contracts';
+import type { TaskMode, TaskReasoningEffort, WebToolMode } from '@athanor/contracts';
 import type { ModelMessage, ModelToolCall } from '@athanor/model-gateway';
 import type { AcceptanceRecord } from './acceptance.js';
 import type { WorkerConfig } from './config.js';
 import type { ArtifactLedger, ContextBrief } from './context.js';
 import type { StoredMediaRoutes } from './media.js';
+import type { NativeInputReference, NativeInputApproval } from './native-input.js';
+import type { TranscriptionApproval } from './transcription-approval.js';
 
 export interface AgentState {
+  pendingNativeInputs?: NativeInputReference[];
+  nativeInputApprovals?: Record<string, NativeInputApproval>;
+  transcriptionApprovals?: Record<string, TranscriptionApproval>;
+  codingMissionWaiting?: boolean;
+  codingMissionReviews?: Record<string, { digest: string; generation: number }>;
+
   messages: ModelMessage[];
   step: number;
   credits: number;
@@ -36,18 +44,7 @@ export interface AgentState {
   contextBrief?: ContextBrief;
   /** Counts summarisation calls so each one bills under its own idempotency key. */
   compactions?: number;
-  /**
-   * What a minute of reading has actually cost on this task, per transcription route.
-   *
-   * Kept because a route whose price nobody publishes has to be measured before a spend cap can be
-   * enforced against it, and the first reading of a task is where that measurement comes from. It
-   * is persisted with the rest of the state for the ordinary reason: a worker handover or a pause
-   * for approval in the middle of a long recording must not throw the price away and go back to
-   * measuring it a minute at a time.
-   *
-   * Per task rather than per box. Nothing here can write to the owner's sealed media routes, so a
-   * new conversation on an unpriced route measures again - one billing minute, once.
-   */
+  /** Observed provider cost per minute, retained for reporting; never bounds a later request. */
   transcriptionRates?: Record<string, number>;
   /**
    * The tightest floor any request in this task has applied to older tool results. Persisted so the
@@ -152,6 +149,10 @@ export interface AgentState {
    * its completion resumes into the same loop and spends the whole step budget on it.
    */
   finishRejections?: number;
+  /** A missing output gets one repair hold per turn, including across worker restarts. */
+  deliveryNagged?: boolean;
+  /** The owner selection survives checkpoints and is replaced when their next message starts. */
+  ownerReasoningEffort?: TaskReasoningEffort;
   /**
    * What the last request actually weighed after the window was prepared.
    *

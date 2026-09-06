@@ -1,14 +1,16 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "loopback-native",
-  "description": "Folder grants only for the private in-app loopback gateway",
+  "description": "Native permissions scoped at runtime to the bound garden main origin",
   "local": false,
   "windows": ["main"],
   "remote": {
-    "urls": ["http://localhost:*/*"]
+    "urls": []
   },
   "permissions": [
     "allow-native-capabilities",
+    "allow-open-authorization-browser",
+    "allow-open-preview-browser",
     "allow-choose-folder",
     "allow-revoke-folder",
     "allow-list-local-folder",

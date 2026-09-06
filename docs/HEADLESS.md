@@ -1,6 +1,6 @@
-# Driving athanor from a script
+# Driving garden from a script
 
-`athanor task` is the larger half of athanor's headless surface. It starts work, waits for it, and
+`athanor task` is the larger half of garden's headless surface. It starts work, waits for it, and
 answers with one JSON object and an exit code that says how the work ended. The one other command
 here is `athanor tool-opens` at the end of this page, which reads back what the box has been doing
 rather than making it do anything; it is on this page because it wants the same API token and the
@@ -51,7 +51,7 @@ token in two places, in this order:
 Override the file's location with `ATHANOR_TOKEN_FILE` and the server's address with `ATHANOR_API`,
 which defaults to `http://127.0.0.1:4100`.
 
-Nothing in athanor creates that file, sets its mode, or checks it. `doctor` does not mention it.
+Nothing in garden creates that file, sets its mode, or checks it. `doctor` does not mention it.
 That is open work, and it is stated here rather than implied.
 
 ### Scopes
@@ -174,7 +174,7 @@ Before this existed a caller recovered the result by filtering the event list fo
 `kind === "completed"` and then searching the JSON for a string; `scripts/live-drill.mjs` still
 does, and looks for `exit 0`.
 
-`status` is athanor's own word for the task and `outcome` is this contract's. They are not the same
+`status` is garden's own word for the task and `outcome` is this contract's. They are not the same
 vocabulary and both are given.
 
 `transcript` is `read` or `unavailable`. Without it an `answer` of `null` on a completed task means

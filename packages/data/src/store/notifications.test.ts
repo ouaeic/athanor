@@ -146,6 +146,35 @@ describe('a candidate for an approval that expired unanswered', () => {
     await database.query('UPDATE push_subscriptions SET created_at = NOW()', []);
     await expect(store.listPendingNotifications()).resolves.toEqual([]);
   });
+
+  it('lets durable media report delivery without a premature or duplicate task completion notice', async () => {
+    const { user, task } = await stranded();
+    await store.setTaskStatusForUser(user.id, task.id, 'completed');
+    await expect(store.listPendingNotifications()).resolves.toMatchObject([
+      { kind: 'task_finished' }
+    ]);
+    const jobId = randomUUID();
+    await database.query(
+      `INSERT INTO provider_media_jobs(id,user_id,workspace_id,task_id,request_key,request_hash,request_ciphertext,model_id,status,reservation_usd,retention_approved_at)
+      VALUES($1,$2,$3,$4,$5,'sealed-hash','{}','video-model','pending',1,NOW())`,
+      [jobId, user.id, task.workspaceId, task.id, jobId]
+    );
+    await expect(store.listPendingNotifications()).resolves.toEqual([]);
+    await database.query("UPDATE provider_media_jobs SET status='completed' WHERE id=$1", [jobId]);
+    await expect(store.listPendingNotifications()).resolves.toEqual([]);
+    await store.appendTaskEvent({ taskId: task.id, kind: 'user_message', summary: 'Next request' });
+    await expect(store.listPendingNotifications()).resolves.toMatchObject([
+      { kind: 'task_finished', taskStatus: 'completed' }
+    ]);
+    await store.setTaskStatusForUser(user.id, task.id, 'failed');
+    await expect(store.listPendingNotifications()).resolves.toMatchObject([
+      { kind: 'task_finished', taskStatus: 'failed' }
+    ]);
+    await store.setTaskStatusForUser(user.id, task.id, 'cancelled');
+    await expect(store.listPendingNotifications()).resolves.toMatchObject([
+      { kind: 'task_finished', taskStatus: 'cancelled' }
+    ]);
+  });
 });
 
 /**

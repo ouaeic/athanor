@@ -356,7 +356,7 @@ describe('what the catalogue declares and the classifiers actually read', () => 
     }
     expect(unbounded).toMatch(/timeoutSeconds/);
     // And the enum the clause talks about is the same list, not a second copy of it.
-    expect(fields('coding_agent').agent?.enum).toEqual([...SUBSCRIPTION_AGENTS]);
+    expect(fields('coding_agent').agent?.enum).toEqual(['garden', ...SUBSCRIPTION_AGENTS]);
   });
 
   it('quarantines the directory the operating contract routes attachments through', () => {

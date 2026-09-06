@@ -14,6 +14,7 @@ import {
   PATH_ENROLL,
   PATH_PARK,
   PROTOCOL_VERSION,
+  PREVIEW_HTTPS_CAPABILITY,
   type BindFrame,
   type RelayToBoxMessage,
   type WelcomeMessage
@@ -34,6 +35,7 @@ export interface BoxHarnessOptions {
   readonly controlHost: string;
   readonly key: string;
   readonly cert: string;
+  readonly caps?: readonly string[];
   readonly onBind?: (frame: BindFrame, stream: ClientHttp2Stream) => void;
   readonly onMessage?: (message: RelayToBoxMessage) => void;
 }
@@ -131,7 +133,7 @@ export class BoxHarness {
         proto: PROTOCOL_VERSION,
         role: 'primary',
         agent: 'athanor-relay-harness/1',
-        caps: ['http1', 'h2']
+        caps: this.options.caps ?? ['http1', 'h2', PREVIEW_HTTPS_CAPABILITY]
       })}\n`
     );
     const reader = new NdjsonReader();

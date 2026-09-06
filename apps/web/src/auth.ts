@@ -24,6 +24,10 @@ const nativeContext = (): { nativeOrigin?: string } =>
   isNativeClient() && typeof window !== 'undefined' ? { nativeOrigin: window.location.origin } : {};
 
 export async function signIn(username?: string): Promise<AuthResult> {
+  if (isNativeClient()) {
+    const native = await import('./native-authorization');
+    if (await native.prefersBrowserAuthorization()) return native.authorizeNative('sign_in');
+  }
   const ceremony = await post<Ceremony<AuthenticationOptions>>('/v1/auth/login/options', {
     ...(username ? { username } : {}),
     ...nativeContext()
@@ -38,6 +42,15 @@ export async function register(input: {
   pairingCode: string;
   username?: string;
 }): Promise<AuthResult> {
+  if (isNativeClient()) {
+    const native = await import('./native-authorization');
+    if (await native.prefersBrowserAuthorization())
+      return native.authorizeNative('sign_in', {
+        mode: 'register',
+        code: input.pairingCode,
+        name: input.displayName
+      });
+  }
   const ceremony = await post<Ceremony<RegistrationOptions>>('/v1/auth/register/options', {
     ...input,
     ...nativeContext()
@@ -54,12 +67,23 @@ export async function register(input: {
 let pendingStepUp: Promise<void> | undefined;
 
 /** Concurrent sensitive actions share one ceremony; the server decides whether one is needed. */
-export function stepUp(): Promise<void> {
-  if (pendingStepUp) return pendingStepUp;
+export function stepUp(force = false): Promise<void> {
+  if (pendingStepUp) {
+    if (!force) return pendingStepUp;
+    // A device request requires a fresh ceremony even if an earlier action reused its window.
+    return pendingStepUp.then(() => stepUp(true));
+  }
   pendingStepUp = (async () => {
+    if (isNativeClient()) {
+      const native = await import('./native-authorization');
+      if (await native.prefersBrowserAuthorization()) {
+        await native.authorizeNative('step_up');
+        return;
+      }
+    }
     const ceremony = await post<Ceremony<AuthenticationOptions> | { verified: true }>(
       '/v1/auth/step-up/options',
-      nativeContext()
+      { ...nativeContext(), ...(force ? { force: true } : {}) }
     );
     if ('verified' in ceremony && ceremony.verified) return;
     if (!('options' in ceremony)) throw new Error('The server returned no passkey challenge');
@@ -73,6 +97,15 @@ export function stepUp(): Promise<void> {
 }
 
 export async function enroll(token: string, deviceLabel?: string): Promise<AuthResult> {
+  if (isNativeClient()) {
+    const native = await import('./native-authorization');
+    if (await native.prefersBrowserAuthorization())
+      return native.authorizeNative('sign_in', {
+        mode: 'enroll',
+        code: token,
+        ...(deviceLabel ? { name: deviceLabel } : {})
+      });
+  }
   const ceremony = await post<Ceremony<RegistrationOptions>>('/v1/auth/enroll/options', {
     token,
     ...nativeContext()
@@ -88,6 +121,11 @@ export async function enroll(token: string, deviceLabel?: string): Promise<AuthR
 }
 
 export async function recover(recoveryCode: string, username = ''): Promise<AuthResult> {
+  if (isNativeClient()) {
+    const native = await import('./native-authorization');
+    if (await native.prefersBrowserAuthorization())
+      return native.authorizeNative('sign_in', { mode: 'recover', code: recoveryCode });
+  }
   const ceremony = await post<Ceremony<RegistrationOptions>>('/v1/auth/recover/options', {
     username,
     recoveryCode,
@@ -103,6 +141,11 @@ export async function recover(recoveryCode: string, username = ''): Promise<Auth
 }
 
 export async function addPasskey(): Promise<unknown> {
+  if (isNativeClient()) {
+    const native = await import('./native-authorization');
+    if (await native.prefersBrowserAuthorization())
+      return native.authorizeNative('step_up', { mode: 'passkey', code: '' });
+  }
   await stepUp();
   const ceremony = await post<Ceremony<RegistrationOptions>>(
     '/v1/auth/passkeys/options',

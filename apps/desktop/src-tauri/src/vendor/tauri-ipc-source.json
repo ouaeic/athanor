@@ -1,0 +1,11 @@
+{
+  "package": "tauri",
+  "version": "2.11.5",
+  "source": "https://github.com/tauri-apps/tauri/tree/tauri-v2.11.5/crates/tauri/scripts",
+  "license": "Apache-2.0 OR MIT",
+  "files": {
+    "tauri-ipc-protocol.js.txt": "68ae690606006f733bde75dd8bb6748464954a22c7e83914a93b1abc221d7072",
+    "tauri-process-ipc-message-fn.js.txt": "d51917f89e4d3d318d63f1f4f5a7ac7ea1399a5b85c81a840c4d606597f29132"
+  },
+  "fetchChannelCommand": "plugin:__TAURI_CHANNEL__|fetch"
+}

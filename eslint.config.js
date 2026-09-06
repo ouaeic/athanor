@@ -9,6 +9,8 @@ export default tseslint.config(
       '**/dist/**',
       '**/node_modules/**',
       '**/coverage/**',
+      // Private, gitignored research harnesses are outside the shipped workspace projects.
+      'docs/design/**',
       '**/src-tauri/target/**',
       '**/*.js',
       '**/*.mjs',

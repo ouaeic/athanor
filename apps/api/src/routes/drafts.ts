@@ -41,7 +41,11 @@ export const registerDraftRoutes = (context: RouteContext): void => {
       bodyCiphertext:
         body || attachments.length
           ? encryptJson(
-              { body: input.body, attachments },
+              {
+                body: input.body,
+                attachments,
+                ...(input.controls ? { controls: input.controls } : {})
+              },
               unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id),
               `draft:${workspace.id}`
             )

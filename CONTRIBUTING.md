@@ -1,6 +1,6 @@
 # Contributing
 
-Contributions are welcome when they preserve athanor’s core boundary: self-hosted software, one
+Contributions are welcome when they preserve garden’s core boundary: self-hosted software, one
 persistent agent computer, user-owned model access, no local model weights, and no mandatory hosted
 athanor service.
 
@@ -25,6 +25,17 @@ approval-policy changes, or anything that exposes a new network surface. Include
 pnpm install --frozen-lockfile
 CI=true pnpm check
 ```
+
+The document-authoring tests use the installed runner Python, or `python3` from `PATH` on a
+local machine. If your document libraries live in another environment, select its absolute
+interpreter path before running the gate:
+
+```bash
+ATHANOR_DOCUMENT_PYTHON=/absolute/path/to/document-environment/bin/python3 CI=true pnpm check
+```
+
+The selected interpreter must actually produce a document; absent local dependencies are reported
+with their names. CI and release probes require the complete installed toolchain.
 
 `pnpm check` runs these gates in a fixed order, cheapest first, so the one that fails is usually the
 one that costs least to run:
@@ -132,7 +143,7 @@ cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked
 
 ## Tests
 
-athanor's suites are not one kind of thing, and the difference decides both whether a test is worth
+garden's suites are not one kind of thing, and the difference decides both whether a test is worth
 writing and when it is safe to delete. Every test in this repository is one of four kinds, and you
 should be able to say which before you write it.
 
@@ -278,3 +289,8 @@ it was written for.
 
 Contributions are accepted under the license of the component changed. By submitting a change, you
 certify that you have the right to do so.
+
+The browser layout drill is `pnpm test:ui`. It uses the runner’s installed Chromium and local
+fixtures, with no provider credentials or network calls. It exercises responsive layout, keyboard
+focus, effort drafts, preview playback, downloads, and expansion without restarting the preview.
+Set `GARDEN_UI_REPORT` to a local directory to retain its screenshots.

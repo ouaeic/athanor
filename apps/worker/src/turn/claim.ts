@@ -1,3 +1,5 @@
+import { CODING_CHILD_TOOLS } from '../coding-missions.js';
+import { codingMissionView } from '@athanor/data';
 /**
  * Everything a turn needs before it can say a word, gathered in one place.
  *
@@ -243,6 +245,9 @@ export const claimTurn = async (
    * `surfaceDescribable`: only a probe that came back and said `absent` removes anything.
    */
   const surfaces = await deps.workspaceSurfaces(task);
+  if (task.parentMissionId)
+    for (const tool of [...agentToolsFor('lead', surfaces, connectorKinds), COMPACT_CONTEXT_TOOL])
+      if (!CODING_CHILD_TOOLS.has(tool.name)) withdrawnTools.add(tool.name);
   const requestTools = [
     ...agentToolsFor('lead', surfaces, connectorKinds),
     COMPACT_CONTEXT_TOOL
@@ -266,7 +271,20 @@ export const claimTurn = async (
     finishRejections: 0,
     completionNags: 0
   };
+  if (state.codingMissionWaiting) {
+    const missions = await deps.store.listCodingMissions(task.userId, task.id);
+    state.messages.push({
+      role: 'system',
+      content: JSON.stringify({
+        codingMissionStatus: missions.map((m) => codingMissionView(m, key)),
+        instruction:
+          'Inspect completed specialist changes using coding_agent review before integrating. Failed or cancelled missions do not imply completed work.'
+      })
+    });
+    delete state.codingMissionWaiting;
+  }
   state.unattended = unattended;
+  state.ownerReasoningEffort = task.reasoningEffort ?? state.ownerReasoningEffort ?? 'auto';
   state.turnToolResults ??= {};
 
   return {

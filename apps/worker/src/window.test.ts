@@ -979,20 +979,7 @@ describe('what the preamble registers besides blocks', () => {
   });
 });
 
-/**
- * Which of the owner's brief files the window reads, and which one wins when there are several.
- *
- * `AGENTS.md` is the convention a good deal of the surrounding tooling writes, and
- * `tools/repository.ts` already globs the name inside `code_context` - so the file was known to
- * this codebase and simply never read into a window. That is the whole defect: an owner who has
- * written down how their project works gets ignored, and finds out by watching the agent do the
- * thing the file told it not to.
- *
- * The order is the point. `ATHANOR.md` is this product's own name for the file and is what the
- * owner wrote FOR this computer, so it wins outright; `OPEN_CLOUD.md` is the name it used to have
- * and is kept for the boxes that still carry one; `AGENTS.md` is the shared convention and is read
- * last, because a brief addressed to every tool must not outrank one addressed to this one.
- */
+/** Specific owner guidance wins; every supported filename remains readable. */
 describe('which brief the window reads', () => {
   const withFiles = (files: Record<string, string>): Probe => {
     const probed = probe();
@@ -1013,6 +1000,19 @@ describe('which brief the window reads', () => {
     const brief = state.messages.find((message) => message.content.includes('BRIEF'));
     return brief?.content ?? state.messages.map((message) => message.content).join('\n');
   };
+
+  it('reads GARDEN.md first when every supported brief exists', async () => {
+    const text = await briefText({
+      'workspace/GARDEN.md': 'Use the garden project workflow.',
+      'workspace/ATHANOR.md': 'Alternative specific workflow.',
+      'workspace/OPEN_CLOUD.md': 'Compatibility workflow.',
+      'workspace/AGENTS.md': 'Shared repository workflow.'
+    });
+    expect(text).toContain('Use the garden project workflow.');
+    expect(text).not.toContain('Alternative specific workflow.');
+    expect(text).not.toContain('Compatibility workflow.');
+    expect(text).not.toContain('Shared repository workflow.');
+  });
 
   it('reads AGENTS.md when it is the only brief the workspace has', async () => {
     expect(
@@ -1038,7 +1038,7 @@ describe('which brief the window reads', () => {
     expect(text).not.toContain('Run the tests with pnpm, never npm.');
   });
 
-  it('carries on with no brief at all when the workspace has none of the three', async () => {
+  it('carries on with no brief at all when the workspace has none of the supported files', async () => {
     const probed = withFiles({});
     const state = freshState();
     await assemblePreamble(probed.deps, { ...preamble, state });

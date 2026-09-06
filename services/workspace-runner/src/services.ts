@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, readdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { uptime } from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
@@ -19,6 +19,9 @@ import { failureCode, runnerLogger } from './log.js';
 
 /** Nothing about a service is per-workspace tunable, so the ceiling lives here rather than in config. */
 export const SERVICE_LIMIT_PER_WORKSPACE = 16;
+export const JOB_HISTORY_LIMIT = 64;
+export const JOB_LOG_BYTES = 128 * 1024;
+export const JOB_CHECKPOINT_MS = 5_000;
 
 export interface ServicePolicy {
   /** The first wait after a death; each further consecutive death doubles it. */
@@ -70,9 +73,9 @@ export const nextFailureCount = (
   policy: ServicePolicy = DEFAULT_SERVICE_POLICY
 ): number => (ranForMs >= policy.healthyAfterMs ? 1 : consecutiveFailures + 1);
 
-const ServiceLaunchSchema = z.object({
+export const ServiceLaunchSchema = z.object({
   executable: z.string().min(1).max(4096),
-  args: z.array(z.string().max(100_000)).max(256).default([]),
+  args: z.array(z.string().max(100_000)).max(8_192).default([]),
   cwd: z.string().default('workspace'),
   env: z.record(z.string(), z.string()).default({}),
   network: z.boolean().default(false),
@@ -104,12 +107,34 @@ const ServiceRecordSchema = z.object({
   workspaceId: z.string().min(1).max(128),
   owner: z.string().min(1).max(256),
   name: z.string().min(1).max(120),
+  kind: z.enum(['service', 'job']).default('service'),
   launch: ServiceLaunchSchema,
+  checkpointResume: ServiceLaunchSchema.optional(),
+  deadlineAt: z.string().optional(),
+  output: z
+    .object({
+      stdout: z.string().max(JOB_LOG_BYTES * 2),
+      stderr: z.string().max(JOB_LOG_BYTES * 2),
+      bytes: z.number().nonnegative(),
+      savedAt: z.string()
+    })
+    .optional(),
   createdAt: z.string(),
   startedAt: z.string(),
   restarts: z.number().int().min(0).default(0),
   consecutiveFailures: z.number().int().min(0).default(0),
-  state: z.enum(['running', 'restarting', 'crash_looped']).default('running'),
+  state: z
+    .enum([
+      'running',
+      'restarting',
+      'crash_looped',
+      'completed',
+      'failed',
+      'timed_out',
+      'stopped',
+      'interrupted'
+    ])
+    .default('running'),
   /*
    * The process group leader of the current run. Written down because `Restart=always` on the
    * runner unit means a runner that is killed rather than asked to stop leaves every detached child
@@ -128,15 +153,21 @@ export const newServiceRecord = (input: {
   owner: string;
   name: string;
   launch: ServiceLaunch;
+  kind?: 'service' | 'job';
+  checkpointResume?: ServiceLaunch;
+  deadlineAt?: string;
   at?: string;
 }): ServiceRecord => {
   const at = input.at ?? new Date().toISOString();
   return {
-    id: `svc_${randomUUID()}`,
+    id: `${input.kind === 'job' ? 'job' : 'svc'}_${randomUUID()}`,
     workspaceId: input.workspaceId,
     owner: input.owner,
     name: input.name,
+    kind: input.kind ?? 'service',
     launch: input.launch,
+    ...(input.checkpointResume ? { checkpointResume: input.checkpointResume } : {}),
+    ...(input.deadlineAt ? { deadlineAt: input.deadlineAt } : {}),
     createdAt: at,
     startedAt: at,
     restarts: 0,
@@ -169,6 +200,8 @@ export class ServiceRegistry {
   readonly #file: string;
   readonly #records = new Map<string, ServiceRecord>();
   #writes: Promise<void> = Promise.resolve();
+  #revision = 0;
+  #writtenRevision = 0;
 
   constructor(workspaceRoot: string) {
     this.#file = path.join(workspaceRoot, '.athanor', 'services.json');
@@ -180,6 +213,7 @@ export class ServiceRegistry {
    * hand-edit must cost the owner their services, not their computer.
    */
   async load(): Promise<ServiceRecord[]> {
+    await this.#writes;
     let contents: string;
     try {
       contents = await readFile(this.#file, 'utf8');
@@ -203,9 +237,20 @@ export class ServiceRegistry {
     return [...this.#records.values()];
   }
 
-  put(record: ServiceRecord): Promise<void> {
+  async put(record: ServiceRecord, strict = false): Promise<void> {
+    const previous = this.#records.get(record.id);
     this.#records.set(record.id, structuredClone(record));
-    return this.#flush();
+    try {
+      await this.#flush(strict);
+    } catch (cause) {
+      if (previous) this.#records.set(record.id, previous);
+      else this.#records.delete(record.id);
+      throw cause;
+    }
+  }
+
+  flush(strict = false): Promise<void> {
+    return strict ? this.#flush(true) : this.#writes;
   }
 
   remove(id: string): Promise<void> {
@@ -218,13 +263,16 @@ export class ServiceRegistry {
    * otherwise interleave a read-modify-write and lose one of them. The set is at most
    * `SERVICE_LIMIT_PER_WORKSPACE` small objects, so rewriting all of it costs nothing.
    */
-  #flush(): Promise<void> {
-    const contents = JSON.stringify([...this.#records.values()], null, 2);
-    this.#writes = this.#writes.then(
-      () => this.#write(contents),
-      () => this.#write(contents)
-    );
-    return this.#writes;
+  #flush(strict = false): Promise<void> {
+    const requested = ++this.#revision;
+    const write = this.#writes.then(async () => {
+      if (this.#writtenRevision >= requested) return;
+      const revision = this.#revision;
+      await this.#write(JSON.stringify([...this.#records.values()], null, 2));
+      this.#writtenRevision = revision;
+    });
+    this.#writes = write.catch(() => undefined);
+    return strict ? write : write.catch(() => undefined);
   }
 
   async #write(contents: string): Promise<void> {
@@ -233,9 +281,10 @@ export class ServiceRegistry {
       await mkdir(path.dirname(this.#file), { recursive: true, mode: 0o700 });
       // 0600 and a rename: the record holds the service's environment, and a half-written file
       // read at the next boot is the one failure that would lose every service on the box at once.
-      await writeFile(staging, contents, { mode: 0o600 });
+      await writeFile(staging, contents, { mode: 0o600, flush: true });
       await rename(staging, this.#file);
     } catch (cause) {
+      await unlink(staging).catch(() => undefined);
       // Which workspace, because the prose this replaced named the file by its absolute path and
       // that path was the only thing saying whose services had just stopped being durable. Read off
       // the records rather than held on the registry: every one of them belongs to this workspace,
@@ -244,6 +293,7 @@ export class ServiceRegistry {
         workspaceId: [...this.#records.values()][0]?.workspaceId,
         code: failureCode(cause)
       });
+      throw cause;
     }
   }
 }

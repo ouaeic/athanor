@@ -2,7 +2,7 @@ import { AUDIO_READ_MAX_SECONDS, publishesPublicly, type SecurityMode } from '@a
 import { connectorActions } from '@athanor/core';
 import { classifyDestination, MAX_TURN_NOVEL_BYTES, type DestinationVerdict } from './egress.js';
 import {
-  mediaEstimateUsd,
+  mediaQuoteUsd,
   transcriptionEstimateUsd,
   MEDIA_APPROVAL_USD,
   type ResolvedMediaModel
@@ -10,6 +10,8 @@ import {
 import { scanSkillBodyForSecrets } from './skills.js';
 import { surfaceActionVerb } from './surface-actions.js';
 import { textValue } from './values.js';
+import { mediaArguments, TranscriptionControls } from './media-controls.js';
+import { checkpointInvocation } from './shell-job.js';
 import {
   callDestinations,
   commandInterpreters,
@@ -175,6 +177,7 @@ export const memoryApprovalReason = (
  * extra card, because a card that fires on everything is a card nobody reads.
  */
 export interface ApprovalContext {
+  nativeInput?: { model: string; reservationUsd: number; sha256: string };
   mediaCommittedUsd?: number;
   /**
    * The media route this generation will take, once the owner's choice has been resolved.
@@ -858,13 +861,57 @@ export const approvalRequirement = (
   context: ApprovalContext = {}
 ): ApprovalRequirement | null => {
   const taintSources = context.taintSources ?? [];
-  return strongestRequirement(
+  if (name === 'process' && args.action === 'describe') return null;
+  if (name === 'process' && args.action === 'debug') {
+    const action = (args.options as { action?: unknown } | undefined)?.action;
+    if (action === 'list' || action === 'status') return null;
+    return {
+      sideEffect: 'external_consequential',
+      action: 'Review native debugger authority',
+      preview:
+        'Resolve the owning task, stored program, stopped epoch and exact live operation before using the debugger.'
+    };
+  }
+  if (name === 'process' && args.action === 'compute') {
+    const action = (args.options as { action?: unknown } | undefined)?.action;
+    if (action === 'list' || action === 'status') return null;
+    return {
+      sideEffect: 'external_consequential',
+      action: 'Review native computation authority',
+      preview:
+        'Evaluate the exact cell against its runner-stored interpreter, workspace, network confinement and deadline before execution.'
+    };
+  }
+  if (name === 'process' && args.action === 'resume')
+    return {
+      sideEffect: 'external_consequential',
+      action: 'Review the stored checkpoint recovery command',
+      preview:
+        'Recovery must be evaluated from the runner’s persisted command before this job resumes.'
+    };
+  const original = strongestRequirement(
     taintSources.length ? taintedRequirement(name, args, context, taintSources) : null,
     strongestRequirement(
       serviceRequirement(name, args, taintSources),
       ordinaryRequirement(name, args, securityMode, context)
     )
   );
+  if (name !== 'shell') return original;
+  const checkpoint = checkpointInvocation(args);
+  if (!checkpoint) return original;
+  const recovery = approvalRequirement('shell', checkpoint, securityMode, context);
+  const declaration: ApprovalRequirement = {
+    sideEffect: taintSources.length ? 'external_consequential' : 'external_reversible',
+    action: `Allow checkpoint recovery for ${textValue(args.job, 'this finite job')}`,
+    preview: `Run ${shellInvocation(args)} now. If interrupted, run only this declared checkpoint command: ${shellInvocation(checkpoint)}. The original deadline still applies; completed work is never restarted.`
+  };
+  const strongest = strongestRequirement(original, strongestRequirement(recovery, declaration))!;
+  return {
+    ...strongest,
+    preview: [declaration.preview, original?.preview, recovery?.preview]
+      .filter(Boolean)
+      .join('\n\n')
+  };
 };
 
 /**
@@ -1010,6 +1057,12 @@ const ordinaryRequirement = (
   securityMode: SecurityMode,
   context: ApprovalContext
 ): ApprovalRequirement | null => {
+  if (name === 'code_diagnostics' && textValue(args.action) === 'start')
+    return {
+      sideEffect: 'external_reversible',
+      action: 'Start native code analysis',
+      preview: `Launch the bundled ${textValue(args.language)} language server for ${textValue(args.path) || 'workspace'}. It reads project source under the workspace sandbox and network policy, and expires when idle. Rename returns previews only.`
+    };
   /*
    * A write that runs later, outside every approval, checked before anything else this function
    * asks.
@@ -1145,51 +1198,135 @@ const ordinaryRequirement = (
     };
   }
   if (name === 'generate_media') {
+    const mediaArgs = mediaArguments(args);
+    if (mediaArgs.action === 'describe' || mediaArgs.action === 'status') return null;
+    if (mediaArgs.action === 'batch') {
+      const shots = Array.isArray(mediaArgs.shots) ? mediaArgs.shots : [];
+      const quotes = shots.map((shot: Record<string, unknown>) =>
+        mediaQuoteUsd({
+          kind: 'video',
+          duration: shot.duration,
+          size: shot.size,
+          ...(context.mediaModel ? { model: context.mediaModel } : {})
+        })
+      );
+      const cost = quotes.every((quote) => quote !== null)
+        ? quotes.reduce<number>((total, quote) => total + (quote ?? 0) / 2, 0)
+        : null;
+      return {
+        sideEffect: 'external_reversible',
+        action: 'Approve this video batch and temporary provider retention',
+        preview: `Submit ${shots.length} video shots through the selected native provider's Batch API. ${cost === null ? `Reserve $${Number(mediaArgs.maxCostUsd || 0).toFixed(2)}; some prices are unresolved.` : `The published batch estimate is $${cost.toFixed(3)}.`} The prompts and references will be retained by the provider. This batch is not eligible for zero data retention. Processing may take up to 24 hours, and garden downloads each completed shot automatically. This approval applies only to these shots. Stopping local watching does not cancel provider processing or charges.`
+      };
+    }
+    if (mediaArgs.action === 'library') {
+      if (mediaArgs.operation === 'cancel_batch')
+        return {
+          sideEffect: 'external_consequential',
+          action: 'Request cancellation of this provider video batch',
+          preview: `Cancel garden batch ${textValue(mediaArgs.batchId)}. Provider cancellation can take up to ten minutes; completed shots still incur charges and will be delivered.`
+        };
+      if (mediaArgs.operation === 'delete_video')
+        return {
+          sideEffect: 'external_consequential',
+          action: 'Delete this completed video from the provider library',
+          preview: `Permanently remove provider video ${textValue(mediaArgs.providerVideoId)} from this connected account. Download any copy you want to keep first. This removes provider storage only; it does not cancel processing or reverse charges.`
+        };
+      if (mediaArgs.operation === 'create_character')
+        return {
+          sideEffect: 'external_reversible',
+          action: 'Create a retained reusable character asset',
+          preview: `Upload ${textValue(mediaArgs.referencePath)} as “${textValue(mediaArgs.name)}” to the selected native video provider. The MP4 will be retained for reuse. This operation is not eligible for zero data retention. The provider publishes no separate upload price; reserve $${Number(mediaArgs.maxCostUsd || 0).toFixed(2)} until billing is reconciled. This approval applies only to this upload.`
+        };
+      return null;
+    }
     // Priced here rather than read out of the call. The estimate used to be a tool parameter, so a
     // model that wrote 0 - or omitted it, which arrived as NaN and failed every comparison - spent
     // the owner's provider money with no card in front of it.
     const model = context.mediaModel;
-    const estimateUsd = mediaEstimateUsd({
-      kind: textValue(args.kind),
-      width: args.width,
-      height: args.height,
-      characterCount: textValue(args.prompt).trim().length,
+    const quoteUsd = mediaQuoteUsd({
+      kind: textValue(mediaArgs.kind),
+      width: mediaArgs.width,
+      height: mediaArgs.height,
+      characterCount: textValue(mediaArgs.prompt).trim().length,
+      count: mediaArgs.count,
+      quality: mediaArgs.quality,
+      resolution: mediaArgs.resolution,
+      size: mediaArgs.size,
+      duration: mediaArgs.duration,
+      inputReferenceCount: Array.isArray(mediaArgs.inputReferences)
+        ? mediaArgs.inputReferences.length
+        : 0,
       ...(model ? { model } : {})
     });
+    const estimateUsd = quoteUsd ?? 0;
+    if (mediaArgs.kind === 'video')
+      return {
+        sideEffect: 'external_reversible',
+        action: 'Approve this video job and temporary provider retention',
+        preview: `${mediaArgs.operation === 'edit' ? 'Edit' : mediaArgs.operation === 'extend' ? 'Extend' : 'Generate'} a ${typeof mediaArgs.duration === 'number' ? mediaArgs.duration : textValue(mediaArgs.duration)} second video${typeof mediaArgs.sourceJobId === 'string' ? ` from garden job ${mediaArgs.sourceJobId}` : ''}${model ? ` with ${model.displayName}` : ''}. ${quoteUsd === null ? `The provider does not publish a complete price for these settings. Reserve $${Number(mediaArgs.maxCostUsd || 0).toFixed(2)}; final billing may differ.` : `The published estimate is $${quoteUsd.toFixed(3)}.`}\n\nThis job sends the prompt and any selected reference images to a provider that retains them temporarily. Video is not eligible for zero data retention. This approval applies only to this job; the task's other routing stays unchanged. Processing continues in the background. Stopping local watching does not cancel provider processing or charges.\n\n${textValue(mediaArgs.prompt).slice(0, 1000)}`
+      };
     const committedUsd = Math.max(0, Number(context.mediaCommittedUsd) || 0);
     // An unpublished price is not a small one. The owner is free to choose a route their provider
     // prices nowhere athanor can read, and the honest consequence of that choice is a card in front
     // of every generation on it rather than a threshold applied to a number nobody stated.
-    const unpriced = model !== undefined && !model.priceKnown;
+    const unpriced = quoteUsd === null;
     if (unpriced || committedUsd + estimateUsd >= MEDIA_APPROVAL_USD)
       return {
         sideEffect: 'external_reversible',
         action: 'Approve continued provider spend on generated media',
-        preview: `Generate ${textValue(args.kind, 'media')}${model ? ` with ${model.displayName}` : ''} ${unpriced ? 'from the connected provider account. This model publishes no price athanor can read, so the cost is only known once the provider bills it.' : `for about $${estimateUsd.toFixed(3)} from the connected provider account.`}${committedUsd > 0 ? ` This task has already spent about $${committedUsd.toFixed(2)} generating media.` : ''}\n\nEvery further generation in this task asks again.`
+        preview: `Generate ${textValue(mediaArgs.kind, 'media')}${model ? ` with ${model.displayName}` : ''} ${unpriced ? 'from the connected provider account. This model publishes no price garden can read, so the cost is only known once the provider bills it.' : `for about $${estimateUsd.toFixed(3)} from the connected provider account.`}${unpriced && typeof mediaArgs.maxCostUsd === 'number' && Number.isFinite(mediaArgs.maxCostUsd) ? ` Reserve $${mediaArgs.maxCostUsd.toFixed(2)} for this request; final billing may differ.` : ''}${committedUsd > 0 ? ` This task has already spent about $${committedUsd.toFixed(2)} generating media.` : ''}\n\nEvery further generation in this task asks again.`
       };
   }
   if (name === 'audio_read') {
-    // Priced on duration, because that is the unit transcription is billed in. The window is what
-    // the call asks for rather than what the file turns out to hold, so this can only ever overstate
-    // - which is the right direction for a card, and is why it says "up to".
+    const native =
+      args.options && typeof args.options === 'object' && 'action' in args.options
+        ? args.options.action
+        : undefined;
+    if (native === 'describe') return null;
+    if (native === 'native')
+      return {
+        sideEffect: 'external_reversible',
+        action: 'Send native recording to the selected model',
+        preview: `Send the exact bytes of ${textValue(args.path, 'a workspace recording')} once in the next normal model request${context.nativeInput ? ` to ${context.nativeInput.model}, reserving up to $${context.nativeInput.reservationUsd.toFixed(3)} for the full context and output bound (source SHA-256 ${context.nativeInput.sha256})` : ''}. This includes the recording’s audio or visual contents and embedded metadata. The task’s current provider and privacy route apply; the source must still match its inspected hash. Unknown modality prices refuse before submission.`
+      };
+    const controls = TranscriptionControls.parse(args.options ?? {});
     const model = context.mediaModel;
     const start = Math.max(0, Number(args.startSeconds) || 0);
     const end = Number(args.endSeconds);
     const seconds = Math.min(
-      AUDIO_READ_MAX_SECONDS,
+      model?.transcriptionBound?.maxSeconds ?? AUDIO_READ_MAX_SECONDS,
       Number.isFinite(end) && end > start ? end - start : AUDIO_READ_MAX_SECONDS
     );
     const estimateUsd = transcriptionEstimateUsd(seconds, model ?? null);
     const committedUsd = Math.max(0, Number(context.mediaCommittedUsd) || 0);
-    // No route resolved is the same case as a route nobody priced: the owner has not chosen one, so
-    // the model is whatever the provider offers and its price is not a number athanor can state.
-    const unpriced = model === undefined || !model.priceKnown;
-    if (unpriced || committedUsd + estimateUsd >= MEDIA_APPROVAL_USD)
+    const nativeBound = model?.transcriptionBound;
+    const external = controls.privacyRoute === 'external';
+    if (
+      external ||
+      estimateUsd === null ||
+      nativeBound ||
+      committedUsd + estimateUsd >= MEDIA_APPROVAL_USD
+    )
       return {
         sideEffect: 'external_reversible',
-        action: 'Approve continued provider spend on reading recordings',
-        preview: `Read up to ${Math.ceil(seconds / 60)} minutes of ${textValue(args.path, 'a recording')}${model ? ` with ${model.displayName}` : ''}. ${unpriced ? 'Transcription is billed by the minute and no price athanor can read is published for this route, so the cost is only known once the provider bills it.' : `That is about $${estimateUsd.toFixed(3)} from the connected provider account.`}${committedUsd > 0 ? ` This task has already spent about $${committedUsd.toFixed(2)} on media.` : ''}\n\nEvery further reading in this task asks again.`
+        action: external
+          ? 'Send this recording for external transcription'
+          : 'Approve continued provider spend on reading recordings',
+        preview: `Read up to ${seconds < 60 ? `${seconds} seconds` : `${Math.ceil(seconds / 60)} minutes`} of ${textValue(args.path, 'a recording')}${model ? ` with ${model.displayName}` : ''}. ${external ? 'This call sends recording contents and metadata outside the verified zero-retention route. A zero-retention routing guarantee is not applied to this request; the transcription provider may retain it under its terms. This exception covers only this reading; task and credential privacy stay unchanged. ' : ''}${estimateUsd === null ? 'This route has no verified whole-request cost bound. The recording will not be sent; choose a supported priced transcription model in Settings.' : nativeBound ? `Reserve up to $${estimateUsd.toFixed(3)} for the model’s full ${nativeBound.contextTokens}-token context and ${nativeBound.maxOutputTokens}-token output limit. Missing provider usage keeps this reservation held.` : external ? `Reserve up to $${estimateUsd.toFixed(3)} before submission. This is held capacity; the provider receipt determines the final charge, and missing usage keeps the reservation held.` : `That is about $${estimateUsd.toFixed(3)} from the connected provider account.`}${controls.maxCostUsd !== undefined ? ` The requested spending ceiling is $${controls.maxCostUsd.toFixed(2)}; it cannot replace a verified cost bound.` : ''}${committedUsd > 0 ? ` This task has already spent about $${committedUsd.toFixed(2)} on media.` : ''}\n\nEvery further reading in this task asks again.`
       };
+  }
+  if (name === 'coding_agent' && args.agent === 'garden') {
+    if (['run', 'integrate'].includes(textValue(args.action)) && securityMode === 'review')
+      return {
+        sideEffect: 'workspace_write',
+        action:
+          textValue(args.action) === 'run'
+            ? 'Start an isolated coding specialist'
+            : 'Integrate reviewed coding changes',
+        preview: JSON.stringify(args.options ?? {}).slice(0, 4000)
+      };
+    return null;
   }
   if (name === 'coding_agent' && textValue(args.action) === 'setup')
     return {
@@ -1202,7 +1339,7 @@ const ordinaryRequirement = (
     return {
       sideEffect: 'external_reversible',
       action: `Delegate repository work to ${codingAgentName(args.agent)}`,
-      preview: `${textValue(args.prompt).slice(0, 2_000)}\n\nThe selected subscription service can inspect and modify files inside this agent computer. athanor keeps the process inside the workspace and records its bounded result.`
+      preview: `${textValue(args.prompt).slice(0, 2_000)}\n\nThe selected subscription service can inspect and modify files inside this agent computer. garden keeps the process inside the workspace and records its bounded result.`
     };
   /*
    * `code_diagnostics` is deliberately absent from this file, and this note is here so the next

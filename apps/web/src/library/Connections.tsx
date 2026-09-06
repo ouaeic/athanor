@@ -136,7 +136,7 @@ export function ConnectionsLibrary({ onChange }: { onChange: () => void }) {
               </Button>
               <ConfirmButton
                 label="Disconnect"
-                description={`Revoke “${connection.label}” from athanor. Work that uses this connection will need it to be reconnected.`}
+                description={`Revoke “${connection.label}” from garden. Work that uses this connection will need it to be reconnected.`}
                 action={async () => {
                   await sensitive(() => del(`/v1/connectors/${connection.id}`));
                   refresh();

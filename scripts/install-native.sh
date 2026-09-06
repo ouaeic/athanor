@@ -163,8 +163,8 @@ fi
 # scripts/check-repository.mjs rather than left to be noticed on a server.
 #
 # WHAT IS DELIBERATELY NOT HERE, because running it again on a box that is serving would break it:
-#   - the three system accounts, and the sudoers policies - creating them is once, and a rewritten
-#     sudoers file that fails visudo would take root helpers away from a running product;
+#   - the three system accounts; native policy activation validates a separate candidate before
+#     atomically replacing the installed sudoers file;
 #   - every generated secret (the runner shared secret, the data master key, the session key, the
 #     Web Push pair, the database password) - regenerating one leaves two services holding
 #     different halves until both restart, and some of them cannot be regenerated at all without
@@ -356,7 +356,7 @@ release_step_runner_settings() {
   # Publishing a preview points the public internet at a loopback port, so the runner is told every
   # port this installation already serves something private on: the API, the preview gateway, the
   # database, and the worker and notification health endpoints. Its own port is added in code.
-  set_env_value "$runner_env" RESERVED_PREVIEW_PORTS 4100,4400,5432,4201,4203
+  set_env_value "$runner_env" RESERVED_PREVIEW_PORTS 4100,4400,5432,4201,4203,443,8443
   # The transposed spelling this key carried for a while, cleared so an upgraded box does not keep
   # a stale list under a name nothing reads.
   remove_env_key "$runner_env" PREVIEW_RESERVED_PORTS
@@ -556,32 +556,7 @@ else
   /usr/local/bin/typst --version >/dev/null || fail "typst did not run after installation"
 fi
 
-# One Python interpreter, at one path, for every document procedure in the skill library. It is
-# created with --system-site-packages so it is a superset of the apt libraries above rather than a
-# second environment competing with them: python-docx, openpyxl, pandas, matplotlib, Pillow, lxml
-# and XlsxWriter come from the distribution, and what the distributions disagree about - or have
-# stopped packaging, as Ubuntu did with python3-pptx after 24.04 - is pinned here by version and by
-# hash. A skill therefore never has to say "python3, or the other python3".
-install -d -m 0755 /usr/local/lib/athanor
-athanor_python=/usr/local/lib/athanor/python
-say "Preparing the pinned document Python environment"
-# Rebuilt rather than repaired when it does not run: a distribution upgrade that moves python3 to
-# a new minor version leaves the virtual environment pointing at an interpreter that is gone, and
-# installing into that would appear to work and then fail on the first import.
-"$athanor_python/bin/python3" --version >/dev/null 2>&1 || {
-  rm -rf "$athanor_python"
-  python3 -m venv --system-site-packages "$athanor_python" ||
-    fail "the pinned document Python environment could not be created"
-}
-"$athanor_python/bin/python3" -m pip install --quiet --disable-pip-version-check --upgrade \
-  --require-hashes --no-deps --only-binary=:all: \
-  --requirement "$athanor_root/infra/native/athanor-python-requirements.txt" ||
-  fail "the pinned document Python libraries could not be installed"
-# Readable and runnable by the account agent commands use, which is not the account that built it.
-chmod -R a+rX "$athanor_python"
-"$athanor_python/bin/python3" -c \
-  'import pypdf, pptx, docx, openpyxl, pandas, matplotlib, PIL' ||
-  fail "the pinned document Python environment cannot import the document libraries"
+/bin/sh "$athanor_root/scripts/athanor-native-runtime" tools
 
 if ! id "$runner_user" >/dev/null 2>&1; then
   useradd --create-home --home-dir /home/athanor --shell /bin/bash "$runner_user"
@@ -624,6 +599,7 @@ cd "$athanor_root"
 # on the previous release. An installer is a non-interactive context and should say so.
 CI=true pnpm install --frozen-lockfile
 CI=true pnpm -r build
+/bin/sh "$athanor_root/scripts/athanor-native-runtime" language-servers
 
 playwright_cli="$athanor_root/services/workspace-runner/node_modules/playwright-core/cli.js"
 playwright_package="$athanor_root/services/workspace-runner/node_modules/playwright-core/package.json"
@@ -692,6 +668,7 @@ if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" != "Di
 fi
 
 install_asset 0755 "$athanor_root/scripts/athanor" /usr/local/bin/athanor
+install_asset 0755 "$athanor_root/scripts/athanor" /usr/local/bin/garden
 # Outside every directory on the agent's PATH, and not executable by the agent's account. On
 # /usr/local/bin it was a root package install with no capability scope and no approval card, one
 # command name away from anything running on this box.
@@ -702,6 +679,7 @@ install_asset 0755 "$athanor_root/scripts/athanor-system-packages" \
   /usr/local/sbin/athanor-system-packages
 # Root-owned and reached only through the sudoers rule below. It hands back less privilege than
 # the runner already has, which is why it may take a command line the agent influenced.
+install_asset 0644 "$athanor_root/scripts/mission-supervisor.py" /usr/local/lib/athanor/mission-supervisor.py
 install_asset 0755 "$athanor_root/scripts/athanor-sandbox" \
   /usr/local/lib/athanor/athanor-sandbox
 install_asset 0755 "$athanor_root/scripts/athanor-service" \
@@ -789,38 +767,7 @@ install -d -m 0755 /etc/update-motd.d
 install_asset 0755 "$athanor_root/infra/native/athanor-motd" \
   /etc/update-motd.d/99-athanor
 
-cat >/etc/sudoers.d/athanor-packages <<'EOF'
-# The runner reaches root for exactly two things: installing an approved package, and dropping an
-# agent command to an account with less privilege than the runner's own. Neither takes a target
-# account or a privileged operation from its caller.
-Cmnd_Alias ATHANOR_SANDBOX_RUN = /usr/local/lib/athanor/athanor-sandbox run *
-Cmnd_Alias ATHANOR_SANDBOX_SHELL = /usr/local/lib/athanor/athanor-sandbox shell *
-Cmnd_Alias ATHANOR_SANDBOX_CHECK = /usr/local/lib/athanor/athanor-sandbox check
-# A pseudo-terminal would merge a command's standard output and error into one stream, and the
-# model reads them apart. The owner's interactive terminal is the opposite case: without a
-# pseudo-terminal the shell has no controlling terminal and loses job control.
-#
-# These two flags are the whole vocabulary available here. Ubuntu 26.04 ships sudo-rs rather than
-# the original sudo, and it knows neither `syslog` nor `log_allowed` nor the `log_input`/`log_output`
-# pair - a file carrying any of them is rejected outright, which stops the install rather than
-# degrading it. So the command line of every invocation below reaches the local system journal,
-# and the journal is persistent. That is why the `run` arm takes no command on its command line:
-# the runner writes the command and its environment to a spec file only it and root can read, and
-# the helper reads and removes that file (scripts/athanor-sandbox, `spec_loader`). What the journal
-# then holds is the helper's path, the modes, the workspace root, the spec path and, as sudo's own
-# PWD, the workspace root again - the runner starts sudo there rather than in the directory the
-# agent chose, which the file carries instead - a record of what asked for privilege, and not of
-# what it ran or where inside the work. docs/PRIVACY.md says so under the "no logging" boundary.
-# The `run *` alias still matches, because the spec path is an argument like any other; the helper
-# accepts one path shape for it, under the runner's own state directory, since it removes the file
-# as root.
-Defaults!ATHANOR_SANDBOX_RUN !use_pty
-Defaults!ATHANOR_SANDBOX_SHELL use_pty
-athanor ALL=(root) NOPASSWD: /usr/local/sbin/athanor-system-packages *
-athanor ALL=(root) NOPASSWD: ATHANOR_SANDBOX_RUN, ATHANOR_SANDBOX_SHELL, ATHANOR_SANDBOX_CHECK
-EOF
-chmod 0440 /etc/sudoers.d/athanor-packages
-visudo -cf /etc/sudoers.d/athanor-packages >/dev/null
+/bin/sh "$athanor_root/scripts/athanor-native-runtime" policy
 
 # A box must never come up believing it confines agent commands when it does not, so this is a
 # hard gate rather than a warning: if the drop to the agent account does not take effect, the
@@ -1139,6 +1086,8 @@ fi
 set_env_value "$control_env" DEPLOYMENT_MODE production
 set_env_value "$control_env" REGISTRATION_BOOTSTRAP_TOKEN "$pairing_code"
 set_env_value "$control_env" REGISTRATION_BOOTSTRAP_EXPIRES_AT "$pairing_expires"
+previous_public_url=$(existing_control_value PUBLIC_APP_URL)
+previous_preview_url=$(existing_control_value PREVIEW_BASE_URL)
 set_env_value "$control_env" PUBLIC_APP_URL "$public_url"
 # Where this build came from, so the app can offer it.
 #
@@ -1152,7 +1101,11 @@ case "$source_origin" in
     set_env_value "$control_env" PUBLIC_SOURCE_URL "${source_origin%.git}"
     ;;
 esac
-set_env_value "$control_env" PREVIEW_BASE_URL "$public_url/__athanor/preview"
+case "$previous_preview_url" in
+  ''|"$previous_public_url/__athanor/preview"|"$previous_public_url:8443/__athanor/preview")
+    set_env_value "$control_env" PREVIEW_BASE_URL "$public_url/__athanor/preview"
+    ;;
+esac
 set_env_value "$control_env" API_HOST 127.0.0.1
 set_env_value "$control_env" API_PORT 4100
 set_env_value "$control_env" PREVIEW_GATEWAY_HOST 127.0.0.1
@@ -1172,6 +1125,7 @@ set_env_value "$control_env" RELAY_STATE_DIR "$athanor_config/relay"
 set_env_value "$control_env" RELAY_LOCAL_HOST 127.0.0.1
 set_env_value "$control_env" RELAY_LOCAL_PORT 443
 set_env_value "$control_env" RELAY_LOCAL_HTTP_PORT 80
+set_env_default "$control_env" RELAY_LOCAL_PREVIEW_PORT 8443
 set_env_value "$control_env" WEBAUTHN_RP_ID "$webauthn_rp_id"
 set_env_value "$control_env" WEBAUTHN_RP_NAME athanor
 set_env_value "$control_env" WEBAUTHN_ORIGIN "$public_url"
@@ -1260,6 +1214,7 @@ else
   [ ! -f /etc/nginx/conf.d/default.conf ] || mv /etc/nginx/conf.d/default.conf \
     /etc/nginx/conf.d/default.conf.athanor-disabled
 fi
+/bin/sh "$athanor_root/scripts/athanor-native-runtime" preview-origin
 nginx -t
 
 # The installer creates every other directory it writes into and this heredoc assumed one. A host
@@ -1396,10 +1351,10 @@ elif command -v nft >/dev/null 2>&1 &&
   nft list ruleset 2>/dev/null | grep -q 'hook input .* policy drop'; then
   # Hand-written packet filters are not edited here: a wrong guess at the rule position
   # can lock the operator out of the host entirely.
-  warn "the nftables input chain drops by default; allow inbound TCP 80 and 443 yourself"
+  warn "the nftables input chain drops by default; allow inbound TCP 80, 443 and 8443 yourself"
 elif command -v iptables >/dev/null 2>&1 &&
   iptables -S INPUT 2>/dev/null | grep -q '^-P INPUT DROP'; then
-  warn "the iptables INPUT policy is DROP; allow inbound TCP 80 and 443 yourself"
+  warn "the iptables INPUT policy is DROP; allow inbound TCP 80, 443 and 8443 yourself"
 fi
 
 for attempt in $(seq 1 60); do
@@ -1454,7 +1409,7 @@ listening_ports=$(
     awk '{ count = split($4, fields, ":"); print fields[count] }' |
     sort -u
 )
-for gateway_port in 80 443; do
+for gateway_port in 80 443 8443; do
   printf '%s\n' "$listening_ports" | grep -qx "$gateway_port" ||
     warn "nothing is listening on TCP $gateway_port, so no client can connect"
 done
@@ -1474,7 +1429,7 @@ for address in $ipv6_addresses; do
   esac
 done
 [ -n "$public_address_found" ] ||
-  warn "this computer only has private addresses: forward inbound TCP 80 and 443 to it on your router, and run sudo athanor ddns configure so clients can find it by name"
+  warn "this computer only has private addresses: forward inbound TCP 80, 443 and 8443 to it on your router, and run sudo athanor ddns configure so clients can find it by name"
 
 endpoints_json=$(
   {
@@ -1502,7 +1457,7 @@ ticket=$(
     process.stdout.write(Buffer.from(JSON.stringify(payload)).toString("base64url"));
   ' "$endpoints_json" "$server_identity" "$pairing_code" "$pairing_expires"
 )
-pairing_uri="athanor://pair/$ticket"
+pairing_uri="garden://pair/$ticket"
 # The same grant as an address a camera can open, which is the only form worth putting in a code
 # printed at install time: the device being paired is by definition one with nothing installed yet,
 # so a phone pointed at an `athanor://` code did nothing at all. The API mints exactly this shape

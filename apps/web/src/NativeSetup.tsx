@@ -72,7 +72,7 @@ export default function NativeSetup({
     <main className="native-setup">
       <header>
         <span className="native-wordmark">
-          athanor
+          garden
           <Leaf size={22} />
         </span>
         <span className="muted">Your computer, anywhere</span>
@@ -84,7 +84,7 @@ export default function NativeSetup({
           <p>
             {status?.configured
               ? 'Your saved server is currently out of reach. Reconnect when it is ready, or enter a new connection ticket.'
-              : 'Connect to the athanor server you control. Your work continues there, even when you close this app.'}
+              : 'Connect to the garden server you control. Your work continues there, even when you close this app.'}
           </p>
           {status?.configured && (
             <div className="native-saved">
@@ -105,12 +105,12 @@ export default function NativeSetup({
           >
             <Field
               label="Connection ticket"
-              hint="Copy the athanor://pair/ link from your server or an already connected device."
+              hint="Copy the garden://pair/ link from your server or an already connected device."
             >
               <textarea
                 value={ticket}
                 onChange={(event) => setTicket(event.target.value)}
-                placeholder="athanor://pair/…"
+                placeholder="garden://pair/…"
                 autoCapitalize="none"
                 autoCorrect="off"
                 spellCheck={false}

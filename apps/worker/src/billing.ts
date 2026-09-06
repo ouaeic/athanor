@@ -13,6 +13,17 @@
  */
 import type { ModelRelease } from '@athanor/contracts';
 import { pricesAtPromptSize, readRoutingMetadata } from '@athanor/core';
+import type { DataStore } from '@athanor/data';
+import type { ModelResponse } from '@athanor/model-gateway';
+
+/** A native request settles or holds its own durable receipt before the ordinary step returns. */
+export const recordModelStepUsage = async (
+  store: Pick<DataStore, 'recordUsage'>,
+  response: ModelResponse,
+  usage: Parameters<DataStore['recordUsage']>[0]
+): Promise<void> => {
+  if (!response.nativeInputUsageRecorded) await store.recordUsage(usage);
+};
 
 export const DELEGATE_BUDGET_SHARE = 0.25;
 

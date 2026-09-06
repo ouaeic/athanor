@@ -151,23 +151,23 @@ pub fn parse_pairing_uri(raw: &str, now: SystemTime) -> Result<ImportedConnectio
     if raw.len() > MAX_TICKET_BYTES {
         return Err("The connection ticket is too large".into());
     }
-    let parsed = Url::parse(raw.trim()).map_err(|_| "This is not an athanor connection ticket")?;
-    if parsed.scheme() != "athanor"
+    let parsed = Url::parse(raw.trim()).map_err(|_| "This is not a garden connection ticket")?;
+    if !matches!(parsed.scheme(), "garden" | "athanor")
         || parsed.host_str() != Some("pair")
         || parsed.query().is_some()
         || parsed.fragment().is_some()
         || !parsed.username().is_empty()
         || parsed.password().is_some()
     {
-        return Err("This is not an athanor connection ticket".into());
+        return Err("This is not a garden connection ticket".into());
     }
     let encoded = parsed.path().strip_prefix('/').unwrap_or_default();
     if encoded.is_empty() || encoded.contains('/') {
-        return Err("The athanor connection ticket payload is missing".into());
+        return Err("The garden connection ticket payload is missing".into());
     }
     let decoded = URL_SAFE_NO_PAD
         .decode(encoded)
-        .map_err(|_| "The athanor connection ticket is not valid base64url")?;
+        .map_err(|_| "The garden connection ticket is not valid base64url")?;
     if decoded.len() > MAX_TICKET_BYTES {
         return Err("The connection ticket is too large".into());
     }
@@ -534,7 +534,7 @@ pub async fn probe_profile(profile: &ServerProfile) -> Result<ServerProfile, Str
                     .await
                     .map_err(|_| "The server returned an invalid connection manifest")?;
                 if manifest.version != 1 || manifest.identity != profile.identity {
-                    return Err("The endpoint returned a different athanor server identity".into());
+                    return Err("The endpoint returned a different garden server identity".into());
                 }
                 validate_discovery(&manifest.discovery)?;
                 let mut refreshed = validated_endpoints(manifest.endpoints)?;
@@ -583,7 +583,7 @@ async fn mdns_candidates(profile: &ServerProfile) -> Result<ServerProfile, Strin
             .map_err(|error| format!("Could not start LAN discovery: {error}"))?;
         let receiver = daemon
             .browse(&service)
-            .map_err(|error| format!("Could not browse for athanor on this LAN: {error}"))?;
+            .map_err(|error| format!("Could not browse for garden on this LAN: {error}"))?;
         let deadline = std::time::Instant::now() + Duration::from_secs(4);
         let mut endpoints = Vec::new();
         while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
@@ -615,7 +615,7 @@ async fn mdns_candidates(profile: &ServerProfile) -> Result<ServerProfile, Strin
     .await
     .map_err(|_| "The LAN discovery worker stopped unexpectedly")??;
     if discovered.is_empty() {
-        return Err("The pinned athanor server was not found on this local network".into());
+        return Err("The pinned garden server was not found on this local network".into());
     }
     let mut candidate = profile.clone();
     candidate.endpoints = validated_endpoints(discovered)?;
@@ -663,6 +663,12 @@ mod tests {
 
     #[test]
     fn parses_and_canonicalizes_a_v2_ticket_without_persisting_the_code() {
+        let garden = parse_pairing_uri(
+            &pairing_uri(2_000).replacen("athanor:", "garden:", 1),
+            UNIX_EPOCH + Duration::from_secs(1_000),
+        )
+        .unwrap();
+        assert_eq!(garden.profile.endpoints[0], "https://example.test");
         let imported =
             parse_pairing_uri(&pairing_uri(2_000), UNIX_EPOCH + Duration::from_secs(1_000))
                 .unwrap();

@@ -4,6 +4,7 @@
   "httpsPort": 443,
   "controlPort": 443,
   "httpPort": 80,
+  "previewPort": 8443,
   "metricsHost": "127.0.0.1",
   "metricsPort": 9095,
   "tlsCertPath": "/etc/athanor-relay/tls/fullchain.pem",

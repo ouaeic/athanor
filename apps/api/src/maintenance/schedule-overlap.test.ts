@@ -95,6 +95,7 @@ const buildHarness = async (): Promise<Harness> => {
     RELAY_LOCAL_HOST: '127.0.0.1',
     RELAY_LOCAL_PORT: 443,
     RELAY_LOCAL_HTTP_PORT: 80,
+    RELAY_LOCAL_PREVIEW_PORT: 8443,
     REGISTRATION_BOOTSTRAP_TOKEN: 'schedule-overlap-token-with-20-chars',
     REGISTRATION_BOOTSTRAP_EXPIRES_AT: Math.floor(Date.now() / 1000) + 86_400,
     PUBLIC_APP_URL: 'http://localhost:5173',

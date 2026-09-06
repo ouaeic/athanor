@@ -11,7 +11,7 @@ assessment within seven. Security fixes target the current release line.
 
 ## Threat model
 
-athanor is designed for one owner. Registration closes the moment the first account is created —
+garden is designed for one owner. Registration closes the moment the first account is created —
 there is no setting that reopens it — and claiming the server needs the single-use pairing token the
 installer prints, which expires and can be rotated with `sudo athanor pairing-code`. There is no
 sharing model, no roles and no second party to authorize against. It is not a hardened hostile multi-tenant compute service.
@@ -56,6 +56,13 @@ The relevant adversaries are:
 - The first account claims the server; registration then closes by default.
 - Passkeys, origin checks, secure cookies, revocable sessions, and recent-authentication checks guard
   owner settings.
+- Generated previews use a separate browser origin from the owner application. The preview
+  gateway verifies the configured public host, port and protocol before serving content; a
+  same-origin development configuration retains an opaque sandbox. Cookies are not port-scoped,
+  so the gateway strips owner credentials and refuses generated applications' attempts to replace
+  them. Preview service workers are confined to the published preview path. Applications on the
+  shared preview origin can use their own storage and same-origin requests; different previews
+  sharing that origin are not isolated from one another. Private links remain bearer capabilities.
 - Workspace requests require capability tokens. Every one is signed, bound to one workspace and one
   subject, scoped to the routes it may use, and rejected past its expiry — which is 90 seconds for
   the worker's own tool calls and never more than 900 seconds for anything, whatever a signer asks
@@ -230,7 +237,7 @@ other than Nginx remain loopback-only; Nginx is the sole public application gate
 limitation: the sandbox helper can put a command in its own network namespace, and the installer
 checks that the kernel allows it, but a command isolated that way also gets its own loopback, so
 nothing outside it — the preview proxy included — can reach a port the command is listening on.
-Turning it on therefore costs published previews. With it off, athanor records network intent and
+Turning it on therefore costs published previews. With it off, garden records network intent and
 applies approval policy, but an allowed process can use the host's ordinary network access.
 Operators who want the stronger boundary can turn it on, or dedicate the machine and enforce
 ingress and egress at their host or cloud firewall.
@@ -321,7 +328,7 @@ to change for the two dials to be worth joining, is recorded beside `ApprovalCon
 - Browser logins and cookies live in the persistent browser profile.
 - Generated files can contain sensitive model output or source content.
 
-“No content logging by athanor” is not “no metadata anywhere.”
+“No content logging by garden” is not “no metadata anywhere.”
 
 ## Backups and recovery
 

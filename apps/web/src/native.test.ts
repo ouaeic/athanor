@@ -6,6 +6,7 @@ import {
   nativeCapabilities,
   nativeNotificationPermission,
   nativeStatus,
+  openPreviewBrowser,
   pairNative,
   previewConnectionTicket,
   readLocalFile,
@@ -32,6 +33,12 @@ const ticket = (changes: Record<string, unknown> = {}) =>
     .replace(/=+$/, '')}`;
 
 describe('native connection boundaries', () => {
+  it('accepts the garden and installed-client schemes with identical ticket validation', () => {
+    expect(previewConnectionTicket(ticket().replace('athanor:', 'garden:'), now)).toEqual(
+      previewConnectionTicket(ticket(), now)
+    );
+    expect(() => previewConnectionTicket(ticket().replace('athanor:', 'https:'), now)).toThrow();
+  });
   it('reads a camera-opened enrollment fragment only on its intended server before expiry', () => {
     vi.useFakeTimers();
     vi.setSystemTime(now);
@@ -135,6 +142,17 @@ describe('native connection boundaries', () => {
     expect(fetcher.mock.calls[0]![1]?.body).toBe(JSON.stringify({ ticket: raw }));
     expect(fetcher.mock.calls[1]![1]?.body).toBe(JSON.stringify({ preference: 'dynamic' }));
   });
+  it('opens the original signed preview through the native owner command and propagates refusal', async () => {
+    const invoke = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal('window', { __TAURI_INTERNALS__: { invoke } });
+    const signed =
+      'https://garden.test:8443/__athanor/preview/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/?access=fixture%2Fgrant%3D#scene';
+    await openPreviewBrowser(signed);
+    expect(invoke).toHaveBeenCalledExactlyOnceWith('open_preview_browser', { url: signed });
+    invoke.mockRejectedValueOnce(new Error('Preview origin unavailable'));
+    await expect(openPreviewBrowser(signed)).rejects.toThrow('Preview origin unavailable');
+  });
+
   it('uses the shell bridge and folder grant tokens; notification permission remains explicit', async () => {
     const invoke = vi.fn().mockImplementation(async (command: string) => {
       if (command === 'native_capabilities')

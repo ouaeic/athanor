@@ -137,9 +137,19 @@ export const isMutatingToolCall = (name: string, args: Record<string, unknown> =
       ['curl', 'wget', 'gh', 'ssh', 'scp', 'systemctl', 'apt', 'apt-get'].includes(executable)
     );
   }
+  if (name === 'process' && args.action === 'describe') return false;
+  if (name === 'process' && args.action === 'debug')
+    return !['list', 'status', 'stack', 'scopes'].includes(
+      String((args.options as { action?: unknown } | undefined)?.action)
+    );
+  if (name === 'process' && args.action === 'compute')
+    return !['list', 'status'].includes(
+      String((args.options as { action?: unknown } | undefined)?.action)
+    );
   if (['schedule', 'memory', 'skill', 'process'].includes(name))
     return !['list', 'poll', 'log', 'view'].includes(textValue(args.action));
-  if (name === 'coding_agent') return textValue(args.action) !== 'status';
+  if (name === 'coding_agent')
+    return !['describe', 'status', 'review', 'wait'].includes(textValue(args.action));
   return true;
 };
 
@@ -230,7 +240,7 @@ export const isDurableInstructionPath = (path: string): boolean => {
     .split(/[\\/]+/)
     .filter((segment) => segment && segment !== '.');
   const last = segments.at(-1) ?? '';
-  if (last === 'athanor.md' || last === 'open_cloud.md')
+  if (['garden.md', 'athanor.md', 'open_cloud.md', 'agents.md'].includes(last))
     return segments.length === 1 || segments.at(-2) === 'workspace';
   const skills = segments.indexOf('skills');
   if (skills < 0 || skills === segments.length - 1) return false;

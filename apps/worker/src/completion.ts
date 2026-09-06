@@ -64,7 +64,9 @@ export const MODEL_DECLARED_VERIFICATION_STATUSES = ['verified', 'not_applicable
 export type CompletionVerificationStatus =
   | (typeof MODEL_DECLARED_VERIFICATION_STATUSES)[number]
   | 'checks_failed'
-  | 'checks_did_not_run';
+  | 'checks_did_not_run'
+  | 'delivery_incomplete'
+  | 'delivery_pending';
 
 export interface CompletionVerification {
   status: CompletionVerificationStatus;
@@ -144,6 +146,7 @@ export const startTurnState = <T extends Record<string, unknown>>(
     reservationKey: input.reservationKey,
     turnToolResults: {},
     finishRejections: 0,
+    deliveryNagged: false,
     completionNags: 0,
     // Both per turn, like every counter around them: what the last turn started is not evidence
     // that this one has, and a turn that opens by thinking must not inherit a stalled count.
@@ -218,7 +221,17 @@ export const startTurnState = <T extends Record<string, unknown>>(
     question?: unknown;
     continuationMark?: unknown;
     artifactLedger?: unknown;
+    codingMissionWaiting?: unknown;
+    codingMissionReviews?: unknown;
+    pendingNativeInputs?: unknown;
+    nativeInputApprovals?: unknown;
+    transcriptionApprovals?: unknown;
   };
+  delete next.codingMissionWaiting;
+  delete next.codingMissionReviews;
+  delete next.pendingNativeInputs;
+  delete next.nativeInputApprovals;
+  delete next.transcriptionApprovals;
   delete next.reasoningFloor;
   delete next.compactedAtStep;
   // Per turn, like the counters above: a transcript write that failed while the last turn was

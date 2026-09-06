@@ -167,11 +167,14 @@ export function InstanceSettings() {
           <>
             <p>
               {text(
-                relay.value.status,
+                data(relay.value.status).state,
                 text(relay.value.state, relay.value.enabled ? 'Enabled' : 'Disabled')
               )}
             </p>
             {text(relay.value.hostname) && <p className="muted">{text(relay.value.hostname)}</p>}
+            {text(data(relay.value.status).lastError) && (
+              <p role="status">{text(data(relay.value.status).lastError)}</p>
+            )}
             <details>
               <summary>Connection details</summary>
               <pre>{JSON.stringify(relay.value, null, 2)}</pre>
@@ -257,14 +260,14 @@ export function InstanceSettings() {
         <p className="muted">
           For a health report, run this in your server administration terminal:
         </p>
-        <pre>sudo athanor doctor</pre>
+        <pre>sudo garden doctor</pre>
         <p className="muted">To update the application with its built-in backup and rollback:</p>
-        <pre>sudo athanor update</pre>
+        <pre>sudo garden update</pre>
         <details>
           <summary>Automatic updates and backups</summary>
           <pre>
             {
-              'sudo athanor auto-update status\nsudo athanor auto-update on\nsudo athanor auto-update off'
+              'sudo garden auto-update status\nsudo garden auto-update on\nsudo garden auto-update off'
             }
           </pre>
           <p className="muted">
@@ -277,7 +280,7 @@ export function InstanceSettings() {
           browser provides status and workspace recovery points.
         </p>
       </Section>
-      <Section title="About athanor">
+      <Section title="About garden">
         <ResourceState resource={legal} />
         <p>A free, self-hosted agent computer for one owner.</p>
         {legal.value && (

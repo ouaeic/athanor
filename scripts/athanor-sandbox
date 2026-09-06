@@ -34,6 +34,7 @@ workspace_parent="/home/athanor"
 # anyway. `spec_path_shape` refuses every other path before a single byte is read or removed, and
 # the reader checks the file's owner against the account sudo says asked.
 spec_parent="$workspace_parent/.athanor/sandbox"
+mission_supervisor="/usr/local/lib/athanor/mission-supervisor.py"
 
 # The file a `run` request's command and environment arrive in, once it has been named and its
 # path has passed `spec_path_shape` - nothing else is ever assigned here. Removed on every refusal
@@ -306,8 +307,8 @@ run_as_agent() {
 # command arrives through "$@", so nothing from the caller is ever interpreted.
 spec_loader='
 import os, stat, sys
-network, spec, parent, asker, setpriv, unshare, uid, gid = sys.argv[1:9]
-landlock = sys.argv[9:]
+network, process_tree, supervisor, spec, parent, asker, setpriv, unshare, uid, gid = sys.argv[1:11]
+landlock = sys.argv[11:]
 
 def fail(message):
     sys.stderr.write("athanor-sandbox: %s\n" % message)
@@ -339,6 +340,19 @@ with os.fdopen(fd, "rb") as handle:
 header = b"athanor-sandbox-spec 2\0"
 if not data.startswith(header) or not data.endswith(b"\0"):
     fail("the spec file is not in the form this helper reads")
+lease_fd = None
+if process_tree == "mission":
+    lease_name = name[:-5] + ".lease"
+    lease_fd = os.open(lease_name, os.O_RDWR | os.O_NOFOLLOW, dir_fd=at)
+    lease_info = os.fstat(lease_fd)
+    if not stat.S_ISREG(lease_info.st_mode) or lease_info.st_uid != int(asker) or lease_info.st_nlink != 1:
+        fail("invalid mission process lease")
+    os.set_inheritable(lease_fd, True)
+    gate_fd = os.open(name[:-5] + ".gate", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=at)
+    gate_info = os.fstat(gate_fd)
+    if not stat.S_ISREG(gate_info.st_mode) or gate_info.st_uid != int(asker) or gate_info.st_nlink != 1:
+        fail("invalid mission process gate")
+    os.set_inheritable(gate_fd, True)
 os.unlink(name, dir_fd=at)
 os.close(at)
 words = data[len(header):-1].split(b"\0")
@@ -356,6 +370,8 @@ chain += landlock + ["--", "/usr/bin/env", "-i"] + words
 if network == "isolated":
     isolate = "ip link set lo up 2>/dev/null || true\nexec \"$@\""
     chain = [unshare, "--net", "--", "/bin/sh", "-c", isolate, "athanor-sandbox"] + chain
+if process_tree == "mission":
+    chain = ["/usr/bin/python3", "-I", "-S", supervisor, str(lease_fd), str(gate_fd), unshare] + chain
 os.execv(chain[0], chain)
 '
 
@@ -396,7 +412,7 @@ case "$mode" in
     spec="$spec_argument"
     [ -f "$spec" ] || fail "the spec file $spec does not exist"
     case "$confinement" in
-      confine)
+      confine | mission)
         confinable_root "$root" ||
           fail "a confined command needs an existing workspace directly under $workspace_parent"
         confine_to "$root"
@@ -405,7 +421,7 @@ case "$mode" in
         landlock_arguments=""
         ;;
       *)
-        fail "the filesystem mode must be confine or open"
+        fail "the filesystem mode must be confine, mission or open"
         ;;
     esac
     case "$network" in
@@ -417,7 +433,7 @@ case "$mode" in
     # reader takes nothing from the environment sudo left it or from anything installed on the box.
     # $landlock_arguments is split on whitespace on purpose, for the reason run_as_agent gives.
     # shellcheck disable=SC2086
-    exec /usr/bin/python3 -I -S -c "$spec_loader" "$network" "$spec" "$workspace_parent" \
+    exec /usr/bin/python3 -I -S -c "$spec_loader" "$network" "$confinement" "$mission_supervisor" "$spec" "$workspace_parent" \
       "$asker_uid" /usr/bin/setpriv /usr/bin/unshare "$agent_uid" "$agent_gid" $landlock_arguments
     ;;
   shell)
@@ -431,6 +447,10 @@ case "$mode" in
     # reaches every one of those files through the file browser.
     [ "$#" -gt 0 ] || fail "no command was given"
     run_as_agent "$@"
+    ;;
+  mission-status)
+    [ "$#" -eq 1 ] || fail "mission-status requires one lease path"
+    exec /usr/bin/python3 -I -S "$mission_supervisor" --status "$1" "$workspace_parent" "$SUDO_UID"
     ;;
   check)
     # The installer runs this and refuses to finish if the answer is wrong, so that a box can
@@ -450,6 +470,11 @@ case "$mode" in
       printf 'network-isolation=yes\n'
     else
       printf 'network-isolation=no\n'
+    fi
+    if [ -r "$mission_supervisor" ] && /usr/bin/unshare --mount --pid --fork --kill-child --mount-proc -- /bin/sh -c '[ "$$" -eq 1 ]' >/dev/null 2>&1; then
+      printf 'process-isolation=yes\n'
+    else
+      printf 'process-isolation=no\n'
     fi
     # The filesystem rung, reported rather than assumed. The installer reads this line and writes
     # CONFINE_AGENT_FILESYSTEM from it, so a kernel or a util-linux that cannot do this is told to
@@ -485,6 +510,6 @@ case "$mode" in
     fi
     ;;
   *)
-    fail "usage: athanor-sandbox {run network|isolated confine|open ROOT --spec PATH|shell [VAR=VALUE...] COMMAND [ARG...]|check}"
+    fail "usage: athanor-sandbox {run network|isolated confine|mission|open ROOT --spec PATH|shell [VAR=VALUE...] COMMAND [ARG...]|check}"
     ;;
 esac

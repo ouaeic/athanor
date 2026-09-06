@@ -1,4 +1,4 @@
-import { type TaskPlanStep } from '@athanor/contracts';
+import { TaskOutputIntents, type TaskOutputIntent, type TaskPlanStep } from '@athanor/contracts';
 import { decryptJson, encryptJson, AthanorError } from '@athanor/core';
 import { type ModelToolCall } from '@athanor/model-gateway';
 import { event } from '../tool-recording.js';
@@ -18,11 +18,18 @@ export async function executePlanTool(context: ToolContext, call: ModelToolCall)
   switch (call.name) {
     case 'set_plan': {
       const current = await context.store.getLatestTaskPlan(task.id);
-      const previous =
+      const previousPlan =
         current?.stepsCiphertext.aad === `task-plan:${task.id}`
-          ? decryptJson<{ steps: TaskPlanStep[] }>(current.stepsCiphertext, key).steps
-          : [];
-      const steps = planStepsFromArguments(call.arguments.steps, previous);
+          ? decryptJson<{ steps: TaskPlanStep[]; outputs?: TaskOutputIntent[] }>(
+              current.stepsCiphertext,
+              key
+            )
+          : { steps: [] };
+      const steps = planStepsFromArguments(call.arguments.steps, previousPlan.steps);
+      const outputs =
+        call.arguments.outputs === undefined
+          ? previousPlan.outputs
+          : TaskOutputIntents.parse(call.arguments.outputs);
       if (!steps.length)
         /*
          * Says what shape would have worked. It used to say only that a step was needed, which
@@ -42,14 +49,19 @@ export async function executePlanTool(context: ToolContext, call: ModelToolCall)
           taskId: task.id,
           expectedVersion: current?.version ?? 0,
           branchName,
-          stepsCiphertext: encryptJson({ steps, branchName }, key, `task-plan:${task.id}`),
+          stepsCiphertext: encryptJson(
+            { steps, branchName, ...(outputs === undefined ? {} : { outputs }) },
+            key,
+            `task-plan:${task.id}`
+          ),
           createdBy: 'agent'
         });
         await event(context.store, task, key, 'plan', `Plan version ${created.version}`, {
           planId: created.id,
           version: created.version,
           branchName,
-          steps
+          steps,
+          ...(outputs === undefined ? {} : { outputs })
         });
         return { version: created.version, steps };
       } catch (cause) {

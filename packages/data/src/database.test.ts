@@ -67,6 +67,20 @@ describe('transaction nesting', () => {
     expect(await notes()).toEqual(['inner', 'outer']);
   });
 
+  it('keeps root-handle domain calls inside their active transaction', async () => {
+    await expect(
+      database.transaction(async () => {
+        await database.query('INSERT INTO nesting(note) VALUES ($1)', ['root-query']);
+        await database.exec("INSERT INTO nesting(note) VALUES ('root-exec')");
+        await database.transaction(async (nested) => {
+          await nested.query('INSERT INTO nesting(note) VALUES ($1)', ['root-nested']);
+        });
+        throw new Error('roll back domain calls');
+      })
+    ).rejects.toThrow('roll back domain calls');
+    expect(await notes()).toEqual([]);
+  }, 5_000);
+
   /**
    * A transaction handle owns nothing it could close: the pool, the socket and the embedded backend
    * outlive it and belong to everything else in the process. `PostgresDatabase` makes the scoped
@@ -81,5 +95,33 @@ describe('transaction nesting', () => {
     });
 
     expect(await notes()).toEqual(['outer']);
+  });
+  it('isolates concurrent callbacks so one rollback cannot commit another transaction', async () => {
+    let entered!: () => void;
+    const firstEntered = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let release!: () => void;
+    const releaseFirst = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const first = database.transaction(async (transaction) => {
+      await transaction.query('INSERT INTO nesting(note) VALUES ($1)', ['rolled-back']);
+      entered();
+      await releaseFirst;
+      throw new Error('roll back first');
+    });
+    await firstEntered;
+    const second = database.transaction(async (transaction) => {
+      const visible = await transaction.query('SELECT note FROM nesting');
+      expect(visible.rows).toEqual([]);
+      await transaction.query('INSERT INTO nesting(note) VALUES ($1)', ['committed']);
+    });
+    // Let the competing BEGIN reach the backend while the first callback still owns its scope.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    release();
+    const results = await Promise.allSettled([first, second]);
+    expect(results.map((result) => result.status)).toEqual(['rejected', 'fulfilled']);
+    expect(await notes()).toEqual(['committed']);
   });
 });

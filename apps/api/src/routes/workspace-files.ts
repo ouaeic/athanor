@@ -13,6 +13,7 @@ import { AthanorError, decryptJson, encryptJson, sha256, unwrapDataKey } from '@
 import type { WorkspaceRecord } from '@athanor/data';
 import { z } from 'zod';
 import { FILE_WINDOW_HEADERS } from '../context.js';
+import { downloadSignal, sendDownload } from '../download-response.js';
 import { requireUser } from '../http/auth-hook.js';
 import type { RouteContext } from '../http/server-context.js';
 import { recordSecurityEvent } from '../security-events.js';
@@ -73,6 +74,32 @@ export const registerWorkspaceFileRoutes = (context: RouteContext): void => {
 
   app.get<{
     Params: { workspaceId: string };
+    Querystring: { path: string };
+  }>('/v1/workspaces/:workspaceId/download', async (request, reply) => {
+    const user = requireUser(request.user);
+    const workspace = await store.getWorkspace(user.id, request.params.workspaceId);
+    if (!workspace) throw new AthanorError('workspace_not_found', 'Workspace not found');
+    const path = z.string().min(1).max(1_024).parse(request.query.path);
+    const headers: Record<string, string> = {};
+    for (const name of ['range', 'if-range'] as const) {
+      const value = request.headers[name];
+      if (typeof value === 'string') headers[name] = value;
+    }
+    const response = await runner.raw({
+      workspaceId: workspace.id,
+      userId: user.id,
+      role: 'user',
+      scopes: ['files.read'],
+      path: `/v1/workspaces/${workspace.id}/download?${new URLSearchParams({ path })}`,
+      headers,
+      acceptAnyStatus: true,
+      signal: downloadSignal(reply)
+    });
+    return sendDownload(reply, response);
+  });
+
+  app.get<{
+    Params: { workspaceId: string };
     Querystring: { path: string; startLine?: string; endLine?: string; maxBytes?: string };
   }>('/v1/workspaces/:workspaceId/file', async (request, reply) => {
     const user = requireUser(request.user);
@@ -103,7 +130,11 @@ export const registerWorkspaceFileRoutes = (context: RouteContext): void => {
       const value = response.headers.get(header);
       if (value !== null) reply.header(header, value);
     }
-    return reply.type('application/octet-stream').send(Buffer.from(await response.arrayBuffer()));
+    if (!response.body)
+      throw new AthanorError('file_unavailable', 'The file stream is unavailable');
+    return reply
+      .type('application/octet-stream')
+      .send(Readable.fromWeb(response.body as unknown as NodeReadableStream));
   });
 
   app.put<{
@@ -367,15 +398,42 @@ export const registerWorkspaceFileRoutes = (context: RouteContext): void => {
       const workspace = await store.getWorkspace(user.id, String(artifact.workspaceId));
       if (!workspace?.wrappedKey)
         throw new AthanorError('workspace_not_found', 'Workspace not found');
-      const content = await runner.request<Buffer>({
+      const response = await runner.raw({
         workspaceId: workspace.id,
         userId: user.id,
         role: 'user',
         scopes: ['files.read'],
-        path: `/v1/workspaces/${workspace.id}/file?path=${encodeURIComponent(String(artifact.storageKey))}`
+        path: `/v1/workspaces/${workspace.id}/download?${new URLSearchParams({ path: String(artifact.storageKey), sha256: String(artifact.sha256) })}`,
+        headers:
+          typeof request.headers.range === 'string'
+            ? {
+                range: request.headers.range,
+                ...(typeof request.headers['if-range'] === 'string'
+                  ? { 'if-range': request.headers['if-range'] }
+                  : {})
+              }
+            : {},
+        signal: downloadSignal(reply),
+        acceptAnyStatus: true
       });
-      if (sha256(content) !== artifact.sha256)
+      if (response.status === 409) {
+        await response.body?.cancel();
         throw new AthanorError('artifact_integrity_failed', 'Artifact integrity check failed');
+      }
+      if (!response.ok) return sendDownload(reply, response);
+      if (!response.body)
+        throw new AthanorError('file_unavailable', 'The artifact stream is unavailable');
+      for (const header of [
+        'content-length',
+        'content-range',
+        'accept-ranges',
+        'etag',
+        'last-modified'
+      ]) {
+        const value = response.headers.get(header);
+        if (value !== null) reply.header(header, value);
+      }
+      reply.code(response.status).header('cache-control', 'private, no-store');
       const name = decryptJson<{ name: string }>(
         artifact.nameCiphertext as Parameters<typeof decryptJson>[0],
         unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id),
@@ -424,7 +482,7 @@ export const registerWorkspaceFileRoutes = (context: RouteContext): void => {
           'content-disposition',
           `${renderInline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(name)}`
         )
-        .send(content);
+        .send(Readable.fromWeb(response.body as unknown as NodeReadableStream));
     }
   );
 

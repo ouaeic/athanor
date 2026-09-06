@@ -1,3 +1,4 @@
+import { CODING_CHILD_TOOLS } from './coding-missions.js';
 import type { ModelRelease, WebToolPlan } from '@athanor/contracts';
 import type { DataStore, TaskRecord } from '@athanor/data';
 import type { ModelGateway, ModelToolCall } from '@athanor/model-gateway';
@@ -182,6 +183,8 @@ const DOMAIN_OF: Readonly<Record<string, ToolDomain>> = {
  * last week is a model that retries differently.
  */
 export async function executeToolCall(context: ToolContext, call: ModelToolCall): Promise<unknown> {
+  if (context.task.parentMissionId && !CODING_CHILD_TOOLS.has(call.name))
+    throw new Error('This capability is outside the coding specialist workspace');
   const domain = DOMAIN_OF[call.name];
   if (!domain) throw new Error(`Unknown tool ${call.name}`);
   return domain(context, call);

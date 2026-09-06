@@ -1,182 +1,424 @@
-/**
- * Turning a recording into text, priced from what this account has actually been charged.
- */
-
-import { AthanorError, assertSpendAllowed, sha256 } from '@athanor/core';
-import { z } from 'zod';
+import { createHmac } from 'node:crypto';
 import {
-  TRANSCRIPTION_FORMATS,
-  transcriptionEstimateUsd,
-  transcriptionSecondsFromPayload
-} from '../context.js';
+  DICTATION_MAX_BYTES,
+  DICTATION_MAX_SECONDS,
+  DICTATION_MAX_COST_USD,
+  AUDIO_RECEIPT_REFERENCE_MAX_LENGTH,
+  PrivacyRoute,
+  type DictationOptions,
+  type MediaModelOption
+} from '@athanor/contracts';
+import { AthanorError, decryptJson, encryptJson, sha256, userMemoryKey } from '@athanor/core';
+import {
+  MediaClient,
+  MediaProviderRejectionError,
+  TranscriptionEmptyError,
+  isNativeOpenAIEndpoint,
+  nativeTranscriptionBound,
+  quoteMediaPrice
+} from '@athanor/model-gateway';
+import { z } from 'zod';
+import { TRANSCRIPTION_FORMATS, type InferenceSecret } from '../context.js';
+import {
+  decodeDictationBase64,
+  dictationDecoder,
+  prepareDictationAudio
+} from '../audio-preparation.js';
 import { requireUser } from '../http/auth-hook.js';
 import type { RouteContext } from '../http/server-context.js';
 
-export const registerTranscriptionRoutes = (context: RouteContext): void => {
-  const { app, store, inferenceCredential, measuredTranscriptionUsdPerMinute, config } = context;
-  app.post('/v1/audio/transcriptions', async (request) => {
-    const user = requireUser(request.user);
-    const input = z
-      .object({
-        data: z.string().min(1).max(20_000_000),
-        format: z.enum(TRANSCRIPTION_FORMATS)
-      })
-      .parse(request.body);
-    const { secret } = await inferenceCredential(user.id);
-    if (secret.provider !== 'openrouter' || !secret.apiKey)
-      throw new AthanorError(
-        'transcription_provider_required',
-        'Voice transcription currently requires an OpenRouter connection in Settings',
-        409
-      );
-    const baseUrl = secret.baseUrl.replace(/\/$/, '');
-    const headers = {
-      authorization: `Bearer ${secret.apiKey}`,
-      'content-type': 'application/json',
-      'http-referer': config.PUBLIC_APP_URL,
-      'x-title': 'athanor'
-    };
-    // The owner's own choice, where they have made one. This route used to take whatever stood at
-    // the top of the provider's weekly list, which meant the model that reads a voice note into the
-    // composer could change under them between one dictation and the next, and could never be the
-    // one they picked in Settings. The catalogue is now the fallback rather than the answer, and it
-    // is the same sealed choice the agent's audio_read reads.
-    const pinned =
-      secret.mediaRoutes?.transcription?.modality === 'transcription'
-        ? secret.mediaRoutes.transcription
-        : undefined;
-    /*
-     * Dictation is spending, and until this it was the only spending on the box that neither asked
-     * the caps first nor left a line in the ledger. `GET /v1/spend` and `GET /v1/usage` reported
-     * task inference and nothing else, so an owner dictating long notes against a monthly cap
-     * watched a ceiling that could never fire and a provider bill nothing in the product could
-     * explain.
-     *
-     * Asked before the recording leaves the box - before the catalogue is even consulted - for the
-     * reason the agent's own `audio_read` gives: duration billing means the money is spent the
-     * moment the request is accepted, so a check that ran afterwards would be a report rather than
-     * a brake. Open commitments count, the same as they do when a task is started: a queued
-     * afternoon of work has already promised the day's headroom, and a voice note must not promise
-     * it a second time.
-     */
-    const seconds = transcriptionSecondsFromPayload(input.data, input.format);
-    const usdPerMinute =
-      pinned &&
-      pinned.priceSource !== 'unknown' &&
-      typeof pinned.usdPerMinute === 'number' &&
-      Number.isFinite(pinned.usdPerMinute)
-        ? pinned.usdPerMinute
-        : await measuredTranscriptionUsdPerMinute(user.id);
-    assertSpendAllowed(
-      await store.spendGuard({
-        userId: user.id,
-        estimateUsd: transcriptionEstimateUsd(seconds, usdPerMinute),
-        includeOpenCommitments: true
-      })
+const DictationRequest = z
+  .object({
+    data: z
+      .string()
+      .min(1)
+      .max(Math.ceil(DICTATION_MAX_BYTES / 3) * 4),
+    format: z.enum(TRANSCRIPTION_FORMATS),
+    expectedRouteId: z.string().min(1).max(512).optional(),
+    expectedModelId: z.string().min(1).max(512).optional(),
+    expectedRouteProof: z.string().min(1).max(128).optional(),
+    privacyRoute: PrivacyRoute.optional(),
+    externalConsent: z.boolean().optional(),
+    maxCostUsd: z.number().finite().positive().max(DICTATION_MAX_COST_USD).optional()
+  })
+  .strict();
+
+const durationRate = (route: MediaModelOption | null): number | null => {
+  if (!route || route.priceSource === 'unknown') return null;
+  if (route.pricing?.length) return quoteMediaPrice(route.pricing, { seconds: 60 });
+  return typeof route.usdPerMinute === 'number' &&
+    Number.isFinite(route.usdPerMinute) &&
+    route.usdPerMinute >= 0
+    ? route.usdPerMinute
+    : null;
+};
+
+export const dictationOptionsFor = async (
+  context: RouteContext,
+  userId: string
+): Promise<{
+  options: DictationOptions;
+  secret: InferenceSecret;
+  route: MediaModelOption | null;
+}> => {
+  const { secret } = await context.inferenceCredential(userId);
+  let route = secret.mediaRoutes?.transcription ?? null;
+  if (secret.provider === 'openrouter' || !route) {
+    const current = (await context.mediaSettings(userId)).modalities.find(
+      (entry) => entry.modality === 'transcription'
     );
-    const model = await (async (): Promise<string | undefined> => {
-      if (pinned?.providerModelId) return pinned.providerModelId;
-      const catalogUrl = new URL(`${baseUrl}/models`);
-      catalogUrl.searchParams.set('output_modalities', 'transcription');
-      catalogUrl.searchParams.set('sort', 'top-weekly');
-      const catalogResponse = await fetch(catalogUrl, {
-        headers,
-        signal: AbortSignal.timeout(15_000)
-      }).catch(() => undefined);
-      if (!catalogResponse?.ok)
+    route = route
+      ? (current?.options?.find((option) => option.id === route!.id) ??
+        (current?.effective?.id === route.id
+          ? current.effective
+          : {
+              ...route,
+              unavailableReason:
+                'The selected transcription model is no longer advertised. Review the model in Settings.'
+            }))
+      : (current?.effective ?? null);
+  }
+  const native = secret.provider !== 'openrouter' && isNativeOpenAIEndpoint(secret.baseUrl);
+  const protocolMatches =
+    route &&
+    (secret.provider === 'openrouter'
+      ? route.apiProtocol !== 'openai'
+      : native && route.apiProtocol === 'openai');
+  const privacyRoutes: DictationOptions['privacyRoutes'] = [];
+  if (
+    native &&
+    protocolMatches &&
+    route?.zeroDataRetentionAvailable &&
+    secret.enforceZeroDataRetention
+  )
+    privacyRoutes.push('provider_zdr');
+  if (secret.provider === 'openrouter' || (native && !secret.enforceZeroDataRetention))
+    privacyRoutes.push('external');
+  const rate = durationRate(route);
+  const bound = native ? nativeTranscriptionBound(route) : null;
+  const reason = !secret.apiKey
+    ? 'Connect a provider credential in Settings.'
+    : !route || route.modality !== 'transcription' || !route.providerModelId
+      ? 'Choose a transcription model in Settings.'
+      : (route.unavailableReason ??
+        (!protocolMatches
+          ? 'The selected transcription route does not match this provider connection.'
+          : !privacyRoutes.length
+            ? 'The selected transcription route cannot meet the configured privacy requirement.'
+            : rate === null && bound === null
+              ? 'This transcription route has no verified whole-recording cost bound. Choose a supported priced transcription model.'
+              : !(await dictationDecoder())
+                ? 'Install the native media capability before using dictation.'
+                : null));
+  return {
+    secret,
+    route,
+    options: {
+      available: reason === null,
+      reason,
+      routeId: route?.id ?? null,
+      routeProof: route
+        ? createHmac('sha256', userMemoryKey(context.masterKey, userId))
+            .update(
+              JSON.stringify({
+                userId,
+                baseUrl: secret.baseUrl,
+                provider: secret.provider,
+                apiKey: secret.apiKey,
+                enforceZeroDataRetention: secret.enforceZeroDataRetention,
+                route: { ...route, updatedAt: undefined, metadataVerifiedAt: undefined },
+                bound
+              })
+            )
+            .digest('base64url')
+        : null,
+      modelId: route?.providerModelId ?? null,
+      displayName: route?.displayName ?? null,
+      provider: route?.provider ?? null,
+      privacyRoutes,
+      defaultPrivacyRoute: privacyRoutes.includes('provider_zdr') ? 'provider_zdr' : 'external',
+      requiresExternalConsent: !privacyRoutes.includes('provider_zdr'),
+      requiresMaxCostUsd: false,
+      pricing: route?.pricing ?? [],
+      usdPerMinute: rate,
+      reservationUsd: bound?.reservationUsd ?? null,
+      maxDurationSeconds: Math.min(
+        DICTATION_MAX_SECONDS,
+        bound?.maxSeconds ?? DICTATION_MAX_SECONDS
+      ),
+      maxBytes: DICTATION_MAX_BYTES
+    }
+  };
+};
+
+export const registerTranscriptionRoutes = (context: RouteContext): void => {
+  const { app, store, config, masterKey, idempotent } = context;
+  const preparing = new Set<string>();
+  app.get('/v1/audio/transcriptions/receipts', async (request) =>
+    store.listDictationReceipts(requireUser(request.user).id)
+  );
+  app.post<{ Params: { receiptId: string } }>(
+    '/v1/audio/transcriptions/:receiptId/reconcile',
+    async (request, reply) => {
+      const user = requireUser(request.user);
+      if (request.apiToken)
         throw new AthanorError(
-          'transcription_catalog_unavailable',
-          'The transcription catalogue could not be reached',
-          503
+          'dictation_owner_required',
+          'Reconcile dictation from a signed-in browser',
+          403
         );
-      const catalog = (await catalogResponse.json()) as { data?: Array<{ id?: string }> };
-      return catalog.data?.find((entry) => typeof entry.id === 'string')?.id;
-    })();
-    if (!model)
+      return idempotent(request, reply, user, async () => {
+        if (preparing.has(user.id))
+          throw new AthanorError(
+            'dictation_active',
+            'Wait for the active dictation request to finish before reconciling its charge',
+            409
+          );
+        const id = z.string().uuid().parse(request.params.receiptId);
+        const input = z
+          .object({
+            costUsd: z.number().finite().min(0).max(1_000_000),
+            providerReceiptRef: z.string().trim().min(1).max(AUDIO_RECEIPT_REFERENCE_MAX_LENGTH)
+          })
+          .strict()
+          .parse(request.body);
+        return store.reconcileDictationReceipt({
+          userId: user.id,
+          id,
+          costUsd: input.costUsd,
+          receiptCiphertext: encryptJson(
+            { providerReceiptRef: input.providerReceiptRef },
+            userMemoryKey(masterKey, user.id),
+            `dictation-reconciliation:${user.id}:${id}`
+          )
+        });
+      });
+    }
+  );
+  app.get('/v1/audio/transcriptions/options', async (request) => {
+    const user = requireUser(request.user);
+    try {
+      return (await dictationOptionsFor(context, user.id)).options;
+    } catch (error) {
+      if (!(error instanceof AthanorError)) throw error;
+      return {
+        available: false,
+        reason: error.message,
+        routeId: null,
+        routeProof: null,
+        modelId: null,
+        displayName: null,
+        provider: null,
+        privacyRoutes: [],
+        defaultPrivacyRoute: 'provider_zdr',
+        requiresExternalConsent: false,
+        requiresMaxCostUsd: true,
+        pricing: [],
+        usdPerMinute: null,
+        reservationUsd: null,
+        maxDurationSeconds: DICTATION_MAX_SECONDS,
+        maxBytes: DICTATION_MAX_BYTES
+      } satisfies DictationOptions;
+    }
+  });
+  app.post('/v1/audio/transcriptions', async (request, reply) => {
+    const user = requireUser(request.user);
+    if (request.apiToken)
       throw new AthanorError(
-        'transcription_model_unavailable',
-        'No transcription model is currently available from OpenRouter',
-        503
+        'dictation_owner_required',
+        'Start dictation from a signed-in browser',
+        403
       );
-    const response = await fetch(`${baseUrl}/audio/transcriptions`, {
-      method: 'POST',
-      headers,
-      signal: AbortSignal.timeout(60_000),
-      body: JSON.stringify({
-        model,
-        input_audio: { data: input.data, format: input.format },
-        temperature: 0,
-        provider: {
-          zdr: true,
-          data_collection: 'deny',
-          require_parameters: true,
-          allow_fallbacks: true
-        }
-      })
-    }).catch(() => undefined);
-    if (!response?.ok)
-      throw new AthanorError(
-        'transcription_failed',
-        response?.status === 429
-          ? 'The transcription provider is busy or rate-limited; try again shortly'
-          : 'No zero-retention transcription route accepted this voice note',
-        response?.status === 429 ? 429 : 503
-      );
-    const result = (await response.json()) as {
-      text?: string;
-      usage?: {
-        seconds?: number;
-        total_tokens?: number;
-        input_tokens?: number;
-        output_tokens?: number;
-        cost?: number;
+    const input = DictationRequest.parse(request.body);
+    const key = userMemoryKey(masterKey, user.id),
+      aad = `dictation-response:${user.id}:${sha256(String(request.headers['idempotency-key']))}`;
+    const sealed = await idempotent(request, reply, user, async () => {
+      if (preparing.has(user.id))
+        throw new AthanorError(
+          'dictation_busy',
+          'Finish the current recording before starting another',
+          409
+        );
+      preparing.add(user.id);
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      const closed = () => {
+        if (!reply.raw.writableEnded) abort();
       };
-    };
-    /*
-     * Written between the charge and everything that could still fail, exactly as a generation is.
-     * The provider has billed by this line: a note it read and then declined to return any speech
-     * from cost the same as one it returned a paragraph from, so the refusal below must not be the
-     * thing that decides whether the owner is told about the money.
-     *
-     * The provider's own figure where it states one. Where it does not, what the estimate said -
-     * which is the same fallback `transcribe` makes on the agent's path, and is a floor rather than
-     * a claim when nobody has priced the route at all.
-     */
-    const billedSeconds =
-      typeof result.usage?.seconds === 'number' && Number.isFinite(result.usage.seconds)
-        ? result.usage.seconds
-        : seconds;
-    await store.recordUsage({
-      userId: user.id,
-      kind: 'model_inference',
-      resourceClass: 'media:transcription',
-      quantity: Math.max(1, Math.round(billedSeconds)),
-      unit: 'second',
-      credits: 0,
-      state: 'settled',
-      costUsd:
-        typeof result.usage?.cost === 'number' &&
-        Number.isFinite(result.usage.cost) &&
-        result.usage.cost >= 0
-          ? result.usage.cost
-          : transcriptionEstimateUsd(billedSeconds, usdPerMinute),
-      // Keyed on the recording, so a client that resends a note whose answer was lost on the way
-      // back is not billed for it twice on the owner's own ledger. Under the account as well as the
-      // bytes: two people on one box saying the same sentence are two charges.
-      idempotencyKey: `audio:${user.id}:${sha256(input.data)}:transcription`,
-      providerRef: `${secret.provider}:${model}`
+      request.raw.once('aborted', abort);
+      reply.raw.once('close', closed);
+      try {
+        const bytes = decodeDictationBase64(input.data);
+        const { secret, route, options } = await dictationOptionsFor(context, user.id);
+        if (!route || !options.available)
+          throw new AthanorError(
+            'transcription_route_unavailable',
+            options.reason ?? 'Choose a transcription model in Settings',
+            409
+          );
+        if (
+          (input.expectedRouteId !== undefined && input.expectedRouteId !== options.routeId) ||
+          (input.expectedModelId !== undefined && input.expectedModelId !== options.modelId) ||
+          (input.expectedRouteProof !== undefined &&
+            input.expectedRouteProof !== options.routeProof)
+        )
+          throw new AthanorError(
+            'dictation_selection_changed',
+            'The transcription connection or model changed. Review it again before sending this recording.',
+            409
+          );
+        const privacyRoute = input.privacyRoute ?? 'provider_zdr';
+        if (!options.privacyRoutes.includes(privacyRoute))
+          throw new AthanorError(
+            'transcription_privacy_conflict',
+            'Choose the advertised privacy route before sending this recording',
+            409
+          );
+        if (
+          privacyRoute === 'external' &&
+          (input.externalConsent !== true ||
+            !input.expectedRouteId ||
+            !input.expectedModelId ||
+            !input.expectedRouteProof)
+        )
+          throw new AthanorError(
+            'transcription_consent_required',
+            'Review the selected transcription connection and explicitly allow external retention before sending this recording',
+            409
+          );
+        if (options.usdPerMinute === null && options.reservationUsd === null)
+          throw new AthanorError(
+            'transcription_price_unbounded',
+            'Choose a supported priced transcription model',
+            409
+          );
+        const prepared = await prepareDictationAudio(bytes, input.format, controller.signal);
+        if (prepared.seconds > options.maxDurationSeconds)
+          throw new AthanorError(
+            'transcription_duration_exceeded',
+            'This recording exceeds the selected model’s bounded duration. Dictate a shorter direction.',
+            413
+          );
+        const estimateUsd =
+          options.reservationUsd ?? Math.ceil(prepared.seconds / 60) * options.usdPerMinute!;
+        if (input.maxCostUsd !== undefined && estimateUsd > input.maxCostUsd)
+          throw new AthanorError(
+            'transcription_reservation_exceeded',
+            'This recording exceeds the chosen transcription cost limit',
+            402
+          );
+        const operationKey = String(request.headers['idempotency-key']);
+        const usage = {
+          userId: user.id,
+          kind: 'model_inference',
+          resourceClass: 'media:transcription',
+          quantity: prepared.seconds,
+          unit: 'second',
+          credits: 0,
+          idempotencyKey: `dictation:${user.id}:${sha256(operationKey)}`,
+          providerRef: `${secret.provider}:${route.providerModelId}`,
+          modelId: route.providerModelId
+        };
+        let reserved = false,
+          settled = false;
+        const reading = await new MediaClient({
+          baseUrl: secret.baseUrl,
+          apiKey: secret.apiKey!,
+          appUrl: config.PUBLIC_APP_URL,
+          openRouter: secret.provider === 'openrouter',
+          timeoutSeconds: 60
+        })
+          .transcribe({
+            model: route.providerModelId,
+            privacyRoute,
+            ...(input.externalConsent === true ? { externalConsent: true } : {}),
+            audio: prepared.bytes,
+            format: prepared.format,
+            seconds: prepared.seconds,
+            usdPerMinute: options.usdPerMinute,
+            ...(route.pricing?.length ? { pricing: route.pricing } : {}),
+            signal: controller.signal,
+            onBeforeSubmit: async () => {
+              const current = (await dictationOptionsFor(context, user.id)).options;
+              if (!current.available || current.routeProof !== options.routeProof)
+                throw new AthanorError(
+                  'dictation_selection_changed',
+                  'The transcription connection or model changed. Review it again before sending this recording.',
+                  409
+                );
+              await store.recordUsage({
+                ...usage,
+                costUsd: estimateUsd,
+                state: 'reserved',
+                reserveAgainstCaps: true
+              });
+              reserved = true;
+            },
+            onUsage: async (receipt) => {
+              if (receipt.costKnown && !settled) {
+                await store.recordUsage({
+                  ...usage,
+                  quantity: receipt.billedSeconds ?? prepared.seconds,
+                  costUsd: receipt.costUsd,
+                  state: 'settled',
+                  settleReservation: true
+                });
+                settled = true;
+              }
+            }
+          })
+          .catch(async (error: unknown) => {
+            if (reserved && !settled && error instanceof MediaProviderRejectionError)
+              await store.recordUsage({
+                ...usage,
+                costUsd: 0,
+                state: 'released',
+                settleReservation: true
+              });
+            if (error instanceof AthanorError) throw error;
+            if (error instanceof TranscriptionEmptyError)
+              throw new AthanorError(
+                'transcription_empty',
+                'The model returned no speech from this recording',
+                422
+              );
+            throw new AthanorError(
+              'transcription_failed',
+              reserved && !settled && !(error instanceof MediaProviderRejectionError)
+                ? 'The provider response could not be confirmed. Its spending reservation remains held; this recording will not be submitted again under the same request.'
+                : 'The recording could not be transcribed',
+              error instanceof MediaProviderRejectionError
+                ? error.status === 429
+                  ? 429
+                  : 422
+                : 503
+            );
+          });
+        return encryptJson(
+          {
+            text: reading.text,
+            model: route.providerModelId,
+            privacyRoute,
+            usage: {
+              seconds: reading.billedSeconds ?? prepared.seconds,
+              cost: reading.costKnown ? reading.costUsd : null,
+              costSource: reading.costFromProvider
+                ? 'provider'
+                : reading.costKnown
+                  ? 'quote'
+                  : 'unresolved',
+              ...(!reading.costKnown ? { reservationUsd: estimateUsd } : {})
+            }
+          },
+          key,
+          aad
+        );
+      } finally {
+        preparing.delete(user.id);
+        request.raw.removeListener('aborted', abort);
+        reply.raw.removeListener('close', closed);
+      }
     });
-    if (!result.text?.trim())
-      throw new AthanorError(
-        'transcription_empty',
-        'The transcription model did not return any speech',
-        422
-      );
-    return {
-      text: result.text.trim(),
-      model,
-      usage: result.usage ?? null,
-      privacyRoute: 'provider_zdr' as const
-    };
+    return decryptJson(sealed, key, aad);
   });
 };

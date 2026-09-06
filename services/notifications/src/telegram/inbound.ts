@@ -364,7 +364,7 @@ const handleCallback = async (
   if (!ledger.nonce || !sameSecret(ledger.nonce, parsed.nonce))
     return reject(input, 'bad_nonce', { approvalId: parsed.approvalId });
 
-  // From here to the status write this is the approval route, call for call.
+  // Settlement uses the same atomic decision as the browser route.
   const approval = await store.getApproval(parsed.approvalId);
   if (!approval || approval.userId !== destination.userId)
     return reject(input, 'foreign_approval', { approvalId: parsed.approvalId });
@@ -415,7 +415,6 @@ const handleCallback = async (
     );
     return 'already_decided';
   }
-  await store.setTaskStatusForUser(destination.userId, String(approval.taskId), 'queued');
   await bestEffort(
     writeCardOutcome({
       ...outcome,

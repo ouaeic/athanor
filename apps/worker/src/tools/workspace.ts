@@ -1,3 +1,4 @@
+import { executeDebuggerTool } from './debugger.js';
 import { sha256, AthanorError } from '@athanor/core';
 import { type ModelToolCall } from '@athanor/model-gateway';
 import {
@@ -28,6 +29,8 @@ import {
 import { finiteNumber } from './numbers.js';
 import { withWorkspacePrefixNote } from './shell-frame.js';
 import { refuseShellReplacementOfUnread } from './shell-writes.js';
+import { executeComputationTool } from './computation.js';
+import { shellJobExecution } from '../shell-job.js';
 
 /**
  * How much of what a patch just wrote comes back in the result.
@@ -705,12 +708,17 @@ async function runWorkspaceTool(context: ToolContext, call: ModelToolCall): Prom
   switch (call.name) {
     case 'shell': {
       const background = call.arguments.background === true;
-      const execution = { ...call.arguments };
-      delete execution.background;
+      const execution = shellJobExecution(call.arguments);
       // A redirect or a `tee` over a file this turn has read part of is the whole-file write the
       // arm below refuses, spelled through the shell - and the runner's ledger cannot see a
       // redirect. Asked here, of the same record, before anything is sent.
       refuseShellReplacementOfUnread(reader, state, execution);
+      if (execution.checkpointResume)
+        refuseShellReplacementOfUnread(
+          reader,
+          state,
+          execution.checkpointResume as Record<string, unknown>
+        );
       const executable = textValue(execution.executable).split('/').pop()?.toLowerCase();
       /*
        * Whether this invocation is asking the computer to install software on itself.
@@ -767,11 +775,22 @@ async function runWorkspaceTool(context: ToolContext, call: ModelToolCall): Prom
       return withWorkspacePrefixNote(execution, result);
     }
     case 'process': {
+      if (call.arguments.action === 'debug') return executeDebuggerTool(context, call);
+      if (call.arguments.action === 'describe' || call.arguments.action === 'compute')
+        return executeComputationTool(context, call);
       const action = textValue(call.arguments.action, 'list');
       if (action === 'list')
         return context.runner.call(task.workspaceId, task.id, 'exec', `${root}/processes`);
       const sessionId = textValue(call.arguments.sessionId);
       if (!sessionId) throw new Error('process requires sessionId for this action');
+      if (action === 'resume')
+        return context.runner.call(
+          task.workspaceId,
+          task.id,
+          'exec',
+          `${root}/processes/${encodeURIComponent(sessionId)}/resume`,
+          {}
+        );
       return context.runner.call(
         task.workspaceId,
         task.id,

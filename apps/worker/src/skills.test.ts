@@ -464,12 +464,9 @@ describe('the shipped built-in library', () => {
   });
 
   it('names only binaries the installer actually leaves on this computer', () => {
-    // A procedure reads as authoritative, so a skill that opens with a command the box does not
-    // have is followed until it fails, one shell call at a time, in front of the owner. Every
-    // binary a skill declares is therefore held against scripts/install-native.sh: either an apt
-    // package that install lists, or a path it installs itself. `magick` is the one that made this
-    // worth writing - the apt package is ImageMagick 6 on every current LTS, which has no such
-    // command, and the installer closes that with a compatibility shim.
+    // Every declared binary needs an installation contract: a host capability, an installed
+    // asset, an executable native activation drill, or the supported host's init system.
+    expect(library.skills.length).toBeGreaterThan(0);
     const installer = readFileSync(
       fileURLToPath(new URL('../../../scripts/install-native.sh', import.meta.url)),
       'utf8'
@@ -543,7 +540,6 @@ describe('the shipped built-in library', () => {
       img2pdf: ['suse']
     };
     const installedPath: Record<string, string> = {
-      '/usr/local/lib/athanor/python/bin/python3': '/usr/local/lib/athanor/python',
       'athanor-office-convert': '/usr/local/bin/athanor-office-convert',
       'athanor-pdf-tables': '/usr/local/bin/athanor-pdf-tables',
       typst: '/usr/local/bin/typst'
@@ -551,10 +547,13 @@ describe('the shipped built-in library', () => {
     // systemd is the init system of every supported host; the installer writes units rather than
     // installing the commands that read them.
     const fromInit = new Set(['systemctl', 'journalctl']);
+    // scripts/test-update.sh executes shared native activation and verifies these installed
+    // executable paths, active links, acquisition failures and offline rollback retention.
+    const fromNativeActivation = new Set(['/usr/local/lib/athanor/python/bin/python3']);
 
     for (const skill of library.skills)
       for (const binary of new Set([...skill.requiredBinaries, ...skill.capability.exec])) {
-        if (fromInit.has(binary)) continue;
+        if (fromInit.has(binary) || fromNativeActivation.has(binary)) continue;
         const path = installedPath[binary];
         if (path) {
           expect(installer.includes(path), `${skill.name} names ${binary}`).toBe(true);

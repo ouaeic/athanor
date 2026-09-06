@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { Task, type TaskEvent } from '@athanor/contracts';
 import type { Bootstrap } from './model.js';
-import { activeQuestion, mergeTaskRefresh, surfaceAnswer } from './model.js';
+import {
+  activeQuestion,
+  hasOngoingWork,
+  needsAttention,
+  taskStatusLabel,
+  mergeTaskRefresh,
+  surfaceAnswer
+} from './model.js';
 
 const id = '11111111-1111-4111-8111-111111111111';
 const time = '2026-09-06T00:00:00.000Z';
@@ -51,6 +58,17 @@ const bootstrap = (tasks: Task[], cursor: string | null): Bootstrap => ({
 });
 
 describe('the current work surface', () => {
+  it('keeps delivery in progress visible and brings failed delivery back to attention', () => {
+    const pending = { ...task, status: 'completed' as const, deliveryStatus: 'pending' as const };
+    expect(hasOngoingWork(pending)).toBe(true);
+    expect(taskStatusLabel(pending)).toBe('Generating media');
+    expect(needsAttention(pending)).toBe(false);
+    const failed = { ...pending, deliveryStatus: 'incomplete' as const };
+    expect(needsAttention(failed)).toBe(true);
+    expect(taskStatusLabel(failed)).toBe('Delivery needs attention');
+    expect(hasOngoingWork(failed)).toBe(false);
+    expect(needsAttention({ ...pending, deliveryStatus: 'ready' })).toBe(false);
+  });
   it('replaces stream fragments with the final answer and isolates a new direction', () => {
     const events = [
       event(1, 'user_message', { markdown: 'First direction' }),

@@ -1638,6 +1638,10 @@ describe('what a tainted turn may still do through shell', () => {
     // The runner resolves an absolute path that lands inside the workspace like any other, so a
     // rule anchored at the front of the string governed one spelling of the same file.
     for (const path of [
+      'workspace/GARDEN.md',
+      '/home/athanor/ws-1/workspace/GARDEN.md',
+      'workspace/AGENTS.md',
+      'workspace/OPEN_CLOUD.md',
       'workspace/ATHANOR.md',
       '/home/athanor/ws-1/workspace/ATHANOR.md',
       'workspace/skills/vendor-notes/SKILL.md'
@@ -2357,12 +2361,42 @@ describe('what a reading of a recording costs before it happens', () => {
     // number this side can state, so the cumulative threshold has nothing to compare against.
     const unchosen = approvalRequirement('audio_read', { path: 'workspace/memo.m4a' });
     expect(unchosen?.sideEffect).toBe('external_reversible');
-    expect(unchosen?.preview).toMatch(/no price athanor can read/i);
+    expect(unchosen?.preview).toMatch(/no verified whole-request cost bound/i);
     // The same is true of a chosen route the provider publishes no price for.
     const unpriced = approvalRequirement('audio_read', { path: 'workspace/memo.m4a' }, 'balanced', {
       mediaModel: route({ priceSource: 'unknown', usdPerMinute: null })!
     });
-    expect(unpriced?.preview).toMatch(/no price athanor can read/i);
+    expect(unpriced?.preview).toMatch(/no verified whole-request cost bound/i);
+  });
+
+  it('states the full native request reservation and clipped output authority', () => {
+    const model = resolvedTranscriptionRoute(
+      {
+        transcription: mediaOption({
+          id: 'native/diarize',
+          providerModelId: 'gpt-4o-transcribe-diarize',
+          apiProtocol: 'openai',
+          modality: 'transcription',
+          pricing: [
+            { billable: 'input_tokens', unit: 'token', costUsd: 0.0000025 },
+            { billable: 'output_tokens', unit: 'token', costUsd: 0.00001 }
+          ]
+        })
+      },
+      true
+    )!;
+    const card = approvalRequirement(
+      'audio_read',
+      { path: 'workspace/long.wav', endSeconds: 5400, options: { maxCostUsd: 10 } },
+      'balanced',
+      { mediaModel: model }
+    );
+    expect(card).not.toBeNull();
+    expect(card!.preview).toContain('30 seconds');
+    expect(card!.preview).toContain('$0.060');
+    expect(card!.preview).toContain('16000-token context');
+    expect(card!.preview).toContain('2000-token output');
+    expect(card!.preview).not.toContain('Reserve up to $10');
   });
 
   it('states the minutes and the money when the route publishes a price', () => {
@@ -2377,6 +2411,26 @@ describe('what a reading of a recording costs before it happens', () => {
     expect(card?.preview).toContain('workspace/meeting.m4a');
     expect(card?.preview).toContain('$0.540');
   });
+
+  it.each(['review', 'balanced', 'autonomous'] as const)(
+    'requires external transcription approval below the spending threshold in %s mode',
+    (securityMode) => {
+      const card = approvalRequirement(
+        'audio_read',
+        {
+          path: 'workspace/private.m4a',
+          endSeconds: 1,
+          options: { privacyRoute: 'external' }
+        },
+        securityMode,
+        { mediaModel: route()!, mediaCommittedUsd: 0 }
+      );
+      expect(card?.sideEffect).toBe('external_reversible');
+      expect(card?.action).toContain('external transcription');
+      expect(card?.preview).toContain('may retain');
+      expect(card?.preview).toContain('task and credential privacy stay unchanged');
+    }
+  );
 
   it('is quiet about a short recording on a route whose price is known', () => {
     expect(

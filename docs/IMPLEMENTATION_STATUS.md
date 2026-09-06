@@ -2,7 +2,8 @@
 
 ## Implemented in source
 
-- Chat-first responsive dark interface with compact task activity.
+- Task-oriented garden interface with a collapsible project sidebar, dark and light appearances,
+  event-derived progress, model effort controls, direct result links and scoped source downloads.
 - One primary agent computer; no SaaS pricing, provisioning, subscriptions, model resale, or local
   inference.
 - First-owner pairing gate, passkeys, sessions, step-up, recovery, and scoped API tokens.
@@ -12,15 +13,21 @@
   Xvfb/Openbox GUI, AT-SPI semantics, screenshots, and takeover.
 - Narrow approval-gated host package helper with arbitrary privilege escalation rejected.
 - Private path-based previews, artifacts, file browser, and rich Markdown/media display.
-- OpenRouter, Ollama Cloud, and compatible inference plus capability/vision routing. Reviewed
-  OpenRouter image and speech routes are available when connected; video is refused in every mode
-  while its only provider route retains the output for asynchronous retrieval, and the media
-  catalogue reports it unavailable rather than accepting a job that cannot finish.
+- OpenRouter, Ollama Cloud, and compatible inference plus capability-aware effort and vision
+  routing. Provider image, speech, transcription and video discovery retains advertised pricing,
+  inputs and privacy requirements. Asynchronous jobs, compatible edits, provider libraries and
+  batch work use durable receipts and explicit approval for retained provider processing.
+- Reviewed native audio/video model input, microphone dictation and native live voice, with
+  source and model binding, conservative reservations and recovery for unconfirmed charges.
+- Native language-server queries, persistent Python/JavaScript computation and debugger sessions.
+  Durable analyses have explicit lifetimes and checkpoints; browser tabs have owner controls and
+  bounded cleanup of eligible idle agent tabs.
 - Codex CLI, Claude Code, and OpenCode setup, publisher login paths, bounded missions, compact
   streaming progress, resume IDs, and task cancellation.
 - Reviewed temporal memory with provenance/validity and a review queue for stale, failing and
   contradicting entries; reviewed skills; task search; friendly and cron
-  schedules that can be edited, paused, resumed, run now or removed; read-only delegation; GitHub,
+  schedules that can be edited, paused, resumed, run now or removed; read-only delegation and
+  isolated writable coding missions with reviewed integration; GitHub,
   WebDAV, mailbox (IMAP and SMTP submission), calendar
   (CalDAV), and remote MCP with no-auth, bearer, or discovery/PKCE OAuth.
 - Mail and calendar deliberately speak the open protocols against the owner's own server rather than
@@ -54,9 +61,10 @@
   and Python program, lints the skill library, and holds `.env.example` to the defaults the code
   declares.
 
-## Live VPS evidence
+## Recorded VPS evidence
 
-On the current test VPS:
+The following exercises were recorded against earlier source builds. They do not establish that a
+new release has passed its deployment and signed-artifact gates:
 
 - all native services and PostgreSQL are active;
 - only Nginx 80/443 and SSH are public; application/database ports are loopback-only;
@@ -79,7 +87,7 @@ On the current test VPS:
   identity, recorded approved package, and Codex publisher login;
 - the official Codex CLI logged in with a ChatGPT subscription, completed a sandboxed repository
   mission, and resumed the same persisted session ID;
-- a synthetic private-content canary passed across Athanor, Nginx, and PostgreSQL journals/logs;
+- a synthetic private-content canary passed across garden, Nginx, and PostgreSQL journals/logs;
 - API, worker, native runner, and native-client suites pass at the revisions recorded by the release
   drill; exact counts are reported by CI rather than frozen in this document;
 - `athanor doctor` passes configuration, services, API, database, Nginx, port isolation, outbound
@@ -91,19 +99,19 @@ On the current test VPS:
   temporary GUI/process/workspace state was removed;
 - a fresh root-only full-host backup passed strict checksums, restored database, home, configuration,
   packages, and identity, and was followed by a clean `athanor doctor` run;
-- synthetic terminal and file-content canaries were absent from Athanor, Nginx, and PostgreSQL logs;
+- synthetic terminal and file-content canaries were absent from garden, Nginx, and PostgreSQL logs;
   the only public TCP listeners are SSH and Nginx, while application and database ports stay on
   loopback; and
 - six unused Compose-era images and two unreferenced Docker volumes were removed after the volume
-  contents were preserved in a root-only checksum archive. Athanor has no container, image, or
-  volume and every Athanor service runs in a native systemd cgroup; unrelated provider-installed
+  contents were preserved in a root-only checksum archive. garden has no container, image, or
+  volume and every garden service runs in a native systemd cgroup; unrelated provider-installed
   Docker software was left untouched.
 
 This evidence is still narrower than a stable release.
 
 ## Compatibility internals
 
-The schema of a product athanor is not has been removed rather than left dormant: the four
+The schema of a product garden is not has been removed rather than left dormant: the four
 organization tables and the four-role authorization model, the workspace order and checkout flow,
 the machine shape and GPU tier columns, the per-user plan id, and the payment-processor reference.
 Each was a column or a table that decided something this program has nobody to decide it for.
@@ -132,7 +140,6 @@ removed. Native Linux is the only production server architecture.
 
 ## Remaining release gates
 
-- Publish the GitHub repository and default clone URL.
 - Run the protected tag workflow with real operator-controlled signing credentials, then
   independently install and verify every separately downloaded draft artifact.
 - Exercise the generic native client's first-owner passkey flow in packaged desktop and mobile

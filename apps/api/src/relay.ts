@@ -42,7 +42,7 @@ const relayFields = (fields: Record<string, unknown> | undefined): LogFields => 
  * no default host and `enabled` is false, so a box that was never told to use a relay makes no
  * outbound connection and appears in no operator's registry.
  */
-export const RelaySettingsSchema = RelayClientConfigSchema.extend({
+export const RelaySettingsSchema = RelayClientConfigSchema.safeExtend({
   enrolledAt: z.string().nullable().default(null),
   /**
    * When the relay operator dropped this box, or null.
@@ -66,13 +66,23 @@ const SETTINGS_FILE = 'settings.json';
 const STATUS_FILE = 'status.json';
 
 /** The settings file is also the off switch, so a torn or hand-edited one has to read as "off". */
-export const readRelaySettings = async (directory: string): Promise<RelaySettings> => {
+type LocalRelayListeners = Pick<
+  RelayClientConfig,
+  'localHost' | 'localPort' | 'localHttpPort' | 'localPreviewPort'
+>;
+
+export const readRelaySettings = async (
+  directory: string,
+  listeners?: LocalRelayListeners
+): Promise<RelaySettings> => {
+  const defaults = RelaySettingsSchema.parse(listeners ?? {});
   try {
     const parsed: unknown = JSON.parse(await readFile(join(directory, SETTINGS_FILE), 'utf8'));
-    const result = RelaySettingsSchema.safeParse(parsed);
-    return result.success ? result.data : defaultRelaySettings();
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return defaults;
+    const result = RelaySettingsSchema.safeParse({ ...parsed, ...listeners });
+    return result.success ? result.data : defaults;
   } catch {
-    return defaultRelaySettings();
+    return defaults;
   }
 };
 
@@ -158,6 +168,7 @@ export interface RelaySupervisorOptions {
   readonly localPort: number;
   /** The box's plaintext listener, where the relay's own :80 is delivered. */
   readonly localHttpPort: number;
+  readonly localPreviewPort?: number;
   readonly log: Logger;
   readonly createLink?: (
     config: RelayClientConfig,
@@ -176,6 +187,7 @@ const offStatus = (settings: RelaySettings): RelayStatus => ({
   openStreams: 0,
   usedBytes: 0,
   quota: null,
+  previewPort: null,
   lastError: null,
   nextAttemptAtMs: null
 });
@@ -238,9 +250,42 @@ export class RelaySupervisor {
     return `${this.#settings.label}.${this.#settings.host}`;
   }
 
+  publicPreviewOrigin(): string | null {
+    const hostname = this.publicHostname();
+    const status = this.status;
+    const port = status.previewPort;
+    if (
+      !hostname ||
+      status.state !== 'online' ||
+      typeof port !== 'number' ||
+      !Number.isInteger(port) ||
+      port < 1 ||
+      port > 65_535 ||
+      port === 80 ||
+      port === 443
+    )
+      return null;
+    try {
+      const url = new URL(`https://${hostname}`);
+      if (
+        url.hostname !== hostname.toLowerCase() ||
+        url.username ||
+        url.password ||
+        url.pathname !== '/' ||
+        url.search ||
+        url.hash
+      )
+        return null;
+      url.port = String(port);
+      return url.origin;
+    } catch {
+      return null;
+    }
+  }
+
   /** Reads what is on disk and dials if it says to. Called once while the server is built. */
   async start(): Promise<void> {
-    this.#settings = await readRelaySettings(this.#options.directory);
+    this.#settings = await readRelaySettings(this.#options.directory, this.#localListeners());
     await this.#reconcile();
   }
 
@@ -289,7 +334,8 @@ export class RelaySupervisor {
       ...defaultRelaySettings(),
       localHost: this.#settings.localHost,
       localPort: this.#settings.localPort,
-      localHttpPort: this.#settings.localHttpPort
+      localHttpPort: this.#settings.localHttpPort,
+      localPreviewPort: this.#settings.localPreviewPort
     });
   }
 
@@ -310,13 +356,17 @@ export class RelaySupervisor {
     return result;
   }
 
-  async #applyNow(next: RelaySettings): Promise<RelayReport> {
-    const settings = RelaySettingsSchema.parse({
-      ...next,
+  #localListeners(): LocalRelayListeners {
+    return {
       localHost: this.#options.localHost,
       localPort: this.#options.localPort,
-      localHttpPort: this.#options.localHttpPort
-    });
+      localHttpPort: this.#options.localHttpPort,
+      localPreviewPort: this.#options.localPreviewPort ?? 8443
+    };
+  }
+
+  async #applyNow(next: RelaySettings): Promise<RelayReport> {
+    const settings = RelaySettingsSchema.parse({ ...next, ...this.#localListeners() });
     // Torn down before the file changes: if the write fails, the connection is still gone, which is
     // the safe direction for an owner who has just asked for the relay to stop.
     this.#closeLink();
@@ -374,6 +424,7 @@ export class RelaySupervisor {
       previous.label === status.label &&
       previous.usedBytes === status.usedBytes &&
       previous.quota === status.quota &&
+      previous.previewPort === status.previewPort &&
       previous.lastError === status.lastError;
     if (!unchanged) await this.#publishStatus();
   }

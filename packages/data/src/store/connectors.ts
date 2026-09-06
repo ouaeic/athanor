@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { AthanorError } from '@athanor/core';
 import type { EncryptedEnvelope } from '@athanor/core';
 import type { Database } from '../database.js';
+import { TaskSignals, TASK_QUEUE_CHANNEL } from './tasks.js';
+import { COMMITTED_TASK_STATUSES } from './sql/tasks.js';
 import type {
   ConnectorAuditRecord,
   ConnectorOAuthAttemptRecord,
@@ -25,6 +27,35 @@ import {
  * this issues two further queries, a key unwrap and a decrypt for every approval it is handed.
  */
 export const MAX_APPROVAL_PAGE = 200;
+
+interface ApprovalInput {
+  userId: string;
+  taskId: string;
+  action: string;
+  origin?: string;
+  sideEffect: string;
+  previewCiphertext: EncryptedEnvelope;
+  previewHash: string;
+  expiresAt: Date;
+}
+
+const insertApproval = async (database: Database, id: string, input: ApprovalInput) => {
+  await database.query(
+    `INSERT INTO approvals(id,user_id,task_id,action,origin,side_effect,preview_ciphertext,preview_hash,expires_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9)`,
+    [
+      id,
+      input.userId,
+      input.taskId,
+      input.action,
+      input.origin ?? null,
+      input.sideEffect,
+      JSON.stringify(input.previewCiphertext),
+      input.previewHash,
+      input.expiresAt.toISOString()
+    ]
+  );
+};
 
 /**
  * The same position-is-a-row trick for approvals, and it is needed here for the same reason and
@@ -58,35 +89,47 @@ const decodeApprovalCursor = (cursor: string): { createdAt: string; id: string }
  * it.
  */
 export class ConnectorStore {
-  constructor(private readonly database: Database) {}
+  constructor(
+    private readonly database: Database,
+    private readonly taskSignals = new TaskSignals(database)
+  ) {}
 
-  async createApproval(input: {
-    userId: string;
-    taskId: string;
-    action: string;
-    origin?: string;
-    sideEffect: string;
-    previewCiphertext: EncryptedEnvelope;
-    previewHash: string;
-    expiresAt: Date;
-  }): Promise<string> {
+  async createApproval(input: ApprovalInput): Promise<string> {
     const id = randomUUID();
-    await this.database.query(
-      `INSERT INTO approvals(id,user_id,task_id,action,origin,side_effect,preview_ciphertext,preview_hash,expires_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9)`,
-      [
-        id,
-        input.userId,
-        input.taskId,
-        input.action,
-        input.origin ?? null,
-        input.sideEffect,
-        JSON.stringify(input.previewCiphertext),
-        input.previewHash,
-        input.expiresAt.toISOString()
-      ]
-    );
+    await insertApproval(this.database, id, input);
     return id;
+  }
+
+  /** A visible decision and its sealed continuation must become durable together. */
+  async parkTaskForApproval(
+    input: ApprovalInput & {
+      id: string;
+      workerId: string;
+      agentStateCiphertext: EncryptedEnvelope;
+      actualComputeCredits: number;
+    }
+  ): Promise<boolean> {
+    const parked = await this.database.transaction(async (tx) => {
+      const changed = await tx.query(
+        `UPDATE tasks SET status='awaiting_user',agent_state_ciphertext=$4::jsonb,
+           actual_compute_credits=$5,lease_owner=NULL,lease_expires_at=NULL,updated_at=NOW()
+         WHERE id=$1 AND user_id=$2 AND lease_owner=$3 AND lease_expires_at > NOW()
+           AND status IN ${COMMITTED_TASK_STATUSES}
+         RETURNING id`,
+        [
+          input.taskId,
+          input.userId,
+          input.workerId,
+          JSON.stringify(input.agentStateCiphertext),
+          input.actualComputeCredits
+        ]
+      );
+      if (changed.rowCount !== 1) return false;
+      await insertApproval(tx, input.id, input);
+      return true;
+    });
+    if (parked) this.taskSignals.signal(TASK_QUEUE_CHANNEL, input.taskId);
+    return parked;
   }
 
   /**
@@ -137,28 +180,7 @@ export class ConnectorStore {
     }));
   }
 
-  /**
-   * Whether one conversation is stopped on an approval.
-   *
-   * NOTHING IN PRODUCTION CALLS THIS. It was written to replace the read on the send path, which
-   * still asks the same question the old way: `apps/api/src/routes/tasks.ts` reads every pending
-   * approval the owner has and scans them in JavaScript before moving a waiting task back into the
-   * queue - one indexed question, asked as a table read, on the hot path of every follow-up
-   * message. This method was never forwarded on `DataStore`, so the route could not have reached
-   * it even had it tried, and its only callers are in `store.test.ts`, which holds a
-   * `ConnectorStore` directly. The comment here used to say the send path asked this, in the
-   * present tense; it never did.
-   *
-   * Wiring it is three lines and is in the handoff: a forward beside `listApprovals` in
-   * `store.ts`, and `await store.hasPendingApproval(user.id, task.id)` in place of the
-   * `listApprovals(...).some(...)` in the unpark condition. Until that lands this is dead, and
-   * saying so is the point - a method that looks alive is worse than one that admits it is not.
-   *
-   * Deliberately blind to `expires_at`, which is what the read it would replace is: an approval
-   * past its deadline that `cleanupExpired` has not swept yet is still `pending`, and it is still
-   * what the conversation is waiting for. `resolveApproval` is the one that owes the deadline an
-   * answer.
-   */
+  /** The follow-up path needs an existence answer, independent of approval-list pagination. */
   async hasPendingApproval(userId: string, taskId: string): Promise<boolean> {
     const result = await this.database.query(
       `SELECT 1 FROM approvals
@@ -173,12 +195,33 @@ export class ConnectorStore {
     id: string,
     decision: 'approved' | 'denied'
   ): Promise<boolean> {
-    const result = await this.database.query(
-      `UPDATE approvals SET status = $3, resolved_at = NOW()
-       WHERE id = $1 AND user_id = $2 AND status = 'pending' AND expires_at > NOW()`,
-      [id, userId, decision]
-    );
-    return result.rowCount === 1;
+    const resolved = await this.database.transaction(async (tx) => {
+      // Cancellation locks the task before its decisions. Keep that order and hold the task
+      // through settlement so a later pause or cancellation cannot be overwritten by queuing.
+      const owned = await tx.query<{ task_id: string; status: string }>(
+        `SELECT t.id AS task_id,t.status FROM tasks t
+         JOIN approvals a ON a.task_id=t.id
+         WHERE a.id=$1 AND a.user_id=$2 AND t.user_id=$2 FOR UPDATE OF t`,
+        [id, userId]
+      );
+      const task = owned.rows[0];
+      if (!task || ['completed', 'failed', 'cancelled'].includes(task.status)) return null;
+      const changed = await tx.query(
+        `UPDATE approvals SET status=$3,resolved_at=NOW()
+         WHERE id=$1 AND user_id=$2 AND status='pending' AND expires_at > NOW()`,
+        [id, userId, decision]
+      );
+      if (changed.rowCount !== 1) return null;
+      const queued = await tx.query(
+        `UPDATE tasks SET status='queued',lease_owner=NULL,lease_expires_at=NULL,
+           spend_paused_at=NULL,attempt=0,updated_at=NOW()
+         WHERE id=$1 AND status='awaiting_user' RETURNING id`,
+        [task.task_id]
+      );
+      return { taskId: task.task_id, queued: queued.rowCount === 1 };
+    });
+    if (resolved?.queued) this.taskSignals.signal(TASK_QUEUE_CHANNEL, resolved.taskId);
+    return resolved !== null;
   }
 
   async getApproval(id: string): Promise<Record<string, unknown> | null> {

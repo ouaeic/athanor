@@ -15,6 +15,7 @@ import {
   PATH_ENROLL,
   PATH_PARK,
   PROTOCOL_VERSION,
+  PREVIEW_HTTPS_CAPABILITY,
   decodeCbor,
   type BindFrame,
   type RelayToBoxMessage,
@@ -31,6 +32,7 @@ export interface RelayStatus {
   readonly label: string | null;
   /** Hostname clients should use, once the relay has confirmed the label. */
   readonly hostname: string | null;
+  readonly previewPort?: number | null;
   readonly openStreams: number;
   readonly usedBytes: number;
   readonly quota: 'ok' | 'warn' | 'shaped' | 'blocked' | null;
@@ -96,6 +98,7 @@ export class RelayConnection {
       label: options.config.label,
       hostname: this.#hostname(options.config.label),
       openStreams: 0,
+      previewPort: null,
       usedBytes: 0,
       quota: null,
       lastError: null,
@@ -151,6 +154,7 @@ export class RelayConnection {
   }
 
   #teardown(): void {
+    this.#status = { ...this.#status, previewPort: null };
     this.#session?.destroy();
     this.#socket?.destroy();
     this.#session = undefined;
@@ -296,7 +300,7 @@ export class RelayConnection {
         proto: PROTOCOL_VERSION,
         role: 'primary',
         agent: 'athanor/1',
-        caps: ['http1', 'h2']
+        caps: ['http1', 'h2', PREVIEW_HTTPS_CAPABILITY]
       })}\n`
     );
 
@@ -308,7 +312,15 @@ export class RelayConnection {
 
     const reader = new NdjsonReader();
     control.on('data', (chunk: Buffer) => {
-      for (const value of reader.push(chunk)) this.#handle(value as RelayToBoxMessage, generation);
+      try {
+        for (const value of reader.push(chunk)) {
+          if (value === null || typeof value !== 'object' || Array.isArray(value))
+            throw new Error('invalid control frame');
+          this.#handle(value as RelayToBoxMessage, generation);
+        }
+      } catch {
+        this.#retry('relay sent an invalid control frame', undefined, false, generation);
+      }
     });
     control.on('error', (error: Error) => this.#retry(error.message, undefined, false, generation));
   }
@@ -317,6 +329,15 @@ export class RelayConnection {
     if (generation !== this.#generation) return;
     switch (message.t) {
       case 'welcome': {
+        if (
+          !Number.isInteger(message.parkTarget) ||
+          message.parkTarget < 1 ||
+          message.parkTarget > 64 ||
+          message.label !== this.#options.config.label
+        ) {
+          this.#retry('relay sent an invalid welcome', undefined, false, generation);
+          return;
+        }
         this.#attempt = 0;
         this.#parkTarget = message.parkTarget;
         this.#onWelcome(message);
@@ -342,11 +363,24 @@ export class RelayConnection {
 
   #onWelcome(message: WelcomeMessage): void {
     this.#log('info', 'relay connected', { label: message.label });
+    const previewPort =
+      Array.isArray(message.caps) &&
+      message.caps.includes(PREVIEW_HTTPS_CAPABILITY) &&
+      typeof message.previewPort === 'number' &&
+      Number.isInteger(message.previewPort) &&
+      message.previewPort > 0 &&
+      message.previewPort <= 65535
+        ? message.previewPort
+        : null;
     this.#publish({
       state: 'online',
       label: message.label,
       hostname: this.#hostname(message.label),
-      lastError: null,
+      previewPort,
+      lastError:
+        previewPort !== null
+          ? null
+          : 'This relay does not serve isolated app previews. Its operator must enable the preview listener before app links can be opened through it.',
       nextAttemptAtMs: null
     });
   }
@@ -382,7 +416,18 @@ export class RelayConnection {
       if (buffered.length < 4 + length) return;
       bound = true;
       this.#parked -= 1;
-      const frame = decodeCbor(buffered.subarray(4, 4 + length)) as unknown as BindFrame;
+      let frame: BindFrame;
+      try {
+        const decoded = decodeCbor(buffered.subarray(4, 4 + length));
+        if (decoded === null || typeof decoded !== 'object' || Array.isArray(decoded))
+          throw new Error('bind frame must be an object');
+        frame = decoded as unknown as BindFrame;
+      } catch {
+        stream.close();
+        this.#log('warn', 'relay stream refused: invalid bind frame');
+        this.#replenish();
+        return;
+      }
       const rest = buffered.subarray(4 + length);
       stream.removeListener('data', onData);
       stream.pause();
@@ -408,6 +453,11 @@ export class RelayConnection {
   /** Splices a bound stream onto the box's own listener. */
   #forward(frame: BindFrame, stream: ClientHttp2Stream): void {
     const port = localPortForBind(this.#options.config, frame.port);
+    if (port === null) {
+      this.#log('warn', 'relay stream refused: unsupported listener', { port: frame.port });
+      stream.close();
+      return;
+    }
     const local =
       this.#options.connectLocal?.(port) ??
       createConnection({ host: this.#options.config.localHost, port });

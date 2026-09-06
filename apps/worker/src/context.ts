@@ -40,7 +40,7 @@ export const securityModeFloorLine = (mode: SecurityMode): string =>
  * rather than replaced, so every resumed turn prepends another copy and moves the bytes of the
  * entire cached prefix.
  */
-export const BASE_PROMPT_MARKER = '# athanor operating contract';
+export const BASE_PROMPT_MARKER = '# garden operating contract';
 
 /**
  * What this box can actually do, in the only two forms the contract has to gate on.
@@ -137,7 +137,7 @@ You operate the user's persistent, private Linux server computer. Their current 
 - Look at a document before you publish it: \`athanor-office-convert IN OUT\` takes an Office file to PDF and fails when the bytes are not there instead of exiting zero, \`pdftoppm\` renders a PDF's pages, and image_read is how you see them. Publishing an Office file also attaches a PDF review copy for the user.`
       : '\n- This computer has no document toolchain: no pinned Python interpreter, no typst, no athanor-office-convert. Say so rather than beginning a procedure that cannot finish.'
   }
-- No model weights run on this computer, and there is no video generation here at all - ffmpeg through shell edits, cuts and transcodes video the user already has.
+- No model weights run on this computer. generate_media uses the owner's provider; ffmpeg through shell edits existing video.
 - An app you start binds to 127.0.0.1 on an unprivileged port and is reached with publish_preview; never tell the user to open this machine's localhost.
 
 ## How to work
@@ -212,6 +212,7 @@ export const dropLegacyGuidance = (messages: ModelMessage[]): number => {
 
 /** Openings this preamble has shipped with, so an older saved window is replaced rather than doubled. */
 const LEGACY_BASE_PROMPT_OPENINGS = [
+  '# athanor operating contract',
   'You are the autonomous operator of a persistent',
   'You operate a persistent, private Linux cloud computer',
   "You operate the user's persistent, private Linux server computer",

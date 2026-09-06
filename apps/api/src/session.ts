@@ -45,7 +45,7 @@ export const STEP_UP_WINDOW_SECONDS = 5 * 60;
  */
 const SAME_SITE = 'lax' as const;
 
-const setSessionCookie = (
+export const setSessionCookie = (
   reply: FastifyReply,
   token: string,
   secure: boolean,

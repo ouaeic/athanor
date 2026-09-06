@@ -140,32 +140,22 @@ export const delegateSpecialists = (
     );
 
 /**
- * Whether a recording may be sent to the model that would read it.
- *
- * Every other modality already asks. A chat model is routed through `usableCapabilities`, and so is
- * the vision specialist an image is handed to when the lead cannot see; audio was the one that
- * asked nobody, which made the owner's own voice the least protected thing on the box.
- *
- * The question goes to the owner's own transcription route, because that is the only place the
- * answer is recorded. It cannot go to the chat catalogue: a model that reads a recording declares
- * `transcription` where a chat model declares `text`, and the catalogue builder drops everything
- * that cannot answer with text, so a transcription id is never a row there. Asked of that
- * catalogue the question had exactly one answer on every box - no - which is a tool switched off
- * wearing the clothes of a privacy check.
- *
- * A route the owner has never chosen falls back to whatever the provider listed a moment ago, and
- * about that this box knows nothing at all. On a zero-retention task nothing at all is a refusal; a
- * recording is not the thing to guess about.
- *
- * An ordinary task keeps the route it has always had. Its owner has already accepted external
- * handling for this work, so asking here would close the tool rather than protect anyone.
+ * Private transcription requires both a verified native connection and its selected route policy.
+ * Generic catalogue ZDR metadata cannot establish the actual transcription endpoint's behavior.
+ * External eligibility here is not consent: the recording executor separately requires an explicit
+ * per-call external choice, its approval proof, and the current task's execution authority.
  */
 export const transcriptionRouteAllowed = (
   route: MediaModelOption | undefined,
-  privacyRoute: string
+  privacyRoute: string,
+  verifiedNativeConnection = false
 ): boolean => {
   if (privacyRoute !== 'provider_zdr') return true;
-  return route?.zeroDataRetentionAvailable === true;
+  return (
+    verifiedNativeConnection &&
+    route?.apiProtocol === 'openai' &&
+    route.zeroDataRetentionAvailable === true
+  );
 };
 
 const USAGE_CLASS_RANK: Record<ModelRelease['usageClass'], number> = {

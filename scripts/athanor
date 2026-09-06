@@ -49,13 +49,14 @@ athanor_backup_idle_wait_seconds="${ATHANOR_BACKUP_IDLE_WAIT_SECONDS:-300}"
 # hundred and seventy consecutive failures - long past anything that fixes itself.
 athanor_catalog_stale_seconds="${ATHANOR_CATALOG_STALE_SECONDS:-604800}"
 last_backup_destination=""
+maintenance_lock_acquired=0
 
 runtime_path() {
   printf '%s%s' "$athanor_runtime_prefix" "$1"
 }
 
 fail() {
-  printf 'athanor: %s\n' "$1" >&2
+  printf 'garden: %s\n' "$1" >&2
   exit 1
 }
 
@@ -63,7 +64,7 @@ fail() {
 # a long operation that could go wrong slightly was written as though it could only go wrong fatally
 # - which is how reinstalling optional packages came to be able to abandon a restore halfway.
 warn() {
-  printf 'athanor: %s\n' "$1" >&2
+  printf 'garden: %s\n' "$1" >&2
 }
 
 need_root() {
@@ -71,6 +72,39 @@ need_root() {
     command -v sudo >/dev/null 2>&1 || fail "this command must run as root"
     exec sudo -E "$0" "$@"
   fi
+}
+
+acquire_maintenance_lock() {
+  [ "$maintenance_lock_acquired" -eq 0 ] || return 0
+  maintenance_lock_directory=/run/athanor-maintenance
+  [ ! -L "$maintenance_lock_directory" ] || fail 'the maintenance lock directory is a symlink'
+  install -d -m 0700 -o root -g root "$maintenance_lock_directory"
+  maintenance_lock_file="$maintenance_lock_directory/lock"
+  [ ! -L "$maintenance_lock_file" ] || fail 'the maintenance lock file is a symlink'
+  if [ -e "$maintenance_lock_file" ] && [ ! -f "$maintenance_lock_file" ]; then
+    fail 'the maintenance lock is not a regular file'
+  fi
+  # A child phase shares the open file description, never an environment flag. The fixed private
+  # root directory prevents an unprivileged caller from supplying a matching descriptor.
+  if ! python3 -I - "$maintenance_lock_file" <<'PYTHON'
+import os, stat, sys
+try:
+    expected = os.stat(sys.argv[1], follow_symlinks=False)
+    inherited = os.fstat(9)
+    matches = (stat.S_ISREG(expected.st_mode) and expected.st_nlink == 1
+               and os.path.samestat(expected, inherited))
+except OSError:
+    matches = False
+sys.exit(0 if matches else 1)
+PYTHON
+  then
+    (umask 077; : >>"$maintenance_lock_file")
+    exec 9>>"$maintenance_lock_file"
+  fi
+  chown root:root "$maintenance_lock_file"
+  chmod 0600 "$maintenance_lock_file"
+  flock -n 9 || fail 'another backup, update or rollback holds the maintenance lock; retry when it finishes'
+  maintenance_lock_acquired=1
 }
 
 set_control_value() {
@@ -219,10 +253,10 @@ status_athanor() {
   # First, because it is the one condition whose other symptom is a browser refusing to open the
   # server at all - by which point the owner cannot be told anything through the interface.
   if [ -r "$athanor_state/certificate.error" ]; then
-    printf 'athanor: TLS renewal failed at %s - %s\n' \
+    printf 'garden: TLS renewal failed at %s - %s\n' \
       "$(sed -n '1p' "$athanor_state/certificate.error")" \
       "$(sed -n '2p' "$athanor_state/certificate.error")" >&2
-    printf 'athanor: clients will see a security warning once the certificate expires. Run sudo athanor certificate issue.\n\n' >&2
+    printf 'garden: clients will see a security warning once the certificate expires. Run sudo athanor certificate issue.\n\n' >&2
   fi
   systemctl --no-pager --full status athanor.target nginx.service || true
   for unit_name in $service_units; do
@@ -395,6 +429,17 @@ doctor() {
   else
     check_fail "configuration must be mode 0600"
   fi
+  case "$(control_env_value PREVIEW_BASE_URL)" in
+    https://*:8443/*)
+      preview_status=$(curl -ksS --max-time 5 -o /dev/null -w '%{http_code}' \
+        https://127.0.0.1:8443/v1/healthz 2>/dev/null || true)
+      if [ "$preview_status" = 404 ]; then
+        check_ok "isolated preview listener rejects control API paths"
+      else
+        check_fail "isolated previews need HTTPS port 8443; verify nginx, firewall and router forwarding"
+      fi
+      ;;
+  esac
   for unit_name in $service_units nginx.service postgresql.service; do
     if systemctl is-active --quiet "$unit_name"; then
       check_ok "$unit_name"
@@ -1229,7 +1274,7 @@ connection_details() {
       process.stdout.write(Buffer.from(JSON.stringify(payload)).toString("base64url"));
     ' "$endpoints_json" "$server_identity" "$pairing_code" "$pairing_expires"
   )
-  pairing_uri="athanor://pair/$ticket"
+  pairing_uri="garden://pair/$ticket"
   # The code has to encode an ordinary address, not the `athanor://` link: the device being paired
   # is the one with nothing installed, so a phone pointed at that link opened nothing at all. Same
   # shape the server mints for the settings screen, and the same shape the installer prints.
@@ -1341,8 +1386,15 @@ set_public_origin() {
       origin_rp_id="$origin_host"
       ;;
   esac
+  previous_origin=$(control_env_value PUBLIC_APP_URL)
+  previous_preview=$(control_env_value PREVIEW_BASE_URL)
   set_control_value PUBLIC_APP_URL "$origin_url"
-  set_control_value PREVIEW_BASE_URL "$origin_url/__athanor/preview"
+  case "$previous_preview" in
+    ''|"$previous_origin/__athanor/preview"|"$previous_origin:8443/__athanor/preview")
+      set_control_value PREVIEW_BASE_URL "$origin_url:8443/__athanor/preview"
+      ;;
+  esac
+  /bin/sh "$athanor_root/scripts/athanor-native-runtime" preview-origin
   set_control_value PUBLIC_RUNNER_URL "$(printf 'wss://%s/runner' "${origin_url#https://}")"
   set_control_value WEBAUTHN_RP_ID "$origin_rp_id"
   set_control_value WEBAUTHN_ORIGIN "$origin_url"
@@ -1459,7 +1511,7 @@ set_hostname() {
   # server broken until the renewal timer notices the missing name.
   if [ "$(sed -n 's/^ACME_ENABLED=//p' "$athanor_config/control.env" | sed -n '1p')" = true ]; then
     "$(runtime_path /usr/local/lib/athanor/athanor-certificate)" issue ||
-      printf 'athanor: the certificate could not be reissued for %s; the previous certificate is still serving. Run sudo athanor certificate issue once the name is reachable.\n' \
+      printf 'garden: the certificate could not be reissued for %s; the previous certificate is still serving. Run sudo athanor certificate issue once the name is reachable.\n' \
         "$hostname_value" >&2
   fi
   restart_athanor
@@ -1750,6 +1802,7 @@ backup_destination_command() {
 
 backup_athanor() {
   need_root backup "${1:-}"
+  acquire_maintenance_lock
   restart_mode="${2:-restart}"
   [ "$restart_mode" = "restart" ] || [ "$restart_mode" = "keep-stopped" ] ||
     fail "invalid internal backup restart mode"
@@ -1859,6 +1912,39 @@ backup_athanor() {
   printf 'It contains server keys and must be stored as securely as the server.\n'
 }
 
+validate_restore_source() {
+  source_directory="$1"
+  checksum_names=$(
+    awk 'NF == 2 {print $2}' "$source_directory/SHA256SUMS" | sort | tr '\n' ' ' |
+      sed 's/ $//'
+  )
+  # Every shape a backup has ever had, oldest first. A copy made by an older release has to stay
+  # restorable by a newer one: the whole point of the file is the day the current release is the
+  # thing that went wrong.
+  case "$checksum_names" in
+    "configuration.tar.gz database.dump workspaces.tar.gz") ;;
+    "configuration.tar.gz database.dump packages.txt workspaces.tar.gz") ;;
+    "configuration.tar.gz database.dump packages.txt revision workspaces.tar.gz") ;;
+    *) fail "backup checksum manifest contains unexpected files" ;;
+  esac
+  (cd "$source_directory" && sha256sum --check --strict SHA256SUMS)
+  workspace_listing=$(mktemp)
+  configuration_listing=$(mktemp)
+  trap 'rm -f "$workspace_listing" "$configuration_listing"' EXIT INT TERM
+  tar -tzf "$source_directory/workspaces.tar.gz" >"$workspace_listing" ||
+    fail "workspace backup is not a readable gzip archive"
+  awk '$0 ~ /^\// || $0 ~ /(^|\/)[.][.]($|\/)/ {exit 1}' "$workspace_listing" ||
+    fail "workspace backup contains an unsafe path"
+  tar -tzf "$source_directory/configuration.tar.gz" >"$configuration_listing" ||
+    fail "configuration backup is not a readable gzip archive"
+  config_parent=$(dirname "$athanor_config")
+  config_name=$(basename "$athanor_config")
+  awk -v root="$config_name" '$0 !~ ("^" root "(/|$)") {exit 1}' "$configuration_listing" ||
+    fail "configuration backup contains an unexpected path"
+  rm -f "$workspace_listing" "$configuration_listing"
+  trap - EXIT INT TERM
+}
+
 restore_athanor() {
   # Parsed by reading "$@" rather than by shifting through it, because `need_root` below re-execs
   # this whole script through sudo with exactly the arguments it is handed. Consuming them first
@@ -1905,35 +1991,8 @@ restore_athanor() {
   [ "$confirmation" = "--yes" ] ||
     fail "restore replaces the database, workspace files, and server keys; re-run with --yes"
   need_root restore "$@"
-  checksum_names=$(
-    awk 'NF == 2 {print $2}' "$source_directory/SHA256SUMS" | sort | tr '\n' ' ' |
-      sed 's/ $//'
-  )
-  # Every shape a backup has ever had, oldest first. A copy made by an older release has to stay
-  # restorable by a newer one: the whole point of the file is the day the current release is the
-  # thing that went wrong.
-  case "$checksum_names" in
-    "configuration.tar.gz database.dump workspaces.tar.gz") ;;
-    "configuration.tar.gz database.dump packages.txt workspaces.tar.gz") ;;
-    "configuration.tar.gz database.dump packages.txt revision workspaces.tar.gz") ;;
-    *) fail "backup checksum manifest contains unexpected files" ;;
-  esac
-  (cd "$source_directory" && sha256sum --check --strict SHA256SUMS)
-  workspace_listing=$(mktemp)
-  configuration_listing=$(mktemp)
-  trap 'rm -f "$workspace_listing" "$configuration_listing"' EXIT INT TERM
-  tar -tzf "$source_directory/workspaces.tar.gz" >"$workspace_listing" ||
-    fail "workspace backup is not a readable gzip archive"
-  awk '$0 ~ /^\// || $0 ~ /(^|\/)[.][.]($|\/)/ {exit 1}' "$workspace_listing" ||
-    fail "workspace backup contains an unsafe path"
-  tar -tzf "$source_directory/configuration.tar.gz" >"$configuration_listing" ||
-    fail "configuration backup is not a readable gzip archive"
-  config_parent=$(dirname "$athanor_config")
-  config_name=$(basename "$athanor_config")
-  awk -v root="$config_name" '$0 !~ ("^" root "(/|$)") {exit 1}' "$configuration_listing" ||
-    fail "configuration backup contains an unexpected path"
-  rm -f "$workspace_listing" "$configuration_listing"
-  trap - EXIT INT TERM
+  acquire_maintenance_lock
+  validate_restore_source "$source_directory"
   # Restore empties the workspace tree before it extracts into it, so a disk that turns out to be
   # too small is discovered with the owner's files already deleted and the archive half unpacked -
   # the one failure this command exists to recover from, caused by the command itself. The backup
@@ -1966,11 +2025,12 @@ restore_athanor() {
   fi
   if [ -n "$restore_kb" ] && [ -n "$available_kb" ] &&
     [ "$((available_kb + reclaimed_kb))" -lt "$((restore_kb + athanor_space_margin_kb))" ]; then
-    fail "not enough room to restore: $(((available_kb + reclaimed_kb) / 1024)) MiB would be free on $athanor_home, about $(((restore_kb + athanor_space_margin_kb) / 1024)) MiB needed. Nothing has been stopped and nothing has been changed. Free space, or restore onto a larger disk."
+    fail "not enough room to restore: $(((available_kb + reclaimed_kb) / 1024)) MiB would be free on $athanor_home, about $(((restore_kb + athanor_space_margin_kb) / 1024)) MiB needed. No restore data has been changed. Free space, or restore onto a larger disk."
   fi
   systemctl stop athanor.target
   for unit_name in $service_units; do systemctl stop "$unit_name"; done
-  trap 'systemctl start athanor.target >/dev/null 2>&1 || true' EXIT INT TERM
+  trap 'systemctl stop athanor.target >/dev/null 2>&1 || true; printf "garden: restore did not complete; the server remains stopped and the backup is preserved.\\n" >&2' EXIT
+  trap 'exit 130' INT TERM
   runuser -u postgres -- psql -v ON_ERROR_STOP=1 -v database_name=athanor \
     -d postgres <<'SQL'
 SELECT pg_terminate_backend(pid)
@@ -1991,7 +2051,12 @@ SQL
   runuser -u postgres -- psql -v ON_ERROR_STOP=1 -v password="$restored_password" <<'SQL'
 SELECT format('ALTER ROLE athanor WITH LOGIN PASSWORD %L', :'password')\gexec
 SQL
+  if [ -f "$athanor_root/scripts/athanor-native-runtime" ] &&
+    grep -q '^  preview-origin)' "$athanor_root/scripts/athanor-native-runtime"; then
+    /bin/sh "$athanor_root/scripts/athanor-native-runtime" preview-origin
+  fi
   systemctl start athanor.target
+  systemctl reload-or-restart nginx
   wait_until_serving
   trap - EXIT INT TERM
 
@@ -2121,6 +2186,7 @@ restore_workspace_ownership() {
 
 install_runtime_files() {
   install -D -m 0755 scripts/athanor "$(runtime_path /usr/local/bin/athanor)"
+  install -D -m 0755 scripts/athanor "$(runtime_path /usr/local/bin/garden)"
   # Deliberately outside every directory on the agent's PATH, and not executable by the account
   # agent commands run as: named directly it would be a root package install with no capability
   # scope and no approval. An update also removes the copy earlier releases left on the PATH.
@@ -2129,6 +2195,8 @@ install_runtime_files() {
     "$(runtime_path /usr/local/lib/athanor/athanor-package-helper)"
   install -D -m 0755 scripts/athanor-system-packages \
     "$(runtime_path /usr/local/sbin/athanor-system-packages)"
+  install -D -m 0644 scripts/mission-supervisor.py \
+    "$(runtime_path /usr/local/lib/athanor/mission-supervisor.py)"
   # Drops an agent command to its own unprivileged account, which the runner cannot do itself.
   install -D -m 0755 scripts/athanor-sandbox \
     "$(runtime_path /usr/local/lib/athanor/athanor-sandbox)"
@@ -2216,8 +2284,14 @@ install_runtime_files() {
   # An owner locked out by an expired certificate reaches for ssh; this is what greets them there.
   install -D -m 0755 infra/native/athanor-motd \
     "$(runtime_path /etc/update-motd.d/99-athanor)"
-  install -D -m 0644 infra/native/nginx.conf \
-    "$(runtime_path /etc/nginx/sites-available/athanor)"
+  if [ -f "$(runtime_path /etc/nginx/conf.d/athanor.conf)" ] &&
+    [ ! -L "$(runtime_path /etc/nginx/sites-enabled/athanor)" ]; then
+    install -D -m 0644 infra/native/nginx.conf \
+      "$(runtime_path /etc/nginx/conf.d/athanor.conf)"
+  else
+    install -D -m 0644 infra/native/nginx.conf \
+      "$(runtime_path /etc/nginx/sites-available/athanor)"
+  fi
   # The site file above includes these on nearly every location it serves, and an update replaced it
   # while leaving them at whatever the install day wrote - so a release that tightened the policy
   # shipped the site that expects the new one and kept the old. The listen snippet is not here on
@@ -2280,7 +2354,7 @@ install_checked_out_runtime_files() {
     install_runtime_files
   fi
   runtime_files_match_checkout ||
-    fail "the install step left /usr/local/bin/athanor differing from this revision's own copy"
+    fail "the install step did not place matching garden and athanor commands for this revision"
 }
 
 # That the runtime files are now this revision's, rather than that something was asked to make them
@@ -2291,7 +2365,10 @@ install_checked_out_runtime_files() {
 # reason the step timeout does: refusing to update at all is worse than an unwitnessed step.
 runtime_files_match_checkout() {
   command -v cmp >/dev/null 2>&1 || return 0
-  cmp -s "$athanor_root/scripts/athanor" "$(runtime_path /usr/local/bin/athanor)"
+  cmp -s "$athanor_root/scripts/athanor" "$(runtime_path /usr/local/bin/athanor)" || return 1
+  if grep -q '^[[:space:]]*install .*runtime_path /usr/local/bin/garden' "$athanor_root/scripts/athanor"; then
+    cmp -s "$athanor_root/scripts/athanor" "$(runtime_path /usr/local/bin/garden)"
+  fi
 }
 
 # No step of an update may run without a bound. `timeout` is coreutils, so it is on every host
@@ -2337,7 +2414,7 @@ run_optional_update_step() {
   fi
   if [ "$optional_step_status" -ne 0 ]; then
     if [ "$optional_step_status" -eq 124 ] || [ "$optional_step_status" -eq 137 ]; then
-      printf 'athanor: %s passed %s minutes and was stopped.\n' \
+      printf 'garden: %s passed %s minutes and was stopped.\n' \
         "$optional_step_label" "$((athanor_update_step_seconds / 60))" >&2
     fi
     return 1
@@ -2396,10 +2473,10 @@ announce_outage() {
     ''|*[!0-9]*) previous_outage="" ;;
   esac
   if [ -n "$previous_outage" ]; then
-    printf 'athanor: stopping the server now for the backup, rebuild and restart. The previous update was offline for about %s minutes.\n' \
+    printf 'garden: stopping the server now for the backup, rebuild and restart. The previous update was offline for about %s minutes.\n' \
       "$(((previous_outage + 59) / 60))"
   else
-    printf 'athanor: stopping the server now for the backup, rebuild and restart. This run is bounded to %s minutes per step and its duration is reported at the end.\n' \
+    printf 'garden: stopping the server now for the backup, rebuild and restart. This run is bounded to %s minutes per step and its duration is reported at the end.\n' \
       "$((athanor_update_step_seconds / 60))"
   fi
   # What the outage actually costs, which the two lines above never said. Stopping the server stops
@@ -2410,7 +2487,7 @@ announce_outage() {
   # next is told only "Background process not found", which names no cause at all. Printed on every
   # update rather than only when something is running, because this shell cannot always tell:
   # `runner_background_work` below is the half of the answer that can be measured.
-  printf 'athanor: this stops every background command an agent left running, and they do not come back. Declared services do.\n'
+  printf 'garden: this stops every background command an agent left running, and they do not come back. Declared services do.\n'
 }
 
 # What an update is about to destroy, asked of the one process on this box that knows.
@@ -2485,6 +2562,7 @@ background_work_summary() {
 # data back under the new code, which is the half that was wrong.
 rollback_athanor() {
   need_root rollback "${1:-}"
+  acquire_maintenance_lock
   source_directory="${1:-}"
   if [ -z "$source_directory" ]; then
     source_directory=$(
@@ -2502,6 +2580,7 @@ rollback_athanor() {
   fi
   [ -f "$source_directory/SHA256SUMS" ] ||
     fail "usage: sudo athanor rollback [/path/to/backup]"
+  validate_restore_source "$source_directory"
   target_revision=""
   [ -f "$source_directory/revision" ] && target_revision=$(cat "$source_directory/revision")
   if [ -n "$target_revision" ]; then
@@ -2509,6 +2588,8 @@ rollback_athanor() {
       fail "revision $target_revision is not in this checkout; fetch it first or restore without changing code: sudo athanor restore $source_directory --yes"
     printf 'Putting the code back to %s and the data back to %s.\n' \
       "$target_revision" "$source_directory"
+    stop_athanor
+    printf 'The server stays stopped if reconstruction fails; keep backup %s.\n' "$source_directory"
     git -C "$athanor_root" reset --hard "$target_revision" >/dev/null ||
       fail "could not put the checkout back to $target_revision"
     cd "$athanor_root" || fail "could not enter $athanor_root"
@@ -2535,13 +2616,14 @@ rollback_athanor() {
 
 update_athanor() {
   need_root update
+  acquire_maintenance_lock
   [ -d "$athanor_root/.git" ] || fail "$athanor_root is not a Git checkout"
   [ -z "$(git -C "$athanor_root" status --porcelain)" ] ||
     fail "$athanor_root has local changes; preserve or remove them before updating"
   # `wait_for_idle_worker` returns before the stop, so a task that the API queued in between used
   # to be killed mid-flight. Re-checked here, where the remaining window is a fraction of a second.
   if [ "${athanor_require_idle:-0}" = 1 ] && ! worker_is_idle; then
-    printf 'athanor: a task started while the update was preparing; the next weekly window will retry.\n'
+    printf 'garden: a task started while the update was preparing; the next weekly window will retry.\n'
     # Corrected before returning, and this is the only place that can. `auto_update_run` has already
     # written `running` pessimistically - it has to, because a run killed by its own start timeout
     # reaches no further line - and returning through here left that record standing for ever. So a
@@ -2565,13 +2647,13 @@ update_athanor() {
   runner_background_work
   case "${runner_background_count:-}" in
     '')
-      printf 'athanor: this runner does not report background commands, so this update cannot tell whether it is about to stop a long job.\n'
+      printf 'garden: this runner does not report background commands, so this update cannot tell whether it is about to stop a long job.\n'
       ;;
     0) ;;
     *)
       [ -n "${ATHANOR_UPDATE_OVER_BACKGROUND_WORK:-}" ] ||
         fail "$(background_work_summary), and this update would stop them for good - only declared services come back. Wait for them, stop them from the interface, or run again with ATHANOR_UPDATE_OVER_BACKGROUND_WORK=1 to update anyway"
-      printf 'athanor: %s, and ATHANOR_UPDATE_OVER_BACKGROUND_WORK is set, so this update will stop them.\n' \
+      printf 'garden: %s, and ATHANOR_UPDATE_OVER_BACKGROUND_WORK is set, so this update will stop them.\n' \
         "$(background_work_summary)"
       ;;
   esac
@@ -2602,16 +2684,22 @@ update_athanor() {
         "$previous_revision" "$rollback_backup" >&2
     fi
     rollback_ok=1
+    stop_athanor || rollback_ok=0
     git -C "$athanor_root" reset --hard "$previous_revision" >/dev/null 2>&1 ||
       rollback_ok=0
     if cd "$athanor_root"; then
       CI=true pnpm install --frozen-lockfile >/dev/null 2>&1 || rollback_ok=0
       CI=true pnpm -r build >/dev/null 2>&1 || rollback_ok=0
-      # This shell's own copy, deliberately, and the one place that is still right. `athanor update`
-      # runs the previous release's script, so the function in memory here is already the logic of
-      # the revision the reset above just put back; going out to the disk for the same code would
-      # only add a way for a rollback to fail.
-      install_runtime_files || rollback_ok=0
+      # Configuration migrations can run before the first service starts. Restore the verified
+      # private configuration before the checked-out revision activates its own runtime files.
+      if (validate_restore_source "$rollback_backup"); then
+        tar -C "$(dirname "$athanor_config")" -xzf "$rollback_backup/configuration.tar.gz" || rollback_ok=0
+      else
+        rollback_ok=0
+      fi
+      if [ "$rollback_ok" -eq 1 ]; then
+        (install_checked_out_runtime_files) || rollback_ok=0
+      fi
     else
       rollback_ok=0
     fi
@@ -2622,10 +2710,11 @@ update_athanor() {
     if [ "$database_at_risk" -eq 1 ]; then
       (restore_athanor "$rollback_backup" --yes) || rollback_ok=0
     else
-      # The checkout and the runtime files are back; nothing else changed, so this only has to put
-      # the services the backup stopped back on.
-      systemctl start athanor.target >/dev/null 2>&1 || rollback_ok=0
-      wait_until_serving || rollback_ok=0
+      if [ "$rollback_ok" -eq 1 ]; then
+        systemctl start athanor.target >/dev/null 2>&1 || rollback_ok=0
+        systemctl reload-or-restart nginx >/dev/null 2>&1 || rollback_ok=0
+        wait_until_serving || rollback_ok=0
+      fi
     fi
     "$(runtime_path /usr/local/lib/athanor/athanor-network-refresh)" >/dev/null 2>&1 ||
       rollback_ok=0
@@ -2691,7 +2780,7 @@ update_athanor() {
   # what places. Before the restart, so the runner comes up reading the settings this release wrote
   # rather than needing a second outage to pick them up.
   if [ -f "$athanor_release_steps_marker" ]; then
-    printf 'athanor: the packages, workspace layout and runner settings this release carries were applied by the checkout while it placed its runtime files.\n'
+    printf 'garden: the packages, workspace layout and runner settings this release carries were applied by the checkout while it placed its runtime files.\n'
   else
     install_release_carried_steps
   fi
@@ -2776,7 +2865,7 @@ auto_backup_run() {
     # working every time the window comes round stands down every day in silence. Standing down
     # once is the design; standing down for a month is the owner's to know about.
     record_backup_status skipped 'a task was still running when the window came round'
-    printf 'athanor: a task is running; the next window will take the backup.\n'
+    printf 'garden: a task is running; the next window will take the backup.\n'
     return 0
   fi
   # Pessimistic first and corrected on the way out, because a run killed by its own start timeout
@@ -2802,7 +2891,7 @@ auto_backup_run() {
 auto_backup_alert() {
   [ "$(backup_status_field outcome)" = running ] || return 0
   record_backup_status failed 'the run was stopped before it finished'
-  printf 'athanor: the daily backup did not finish. The last complete copy in %s is untouched.\n' \
+  printf 'garden: the daily backup did not finish. The last complete copy in %s is untouched.\n' \
     "$athanor_backup_root" >&2
 }
 
@@ -2937,7 +3026,7 @@ update_status_field() {
 # `tar` and `pg_dump` name the file they choked on, and a path inside somebody's workspace has no
 # business sitting outside the encrypted store.
 backup_failure_reason() {
-  own_words=$(printf '%s\n' "$1" | sed -n 's/^athanor: //p' | awk 'NF { last = $0 } END { print last }')
+  own_words=$(printf '%s\n' "$1" | sed -n -e 's/^garden: //p' -e 's/^athanor: //p' | awk 'NF { last = $0 } END { print last }')
   if [ -n "$own_words" ]; then
     printf '%s' "$own_words"
   else
@@ -2974,14 +3063,14 @@ auto_update_run() {
   upstream_revision=$(git -C "$athanor_root" rev-parse --verify --quiet '@{upstream}') ||
     update_failed "$athanor_root has no upstream branch to update from"
   if [ "$(git -C "$athanor_root" rev-parse --verify HEAD)" = "$upstream_revision" ]; then
-    printf 'athanor: already up to date.\n'
+    printf 'garden: already up to date.\n'
     # A run that found nothing to do is a run that worked. Recording it is what tells the owner
     # weeks later that the timer is still turning, which the revision alone cannot say.
     record_update_status ok 'already on the newest revision'
     return 0
   fi
   if ! wait_for_idle_worker; then
-    printf 'athanor: a task is still running; the next weekly window will retry.\n'
+    printf 'garden: a task is still running; the next weekly window will retry.\n'
     # The silent path, and the same one the backup had. Standing down once is the design; standing
     # down every week on a box that is busy whenever the window comes round is the box quietly
     # never updating again, and the exit status says nothing went wrong because nothing did.
@@ -3005,7 +3094,7 @@ auto_update_run() {
   case "${runner_background_count:-}" in
     '' | 0) ;;
     *)
-      printf 'athanor: %s; the next weekly window will retry.\n' "$(background_work_summary)"
+      printf 'garden: %s; the next weekly window will retry.\n' "$(background_work_summary)"
       record_update_status skipped \
         "$runner_background_count background command(s) an agent left running would have been stopped"
       return 0
@@ -3026,7 +3115,7 @@ auto_update_run() {
 auto_update_alert() {
   [ "$(update_status_field outcome)" = running ] || return 0
   record_update_status failed 'the run was stopped before it finished; the server may be part-updated'
-  printf 'athanor: the unattended update did not finish. Run sudo athanor doctor.\n' >&2
+  printf 'garden: the unattended update did not finish. Run sudo athanor doctor.\n' >&2
 }
 
 # The last run, in the words the interface uses for it.
@@ -3114,6 +3203,7 @@ uninstall_athanor() {
     "$(runtime_path /etc/nginx/snippets/athanor-https-listen.conf)" \
     "$(runtime_path /etc/nginx/snippets/athanor-security-headers.conf)" \
     "$(runtime_path /etc/nginx/snippets/athanor-app-csp.conf)" \
+    "$(runtime_path /etc/nginx/snippets/athanor-preview-origin.conf)" \
     "$(runtime_path /etc/nginx/snippets/athanor-hsts.conf)"
   # The agent account keeps passwordless root for the package helper for as long as this
   # rule exists, so it has to go with the services it was granted for.
@@ -3128,6 +3218,13 @@ uninstall_athanor() {
   fi
   systemctl reload avahi-daemon >/dev/null 2>&1 ||
     systemctl restart avahi-daemon >/dev/null 2>&1 || true
+  if [ -f "$athanor_root/scripts/athanor-native-runtime" ]; then
+    /bin/sh "$athanor_root/scripts/athanor-native-runtime" remove
+  fi
+  supervisor_path="$(runtime_path /usr/local/lib/athanor/mission-supervisor.py)"
+  if cmp -s "$athanor_root/scripts/mission-supervisor.py" "$supervisor_path"; then
+    rm -f "$supervisor_path"
+  fi
   systemctl daemon-reload
   systemctl reload nginx >/dev/null 2>&1 || true
   printf 'athanor was disabled, the agent sudo rule and the local advertisement were removed.\n'
@@ -3417,7 +3514,7 @@ spend_ceiling_command() {
       # and stores nothing is how a control comes to wear a brake's name while being wired to
       # nothing, which is the one thing this command exists not to be.
       spend_ceiling_storable || {
-        printf 'athanor: %s per million in and %s per million out is a valid ceiling, and this\n' \
+        printf 'garden: %s per million in and %s per million out is a valid ceiling, and this\n' \
           "$1" "$2" >&2
         printf 'server cannot store it: its database has no column for one. Nothing was changed.\n' >&2
         printf 'Run sudo athanor update once a release that adds it is published.\n' >&2
@@ -3567,7 +3664,7 @@ spend_cap_command() {
       cap_daily=$(spend_cap_amount "$1") || exit 1
       cap_monthly=$(spend_cap_amount "$2") || exit 1
       spend_cap_storable || {
-        printf 'athanor: this server has no column to store a spending cap. Nothing was changed.\n' >&2
+        printf 'garden: this server has no column to store a spending cap. Nothing was changed.\n' >&2
         exit 1
       }
       runuser -u postgres -- psql -v ON_ERROR_STOP=1 -q athanor <<SQL
@@ -4170,7 +4267,7 @@ task_answer() {
 
 task_usage() {
   printf '%s\n' \
-    'Usage: athanor task {run|wait|show|cancel|approvals|approve|deny|answer}' \
+    'Usage: garden task {run|wait|show|cancel|approvals|approve|deny|answer}' \
     '' \
     '  run --workspace ID (--prompt TEXT | --prompt-file PATH)' \
     '      [--model ID] [--privacy-route ROUTE] [--credits N] [--spend-usd N]' \
@@ -4321,7 +4418,7 @@ task_command() {
 
 usage() {
   printf '%s\n' \
-    'Usage: athanor {install|start|stop|restart|status|logs [api|worker|runner|registry|notifications|nginx]|doctor|connect|pairing-code|set-hostname HOST|price-ceiling [show|set INPUT OUTPUT|clear]|spend-cap [show|set DAILY MONTHLY|clear]|backup [dir]|backup auto on|off|status|backup destination [show|PATH --recipient FILE|off]|restore DIR --yes [--new-host [--hostname NAME]]|update|rollback [dir]|auto-update on|off|status|relay status|on|off|uninstall|certificate ...|ddns ...|task ...|tool-opens [DAYS] [--json]|acp --workspace ID [--approvals park|relay]}' \
+    'Usage: garden {install|start|stop|restart|status|logs [api|worker|runner|registry|notifications|nginx]|doctor|connect|pairing-code|set-hostname HOST|price-ceiling [show|set INPUT OUTPUT|clear]|spend-cap [show|set DAILY MONTHLY|clear]|backup [dir]|backup auto on|off|status|backup destination [show|PATH --recipient FILE|off]|restore DIR --yes [--new-host [--hostname NAME]]|update|rollback [dir]|auto-update on|off|status|relay status|on|off|uninstall|certificate ...|ddns ...|task ...|tool-opens [DAYS] [--json]|acp --workspace ID [--approvals park|relay]}' \
     '' \
     'Browser sign-in needs a hostname: a passkey is bound to a domain name and the WebAuthn' \
     'standard does not allow an IP address. If this server has no name, run:' \
@@ -4354,7 +4451,7 @@ case "$command_name" in
   # now, not told there is no such command. Two lines, and it also disambiguates: there is now a
   # real spend cap, and somebody typing the old name may want either.
   spend-ceiling)
-    printf 'athanor: "spend-ceiling" set a price per million tokens, and is now called
+    printf 'garden: "spend-ceiling" set a price per million tokens, and is now called
 ' >&2
     printf '  sudo athanor price-ceiling %s
 ' "$*" >&2
@@ -4382,6 +4479,7 @@ case "$command_name" in
       # stopping it, without a backup and with nothing to go back to. The update is the command.
       install-runtime-files)
         need_root update install-runtime-files
+        acquire_maintenance_lock
         cd "$athanor_root" || fail "could not enter $athanor_root"
         install_runtime_files
         # And what this release carries besides its files, here as well as in `update_athanor`.
@@ -4408,6 +4506,9 @@ case "$command_name" in
         # running /usr/local/lib/athanor/athanor-sandbox, and the line above is what puts this
         # release's copy of that helper there.
         install_release_carried_steps
+        # Native entry points must be usable before this release is activated.
+        run_update_step "activating native tools" \
+          /bin/sh "$athanor_root/scripts/athanor-native-runtime" all
         ;;
       '') update_athanor ;;
       *) fail "usage: athanor update" ;;
@@ -4446,7 +4547,7 @@ case "$command_name" in
   # carried on as though the server had been restarted, and so did the operator reading a green
   # terminal. Asking for help is a success; asking for a command that does not exist is not.
   *)
-    printf 'athanor: unknown command: %s\n' "$command_name" >&2
+    printf 'garden: unknown command: %s\n' "$command_name" >&2
     usage >&2
     exit 64
     ;;

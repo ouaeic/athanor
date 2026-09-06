@@ -25,7 +25,8 @@
 import cookie from '@fastify/cookie';
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
-import { AgentWorker } from '@athanor/worker';
+import { AgentWorker, runCodingMissionLoop } from '@athanor/worker';
+import { runMediaJobLoop } from '@athanor/worker/media-jobs';
 import { registerAuthRoutes } from './auth-routes.js';
 import type { ApiConfig } from './config.js';
 import {
@@ -56,6 +57,11 @@ import { registerDraftRoutes } from './routes/drafts.js';
 import { registerHealthRoutes } from './routes/health.js';
 import { registerKnowledgeRoutes } from './routes/knowledge.js';
 import { registerMediaRoutes } from './routes/media.js';
+import { registerMediaJobRoutes } from './routes/media-jobs.js';
+import { registerComputationRoutes } from './routes/computation.js';
+import { registerDebuggerRoutes } from './routes/debugger.js';
+import { registerNativeAuthorizationRoutes } from './routes/native-authorization.js';
+import { registerCodingMissionRoutes } from './routes/coding-missions.js';
 import { registerModelRoutes, seedModelCatalog } from './routes/models.js';
 import { registerNotificationRoutes } from './routes/notifications.js';
 import { registerPreviewRoutes } from './routes/previews.js';
@@ -70,8 +76,10 @@ import { registerSnapshotRoutes } from './routes/snapshots.js';
 import { createServerSupport } from './routes/support.js';
 import { registerTaskEventRoutes } from './routes/task-events.js';
 import { registerTaskRoutes } from './routes/tasks.js';
+import { registerTaskPresentationRoutes } from './routes/task-presentation.js';
 import { registerTrajectoryRoutes } from './routes/trajectory.js';
 import { registerTranscriptionRoutes } from './routes/transcriptions.js';
+import { registerVoiceRoutes } from './routes/voice.js';
 import { registerUsageRoutes } from './routes/usage.js';
 import { registerWorkspaceFileRoutes } from './routes/workspace-files.js';
 import { registerWorkspaceRoutes } from './routes/workspaces.js';
@@ -136,9 +144,29 @@ export const buildServer = async (
     stopEmbeddedWorker = resolve;
   });
   let embeddedWorkerLoop: Promise<void> = Promise.resolve();
+  let mediaJobLoop: Promise<void> = Promise.resolve();
+  let codingMissionLoop: Promise<void> = Promise.resolve();
+  const mediaJobShutdown = new AbortController();
+  const codingMissionShutdown = new AbortController();
   if (config.EMBEDDED_WORKER ?? config.DATABASE_DRIVER === 'pglite') {
     const embeddedWorker = new AgentWorker(store, config, masterKey, runnerSharedSecret, log);
     embeddedWorkerRunning = true;
+    codingMissionLoop = runCodingMissionLoop({
+      store,
+      runnerBaseUrl: config.WORKSPACE_RUNNER_URL,
+      runnerSecret: runnerSharedSecret,
+      signal: codingMissionShutdown.signal,
+      onError: (error) => log.error('worker.coding_mission_recovery_failed', errorFields(error))
+    });
+    mediaJobLoop = runMediaJobLoop({
+      store,
+      masterKey,
+      runnerBaseUrl: config.WORKSPACE_RUNNER_URL,
+      runnerSecret: runnerSharedSecret,
+      workerId: config.WORKER_ID,
+      signal: mediaJobShutdown.signal,
+      onError: (error) => log.error('worker.media_poll_failed', errorFields(error))
+    });
     /**
      * Pickup waits on the write, not on a clock: `waitForQueuedTask` returns the moment a task is
      * queued and otherwise after the poll interval, so a send is picked up in milliseconds instead
@@ -219,6 +247,7 @@ export const buildServer = async (
   registerErrorHandler(base);
   registerAuthHooks(base);
   registerMetrics(base);
+  await registerVoiceRoutes(routes);
   registerAuthRoutes(app, store, config);
   registerHealthRoutes(routes);
   registerAccountRoutes(routes);
@@ -242,8 +271,14 @@ export const buildServer = async (
   registerModelRoutes(routes);
   registerProviderRoutes(routes);
   registerMediaRoutes(routes);
+  registerMediaJobRoutes(routes);
+  registerComputationRoutes(routes);
+  registerDebuggerRoutes(routes);
+  registerNativeAuthorizationRoutes(routes);
+  registerCodingMissionRoutes(routes);
   registerTranscriptionRoutes(routes);
   registerTaskRoutes(routes);
+  registerTaskPresentationRoutes(routes);
   registerTrajectoryRoutes(routes);
   registerTaskEventRoutes(routes);
   registerShareRoutes(routes);
@@ -260,6 +295,9 @@ export const buildServer = async (
   );
 
   app.addHook('onClose', async () => {
+    mediaJobShutdown.abort();
+    codingMissionShutdown.abort();
+    await Promise.all([mediaJobLoop, codingMissionLoop]);
     embeddedWorkerRunning = false;
     stopEmbeddedWorker();
     clearInterval(maintenanceTimer);

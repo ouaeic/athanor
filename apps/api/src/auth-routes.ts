@@ -64,7 +64,7 @@ const nativeClientLabel = (value: string | string[] | undefined): string | undef
   if (typeof value !== 'string') return undefined;
   const platform = /^athanor-([a-z]{3,10})\/[0-9A-Za-z.+-]{1,32}$/.exec(value.trim())?.[1];
   const named = platform ? NATIVE_CLIENT_PLATFORMS[platform] : undefined;
-  return named ? `athanor app on ${named}` : undefined;
+  return named ? `garden app on ${named}` : undefined;
 };
 
 export const deviceLabel = (headers: {
@@ -724,69 +724,73 @@ export const registerAuthRoutes = (
     return { revoked: result === 'deleted' };
   });
 
-  app.post<{ Body: { nativeOrigin?: string } }>('/v1/auth/step-up/options', async (request) => {
-    const user = request.user;
-    if (!user) throw new AthanorError('authentication_required', 'Sign in to continue', 401);
-    /*
-     * A ceremony that already happened, inside the window, is the answer.
-     *
-     * Registration, sign-in, recovery and device enrolment each complete a WebAuthn ceremony with
-     * `userVerification: 'required'` against the very authenticator this route would challenge, and
-     * each opens the step-up window (`createSession(..., steppedUp)`). Every route behind
-     * `requireRecentStepUp` already accepts that proof for the next five minutes without asking
-     * again — but this route never consulted it, so it minted a challenge regardless and the client
-     * ran it. The result was a fingerprint per sensitive action for the first five minutes after
-     * first run, each one re-proving a fact the server was about to accept anyway. Nothing is
-     * granted here that the window did not already grant; the floor that must always ask still
-     * asks, because that floor is enforced where the action happens, on the same window.
-     *
-     * `step_up_at` is deliberately not touched. The window is anchored to the last real ceremony,
-     * and refreshing it from a route that proves nothing would let whoever holds the cookie hold
-     * the window open indefinitely by polling.
-     */
-    const sessionToken = request.cookies[sessionCookieName(secure)];
-    if (
-      sessionToken &&
-      (await store.hasRecentSessionStepUp(user.id, sha256(sessionToken), STEP_UP_WINDOW_SECONDS))
-    ) {
-      return { verified: true };
-    }
-    const passkeys = await store.listPasskeys(user.id);
-    if (!passkeys.length) {
-      // Step-up exists to prove a person is present. On a real deployment there is nothing to fall
-      // back to when no passkey is registered, so this fails closed; only a developer machine,
-      // which has no passkeys at all, takes the shortcut.
-      if (devAuthEnabled) {
-        const token = request.cookies[sessionCookieName(secure)];
-        if (!token || !(await store.markSessionStepUp(user.id, sha256(token)))) {
-          throw new AthanorError(
-            'step_up_failed',
-            'The current development session is unavailable',
-            401
-          );
-        }
+  app.post<{ Body: { nativeOrigin?: string; force?: boolean } }>(
+    '/v1/auth/step-up/options',
+    async (request) => {
+      const user = request.user;
+      if (!user) throw new AthanorError('authentication_required', 'Sign in to continue', 401);
+      /*
+       * A ceremony that already happened, inside the window, is the answer.
+       *
+       * Registration, sign-in, recovery and device enrolment each complete a WebAuthn ceremony with
+       * `userVerification: 'required'` against the very authenticator this route would challenge, and
+       * each opens the step-up window (`createSession(..., steppedUp)`). Every route behind
+       * `requireRecentStepUp` already accepts that proof for the next five minutes without asking
+       * again — but this route never consulted it, so it minted a challenge regardless and the client
+       * ran it. The result was a fingerprint per sensitive action for the first five minutes after
+       * first run, each one re-proving a fact the server was about to accept anyway. Nothing is
+       * granted here that the window did not already grant; the floor that must always ask still
+       * asks, because that floor is enforced where the action happens, on the same window.
+       *
+       * `step_up_at` is deliberately not touched. The window is anchored to the last real ceremony,
+       * and refreshing it from a route that proves nothing would let whoever holds the cookie hold
+       * the window open indefinitely by polling.
+       */
+      const sessionToken = request.cookies[sessionCookieName(secure)];
+      if (
+        request.body.force !== true &&
+        sessionToken &&
+        (await store.hasRecentSessionStepUp(user.id, sha256(sessionToken), STEP_UP_WINDOW_SECONDS))
+      ) {
         return { verified: true };
       }
-      throw new AthanorError('passkey_required', 'Register a passkey to continue', 403);
+      const passkeys = await store.listPasskeys(user.id);
+      if (!passkeys.length) {
+        // Step-up exists to prove a person is present. On a real deployment there is nothing to fall
+        // back to when no passkey is registered, so this fails closed; only a developer machine,
+        // which has no passkeys at all, takes the shortcut.
+        if (devAuthEnabled) {
+          const token = request.cookies[sessionCookieName(secure)];
+          if (!token || !(await store.markSessionStepUp(user.id, sha256(token)))) {
+            throw new AthanorError(
+              'step_up_failed',
+              'The current development session is unavailable',
+              401
+            );
+          }
+          return { verified: true };
+        }
+        throw new AthanorError('passkey_required', 'Register a passkey to continue', 403);
+      }
+      const context = webauthnContext(request.body.nativeOrigin);
+      const options = await generateAuthenticationOptions({
+        rpID: context.rpId,
+        userVerification: 'required',
+        allowCredentials: passkeys.map((key) => ({
+          id: key.credentialId,
+          transports: key.transports as AuthenticatorTransport[]
+        }))
+      });
+      const challengeId = await store.createChallenge({
+        username: user.username,
+        challenge: options.challenge,
+        kind: 'step_up',
+        expectedOrigin: context.expectedOrigin,
+        rpId: context.rpId
+      });
+      return { challengeId, options };
     }
-    const context = webauthnContext(request.body.nativeOrigin);
-    const options = await generateAuthenticationOptions({
-      rpID: context.rpId,
-      userVerification: 'required',
-      allowCredentials: passkeys.map((key) => ({
-        id: key.credentialId,
-        transports: key.transports as AuthenticatorTransport[]
-      }))
-    });
-    const challengeId = await store.createChallenge({
-      username: user.username,
-      challenge: options.challenge,
-      kind: 'step_up',
-      expectedOrigin: context.expectedOrigin,
-      rpId: context.rpId
-    });
-    return { challengeId, options };
-  });
+  );
 
   app.post<{
     Body: {

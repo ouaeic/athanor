@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useRef, useState } from 'react';
 import { ArrowUpRight, Paperclip, X, SlidersHorizontal, Mic, Square } from 'lucide-react';
-import type { Task, Workspace } from '@athanor/contracts';
+import type { Task, Workspace, TaskReasoningEffort } from '@athanor/contracts';
+import { effortChoices, effortLabel } from './reasoning-options';
 import type { Bootstrap, Draft, DraftAttachment } from './model';
 import { defaultPrivacy, isWorking, text, data } from './model';
 import { isNativeClient, post, put, request } from './client';
@@ -14,7 +15,9 @@ import {
   uploadAttachments
 } from './composer-operations.js';
 import type { DictationState } from './composer-operations.js';
+import type { DictationConsent } from './dictation-preflight';
 const LocalFolderAttachments = lazy(() => import('./LocalFolderAttachments.js'));
+const DictationSetup = lazy(() => import('./DictationSetup'));
 
 export interface ComposerProps {
   workspace: Workspace;
@@ -38,9 +41,14 @@ export default function Composer({
   const [attachments, setAttachments] = useState<DraftAttachment[]>(
     initialDraft?.attachments ?? []
   );
-  const [modelId, setModelId] = useState('');
-  const [privacyRoute, setPrivacyRoute] = useState(task?.privacyRoute ?? defaultPrivacy(bootstrap));
-  const [cap, setCap] = useState('');
+  const [modelId, setModelId] = useState(initialDraft?.controls?.modelId ?? '');
+  const [reasoningEffort, setReasoningEffort] = useState<TaskReasoningEffort>(
+    initialDraft?.controls?.reasoningEffort ?? task?.reasoningEffort ?? 'auto'
+  );
+  const [privacyRoute, setPrivacyRoute] = useState(
+    initialDraft?.controls?.privacyRoute ?? task?.privacyRoute ?? defaultPrivacy(bootstrap)
+  );
+  const [cap, setCap] = useState(initialDraft?.controls?.spendCap ?? '');
   const [interrupt, setInterrupt] = useState(false);
   const [advanced, setAdvanced] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -48,11 +56,13 @@ export default function Composer({
   const [error, setError] = useState<unknown>(null);
   const [saved, setSaved] = useState('');
   const [dictationState, setDictationState] = useState<DictationState>('idle');
+  const [dictationSetup, setDictationSetup] = useState(false);
   const [pendingTask, setPendingTask] = useState<Task | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
   const voice = useRef<ReturnType<typeof dictationSession> | null>(null);
   const voiceState = useRef<DictationState>('idle');
+  const dictationConsent = useRef<DictationConsent | null>(null);
   const uploadController = useRef<AbortController | null>(null);
   const operation = useRef<{ signature: string; key: string } | null>(null);
   const changed = useRef(false);
@@ -67,7 +77,13 @@ export default function Composer({
   onDraftRef.current = onDraft;
   useEffect(() => {
     if (!changed.current || sending.current || busy) return;
-    const draft: Draft = { workspaceId: workspace.id, taskId: task?.id ?? null, body, attachments };
+    const draft: Draft = {
+      workspaceId: workspace.id,
+      taskId: task?.id ?? null,
+      body,
+      attachments,
+      controls: { modelId, reasoningEffort, privacyRoute, spendCap: cap }
+    };
     onDraftRef.current(draft);
     const revision = ++draftRevision.current;
     draftTimer.current = setTimeout(() => {
@@ -88,16 +104,33 @@ export default function Composer({
     return () => {
       if (draftTimer.current) clearTimeout(draftTimer.current);
     };
-  }, [body, attachments, workspace.id, task?.id, busy, draftWrites]);
+  }, [
+    body,
+    attachments,
+    modelId,
+    reasoningEffort,
+    privacyRoute,
+    cap,
+    workspace.id,
+    task?.id,
+    busy,
+    draftWrites
+  ]);
   useEffect(() => {
     mounted.current = true;
     voice.current = dictationSession({
       getStream: () => navigator.mediaDevices.getUserMedia({ audio: true }),
       createRecorder: (stream) => new MediaRecorder(stream),
       transcribe: async (audio, signal) => {
+        const consent = dictationConsent.current;
+        if (!consent) throw new Error('Review dictation options before recording.');
         const payload = await transcriptionPayload(audio, signal);
         signal.throwIfAborted();
-        const result = await post<unknown>('/v1/audio/transcriptions', payload, { signal });
+        const result = await post<unknown>(
+          '/v1/audio/transcriptions',
+          { ...payload, ...consent },
+          { signal }
+        );
         return text(data(result).text);
       },
       onText: (transcript) => {
@@ -107,6 +140,7 @@ export default function Composer({
       },
       onError: setError,
       onState: (state) => {
+        if (state === 'idle') dictationConsent.current = null;
         voiceState.current = state;
         setDictationState(state);
       }
@@ -190,6 +224,7 @@ export default function Composer({
   }
   async function send() {
     if (
+      dictationSetup ||
       !body.trim() ||
       sending.current ||
       uploadController.current ||
@@ -217,6 +252,7 @@ export default function Composer({
       prompt,
       attachments: attachments.map((file) => file.path),
       ...(modelId ? { modelId } : {}),
+      reasoningEffort,
       privacyRoute,
       ...(limit !== undefined ? { maxSpendUsd: limit } : {}),
       ...(task ? { interrupt } : { workspaceId: workspace.id })
@@ -253,7 +289,7 @@ export default function Composer({
     if (sending.current || uploadController.current || pendingTask || voiceState.current !== 'idle')
       return;
     setError(null);
-    void voice.current?.start();
+    setDictationSetup(true);
   }
   const recording = dictationState === 'recording';
   const voiceBusy = dictationState !== 'idle';
@@ -261,6 +297,9 @@ export default function Composer({
   const models = bootstrap.models.filter(
     (model) => model.availability === 'available' && model.privacyRoute === privacyRoute
   );
+  const selectedModel = models.find((model) => model.id === (modelId || task?.modelId));
+  const efforts = effortChoices(selectedModel?.reasoning);
+  const effortIndex = efforts.indexOf(reasoningEffort);
   return (
     <form
       className={`intent-editor ${task ? 'follow-up' : ''}`}
@@ -269,6 +308,18 @@ export default function Composer({
         void send();
       }}
     >
+      {dictationSetup && (
+        <Suspense fallback={null}>
+          <DictationSetup
+            onClose={() => setDictationSetup(false)}
+            onStart={(consent, maxSeconds) => {
+              dictationConsent.current = consent;
+              setDictationSetup(false);
+              void voice.current?.start({ maxMilliseconds: maxSeconds * 1000 });
+            }}
+          />
+        </Suspense>
+      )}
       {scope && <div className="scope-label">This direction includes your selected context.</div>}
       <label className="sr-only" htmlFor={`intent-${task?.id ?? 'new'}`}>
         {task ? 'Add direction to this work' : 'Describe what you want to do'}
@@ -291,9 +342,7 @@ export default function Composer({
           }
         }}
         placeholder={
-          task
-            ? 'Add a thought, ask a question, or shape the next step…'
-            : 'Describe what you want to do…'
+          task ? 'Add a thought or shape the next step…' : 'Describe what you want to do…'
         }
       />
       {attachments.length > 0 && (
@@ -418,22 +467,58 @@ export default function Composer({
           </Button>
         </div>
       )}
+      <div className="garden-model-controls">
+        <label className="garden-model-select">
+          <span>Model</span>
+          <select
+            aria-label="Model for this direction"
+            value={modelId}
+            disabled={editingDisabled || uploading || voiceBusy}
+            onChange={(event) => {
+              changed.current = true;
+              setModelId(event.target.value);
+              setReasoningEffort('auto');
+            }}
+          >
+            <option value="">
+              {task ? (selectedModel?.displayName ?? 'Current model') : 'Automatic selection'}
+            </option>
+            {models.map((model) => (
+              <option key={model.id} value={model.id}>
+                {model.displayName}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="garden-effort-control">
+          <span>
+            Effort <strong>{effortLabel(reasoningEffort)}</strong>
+          </span>
+          <input
+            type="range"
+            aria-label="Model reasoning effort"
+            aria-valuetext={effortLabel(reasoningEffort)}
+            min={0}
+            max={Math.max(1, efforts.length - 1)}
+            step={1}
+            value={Math.max(0, effortIndex)}
+            disabled={editingDisabled || efforts.length < 2}
+            onChange={(event) => {
+              changed.current = true;
+              setReasoningEffort(efforts[Number(event.target.value)] ?? 'auto');
+            }}
+          />
+          <small>
+            {efforts.length < 2
+              ? selectedModel
+                ? 'No adjustable levels advertised'
+                : 'Choose a model for exact levels'
+              : 'Provider-supported levels'}
+          </small>
+        </label>
+      </div>
       {advanced && (
         <div className="intent-options">
-          <Field label="Model">
-            <select
-              disabled={editingDisabled || uploading || voiceBusy}
-              value={modelId}
-              onChange={(event) => setModelId(event.target.value)}
-            >
-              <option value="">Automatic · match this request</option>
-              {models.map((model) => (
-                <option key={model.id} value={model.id}>
-                  {model.displayName}
-                </option>
-              ))}
-            </select>
-          </Field>
           <Field label="Privacy route">
             <select
               value={privacyRoute}
@@ -444,8 +529,10 @@ export default function Composer({
                 bootstrap.instance.enforceZeroDataRetention
               }
               onChange={(event) => {
+                changed.current = true;
                 setPrivacyRoute(event.target.value === 'external' ? 'external' : 'provider_zdr');
                 setModelId('');
+                setReasoningEffort('auto');
               }}
             >
               <option value="provider_zdr">Zero data retention</option>
@@ -463,7 +550,10 @@ export default function Composer({
               disabled={editingDisabled || uploading || voiceBusy}
               step="0.01"
               value={cap}
-              onChange={(event) => setCap(event.target.value)}
+              onChange={(event) => {
+                changed.current = true;
+                setCap(event.target.value);
+              }}
               placeholder="Account default"
             />
           </Field>

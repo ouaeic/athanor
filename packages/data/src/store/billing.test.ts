@@ -51,7 +51,7 @@ describe('BillingStore spend readers', () => {
    * is money nobody took; a refund is money that came back. Both were counted for the life of the
    * task, because this was the one reader in the file with no `state` filter at all.
    */
-  it('counts only settled media charges against the media brake', async () => {
+  it('counts reserved and settled media charges against the media brake', async () => {
     const { userId, taskId } = await seedTask();
     const charge = async (
       key: string,
@@ -83,11 +83,11 @@ describe('BillingStore spend readers', () => {
     // Not media, so out of scope whatever its state.
     await charge('settled-tokens', 'settled', 4.5, 'model:tokens');
 
-    await expect(store.mediaSpendForTask(taskId)).resolves.toBeCloseTo(0.3, 10);
+    await expect(store.mediaSpendForTask(taskId)).resolves.toBeCloseTo(0.8, 10);
   });
 
   /** The neighbours this reader was brought into line with, on the same rows. */
-  it('reads the same settled subset as the task and window totals', async () => {
+  it('keeps unsettled reservations in the media brake while task totals report actual spend', async () => {
     const { userId, taskId } = await seedTask();
     for (const [key, state, cost] of [
       ['settled-a', 'settled', 0.25],
@@ -108,6 +108,6 @@ describe('BillingStore spend readers', () => {
       });
     }
     await expect(store.taskSpend(taskId)).resolves.toBeCloseTo(0.25, 10);
-    await expect(store.mediaSpendForTask(taskId)).resolves.toBeCloseTo(0.25, 10);
+    await expect(store.mediaSpendForTask(taskId)).resolves.toBeCloseTo(9.25, 10);
   });
 });

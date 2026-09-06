@@ -1,7 +1,7 @@
 /**
  * Parking a turn on an approval card: the card, the calls behind it, and the saved state.
  *
- * Three things have to happen together and in this order, which is why they are one function.
+ * The decision and its continuation become durable together before the event is published.
  *
  * The **card** carries an encrypted preview and a hash of the exact arguments. The hash is what the
  * resume checks against on the way back in (`turn/resume.ts`), so an approval the owner gave for
@@ -11,12 +11,11 @@
  * proposes several actions at once; a tool call with no tool result is a malformed window, and
  * nothing behind a decision may run before the decision is made.
  *
- * The **state** is written with `clearLease`, which is what actually parks the task. This is also
- * why the eval rig structurally cannot count cards per task: a card ends the run.
- *
- * Lifted out of `AgentWorker.run()`'s batch loop unchanged.
+ * The **state** and decision are written together while releasing the worker lease. No caller
+ * can answer the decision before the exact pending call is available to the next worker.
  */
 import { encryptJson } from '@athanor/core';
+import { randomUUID } from 'node:crypto';
 import type { DataStore, TaskRecord } from '@athanor/data';
 import type { ModelToolCall } from '@athanor/model-gateway';
 import type { AgentState, AgentWorkerConfig } from '../agent-state.js';
@@ -42,7 +41,23 @@ export const parkForApproval = async (
   deferredCalls: readonly ModelToolCall[]
 ): Promise<void> => {
   const origin = approvalOrigin(state);
-  const approvalId = await deps.store.createApproval({
+  const approvalId = randomUUID();
+  state.pending = {
+    approvalId,
+    toolCall: call,
+    ...(approval.handoffOnly ? { handoffOnly: true } : {})
+  };
+  for (const deferred of deferredCalls) {
+    state.messages.push({
+      role: 'tool',
+      toolCallId: deferred.id,
+      content:
+        'Deferred because an earlier action requires user approval. Request it again if still needed.'
+    });
+  }
+  const parked = await deps.store.parkTaskForApproval({
+    id: approvalId,
+    workerId: deps.config.WORKER_ID,
     userId: task.userId,
     taskId: task.id,
     action: approval.handoffOnly ? 'secure_input_handoff' : call.name,
@@ -61,32 +76,14 @@ export const parkForApproval = async (
       `approval:${task.id}`
     ),
     previewHash: approvalPreviewHash(key, call.name, call.arguments),
-    expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000)
+    expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+    actualComputeCredits: state.credits,
+    agentStateCiphertext: encryptJson(state, key, `task-state:${task.id}`)
   });
-  state.pending = {
-    approvalId,
-    toolCall: call,
-    ...(approval.handoffOnly ? { handoffOnly: true } : {})
-  };
-  for (const deferred of deferredCalls) {
-    state.messages.push({
-      role: 'tool',
-      toolCallId: deferred.id,
-      content:
-        'Deferred because an earlier action requires user approval. Request it again if still needed.'
-    });
-  }
+  if (!parked) return;
   await event(deps.store, task, key, 'approval_requested', approval.action, {
     approvalId,
     sideEffect: approval.sideEffect,
     preview: approval.preview
-  });
-  await deps.store.updateTask({
-    id: task.id,
-    workerId: deps.config.WORKER_ID,
-    status: 'awaiting_user',
-    actualComputeCredits: state.credits,
-    agentStateCiphertext: encryptJson(state, key, `task-state:${task.id}`),
-    clearLease: true
   });
 };

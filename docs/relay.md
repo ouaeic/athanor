@@ -13,7 +13,7 @@ the end of the next two sections.
 
 The relay ships **off**. Nothing dials anywhere, nothing registers anywhere, and no relay address
 appears in your connection ticket until you turn it on yourself. There is no default relay and no
-Athanor-operated relay.
+garden-operated relay.
 
 ## First choice: a direct address
 

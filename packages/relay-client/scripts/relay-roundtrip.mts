@@ -53,6 +53,7 @@ const config = parseRelayConfig({
   relayDomain: RELAY_DOMAIN,
   listenHost: '127.0.0.1',
   httpsPort: 0,
+  previewPort: 0,
   controlPort: 0,
   httpPort: 0,
   metricsPort: 0,
@@ -112,6 +113,12 @@ const boxHttp = createHttpServer((request, response) => {
 await new Promise<void>((r) => boxHttp.listen(0, '127.0.0.1', r));
 const boxHttpPort = (boxHttp.address() as any).port;
 
+const boxPreview = createTlsServer({ key: boxCert.keyPem, cert: boxCert.certPem }, (socket) =>
+  socket.on('data', (chunk) => socket.write(`PREVIEW:${chunk.toString()}`))
+);
+await new Promise<void>((resolve) => boxPreview.listen(0, '127.0.0.1', resolve));
+const boxPreviewPort = (boxPreview.address() as any).port;
+
 const conn = new RelayConnection({
   config: RelayClientConfigSchema.parse({
     enabled: true,
@@ -122,7 +129,8 @@ const conn = new RelayConnection({
     pinnedRelaySpkiSha256: enrollment.pinnedRelaySpkiSha256,
     localHost: '127.0.0.1',
     localPort: boxPort,
-    localHttpPort: boxHttpPort
+    localHttpPort: boxHttpPort,
+    localPreviewPort: boxPreviewPort
   }),
   identity,
   logger: (l, m, f) => console.log('[relay-client]', l, m, JSON.stringify(f ?? {}))
@@ -152,6 +160,30 @@ if (reply !== 'HELLO THROUGH THE RELAY') {
   process.exit(1);
 }
 console.log('ok: a real TLS client reached the box through the relay');
+
+if (conn.status.lastError !== null)
+  throw new Error(`Preview capability was not accepted: ${conn.status.lastError}`);
+if (conn.status.previewPort !== server.previewPort)
+  throw new Error('The negotiated preview port must match the actual public listener');
+const previewClient = connectTls({
+  host: '127.0.0.1',
+  port: server.previewPort!,
+  servername: enrollment.hostname,
+  rejectUnauthorized: false
+});
+const previewReply = await new Promise<string>((resolve, reject) => {
+  const timer = setTimeout(() => reject(new Error('preview timeout')), 8000);
+  previewClient.on('error', reject);
+  previewClient.once('secureConnect', () => previewClient.write('a generated app'));
+  previewClient.once('data', (chunk) => {
+    clearTimeout(timer);
+    resolve(chunk.toString());
+  });
+});
+if (previewReply !== 'PREVIEW:a generated app')
+  throw new Error(`Preview reached the wrong listener: ${previewReply}`);
+previewClient.destroy();
+console.log('ok: preview TLS reaches only the separate box preview listener');
 
 // ACME HTTP-01 arrives this way: plaintext, on the relay's :80, routed on Host rather than SNI.
 const challengePath = '/.well-known/acme-challenge/roundtrip';
@@ -204,8 +236,11 @@ console.log('ok: the relay survived the box disconnecting, and the connection is
 
 client.destroy();
 httpSocket.destroy();
+if (conn.status.previewPort !== null)
+  throw new Error('Stopped relay must not advertise a preview port');
 box.close();
 boxHttp.close();
+boxPreview.close();
 await server.close();
 console.log('ok: clean shutdown');
 process.exit(0);

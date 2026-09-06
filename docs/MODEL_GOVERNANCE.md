@@ -2,7 +2,7 @@
 
 ## Boundary
 
-athanor runs no model weights. The owner supplies an OpenRouter or OpenAI-compatible provider account,
+garden runs no model weights. The owner supplies an OpenRouter or OpenAI-compatible provider account,
 or uses Codex/Claude subscriptions for bounded coding missions.
 
 ## Catalog scope
@@ -14,10 +14,10 @@ or uses Codex/Claude subscriptions for bounded coding missions.
 | `provider_catalog` (default) | Every chat model the owner's own provider account can reach   | The model keeps working and loses its open-weight badge |
 | `reviewed_open_weight`       | Only models carrying an independent commercial-licence review | The model is withdrawn from selection (fails closed)    |
 
-The default is `provider_catalog` because Athanor never redistributes model weights. It calls a
+The default is `provider_catalog` because garden never redistributes model weights. It calls a
 hosted endpoint using the owner's own provider account, so a model's weight licence governs
 redistribution of the weights rather than the owner's right to call the service. Treating that
-review as a _badge_ rather than a _gate_ also means a model released after an Athanor build appears
+review as a _badge_ rather than a _gate_ also means a model released after an garden build appears
 without a code change, which is what keeps an unattended server working.
 
 `reviewed_open_weight` preserves the stricter posture for owners who deliberately want to run only
@@ -31,7 +31,7 @@ confirm - which is what a relicensing upstream looks like from here - not the pa
 expiry date would fail a checkout nobody had touched, on a machine installed from a tag and left to
 run, and in this scope that turns a working catalogue into an unselectable one.
 
-Neither scope changes what Athanor itself is licensed under, and neither implies the model's
+Neither scope changes what garden itself is licensed under, and neither implies the model's
 output rights, acceptable-use terms, or jurisdictional rules. See **Licenses** below.
 
 ## Live catalog
@@ -74,7 +74,7 @@ Specialist observations return to the lead so the conversation does not silently
 ## Privacy
 
 `AI_REQUIRE_ZDR=true` restricts OpenRouter routing to eligible endpoints and requests data-collection
-denial. If no eligible route exists, athanor fails closed. Custom compatible endpoints rely on owner
+denial. If no eligible route exists, garden fails closed. Custom compatible endpoints rely on owner
 configuration and their actual service policy.
 
 Video generation is disabled. The only provider route for it is asynchronous and keeps the output
@@ -83,14 +83,14 @@ unavailable and a job for one is refused rather than started.
 
 ## Cost
 
-athanor adds no markup or allowance. The model provider reports usage/cost where available; athanor
+garden adds no markup or allowance. The model provider reports usage/cost where available; garden
 stores content-free task cost metadata and can show an estimate before material media work.
 
-Publisher subscription limits for Codex/Claude are enforced by those services and may change. athanor
+Publisher subscription limits for Codex/Claude are enforced by those services and may change. garden
 does not pool or emulate them.
 
 ## Licenses
 
 Provider availability does not make a model open source or open weight. Model code/weight licenses,
 service terms, acceptable use, generated-output rights, and jurisdictional rules remain separate from
-the athanor AGPL license.
+the garden AGPL license.

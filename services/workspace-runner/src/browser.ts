@@ -18,6 +18,8 @@ import type {
   ParallelWebReadResult,
   ResearchReadSource
 } from '@athanor/contracts';
+import type { BrowserTabCleanup, BrowserTabState } from '@athanor/contracts';
+import { BrowserTabs, AGENT_TAB_LIMIT, TAB_SWEEP_MS } from './browser-tabs.js';
 import { assertPublicHttpUrl, isPublicHttpUrl, isPublicInternetAddress } from '@athanor/core';
 import {
   assertUserDataPath,
@@ -47,6 +49,8 @@ export interface BrowserStreamState {
   width: number;
   height: number;
   transport: 'chromium_screencast';
+  tabs: BrowserTabState[];
+  cleanup: BrowserTabCleanup;
   /**
    * The challenge currently waiting for a person, on whichever tab raised it. It rides the stream
    * because a wall is the one browser state nobody can act on but the owner, and the pane is where
@@ -143,6 +147,10 @@ interface Session {
    */
   tabs: Map<string, Page>;
   nextTabId: number;
+  tabLifecycle?: BrowserTabs;
+  tabSweep?: NodeJS.Timeout;
+  caller?: { owner: 'agent' | 'user'; taskId: string | null };
+  creatingTab?: { owner: 'agent' | 'user'; taskId: string | null };
   /**
    * Who holds the screen this browser is drawn on, which is not a fact this file owns any more.
    *
@@ -1535,7 +1543,13 @@ export const sessionTabs = async (session: Session): Promise<BrowserTabSummary[]
       tabId,
       active: page === session.page,
       url: page.url(),
-      title: await page.title().catch(() => '')
+      title: session.tabLifecycle?.has(tabId)
+        ? session.tabLifecycle.title(tabId)
+        : await withDeadline(
+            page.title().catch(() => ''),
+            STREAM_TITLE_TIMEOUT_MS,
+            ''
+          )
     });
   }
   return entries;
@@ -1712,8 +1726,66 @@ export class BrowserManager {
        * API arriving by another door and must not be a way around its limits.
        */
       maxFileBytes: number;
+      now?: () => number;
     }
   ) {}
+
+  #now(): number {
+    return this.options.now?.() ?? Date.now();
+  }
+
+  #tabLifecycle(session: Session): BrowserTabs {
+    session.tabLifecycle ??= new BrowserTabs();
+    for (const [id, page] of session.tabs) {
+      if (!page.isClosed() && !session.tabLifecycle.has(id))
+        session.tabLifecycle.add(id, 'user', null, this.#now());
+    }
+    return session.tabLifecycle;
+  }
+
+  #tabStates(session: Session): BrowserTabState[] {
+    const lifecycle = this.#tabLifecycle(session);
+    return [...session.tabs]
+      .filter(([, page]) => !page.isClosed())
+      .map(([id, page]) =>
+        lifecycle.state(id, page.url(), page === session.page, session.control.holder)
+      );
+  }
+
+  async #sweepTabs(session: Session, makeRoom = false): Promise<string[]> {
+    const lifecycle = this.#tabLifecycle(session);
+    const closed: string[] = [];
+    for (const id of lifecycle.candidates(this.#tabStates(session), this.#now(), makeRoom)) {
+      const current = this.#tabStates(session).find((tab) => tab.tabId === id);
+      if (!current || current.protectedReason !== null) continue;
+      const page = session.tabs.get(id);
+      if (!page) continue;
+      await page.close();
+      lifecycle.closed(this.#now());
+      closed.push(id);
+    }
+    if (closed.length) this.#notifyStreamState(session);
+    return closed;
+  }
+
+  async sweepTabs(workspaceId: string): Promise<string[]> {
+    const session = this.#sessions.get(workspaceId);
+    if (!session || session.control.holder !== 'agent') return [];
+    return this.#controlOf(session).submit('agent', () => this.#sweepTabs(session));
+  }
+
+  async retainTab(
+    workspaceId: string,
+    root: string,
+    tabId: string,
+    pinned: boolean
+  ): Promise<BrowserTabState[]> {
+    const session = await this.ensure(workspaceId, root);
+    resolveTab(session, tabId);
+    this.#tabLifecycle(session).pin(tabId, pinned);
+    this.#notifyStreamState(session);
+    return this.#tabStates(session);
+  }
 
   /**
    * The desktop's control for this workspace, if this runner has a desktop at all.
@@ -1833,6 +1905,7 @@ export class BrowserManager {
     context.once('close', () => {
       closed = true;
       if (!active) return;
+      if (active.tabSweep) clearInterval(active.tabSweep);
       active.detachControl?.();
       delete active.detachControl;
       this.#attached.delete(active);
@@ -1875,15 +1948,23 @@ export class BrowserManager {
         pendingDownloads: new Set(),
         tabs: new Map(),
         nextTabId: 1,
+        tabLifecycle: new BrowserTabs(),
         walls: new BotWallLedger()
       };
-      const attachPage = (candidate: Page) => {
+      const attachPage = (
+        candidate: Page,
+        owner: 'agent' | 'user' = 'user',
+        taskId: string | null = null
+      ) => {
         const tabId = `tab-${session.nextTabId}`;
         session.nextTabId += 1;
         session.tabs.set(tabId, candidate);
+        this.#tabLifecycle(session).add(tabId, owner, taskId, this.#now());
         candidate.on('close', () => {
           session.tabs.delete(tabId);
+          session.tabLifecycle?.remove(tabId);
           session.walls.forgetTab(tabId);
+          this.#notifyStreamState(session);
         });
         candidate.on('console', (message) => {
           session.consoleMessages.push({
@@ -1941,6 +2022,7 @@ export class BrowserManager {
         });
         candidate.on('dialog', (dialog) => {
           session.pendingDialog = dialog;
+          session.tabLifecycle?.dialog(tabId, true);
           // Parking the handle suppresses Playwright's auto-dismiss, so the page is stopped from
           // here until something answers. Telling the pane is the whole of the owner's way out.
           this.#notifyStreamState(session);
@@ -1954,7 +2036,7 @@ export class BrowserManager {
          * background tabs are not on the stream.
          */
         const republish = () => {
-          if (candidate === session.page) void this.#refreshStreamState(session);
+          void this.#refreshTabTitle(session, tabId, candidate);
         };
         candidate.on('domcontentloaded', republish);
         candidate.on('load', republish);
@@ -1983,13 +2065,33 @@ export class BrowserManager {
             return;
           }
           const saving = this.#saveDownload(session, root, download);
+          session.tabLifecycle?.download(tabId, 1);
           session.pendingDownloads.add(saving);
-          void saving.finally(() => session.pendingDownloads.delete(saving));
+          void saving.finally(() => {
+            session.pendingDownloads.delete(saving);
+            session.tabLifecycle?.download(tabId, -1);
+            this.#notifyStreamState(session);
+          });
         });
+        void this.#refreshTabTitle(session, tabId, candidate);
+        return tabId;
       };
       for (const candidate of context.pages()) attachPage(candidate);
       context.on('page', (candidate) => {
-        attachPage(candidate);
+        const creator = session.creatingTab;
+        const tabId = attachPage(candidate, creator?.owner, creator?.taskId);
+        if (!creator && typeof candidate.opener === 'function')
+          void candidate
+            .opener()
+            .then((opener) => {
+              const sourceId = opener ? tabIdFor(session, opener) : null;
+              const source = sourceId ? session.tabLifecycle?.ownership(sourceId) : undefined;
+              if (source) session.tabLifecycle?.adopt(tabId, source);
+              this.#notifyStreamState(session);
+              void this.sweepTabs(workspaceId).catch(() => undefined);
+            })
+            .catch(() => undefined);
+        this.#notifyStreamState(session);
         // An ad or oauth popup opens a page too; it stays a background tab the agent can
         // select deliberately instead of hijacking the one being driven.
         if (!shouldAdoptNewPage(session.page)) return;
@@ -2003,6 +2105,10 @@ export class BrowserManager {
       if (closed) throw new Error('Browser context closed during startup');
       active = session;
       this.#sessions.set(workspaceId, session);
+      session.tabSweep = setInterval(() => {
+        void this.sweepTabs(workspaceId).catch(() => undefined);
+      }, TAB_SWEEP_MS);
+      session.tabSweep.unref();
       // Registered the moment the session exists rather than at its first action, so a handover that
       // arrives while this browser has only ever been watched still lifts what it is holding down.
       this.#controlOf(session);
@@ -2671,6 +2777,8 @@ export class BrowserManager {
       width: BROWSER_VIEWPORT.width,
       height: BROWSER_VIEWPORT.height,
       transport: 'chromium_screencast',
+      tabs: session.control.holder === 'secure_input' ? [] : this.#tabStates(session),
+      cleanup: { ...this.#tabLifecycle(session).cleanup },
       botWall: session.walls.latest(),
       pendingDialog: session.pendingDialog
         ? { type: session.pendingDialog.type(), message: session.pendingDialog.message() }
@@ -2680,6 +2788,7 @@ export class BrowserManager {
 
   /** Takes a title an action has already read, rather than asking the page for it again. */
   #adoptStreamTitle(session: Session, tabId: string | null, title: string): void {
+    if (tabId) this.#tabLifecycle(session).setTitle(tabId, title);
     if (!session.stream || tabId !== tabIdFor(session, session.page)) return;
     session.streamTitle = title;
     this.#notifyStreamState(session);
@@ -2705,6 +2814,19 @@ export class BrowserManager {
       STREAM_TITLE_TIMEOUT_MS,
       session.streamTitle
     );
+    this.#notifyStreamState(session);
+  }
+
+  async #refreshTabTitle(session: Session, tabId: string, page: Page): Promise<void> {
+    const lifecycle = this.#tabLifecycle(session);
+    const title = await withDeadline(
+      page.title().catch(() => ''),
+      STREAM_TITLE_TIMEOUT_MS,
+      lifecycle.title(tabId)
+    );
+    if (!session.tabs.has(tabId)) return;
+    lifecycle.setTitle(tabId, title);
+    if (page === session.page) session.streamTitle = title;
     this.#notifyStreamState(session);
   }
 
@@ -2892,7 +3014,8 @@ export class BrowserManager {
     root: string,
     action: BrowserAction,
     actor: 'agent' | 'user',
-    consequentialApproved = false
+    consequentialApproved = false,
+    taskId: string | null = null
   ) {
     const shared = await this.#sharedControl(workspaceId, root);
     shared?.authorize(actor);
@@ -2900,7 +3023,7 @@ export class BrowserManager {
     return this.#adopt(session, shared).submit(actor, (signal) =>
       this.#raceTakeover(
         signal,
-        this.#act(session, root, action, actor, consequentialApproved, signal)
+        this.#act(session, root, action, actor, consequentialApproved, signal, taskId)
       )
     );
   }
@@ -2928,8 +3051,10 @@ export class BrowserManager {
     action: BrowserAction,
     actor: 'agent' | 'user',
     consequentialApproved: boolean,
-    signal: AbortSignal
+    signal: AbortSignal,
+    taskId: string | null
   ) {
+    session.caller = { owner: actor, taskId: actor === 'agent' ? taskId : null };
     return session.downloads.collect(async (receipts) => {
       if (action.type === 'batch') {
         const steps: Array<{
@@ -3025,6 +3150,10 @@ export class BrowserManager {
     /** Only for a screenshot: the workspace path the picture was written to. */
     path?: string;
   }> {
+    const targetId =
+      'tabId' in action && action.tabId ? action.tabId : tabIdFor(session, session.page);
+    if (targetId)
+      this.#tabLifecycle(session).touch(targetId, session.caller?.owner ?? 'agent', this.#now());
     const page = resolveTab(session, 'tabId' in action ? action.tabId : undefined);
     let acted = page;
     switch (action.type) {
@@ -3146,7 +3275,23 @@ export class BrowserManager {
         break;
       }
       case 'new_tab': {
-        const next = await session.context.newPage();
+        if (session.caller?.owner === 'agent') {
+          await this.#sweepTabs(session, true);
+          if (
+            this.#tabStates(session).filter((tab) => tab.owner === 'agent').length >=
+            AGENT_TAB_LIMIT
+          )
+            throw new Error(
+              'All temporary browser tabs are protected. Close an unneeded tab before opening another.'
+            );
+        }
+        session.creatingTab = session.caller ?? { owner: 'agent', taskId: null };
+        let next: Page;
+        try {
+          next = await session.context.newPage();
+        } finally {
+          delete session.creatingTab;
+        }
         acted = next;
         // A background tab is how the posting stays open while the form is filled in another,
         // so `activate: false` genuinely leaves the driven tab where it was.
@@ -3230,6 +3375,9 @@ export class BrowserManager {
         const dialog = session.pendingDialog;
         if (!dialog) throw new Error('No page dialog is waiting for a response');
         delete session.pendingDialog;
+        const dialogPage = typeof dialog.page === 'function' ? dialog.page() : session.page;
+        const dialogTab = dialogPage ? tabIdFor(session, dialogPage) : null;
+        if (dialogTab) session.tabLifecycle?.dialog(dialogTab, false);
         // Published before the answer is delivered: the page resumes the moment it is, and a
         // banner left standing over a running page is the same lie in the other direction.
         this.#notifyStreamState(session);

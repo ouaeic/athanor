@@ -30,6 +30,8 @@
  * tidying it would invent an id the provider never published.
  */
 
+import { readReasoningOptions, type ReasoningOptions } from './reasoning.js';
+
 /** A rate as this feed publishes rates, or nothing said. */
 type Rate = string | undefined;
 
@@ -42,6 +44,8 @@ interface ShapedPriceTier {
 }
 
 interface ShapedPricing {
+  audio: Rate;
+  image_token: Rate;
   prompt: Rate;
   completion: Rate;
   input_cache_read: Rate;
@@ -83,7 +87,7 @@ interface ShapedModel {
   knowledge_cutoff: string | null;
   expiration_date: string | null;
   alias_target: { slug: string | undefined; name: string | undefined } | null;
-  reasoning: { mandatory: boolean } | null;
+  reasoning: ReasoningOptions | null;
   benchmarks: { artificial_analysis: ShapedAnalysis | null; design_arena: ShapedArenaEntry[] };
 }
 
@@ -143,6 +147,8 @@ const pricingIn = (value: unknown): ShapedPricing => {
   const pricing = isRecord(value) ? value : {};
   return {
     prompt: rateIn(pricing.prompt),
+    audio: rateIn(pricing.audio),
+    image_token: rateIn(pricing.image_token),
     completion: rateIn(pricing.completion),
     input_cache_read: rateIn(pricing.input_cache_read),
     input_cache_write: rateIn(pricing.input_cache_write),
@@ -199,7 +205,7 @@ const modelIn = (row: Record<string, unknown>, id: string): ShapedModel => {
     knowledge_cutoff: textIn(row.knowledge_cutoff) ?? null,
     expiration_date: textIn(row.expiration_date) ?? null,
     alias_target: aliasTargetIn(row.alias_target),
-    reasoning: isRecord(row.reasoning) ? { mandatory: row.reasoning.mandatory === true } : null,
+    reasoning: readReasoningOptions(row.reasoning),
     benchmarks: {
       artificial_analysis: analysisIn(benchmarks.artificial_analysis),
       design_arena: Array.isArray(benchmarks.design_arena)

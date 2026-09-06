@@ -15,6 +15,7 @@ export interface NativeBootstrap {
   installerUrl: string;
 }
 export interface NativeCapabilities {
+  browserAuthorization?: boolean;
   folderPicker: boolean;
   notifications: boolean;
   downloads: boolean;
@@ -36,7 +37,7 @@ export interface TicketPreview {
   expiresAt: number;
 }
 
-const invalidTicket = (message = 'Paste a complete athanor connection ticket.') =>
+const invalidTicket = (message = 'Paste a complete garden connection ticket.') =>
   new ApiError('invalid_connection_ticket', message);
 const record = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -47,7 +48,7 @@ const record = (value: unknown): Record<string, unknown> =>
 export function previewConnectionTicket(raw: string, now = Date.now()): TicketPreview {
   if (new TextEncoder().encode(raw).length > 32 * 1024)
     throw invalidTicket('This connection ticket is too large.');
-  const match = /^athanor:\/\/pair\/([A-Za-z0-9_-]+)$/.exec(raw.trim());
+  const match = /^(?:garden|athanor):\/\/pair\/([A-Za-z0-9_-]+)$/.exec(raw.trim());
   if (!match?.[1]) throw invalidTicket();
   let parsed: unknown;
   try {
@@ -134,7 +135,7 @@ export function enrollmentCodeFromFragment(fragment: string, origin: string): st
   const match = /^#pair=([A-Za-z0-9_-]+)$/.exec(fragment);
   if (!match?.[1]) return null;
   try {
-    const preview = previewConnectionTicket(`athanor://pair/${match[1]}`);
+    const preview = previewConnectionTicket(`garden://pair/${match[1]}`);
     const current = new URL(origin);
     if (current.protocol !== 'https:' || !preview.endpoints.includes(current.origin)) return null;
     const bytes = Uint8Array.from(atob(match[1].replace(/-/g, '+').replace(/_/g, '/')), (c) =>
@@ -188,12 +189,16 @@ const bridge = (): NativeBridge | null => {
 async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   const native = bridge();
   if (!native)
-    throw new ApiError('native_unavailable', 'This action is available in the athanor app.');
+    throw new ApiError('native_unavailable', 'This action is available in the garden app.');
   return native.invoke<T>(command, args);
 }
 export async function nativeCapabilities(): Promise<NativeCapabilities | null> {
   return bridge() ? invoke<NativeCapabilities>('native_capabilities') : null;
 }
+export const openAuthorizationBrowser = (url: string): Promise<void> =>
+  invoke('open_authorization_browser', { url });
+export const openPreviewBrowser = (url: string): Promise<void> =>
+  invoke('open_preview_browser', { url });
 export const chooseLocalFolder = (): Promise<LocalFolder | null> => invoke('choose_folder');
 export const revokeLocalFolder = (token: string): Promise<void> =>
   invoke('revoke_folder', { token });

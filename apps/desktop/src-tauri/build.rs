@@ -25,6 +25,8 @@ fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "native_capabilities",
+            "open_authorization_browser",
+            "open_preview_browser",
             "choose_folder",
             "revoke_folder",
             "list_local_folder",

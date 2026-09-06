@@ -3,6 +3,7 @@ import {
   decryptJson,
   encryptJson,
   generateDataKey,
+  inferenceCredentialAad,
   userMemoryAad,
   userMemoryKey,
   verifyCapabilityToken,
@@ -12,6 +13,7 @@ import type { DataStore, TaskRecord, WorkspaceRecord } from '@athanor/data';
 import type { ModelRelease } from '@athanor/contracts';
 import { AgentWorker, approvalPreviewHash } from './agent.js';
 import type { WorkerConfig } from './config.js';
+import type { InferenceCredential } from './agent-state.js';
 import { forgetReads, recordRead } from './edit/index.js';
 
 /**
@@ -344,6 +346,7 @@ const isTurnScaffolding = (call: RunnerCall): boolean =>
   // process that can see them is the runner rather than this one. @see machineReport.
   call.path === `${root}/machine` ||
   call.path === `${root}/checkpoints` ||
+  call.path === `${root}/file?path=workspace%2FGARDEN.md` ||
   call.path === `${root}/file?path=workspace%2FATHANOR.md` ||
   call.path === `${root}/file?path=workspace%2FOPEN_CLOUD.md` ||
   call.path === `${root}/file?path=workspace%2FAGENTS.md`;
@@ -383,7 +386,47 @@ interface DispatchOptions {
   readonly config?: Partial<WorkerConfig>;
   /** Provider bodies after the one that carries the tool call, for arms that spend a second call. */
   readonly provider?: string[];
+  readonly providerBaseUrl?: string;
 }
+
+/** A selected, priced recording route, sealed exactly as the owner's provider configuration is. */
+const NATIVE_PROVIDER_URL = 'https://api.openai.com/v1';
+
+const transcriptionStore = (
+  providerModelId: string,
+  nativePrivate = false
+): Record<string, unknown> => {
+  const credential: InferenceCredential = {
+    provider: 'openai-compatible',
+    baseUrl: nativePrivate ? NATIVE_PROVIDER_URL : PROVIDER_URL,
+    apiKey: 'provider-key',
+    enforceZeroDataRetention: nativePrivate,
+    mediaRoutes: {
+      transcription: {
+        id: `fixture/${providerModelId}`,
+        providerModelId,
+        displayName: 'Recording fixture',
+        provider: nativePrivate ? 'openai' : 'fixture',
+        apiProtocol: 'openai',
+        modality: 'transcription',
+        usdPerImage: null,
+        usdPerMillionCharacters: null,
+        usdPerMinute: 0.006,
+        pricing: [{ billable: 'input_audio', unit: 'minute', costUsd: 0.006 }],
+        priceSource: 'provider',
+        zeroDataRetentionAvailable: nativePrivate,
+        recommendationTags: [],
+        updatedAt: model.updatedAt
+      }
+    }
+  };
+  return {
+    getManagedProviderCredential: async () => ({
+      provider: 'inference',
+      secretCiphertext: encryptJson(credential, masterKey, inferenceCredentialAad(userId))
+    })
+  };
+};
 
 interface Dispatched {
   /** The arm's own runner calls, in order, with the turn's scaffolding removed. */
@@ -490,8 +533,9 @@ const dispatch = async (
 
   vi.stubGlobal('fetch', (async (input: string | URL | Request, init?: RequestInit) => {
     const url = input instanceof Request ? input.url : input.toString();
-    if (url.startsWith(PROVIDER_URL)) {
-      providerPaths.push(url.slice(PROVIDER_URL.length));
+    const providerBaseUrl = options.providerBaseUrl ?? PROVIDER_URL;
+    if (url.startsWith(providerBaseUrl)) {
+      providerPaths.push(url.slice(providerBaseUrl.length));
       const routed = options.route?.(url, init);
       if (routed) return routed;
       if (typeof init?.body === 'string')
@@ -594,7 +638,7 @@ const mediaUsage = (executed: Dispatched): Record<string, unknown> | undefined =
   executed
     .askedAll('recordUsage')
     .map((args) => args[0] as Record<string, unknown>)
-    .find((row) => String(row.resourceClass).startsWith('media:'));
+    .find((row) => String(row.resourceClass).startsWith('media:') && row.state === 'settled');
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -608,14 +652,12 @@ describe('what a turn asks the runner for on its own account', () => {
    * becoming an arm's - and if one of these disappears, the turn has stopped reading something it
    * reads today.
    *
-   * The brief is three reads, not one, and they are tried most-specific first: `ATHANOR.md` is what
-   * the owner wrote for this computer, `OPEN_CLOUD.md` is the name it carried before the rename,
-   * and `AGENTS.md` is the shared convention the surrounding tooling writes. A workspace carrying
-   * none of the three pays all three round trips once per run, which is the price of reading the
-   * file an owner actually wrote; a workspace with `ATHANOR.md` pays one, because the chain stops
-   * at the first that answers.
+   * Brief names are tried in preference order and stop at the first available file. GARDEN.md
+   * is preferred, followed by compatible ATHANOR.md and OPEN_CLOUD.md names and then AGENTS.md.
+   * A workspace carrying none pays the complete lookup chain once per run; the exact sequence
+   * below prevents these automatic reads from hiding an unrelated dispatch request.
    */
-  it('reads the surfaces, the machine, the toolchain and all three brief names once, and takes one undo point before a write', async () => {
+  it('reads the surfaces, the machine, the toolchain and each brief name once, and takes one undo point before a write', async () => {
     const executed = await dispatch(
       { name: 'file_write', arguments: { path: 'workspace/new.md', content: 'hello' } },
       { route: (_url, init) => (init?.method === 'PUT' ? json({ ok: true }) : undefined) }
@@ -638,6 +680,7 @@ describe('what a turn asks the runner for on its own account', () => {
       // the run, and neither decides anything about the other. Sequencing them would put a second
       // runner latency in front of every turn's first token for nothing.
       `GET ${root}/machine exec`,
+      `GET ${root}/file?path=workspace%2FGARDEN.md files.read`,
       `GET ${root}/file?path=workspace%2FATHANOR.md files.read`,
       `GET ${root}/file?path=workspace%2FOPEN_CLOUD.md files.read`,
       `GET ${root}/file?path=workspace%2FAGENTS.md files.read`,
@@ -3010,9 +3053,14 @@ describe('the publishing arms', () => {
       {
         task: { privacyRoute: 'external' },
         route: (url, init) =>
-          url.endsWith('/images')
+          url.endsWith('/images') || url.endsWith('/images/generations')
             ? json({
-                data: [{ b64_json: Buffer.from('generated').toString('base64') }],
+                data: [
+                  {
+                    b64_json:
+                      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6bQAAAABJRU5ErkJggg=='
+                  }
+                ],
                 usage: { cost: 0.0102 }
               })
             : init?.method === 'PUT'
@@ -3026,7 +3074,10 @@ describe('the publishing arms', () => {
         method: 'PUT',
         path: `${root}/file?path=workspace%2Flogo.png`,
         scopes: ['files.write'],
-        body: Buffer.from('generated')
+        body: Buffer.from(
+          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6bQAAAABJRU5ErkJggg==',
+          'base64'
+        )
       },
       { method: 'GET', path: `${root}/usage`, scopes: ['files.read'], body: undefined }
     ]);
@@ -3061,13 +3112,19 @@ describe('the publishing arms', () => {
     const executed = await dispatch(
       // 20 characters is below the tool's own floor of 1,000, so the cut lands there - which is
       // what makes this transcript long enough to be cut at all.
-      { name: 'audio_read', arguments: { path: 'workspace/call.m4a', maxCharacters: 20 } },
       {
-        approved: true,
-        task: { privacyRoute: 'external' },
+        name: 'audio_read',
+        arguments: {
+          path: 'workspace/call.m4a',
+          endSeconds: 60,
+          maxCharacters: 20,
+          options: { maxCostUsd: 0.05 }
+        }
+      },
+      {
+        providerBaseUrl: NATIVE_PROVIDER_URL,
+        store: transcriptionStore('whisper-1', true),
         route: (url, init) => {
-          if (url.startsWith(`${PROVIDER_URL}/models`))
-            return json({ data: [{ id: 'vendor/listener' }] });
           if (url.endsWith('/audio/transcriptions'))
             return json({
               text: `The regulator published guidance in March. ${'It applies from June. '.repeat(60)}`,
@@ -3094,7 +3151,7 @@ describe('the publishing arms', () => {
         method: 'POST',
         path: `${root}/audio/prepare`,
         scopes: ['files.read'],
-        // One billed minute, because no per-minute price is published for a route nobody pinned.
+        // The explicit one-minute window is admitted using the selected route’s published price.
         body: { path: 'workspace/call.m4a', startSeconds: 0, endSeconds: 60 }
       },
       {
@@ -3116,34 +3173,22 @@ describe('the publishing arms', () => {
       transcriptPath: 'workspace/call.m4a.transcript.txt',
       secondsRead: 60,
       truncated: true,
-      modelId: 'vendor/listener'
+      modelId: 'whisper-1'
     });
   });
 
-  /**
-   * Two readings of the same window down two different routes are two charges, not one.
-   *
-   * The transcription ledger row was keyed on `transcription:<task>:<sha of path:start:seconds>`
-   * and nothing else, though the arm has just resolved a model id and writes it into
-   * `providerRef`. Switch the media route mid-task - the owner pins one in Settings, or the
-   * provider's list comes back in a different order - and re-read the same window: the provider
-   * bills for the second reading and `recordUsage` deduplicates the row away, so the money is
-   * spent and the ledger the caps are measured against never hears about it.
-   *
-   * The `generate_media` writer nineteen lines below keys on the per-generation id and cannot
-   * collide. This is the same fix: put the thing that makes the two charges different into the key
-   * that is supposed to tell them apart.
-   */
+  /** Each paid reading keeps its own ledger identity, including a route switch on one window. */
   it('bills a second reading of the same window down a different route', async () => {
     const readOn = async (transcriptionModel: string): Promise<string> => {
       const executed = await dispatch(
-        { name: 'audio_read', arguments: { path: 'workspace/call.m4a' } },
         {
-          approved: true,
-          task: { privacyRoute: 'external' },
+          name: 'audio_read',
+          arguments: { path: 'workspace/call.m4a', endSeconds: 60, options: { maxCostUsd: 0.05 } }
+        },
+        {
+          providerBaseUrl: NATIVE_PROVIDER_URL,
+          store: transcriptionStore(transcriptionModel, true),
           route: (url, init) => {
-            if (url.startsWith(`${PROVIDER_URL}/models`))
-              return json({ data: [{ id: transcriptionModel }] });
             if (url.endsWith('/audio/transcriptions'))
               return json({ text: 'A short reading.', usage: { seconds: 60, cost: 0.006 } });
             if (url.endsWith(`${root}/audio/prepare`))
@@ -3168,7 +3213,7 @@ describe('the publishing arms', () => {
 
     // Same task, same file, same window - only the route changed, which is exactly the case the
     // key has to be able to tell apart.
-    expect(await readOn('vendor/listener')).not.toBe(await readOn('vendor/listener-pro'));
+    expect(await readOn('whisper-1')).not.toBe(await readOn('gpt-transcribe'));
   });
 
   it('will not send a private recording down a route with no zero-retention endpoint', async () => {
@@ -3176,15 +3221,12 @@ describe('the publishing arms', () => {
       { name: 'audio_read', arguments: { path: 'workspace/call.m4a' } },
       {
         approved: true,
-        route: (url) =>
-          url.startsWith(`${PROVIDER_URL}/models`)
-            ? json({ data: [{ id: 'vendor/listener' }] })
-            : undefined
+        store: transcriptionStore('vendor/listener')
       }
     );
 
     expect(executed.calls).toEqual([]);
-    expect(executed.failure?.code).toBe('transcription_privacy_conflict');
+    expect(executed.failure?.code).toBe('transcription_external_consent_required');
   });
 });
 

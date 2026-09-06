@@ -107,34 +107,25 @@ describe('finished message reservation upgrades', () => {
     const expected = new Map<string, string>();
     let firstTaskId = '';
     for (const [index, item] of cases.entries()) {
-      const task = await store.createTask({
-        userId: user.id,
-        workspaceId: workspace.id,
-        titleCiphertext: envelope,
-        nameIndex: { nameTokens: '', openingTokens: '' },
-        modelId: 'test-model',
-        privacyRoute: 'provider_zdr',
-        maxComputeCredits: 1,
-        maxSpendUsd: 0.75,
-        promptCiphertext: envelope
-      });
+      const task = { id: randomUUID() };
+      await database.query(
+        `INSERT INTO tasks(id,user_id,workspace_id,title,status,model_id,privacy_route,max_compute_credits,max_spend_usd,prompt_ciphertext)
+         VALUES ($1,$2,$3,$4::text,'queued','test-model','provider_zdr',1,0.75,$4::text::jsonb)`,
+        [task.id, user.id, workspace.id, JSON.stringify(envelope)]
+      );
       firstTaskId ||= task.id;
       const messageId = randomUUID();
       const reservationKey = `message:${messageId}`;
-      await store.enqueueTaskMessage({
-        id: messageId,
-        taskId: task.id,
-        userId: user.id,
-        modelId: 'test-model',
-        privacyRoute: 'provider_zdr',
-        maxComputeCredits: index + 1,
-        maxSpendUsd: 0.25,
-        resourceClass: 'medium',
-        reservationKey,
-        interrupt: true,
-        promptCiphertext: envelope,
-        queuedEventCiphertext: envelope
-      });
+      await database.query(
+        `INSERT INTO task_message_queue(id,task_id,user_id,prompt_ciphertext,model_id,privacy_route,max_compute_credits,max_spend_usd,resource_class,reservation_key,interrupt)
+         VALUES ($1,$2,$3,$4::jsonb,'test-model','provider_zdr',$5,0.25,'medium',$6,TRUE)`,
+        [messageId, task.id, user.id, JSON.stringify(envelope), index + 1, reservationKey]
+      );
+      await database.query(
+        `INSERT INTO usage_entries(id,user_id,workspace_id,task_id,kind,resource_class,quantity,unit,credits,state,idempotency_key)
+         VALUES ($1,$2,$3,$4,'task_compute','medium',$5,'credits',$5,'reserved',$6)`,
+        [randomUUID(), user.id, workspace.id, task.id, index + 1, reservationKey]
+      );
       await database.query('UPDATE tasks SET status=$2 WHERE id=$1', [task.id, item.taskStatus]);
       await database.query('UPDATE task_message_queue SET status=$2 WHERE id=$1', [
         messageId,
@@ -174,10 +165,25 @@ describe('finished message reservation upgrades', () => {
       before.map((row) => ({ ...row, state: expected.get(row.idempotency_key) }))
     );
     expect(after.filter((row) => row.state === 'reserved')).toHaveLength(6);
-    expect((await database.query('SELECT * FROM tasks ORDER BY id')).rows).toEqual(taskHistory);
-    expect((await database.query('SELECT * FROM task_message_queue ORDER BY id')).rows).toEqual(
-      messageHistory
-    );
+    // Later migrations can add columns; every historical field must retain its value.
+    const historicalFields = (
+      rows: Record<string, unknown>[],
+      original: Record<string, unknown>[]
+    ) => {
+      expect(original.length).toBeGreaterThan(0);
+      return rows.map((row) =>
+        Object.fromEntries(Object.keys(original[0]!).map((key) => [key, row[key]]))
+      );
+    };
+    expect(
+      historicalFields((await database.query('SELECT * FROM tasks ORDER BY id')).rows, taskHistory)
+    ).toEqual(taskHistory);
+    expect(
+      historicalFields(
+        (await database.query('SELECT * FROM task_message_queue ORDER BY id')).rows,
+        messageHistory
+      )
+    ).toEqual(messageHistory);
     await migrateDatabase(database);
     expect(await snapshot()).toEqual(after);
   });

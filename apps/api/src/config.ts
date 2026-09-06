@@ -56,7 +56,7 @@ const Config = z.object({
    * the installer: the two carried transposed names for a while, which is a trap for whoever next
    * moves a port.
    */
-  RESERVED_PREVIEW_PORTS: z.string().default('4201,4203'),
+  RESERVED_PREVIEW_PORTS: z.string().default('443,8443,4201,4203'),
   DATABASE_DRIVER: sharedEnv.DATABASE_DRIVER,
   DATABASE_URL: sharedEnv.DATABASE_URL,
   PGLITE_PATH: sharedEnv.PGLITE_PATH,
@@ -135,6 +135,7 @@ const Config = z.object({
   RELAY_LOCAL_PORT: z.coerce.number().int().positive().max(65_535).default(443),
   /** The plaintext listener, where the relay's own :80 goes: ACME challenges and the redirect. */
   RELAY_LOCAL_HTTP_PORT: z.coerce.number().int().positive().max(65_535).default(80),
+  RELAY_LOCAL_PREVIEW_PORT: z.coerce.number().int().positive().max(65_535).default(8443),
   ALLOW_INSECURE_PROVIDER_URLS: sharedEnv.ALLOW_INSECURE_PROVIDER_URLS,
   CONNECTOR_ALLOWED_HOST_SUFFIXES: sharedEnv.CONNECTOR_ALLOWED_HOST_SUFFIXES,
   PUSH_VAPID_PUBLIC_KEY: z.preprocess(
@@ -215,6 +216,8 @@ export const loadConfig = (): ApiConfig => {
     const app = new URL(config.PUBLIC_APP_URL);
     const preview = new URL(config.PREVIEW_BASE_URL);
     const webauthn = new URL(config.WEBAUTHN_ORIGIN);
+    if (preview.origin === app.origin)
+      throw new Error('Production previews require a separate HTTPS origin from PUBLIC_APP_URL');
     if (
       app.protocol !== 'https:' ||
       preview.protocol !== 'https:' ||

@@ -75,9 +75,9 @@ The installer refuses to start on a host with less than about 2 GB of RAM, less 
 the checkout, `/var`, or `/home`, or an architecture other than amd64/arm64. It warns, without
 stopping, about a small-memory host with no swap and about less than 25 GiB free.
 
-After the services start it opens inbound 80/443 in ufw or firewalld when either is active, warns
+After the services start it opens inbound 80/443/8443 in ufw or firewalld when either is active, warns
 when a hand-written nftables or iptables ruleset drops input by default, warns when nothing listens
-on 80 or 443, warns when this computer has only private addresses, and warns when it has no
+on 80, 443 or 8443, warns when this computer has only private addresses, and warns when it has no
 hostname, because browser sign-in cannot work without one. Warnings are repeated with
 the connection ticket, and the closing banner says "installed, but these need attention first"
 instead of "ready". None of these checks can prove that a request from the internet arrives; that
@@ -205,12 +205,12 @@ is over; this refuses to _pick_ a model priced above the rates named here in the
 rates are dollars per million tokens — `set 2 10` means at most $2 per million in and $10 per million
 out — and either may be the word `none`.
 
-Every place athanor selects a model for the owner ranks against it: the lead when a task is created,
+Every place garden selects a model for the owner ranks against it: the lead when a task is created,
 the vision specialist, the model the picker recommends, and the support picker behind titling and the
 subscription flows. When the ceiling leaves nothing eligible, selection is refused with the cheapest
 route that could have done the work and what it costs, rather than quietly substituting something
 weaker or reporting the model as unavailable. A model the owner names explicitly is never
-constrained: the ceiling governs what athanor chooses for them, not what they choose for themselves.
+constrained: the ceiling governs what garden chooses for them, not what they choose for themselves.
 
 `show` prints the ceiling currently stored. Changes take effect on the next selection; a task
 already running keeps the model it was given. On a server whose database predates the column, both
@@ -238,12 +238,12 @@ sudo athanor backup
 sudo athanor backup /mnt/encrypted-backups/athanor-2026-07-30
 ```
 
-Mutating Athanor services pause under a restart trap. A backup contains:
+Mutating garden services pause under a restart trap. A backup contains:
 
 - `database.dump`;
 - `workspaces.tar.gz` for `/home/athanor`;
 - `configuration.tar.gz` for `/etc/athanor`;
-- `packages.txt` for additional operating-system packages installed through Athanor; and
+- `packages.txt` for additional operating-system packages installed through garden; and
 - `SHA256SUMS`.
 
 The configuration archive contains the keys required to decrypt the database; the workspace archive
@@ -356,6 +356,10 @@ plugged in ten minutes ago prints what to run and leaves the restored server ser
 sudo athanor update
 ```
 
+Backup, update, restore and rollback share a root-owned kernel lock. A competing maintenance
+command stops before changing services or files; nested backup and rollback phases keep the same
+lock until they finish. The lock is released with the operation, including failure or termination.
+
 Update refuses a dirty managed checkout, pauses mutating services, makes a checksum backup,
 fast-forwards the Git checkout, installs the locked dependencies, builds source, updates native
 helpers/systemd/Nginx definitions, refreshes network metadata, and waits for health. If any step
@@ -382,20 +386,37 @@ three arrived a release late or not at all. On the server this was found on, the
 had shipped present and switched off, two Python packages in the table were missing, and `doctor`
 was telling the owner to run an update that would not have installed them.
 
-**It does not repeat what an install does once.** No account is created, no sudoers file is written,
-no secret is regenerated, no certificate is issued, and the database is not initialised - re-running
-any of those on a machine that is serving would break it. Node itself is also not upgraded: a
-release needing a newer Node major is something to be told about rather than something a weekly
-timer does to a host.
+The required native activation phase runs after those release steps. It verifies the lockfile's
+language servers, installs the pinned Python libraries and JavaScript debugger into separate caches,
+checks the process supervisor, and validates the shared sudo policy before its atomic replacement.
+A missing dependency or failed integrity check prevents activation and rolls the update back.
+Incomplete downloads never replace active tools. Completed environments remain available for
+offline native-tool recovery, including the initial environment at
+`/usr/local/lib/athanor/python-before-managed` when the installation began with a directory there.
 
-A step that fails does **not** roll the release back. A distribution mirror that is unreachable at
-three in the morning would otherwise put a working release back and do it again every week. The run
-says which step could not finish, and `sudo athanor doctor` reports the consequences: the document
-toolchain, and the boundary the runner is actually enforcing.
+Accounts, generated secrets, certificates and the database cluster are not recreated. Node itself is
+also not upgraded by this phase. Failure of an optional operating-system package step is reported;
+failure of required native activation is fatal. The database is restored only if the new release
+has started and may have run migrations; failures before that point leave the database alone.
 
-Re-running the one-command installer against an existing checkout is also merge-safe: optional
-operator/provider/privacy settings in `/etc/athanor` are retained, generated identity and encryption
-secrets are reused, and a configured stable hostname is not replaced by address discovery.
+Use the exact backup path printed by the update to revert an activated release:
+
+```bash
+sudo athanor auto-update off
+sudo athanor rollback /path/to/the/pre-update-backup
+sudo athanor doctor
+```
+
+Rollback validates the backup and recorded Git commit before stopping services, then restores both
+the source revision and checksummed data. A failed rebuild or data restore leaves the server stopped
+and preserves the backup. It requires the old Git
+commit and its JavaScript dependency/build inputs to remain available; the native caches alone do
+not make the entire source rebuild offline. Native tools are kept at their completed, verified
+versions and are not downloaded again while their cache is intact. A native compatibility issue can
+be investigated against the retained previous environment without overwriting either copy. Keep the
+backup and previous caches until browser sign-in, task execution, file delivery, and native tool
+checks pass. Uninstall removes only native caches with garden completion receipts and preserves the
+initial Python environment and unrelated operator directories.
 
 ## Unattended updates
 
@@ -448,7 +469,7 @@ choice survives updates.
 sudo athanor uninstall
 ```
 
-Uninstall disables Athanor services, the network watcher, the unattended-update timer, the
+Uninstall disables garden services, the network watcher, the unattended-update timer, the
 certificate renewal timer, and its Nginx site, and removes the `/etc/sudoers.d/athanor-packages` rule that let the agent account install
 system packages as root, the Avahi advertisement at `/etc/avahi/services/athanor.service`, and the
 `magick` compatibility command if the installer had to supply one. It preserves `/home/athanor`, `/etc/athanor`, PostgreSQL data,
@@ -517,13 +538,13 @@ starts a turn on this box. `docs/HEADLESS.md` has the request shape. Operational
 ## Phone transport
 
 Beside Web Push, a notification can reach the owner's phone through a bot on the Telegram Bot API.
-It needs no app installed by athanor - the phone runs the service's own client - and it is two-way:
+It needs no app installed by garden - the phone runs the service's own client - and it is two-way:
 an approval card arrives with Approve and Deny buttons, a question the agent asked arrives as a
 message to reply to, and both are acted on from the phone. Operationally:
 
 - **It is not end-to-end encrypted, and the owner is told so in Settings.** A bot's chat is a cloud
   chat: what a card carries transits the service's servers and is readable there. By default a
-  card is therefore _redacted_ - the conversation's name and a link into athanor, nothing else -
+  card is therefore _redacted_ - the conversation's name and a link into garden, nothing else -
   and the buttons carry an id and a nonce, never content. With redaction switched off, a card also
   carries the class of thing an approval asks for (never the command itself; the service never
   holds the key to it) and the sentence an agent chose to send. That sentence is the agent's own
@@ -626,7 +647,7 @@ An owner can hand out a read-only link to one conversation. Operationally:
 - **GUI unavailable:** verify Xvfb, Openbox, D-Bus, AT-SPI, and screenshot paths.
 - **Codex/Claude unauthenticated:** use Terminal and the publisher status/login command.
 - **Provider setup required:** save a key/model in Settings.
-- **Preview unavailable:** verify the user process, loopback port, preview state, and path base.
+- **Preview unavailable:** verify the user process, loopback port, preview state, path base, and HTTPS 8443 firewall/router forwarding. The isolated preview listener must reject garden API and runner paths; `garden doctor` checks the local listener.
 - **Passkey origin mismatch:** restore the original public origin; do not repeatedly rewrite it.
 - **Push notifications missing:** run `sudo athanor doctor`, which distinguishes a service that is
   not answering from one that is running with no Web Push signing keys, and both from one that is
@@ -643,7 +664,7 @@ An owner can hand out a read-only link to one conversation. Operationally:
   permission rather than a server fault.
 - **A quiet iPhone:** check the phone before checking the box. Safari on iOS has no `PushManager`
   in an ordinary tab, so there is nothing to subscribe and nothing the server can send to. The
-  repair is on the phone and takes one gesture: Share, then Add to Home Screen, then open athanor
+  repair is on the phone and takes one gesture: Share, then Add to Home Screen, then open garden
   from there. Settings says so on an iPhone rather than reporting the browser as incapable. Below
   iOS 16.4 there is no Web Push even on the Home Screen, and there is no repair on that phone: the
   packaged client holds no push subscription either and raises its notices from a poll inside the

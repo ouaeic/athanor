@@ -8,7 +8,9 @@ import {
   FileText,
   FolderOpen,
   Grid2X2,
-  Leaf,
+  PanelLeft,
+  X,
+  Sparkles,
   Monitor,
   Moon,
   Plus,
@@ -24,10 +26,18 @@ import { subscribeWorkerNavigation } from './worker-navigation';
 import { devSignIn, enroll, recover, register, signIn } from './auth';
 import type { AuthResult } from './auth';
 import type { Bootstrap, Decision, Draft } from './model';
-import { isWorking, money, shortDate, statusLabel, mergeTaskRefresh } from './model';
+import {
+  hasOngoingWork,
+  needsAttention,
+  money,
+  shortDate,
+  taskStatusLabel,
+  mergeTaskRefresh
+} from './model';
 import { Button, Dialog, Empty, ErrorNotice, Field, Spinner } from './ui';
 import DecisionQueue from './DecisionQueue';
 import './styles.css';
+import './garden.css';
 const Composer = lazy(() => import('./Composer'));
 const TaskSurface = lazy(() => import('./TaskSurface'));
 const Computer = lazy(() => import('./Computer'));
@@ -75,9 +85,13 @@ export default function App() {
   return (
     <Boundary>
       <WorkspaceApp />
+      <Suspense fallback={null}>
+        <NativeAuthorizationPortal />
+      </Suspense>
     </Boundary>
   );
 }
+const NativeAuthorizationPortal = lazy(() => import('./NativeAuthorization'));
 function WorkspaceApp() {
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null);
   const [loading, setLoading] = useState(true);
@@ -89,7 +103,67 @@ function WorkspaceApp() {
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [navigation, setNavigation] = useState(initialNavigation);
   const [workspaceId, setWorkspaceId] = useState('');
+  const [taskWorkspaces, setTaskWorkspaces] = useState<{
+    ownerId: string;
+    values: Record<string, Workspace>;
+  }>({ ownerId: '', values: {} });
   const [theme, setTheme] = useState(initialTheme);
+  const [mobile, setMobile] = useState(() => window.innerWidth <= 760);
+  const [sidebarOpen, setSidebarOpen] = useState(() => {
+    try {
+      return window.innerWidth > 760 && localStorage.getItem('garden-sidebar') !== 'closed';
+    } catch {
+      return window.innerWidth > 760;
+    }
+  });
+  useEffect(() => {
+    const query = window.matchMedia('(max-width: 760px)');
+    const resize = () => {
+      setMobile(query.matches);
+      if (query.matches) setSidebarOpen(false);
+    };
+    query.addEventListener('change', resize);
+    return () => query.removeEventListener('change', resize);
+  }, []);
+  useEffect(() => {
+    if (!mobile || !sidebarOpen) return;
+    const close = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setSidebarOpen(false);
+        document.querySelector<HTMLButtonElement>('[aria-controls="garden-sidebar"]')?.focus();
+      }
+      if (event.key === 'Tab') {
+        const items = [
+          ...document.querySelectorAll<HTMLElement>(
+            '#garden-sidebar button:not(:disabled), #garden-sidebar input, #garden-sidebar a[href]'
+          )
+        ].filter((item) => item.getClientRects().length > 0);
+        const next = event.shiftKey ? items.at(-1) : items[0];
+        const boundary = event.shiftKey ? items[0] : items.at(-1);
+        if (
+          next &&
+          (document.activeElement === boundary ||
+            !items.includes(document.activeElement as HTMLElement))
+        ) {
+          event.preventDefault();
+          next.focus();
+        }
+      }
+    };
+    document.addEventListener('keydown', close);
+    document.querySelector<HTMLButtonElement>('.garden-sidebar-close')?.focus();
+    return () => document.removeEventListener('keydown', close);
+  }, [mobile, sidebarOpen]);
+  function toggleSidebar() {
+    setSidebarOpen((current) => {
+      try {
+        localStorage.setItem('garden-sidebar', current ? 'closed' : 'open');
+      } catch {
+        /* Storage is optional. */
+      }
+      return !current;
+    });
+  }
   const [newWork, setNewWork] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [tool, setTool] = useState<Tool>('files');
@@ -276,7 +350,8 @@ function WorkspaceApp() {
         setBootstrap((current) =>
           current ? { ...current, tasks: [task, ...current.tasks] } : current
         );
-        setWorkspaceId(task.workspaceId);
+        if (bootstrap.workspaces.some((workspace) => workspace.id === task.workspaceId))
+          setWorkspaceId(task.workspaceId);
       })
       .catch((err: unknown) => {
         if (!controller.signal.aborted) setError(err);
@@ -293,13 +368,14 @@ function WorkspaceApp() {
     return () => clearInterval(timer);
   }, [workspaceId, Boolean(bootstrap), authRequired]);
   function navigate(view: View, taskId: string | null = null) {
+    if (mobile) setSidebarOpen(false);
     if (view === 'computer') setComputerOpened(true);
     setNavigation({ view, taskId });
     const params = new URLSearchParams();
     if (taskId) params.set('task', taskId);
     if (view !== 'work') params.set('view', view);
     history.pushState({}, '', `${location.pathname}${params.size ? '?' + params.toString() : ''}`);
-    window.scrollTo({ top: 0, behavior: 'instant' });
+    document.getElementById('main')?.scrollTo({ top: 0, behavior: 'instant' });
   }
   const workspace =
     bootstrap?.workspaces.find((item) => item.id === workspaceId) ??
@@ -307,10 +383,33 @@ function WorkspaceApp() {
     null;
   const task = bootstrap?.tasks.find((item) => item.id === navigation.taskId) ?? null;
   const taskWorkspace =
-    bootstrap?.workspaces.find((item) => item.id === task?.workspaceId) ?? workspace;
+    bootstrap?.workspaces.find((item) => item.id === task?.workspaceId) ??
+    (task && taskWorkspaces.ownerId === bootstrap?.user.id
+      ? taskWorkspaces.values[task.workspaceId]
+      : null);
+  const computerWorkspace = navigation.taskId ? (taskWorkspace ?? null) : workspace;
+  useEffect(() => {
+    const ownerId = bootstrap?.user.id;
+    if (!task || taskWorkspace || !ownerId) return;
+    const controller = new AbortController();
+    void get<Workspace>(`/v1/workspaces/${task.workspaceId}`, { signal: controller.signal })
+      .then((value) => {
+        if (controller.signal.aborted || bootstrapRef.current?.user.id !== ownerId) return;
+        setTaskWorkspaces((current) => ({
+          ownerId,
+          values: { ...(current.ownerId === ownerId ? current.values : {}), [value.id]: value }
+        }));
+      })
+      .catch((cause) => {
+        if (!controller.signal.aborted) setError(cause);
+      });
+    return () => controller.abort();
+  }, [task?.workspaceId, taskWorkspace?.id, bootstrap?.user.id]);
   function openTask(id: string) {
+    if (window.innerWidth <= 760) setSidebarOpen(false);
     const target = bootstrapRef.current?.tasks.find((item) => item.id === id);
-    if (target) setWorkspaceId(target.workspaceId);
+    if (target && bootstrapRef.current?.workspaces.some((item) => item.id === target.workspaceId))
+      setWorkspaceId(target.workspaceId);
     navigate('work', id);
   }
   function updateTask(next: Task) {
@@ -419,10 +518,8 @@ function WorkspaceApp() {
         />
       </main>
     );
-  const running = bootstrap.tasks.filter(isWorking);
-  const attentionTasks = bootstrap.tasks.filter((item) =>
-    ['awaiting_user', 'awaiting_resource', 'failed'].includes(item.status)
-  );
+  const running = bootstrap.tasks.filter(hasOngoingWork);
+  const attentionTasks = bootstrap.tasks.filter(needsAttention);
   const attentionCount = new Set([
     ...decisions.map((decision) => decision.taskId),
     ...attentionTasks.map((item) => item.id)
@@ -435,9 +532,9 @@ function WorkspaceApp() {
     )
     .filter((item) =>
       filter === 'running'
-        ? isWorking(item)
+        ? hasOngoingWork(item)
         : filter === 'complete'
-          ? item.status === 'completed'
+          ? item.status === 'completed' && item.deliveryStatus !== 'pending'
           : true
     )
     .filter((item) => item.title.toLowerCase().includes(search.toLowerCase()));
@@ -446,19 +543,29 @@ function WorkspaceApp() {
     .sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updatedAt.localeCompare(a.updatedAt));
   const scheduleTasks = visibleTasks.filter((item) => item.scheduleId);
   return (
-    <div className="app-shell">
+    <div
+      className={`garden-shell ${sidebarOpen ? 'sidebar-open' : 'sidebar-closed'} ${task && navigation.view === 'work' ? 'task-open' : ''}`}
+    >
       <a className="skip-link" href="#main">
         Skip to work
       </a>
-      <header className="masthead">
+      <header className="garden-masthead">
+        <Button
+          aria-label={sidebarOpen ? 'Hide projects' : 'Show projects'}
+          aria-expanded={sidebarOpen}
+          aria-controls="garden-sidebar"
+          onClick={toggleSidebar}
+        >
+          <PanelLeft size={19} />
+        </Button>
         <button
           className="brand-button"
           onClick={() => navigate('work')}
-          aria-label="athanor · All work"
+          aria-label="garden · All work"
         >
           <Brand />
         </button>
-        <nav className="main-navigation" aria-label="Main navigation">
+        <nav className="garden-main-navigation" aria-label="Main navigation">
           {(
             [
               { id: 'work', label: 'Work', icon: Grid2X2 },
@@ -468,16 +575,17 @@ function WorkspaceApp() {
           ).map((item) => (
             <Button
               key={item.id}
+              aria-label={item.label}
               className={navigation.view === item.id ? 'selected' : ''}
               aria-current={navigation.view === item.id ? 'page' : undefined}
-              onClick={() => navigate(item.id)}
+              onClick={() => navigate(item.id, item.id === 'computer' ? navigation.taskId : null)}
             >
               <item.icon size={16} />
               <span>{item.label}</span>
             </Button>
           ))}
         </nav>
-        <div className="masthead-end">
+        <div className="garden-masthead-end">
           <Button
             className="global-search"
             onClick={() => setSearchOpen(true)}
@@ -510,31 +618,126 @@ function WorkspaceApp() {
           </Button>
         </div>
       </header>
-      {running.length > 0 && (
-        <nav className="work-ribbon" aria-label="Running work">
-          {running.slice(0, 8).map((item) => (
+      {sidebarOpen && (
+        <button
+          className="garden-sidebar-scrim"
+          aria-label="Close projects"
+          onClick={() => setSidebarOpen(false)}
+        />
+      )}
+      <aside
+        id="garden-sidebar"
+        className="garden-sidebar"
+        aria-label="Projects"
+        inert={!sidebarOpen}
+      >
+        <div className="garden-sidebar-heading">
+          <span className="eyebrow">Your projects</span>
+          <Button
+            className="garden-sidebar-close"
+            aria-label="Close projects"
+            onClick={() => setSidebarOpen(false)}
+          >
+            <X size={16} />
+          </Button>
+        </div>
+        <Button
+          className="garden-new-work"
+          onClick={() => {
+            setNewWork(true);
+            if (window.innerWidth <= 760) setSidebarOpen(false);
+          }}
+        >
+          <Plus size={16} />
+          Plant an idea
+        </Button>
+        {bootstrap.workspaces.length > 1 && (
+          <select
+            aria-label="Project computer"
+            value={workspaceId}
+            onChange={(event) => {
+              setWorkspaceId(event.target.value);
+              navigate('work');
+            }}
+          >
+            {bootstrap.workspaces.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.name}
+              </option>
+            ))}
+          </select>
+        )}
+        <button
+          className={`garden-sidebar-home ${navigation.view === 'work' && !task ? 'selected' : ''}`}
+          onClick={() => {
+            navigate('work');
+            if (window.innerWidth <= 760) setSidebarOpen(false);
+          }}
+        >
+          <Grid2X2 size={15} />
+          Overview<span>{personalTasks.length}</span>
+        </button>
+        <label className="garden-sidebar-search">
+          <Search size={14} />
+          <input
+            aria-label="Find a project"
+            placeholder="Find a project…"
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+          />
+        </label>
+        <nav className="garden-project-list" aria-label="Project work">
+          {personalTasks.map((item) => (
             <button
               key={item.id}
               aria-current={task?.id === item.id ? 'page' : undefined}
               onClick={() => openTask(item.id)}
             >
-              <i />
-              <span>{item.title}</span>
-              <small>{statusLabel[item.status]}</small>
+              <span className={`garden-project-dot status-${item.status}`} />
+              <span>
+                <strong>{item.title}</strong>
+                <small>
+                  {taskStatusLabel(item)}
+                  {item.pinned ? ' · Pinned' : ''}
+                </small>
+              </span>
             </button>
           ))}
+          {!personalTasks.length && (
+            <p className="muted">Your ideas and ongoing work will live here.</p>
+          )}
         </nav>
-      )}
+        <div className="garden-sidebar-bottom">
+          <span className="status-line">
+            <i />
+            {workspace?.name ?? 'Your computer'}
+          </span>
+          <small>{running.length ? `${running.length} running` : 'Ready when you are'}</small>
+          <Button
+            className="garden-sidebar-theme"
+            onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+          >
+            {theme === 'dark' ? <Sun size={14} /> : <Moon size={14} />}{' '}
+            {theme === 'dark' ? 'Light' : 'Dark'} appearance
+          </Button>
+        </div>
+      </aside>
       {offline && (
         <div className="offline-banner" role="status">
           You’re offline. Your work continues on the computer; updates will reconnect here.
         </div>
       )}
-      <main id="main" className={`main-area view-${navigation.view}`}>
+      <main
+        id="main"
+        inert={mobile && sidebarOpen}
+        className={`garden-main view-${navigation.view}`}
+      >
         <ErrorNotice error={error} onRetry={requestRefresh} />
         <Suspense fallback={<Spinner label="Opening this surface…" />}>
           {navigation.view === 'work' &&
-            (task && taskWorkspace ? (
+            (navigation.taskId && (!task || !taskWorkspace) ? (
+              <Spinner label="Opening the work’s computer…" />
+            ) : task && taskWorkspace ? (
               <TaskSurface
                 key={task.id}
                 task={task}
@@ -546,6 +749,7 @@ function WorkspaceApp() {
                 onTask={updateTask}
                 onRefresh={requestRefresh}
                 onBack={() => navigate('work')}
+                onOpenTask={openTask}
                 onComputer={(nextTool) => {
                   setTool(nextTool);
                   navigate('computer', task.id);
@@ -586,7 +790,7 @@ function WorkspaceApp() {
                 </div>
                 {!bootstrap.instance.providerConfigured && (
                   <div className="setup-note">
-                    <Leaf size={24} />
+                    <Sparkles size={24} />
                     <div>
                       <h3>Connect your model provider.</h3>
                       <p>
@@ -620,12 +824,6 @@ function WorkspaceApp() {
                 )}
                 {!personalTasks.length && filter === 'active' && !search && workspace && (
                   <div className="first-intent">
-                    <div className="field-ornament" aria-hidden="true">
-                      <span />
-                      <span />
-                      <span />
-                      <span />
-                    </div>
                     <Composer
                       key={`new:${workspace.id}`}
                       workspace={workspace}
@@ -685,12 +883,11 @@ function WorkspaceApp() {
                       </label>
                     </div>
                     <div className="work-grid">
-                      {personalTasks.map((item, index) => (
+                      {personalTasks.map((item) => (
                         <WorkCard
                           key={item.id}
                           task={item}
                           artifact={artifacts.find((artifact) => artifact.taskId === item.id)}
-                          index={index}
                           onOpen={() => openTask(item.id)}
                         />
                       ))}
@@ -719,8 +916,7 @@ function WorkspaceApp() {
                           <div className="stack">
                             {rows.map((item) => (
                               <Button key={item.id} onClick={() => openTask(item.id)}>
-                                {item.title} · {statusLabel[item.status]} ·{' '}
-                                {shortDate(item.createdAt)}
+                                {item.title} · {taskStatusLabel(item)} · {shortDate(item.createdAt)}
                                 <ArrowUpRight size={14} />
                               </Button>
                             ))}
@@ -756,14 +952,18 @@ function WorkspaceApp() {
           )}
           {computerOpened && (
             <section hidden={navigation.view !== 'computer'}>
-              <Computer
-                key={workspace?.id}
-                workspace={taskWorkspace ?? workspace}
-                task={task}
-                initialTool={tool}
-                visible={navigation.view === 'computer'}
-                onChange={requestRefresh}
-              />
+              {navigation.taskId && !computerWorkspace ? (
+                <Spinner />
+              ) : (
+                <Computer
+                  key={computerWorkspace?.id}
+                  workspace={computerWorkspace}
+                  task={task}
+                  initialTool={tool}
+                  visible={navigation.view === 'computer'}
+                  onChange={requestRefresh}
+                />
+              )}
             </section>
           )}
           {navigation.view === 'settings' && (
@@ -790,7 +990,7 @@ function WorkspaceApp() {
                     onClick={() => openTask(item.id)}
                   >
                     <span>
-                      <small>{statusLabel[item.status]}</small>
+                      <small>{taskStatusLabel(item)}</small>
                       <strong>{item.title}</strong>
                     </span>
                     <ArrowUpRight size={20} />
@@ -805,7 +1005,7 @@ function WorkspaceApp() {
           )}
         </Suspense>
       </main>
-      <footer className="status-footer">
+      <footer className="garden-status-footer">
         <span className={`status-line ${running.length ? 'active' : ''}`}>
           <i />
           {running.length ? `${running.length} running` : 'Your workspace'}
@@ -863,56 +1063,40 @@ function WorkspaceApp() {
 function Brand() {
   return (
     <span className="brand">
-      <span className="brand-mark" aria-hidden="true" />
-      <span>athanor</span>
+      <span>garden</span>
     </span>
   );
 }
 function WorkCard({
   task,
   artifact,
-  index,
   onOpen
 }: {
   task: Task;
   artifact?: Artifact | undefined;
-  index: number;
   onOpen: () => void;
 }) {
   return (
     <button
-      className={`work-card ${isWorking(task) ? 'working' : ''} card-${index % 3}`}
+      className={`garden-work-card ${hasOngoingWork(task) ? 'working' : ''}`}
       onClick={onOpen}
     >
       <div className="card-top">
-        <span className="eyebrow">{task.pinned ? 'Pinned work' : statusLabel[task.status]}</span>
+        <span className="eyebrow">{task.pinned ? 'Pinned work' : taskStatusLabel(task)}</span>
         <ArrowUpRight size={19} />
       </div>
-      <div className="work-card-visual" aria-hidden="true">
-        {artifact ? (
-          <div className="mini-document">
-            <FileText size={28} />
-            <span>{artifact.name}</span>
-            <i />
-            <i />
-            <i />
-          </div>
-        ) : (
-          <div className="branch-art">
-            <i />
-            <i />
-            <i />
-            <i />
-            <i />
-          </div>
-        )}
-      </div>
+      {artifact && (
+        <div className="garden-card-artifact">
+          <FileText size={20} />
+          <span>{artifact.name}</span>
+        </div>
+      )}
       <div className="card-bottom">
         <h2>{task.title}</h2>
         <div className="row between">
           <span className="status-line">
             <i />
-            {statusLabel[task.status]}
+            {taskStatusLabel(task)}
           </span>
           <small>
             {money(task.spentUsd)} · {shortDate(task.updatedAt)}
@@ -1003,7 +1187,7 @@ function SearchDialog({
           : tasks.slice(0, 8).map((task) => ({
               taskId: task.id,
               title: task.title,
-              excerpt: statusLabel[task.status]
+              excerpt: taskStatusLabel(task)
             }))
         ).map((result) => (
           <button key={result.taskId} onClick={() => onTask(result.taskId)}>
@@ -1046,6 +1230,9 @@ function Login({
     void (async () => {
       const native = await import('./native');
       const token = native.enrollmentCodeFromFragment(location.hash, location.origin);
+      const browserAuthorization = (
+        await import('./native-authorization')
+      ).browserAuthorizationLocation();
       if (location.hash.startsWith('#pair=')) {
         history.replaceState({}, '', `${location.pathname}${location.search}`);
         if (!token)
@@ -1056,7 +1243,11 @@ function Login({
       const value = await get<typeof legal>('/v1/legal');
       if (!alive) return;
       setLegal(value);
-      if (token) {
+      if (browserAuthorization?.onboarding && browserAuthorization.onboarding.mode !== 'passkey') {
+        setMode(browserAuthorization.onboarding.mode);
+        setCode(browserAuthorization.onboarding.code);
+        setName(browserAuthorization.onboarding.name ?? '');
+      } else if (token) {
         setCode(token);
         setMode('enroll');
         history.replaceState({}, '', `${location.pathname}${location.search}`);

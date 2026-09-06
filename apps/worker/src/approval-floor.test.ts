@@ -1,10 +1,12 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { wrapDataKey } from '@athanor/core';
 import type { DataStore, TaskRecord } from '@athanor/data';
 import type { ModelToolCall } from '@athanor/model-gateway';
 import type { AgentState } from './agent-state.js';
 import type { DestinationContext } from './egress.js';
 import {
   approvalForCallOnce,
+  transcriptionModelForCall,
   createApprovalFloorMemo,
   type ApprovalFloorDeps
 } from './approval-floor.js';
@@ -285,5 +287,121 @@ describe('what the floor tells the destructive rule about this turn’s undo poi
       await expect(ask(agentState), why).resolves.toMatchObject({
         sideEffect: 'external_consequential'
       });
+  });
+});
+
+describe('transcription floor price authority', () => {
+  const route = {
+    id: 'openai/transcribe',
+    providerModelId: 'gpt-4o-transcribe',
+    displayName: 'Transcription',
+    provider: 'openai',
+    apiProtocol: 'openai',
+    modality: 'transcription',
+    usdPerImage: null,
+    usdPerMillionCharacters: null,
+    usdPerMinute: null,
+    priceSource: 'provider',
+    recommendationTags: [],
+    updatedAt: '2026-09-06T00:00:00.000Z',
+    pricing: [
+      { billable: 'input_tokens', unit: 'token', costUsd: 0.0000025 },
+      { billable: 'output_tokens', unit: 'token', costUsd: 0.00001 }
+    ]
+  } as const;
+  it('ties native model limits to the actual credential endpoint', async () => {
+    const { deps } = countingFloor();
+    const secret = {
+      provider: 'openai-compatible',
+      baseUrl: 'https://api.openai.com/v1',
+      apiKey: 'test',
+      mediaRoutes: { transcription: route }
+    };
+    deps.inferenceCredential = async () =>
+      secret as unknown as Awaited<ReturnType<ApprovalFloorDeps['inferenceCredential']>>;
+    expect(
+      (await transcriptionModelForCall(deps, task)).mediaModel?.transcriptionBound?.reservationUsd
+    ).toBeCloseTo(0.06);
+    secret.baseUrl = 'https://unverified.example/v1';
+    expect(
+      (await transcriptionModelForCall(deps, task)).mediaModel?.transcriptionBound
+    ).toBeUndefined();
+    secret.baseUrl = 'https://api.openai.com/v1';
+    secret.provider = 'openrouter';
+    expect(
+      (await transcriptionModelForCall(deps, task)).mediaModel?.transcriptionBound
+    ).toBeUndefined();
+  });
+});
+
+describe('recording approval source and destination binding', () => {
+  it('pins a cheap external reading at the common floor and requires its real source receipt', async () => {
+    const counted = countingFloor();
+    const key = Buffer.alloc(32, 9);
+    const deps = { ...counted.deps };
+    const inspect = vi.fn(async () => ({ sourceSha256: 'b'.repeat(64), sourceBytes: 500 }));
+    deps.runner = { inspectAudioSource: inspect } as unknown as AgentRunnerClient;
+    deps.store = {
+      mediaSpendForTask: async () => 0,
+      getWorkspaceById: async () => ({
+        id: task.workspaceId,
+        wrappedKey: wrapDataKey(key, deps.masterKey, task.workspaceId)
+      })
+    } as unknown as DataStore;
+    deps.inferenceCredential = async () => ({
+      provider: 'openai-compatible',
+      baseUrl: 'https://api.openai.com/v1',
+      apiKey: 'fixture',
+      enforceZeroDataRetention: true,
+      mediaRoutes: {
+        transcription: {
+          id: 'openai/whisper-1',
+          providerModelId: 'whisper-1',
+          provider: 'openai',
+          displayName: 'Whisper',
+          apiProtocol: 'openai',
+          modality: 'transcription',
+          usdPerImage: null,
+          usdPerMillionCharacters: null,
+          usdPerMinute: 0.006,
+          priceSource: 'provider',
+          pricing: [{ billable: 'input_audio', unit: 'minute', costUsd: 0.006 }],
+          zeroDataRetentionAvailable: true,
+          recommendationTags: [],
+          updatedAt: '2026-09-06T00:00:00.000Z'
+        }
+      }
+    });
+    const state = { messages: [], turn: 1 } as unknown as AgentState;
+    const request = call('external-source', 'audio_read', {
+      path: 'workspace/private.ogg',
+      endSeconds: 1,
+      options: { privacyRoute: 'external' }
+    });
+    const card = await approvalForCallOnce(deps, createApprovalFloorMemo(), task, request, state);
+    expect(card?.sideEffect).toBe('external_reversible');
+    expect(card?.preview).toContain('https://api.openai.com');
+    expect(card?.preview).toContain('b'.repeat(64));
+    expect(card?.preview).toContain('500 bytes');
+    expect(inspect).toHaveBeenCalledExactlyOnceWith(
+      task.workspaceId,
+      task.id,
+      'workspace/private.ogg'
+    );
+    expect(state.transcriptionApprovals?.[request.id]).toMatchObject({
+      sourceSha256: 'b'.repeat(64),
+      sourceBytes: 500
+    });
+    expect(state.transcriptionApprovals?.[request.id]?.binding).toMatch(/^[0-9a-f]{64}$/);
+    inspect.mockResolvedValue({ sourceSha256: '', sourceBytes: 0 });
+    await expect(
+      approvalForCallOnce(
+        deps,
+        createApprovalFloorMemo(),
+        task,
+        { ...request, id: 'unverified' },
+        state
+      )
+    ).rejects.toMatchObject({ code: 'transcription_source_unverified' });
   });
 });

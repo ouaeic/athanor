@@ -2,7 +2,8 @@ import type { Task } from '@athanor/contracts';
 import { nativeNotificationPermission, notifyNative } from './native.js';
 import { get } from './client.js';
 
-type NoticeTask = Pick<Task, 'id' | 'title' | 'status'> & Partial<Pick<Task, 'updatedAt'>>;
+type NoticeTask = Pick<Task, 'id' | 'title' | 'status'> &
+  Partial<Pick<Task, 'updatedAt' | 'deliveryStatus'>>;
 const noticeTitles = {
   awaiting_user: 'Work needs you',
   failed: 'Work needs attention',
@@ -79,7 +80,7 @@ export function createTaskNotifier(): TaskNotifier {
           Date.parse(task.updatedAt) < Date.parse(previous.updatedAt)
         )
           continue;
-        if (previous?.status === task.status) {
+        if (previous?.status === task.status && previous?.deliveryStatus === task.deliveryStatus) {
           previous.title = task.title;
           if (task.updatedAt) previous.updatedAt = task.updatedAt;
           continue;
@@ -88,10 +89,12 @@ export function createTaskNotifier(): TaskNotifier {
           id: task.id,
           title: task.title,
           status: task.status,
+          deliveryStatus: task.deliveryStatus,
           ...(task.updatedAt ? { updatedAt: task.updatedAt } : {})
         };
         observed.set(task.id, current);
-        if (previous && current.status in noticeTitles) changed.push(current);
+        if (previous && current.status in noticeTitles && current.deliveryStatus !== 'pending')
+          changed.push(current);
       }
       if (!changed.length) return delivery;
       delivery = delivery
@@ -110,8 +113,11 @@ export function createTaskNotifier(): TaskNotifier {
               )
                 continue;
               if (observed.get(task.id) !== task) continue;
-              const title = noticeTitles[task.status as keyof typeof noticeTitles];
-              await notifyNative(title, task.title.trim() || 'Your athanor work');
+              const title =
+                task.deliveryStatus === 'incomplete'
+                  ? 'Delivery needs attention'
+                  : noticeTitles[task.status as keyof typeof noticeTitles];
+              await notifyNative(title, task.title.trim() || 'Your garden work');
             } catch {
               // Notifications cannot prevent task refresh; an uncertain delivery is not replayed.
             }

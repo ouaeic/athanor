@@ -11,6 +11,10 @@ export const CONTROL_ALPN = 'athanor-relay/1';
 /** Protocol major version carried in `hello`. A box speaking a different one is refused. */
 export const PROTOCOL_VERSION = 1;
 
+/** Dedicated TLS data plane; never delivered to the owner application listener. */
+export const PREVIEW_HTTPS_PORT = 8443;
+export const PREVIEW_HTTPS_CAPABILITY = 'preview-https';
+
 export const PATH_CONTROL = '/v1/control';
 export const PATH_PARK = '/v1/park';
 export const PATH_ENROLL = '/v1/enroll';
@@ -50,6 +54,10 @@ export interface QuotaLimits {
 
 export interface WelcomeMessage {
   readonly t: 'welcome';
+  /** Absent on peers that do not provide a separate preview listener. */
+  readonly caps?: readonly string[];
+  /** Public TLS listener for app previews, available only with the preview capability. */
+  readonly previewPort?: number | null;
   readonly label: string;
   readonly serverTimeMs: number;
   readonly parkTarget: number;

@@ -1,3 +1,5 @@
+import { codingMissionAdapter } from './coding-mission-gateway.js';
+import type { ReasoningEffort } from '@athanor/contracts';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
@@ -114,6 +116,9 @@ import { resumeParkedTurn, type TurnResumeDeps } from './turn/resume.js';
 import { enforceStepBounds, type StepBoundsDeps } from './turn/step-bounds.js';
 import { dispatchToolCalls, type TurnDispatchDeps } from './turn/dispatch.js';
 import { generateModelStep, type TurnGenerateDeps } from './turn/generate.js';
+import { nativeInputAdapter } from './native-input-gateway.js';
+import { nativeCredentialBinding } from './native-input.js';
+import { recordModelStepUsage } from './billing.js';
 import type { TurnLoopControl, TurnStepBudget } from './turn/loop-context.js';
 import { recordAssistantStep, type TurnRecordStepDeps } from './turn/record-step.js';
 import { prepareStepRequest, type TurnRequestDeps } from './turn/request.js';
@@ -332,6 +337,7 @@ export class AgentWorker {
     };
     this.#finish = {
       store,
+      runner: this.#runner,
       config,
       outstandingPlanSteps: (task, key) => this.#outstandingPlanSteps(task, key),
       runAcceptanceChecks: (task, key, record, options, state) =>
@@ -412,6 +418,7 @@ export class AgentWorker {
       assertProviderConfigured: (task) => this.#assertProviderConfigured(task)
     };
     this.#generate = {
+      runner: this.#runner,
       store,
       config,
       withLeaseRenewal: (task, operation) => this.#withLeaseRenewal(task, operation),
@@ -518,16 +525,31 @@ export class AgentWorker {
       );
     gateway.register(
       model.provider,
-      new OpenAICompatibleAdapter({
-        baseUrl: secret.baseUrl,
-        ...(secret.apiKey ? { apiKey: secret.apiKey } : {}),
-        provider: model.provider,
-        privacyRoute: model.privacyRoute,
-        appUrl: this.config.PUBLIC_APP_URL,
-        appTitle: 'athanor',
-        enforceZeroDataRetention:
-          secret.provider === 'openrouter' && secret.enforceZeroDataRetention
-      })
+      nativeInputAdapter(
+        codingMissionAdapter(
+          new OpenAICompatibleAdapter({
+            baseUrl: secret.baseUrl,
+            ...(secret.apiKey ? { apiKey: secret.apiKey } : {}),
+            provider: model.provider,
+            privacyRoute: model.privacyRoute,
+            appUrl: this.config.PUBLIC_APP_URL,
+            appTitle: 'garden',
+            enforceZeroDataRetention:
+              secret.provider === 'openrouter' && secret.enforceZeroDataRetention
+          }),
+          this.store,
+          task,
+          model,
+          this.config.WORKER_ID
+        ),
+        this.store,
+        task,
+        model,
+        nativeCredentialBinding(secret),
+        async () =>
+          nativeCredentialBinding(await this.#inferenceCredential(task), task.privacyRoute),
+        this.config.WORKER_ID
+      )
     );
     return {
       gateway,
@@ -717,7 +739,7 @@ export class AgentWorker {
       preparedContext: PreparedContext;
       reservedTokens: number;
       turn: number;
-      reasoningEffort: 'low' | 'medium' | 'high';
+      reasoningEffort: ReasoningEffort | undefined;
     }
   ): Promise<void> {
     const { response, model, preparedContext, reservedTokens, turn, reasoningEffort } = input;
@@ -763,7 +785,7 @@ export class AgentWorker {
     // happened to run last, which on an image-heavy turn is a light specialist standing in for a
     // full-window lead call. The loop clears it once, before the call the step is named for.
     state.lastStepUsd = (state.lastStepUsd ?? 0) + costUsd;
-    await this.store.recordUsage({
+    await recordModelStepUsage(this.store, response, {
       userId: task.userId,
       workspaceId: task.workspaceId,
       taskId: task.id,
@@ -780,6 +802,9 @@ export class AgentWorker {
       costUsd,
       state: 'settled',
       idempotencyKey: stepUsageKey(task.id, turn, state.step),
+      ...(response.codingReservationId
+        ? { codingReservationId: response.codingReservationId }
+        : {}),
       providerRef: `${response.metadata.provider}:${response.metadata.model}`
     });
     await event(this.store, task, key, 'cost', `Step ${state.step + 1} completed`, {
@@ -1466,6 +1491,9 @@ export class AgentWorker {
               ),
             state: 'settled',
             idempotencyKey: `web-search:${task.id}:${call.id}`,
+            ...(response.codingReservationId
+              ? { codingReservationId: response.codingReservationId }
+              : {}),
             providerRef: `${response.metadata.provider}:${response.metadata.model}`
           })
           // The results are already retrieved and the owner asked for them. Losing the ledger row is
@@ -2108,6 +2136,49 @@ export class AgentWorker {
 
   async fail(task: TaskRecord, error: unknown, durationMs?: number): Promise<void> {
     const workspace = await this.store.getWorkspaceById(task.workspaceId).catch(() => null);
+    if (
+      task.hasCodingFamily &&
+      !task.parentMissionId &&
+      error instanceof AthanorError &&
+      ['coding_family_budget', 'coding_family_spend'].includes(error.code) &&
+      workspace?.wrappedKey
+    ) {
+      const key = unwrapDataKey(workspace.wrappedKey, this.#masterKey, workspace.id);
+      const current = await this.store.getTask(task.userId, task.id);
+      if (current?.agentStateCiphertext) {
+        const state = decryptJson<AgentState>(current.agentStateCiphertext, key);
+        state.codingMissionWaiting = true;
+        state.messages.push({
+          role: 'system',
+          content:
+            'The parent is waiting for its coding specialists to release shared budget capacity. Continue from their recorded state when resumed.'
+        });
+        if (
+          await this.store.parkForCodingMissions({
+            taskId: task.id,
+            workerId: this.config.WORKER_ID,
+            agentStateCiphertext: encryptJson(state, key, `task-state:${task.id}`),
+            actualComputeCredits: state.credits
+          })
+        ) {
+          await event(this.store, task, key, 'status', 'Waiting for coding specialist capacity', {
+            codingMissions: { waiting: true }
+          });
+          return;
+        }
+      }
+      await this.store.updateTask({
+        id: task.id,
+        workerId: this.config.WORKER_ID,
+        status: 'paused',
+        clearLease: true
+      });
+      await event(this.store, task, key, 'warning', error.message, {
+        owner: true,
+        code: error.code
+      });
+      return;
+    }
     const message = error instanceof Error ? error.message : 'Task failed';
     // Both halves have to hold. `isProviderWall` answers whether waiting is any use, and
     // `PARKABLE_PROVIDER_WALLS` answers whether anything on this box would ever ask again: a code
@@ -2272,3 +2343,5 @@ export class AgentWorker {
     }
   }
 }
+
+export { runCodingMissionLoop } from './coding-mission-loop.js';

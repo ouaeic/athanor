@@ -21,6 +21,7 @@ import { createLogger, type Logger } from './log.js';
 import { METRIC_NAMES, Metrics } from './metrics.js';
 import {
   CONTROL_ALPN,
+  PREVIEW_HTTPS_PORT,
   PATH_CONTROL,
   PATH_ENROLL,
   PATH_PARK,
@@ -76,6 +77,7 @@ export class RelayServer {
   private readonly tlsServer: TlsServer;
   private readonly h2Server: Http2Server;
   private readonly httpsListener: NetServer;
+  private readonly previewListener: NetServer | null;
   private readonly controlListener: NetServer | null;
   private readonly httpListener: NetServer | null;
   private readonly metricsServer: HttpServer | null;
@@ -177,6 +179,12 @@ export class RelayServer {
     this.controlListener = sameListener
       ? null
       : createNetServer({ allowHalfOpen: true }, (socket) => this.onTlsSocket(socket, true, true));
+    this.previewListener =
+      options.config.previewPort === null
+        ? null
+        : createNetServer({ allowHalfOpen: true }, (socket) =>
+            this.onTlsSocket(socket, false, false, PREVIEW_HTTPS_PORT)
+          );
     this.httpListener =
       options.config.httpPort === null
         ? null
@@ -243,6 +251,9 @@ export class RelayServer {
     if (this.controlListener !== null) {
       await listenOn(this.controlListener, config.controlPort, config.listenHost);
     }
+    if (this.previewListener !== null && config.previewPort !== null) {
+      await listenOn(this.previewListener, config.previewPort, config.listenHost);
+    }
     if (this.httpListener !== null && config.httpPort !== null) {
       await listenOn(this.httpListener, config.httpPort, config.listenHost);
     }
@@ -252,6 +263,7 @@ export class RelayServer {
     this.logger.info('relay listening', {
       domain: config.relayDomain,
       https: this.httpsPort ?? -1,
+      preview: this.previewPort ?? -1,
       control: this.controlPort ?? -1,
       http: this.httpPort ?? -1,
       peers: this.registry.peerCount
@@ -260,6 +272,10 @@ export class RelayServer {
 
   get httpsPort(): number | null {
     return portOf(this.httpsListener);
+  }
+
+  get previewPort(): number | null {
+    return this.previewListener === null ? null : portOf(this.previewListener);
   }
 
   get controlPort(): number | null {
@@ -300,6 +316,7 @@ export class RelayServer {
     this.clientSockets.clear();
     await Promise.all([
       closeServer(this.httpsListener),
+      this.previewListener === null ? Promise.resolve() : closeServer(this.previewListener),
       this.controlListener === null ? Promise.resolve() : closeServer(this.controlListener),
       this.httpListener === null ? Promise.resolve() : closeServer(this.httpListener),
       this.metricsServer === null ? Promise.resolve() : closeServer(this.metricsServer)
@@ -316,7 +333,12 @@ export class RelayServer {
     socket.once('close', () => this.clientSockets.delete(socket));
   }
 
-  private onTlsSocket(socket: Socket, allowControl: boolean, controlOnly = false): void {
+  private onTlsSocket(
+    socket: Socket,
+    allowControl: boolean,
+    controlOnly = false,
+    port: 443 | typeof PREVIEW_HTTPS_PORT = 443
+  ): void {
     if (!this.halfOpen.tryAcquire()) {
       this.metrics.counter(METRIC_NAMES.connectionsRejected);
       socket.destroy();
@@ -374,7 +396,8 @@ export class RelayServer {
       }
       this.routeTls(socket, buffered, result.info.serverName, result.info.alpnProtocols, {
         allowControl,
-        controlOnly
+        controlOnly,
+        port
       });
     };
 
@@ -391,7 +414,7 @@ export class RelayServer {
     buffered: Buffer,
     serverName: string | null,
     alpn: readonly string[],
-    mode: { allowControl: boolean; controlOnly: boolean }
+    mode: { allowControl: boolean; controlOnly: boolean; port: 443 | typeof PREVIEW_HTTPS_PORT }
   ): void {
     const isControl =
       serverName === this.controlHost &&
@@ -416,7 +439,7 @@ export class RelayServer {
       this.rejectTls(socket, 'no-route');
       return;
     }
-    this.bindToTunnel(socket, buffered, label, serverName ?? '', 443);
+    this.bindToTunnel(socket, buffered, label, serverName ?? '', mode.port);
   }
 
   private bindToTunnel(
@@ -424,12 +447,12 @@ export class RelayServer {
     buffered: Buffer,
     label: string,
     sni: string,
-    port: 443 | 80
+    port: 443 | 80 | typeof PREVIEW_HTTPS_PORT
   ): void {
     const tunnel = this.tunnels.get(label);
     if (tunnel === undefined || !tunnel.isReady) {
       this.metrics.counter(METRIC_NAMES.unknownLabel);
-      if (port === 443) this.rejectTls(socket, 'offline');
+      if (port !== 80) this.rejectTls(socket, 'offline');
       else this.rejectHttp(socket, 502, 'server offline');
       return;
     }
@@ -452,7 +475,7 @@ export class RelayServer {
     }
     if (result.reason === 'quota-blocked') this.metrics.counter(METRIC_NAMES.quotaBlocked);
     else this.metrics.counter(METRIC_NAMES.rateLimited);
-    if (port === 443) this.rejectTls(socket, result.reason);
+    if (port !== 80) this.rejectTls(socket, result.reason);
     else this.rejectHttp(socket, 503, result.reason);
   }
 
@@ -562,7 +585,8 @@ export class RelayServer {
         if (this.tunnels.get(tunnel.label) === tunnel) this.tunnels.delete(tunnel.label);
       },
       globalShaping: () => this.globalShaping(),
-      globalBlocked: () => this.globalBlocked()
+      globalBlocked: () => this.globalBlocked(),
+      previewPort: () => this.previewPort
     };
   }
 

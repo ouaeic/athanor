@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import {
   assertTimeZone,
+  AthanorError,
   evaluateSpendCaps,
   localDayKey,
   readRoutingMetadata,
@@ -198,6 +199,7 @@ export class BillingStore {
           // type and were dropped in transit, which made the whole routing layer inert.
           ...readRoutingMetadata(model),
           inputUsdPerMillionTokens: model.inputUsdPerMillionTokens ?? null,
+          nativeInputPricing: model.nativeInputPricing,
           outputUsdPerMillionTokens: model.outputUsdPerMillionTokens ?? null,
           benchmarkRank: model.benchmarkRank ?? null,
           benchmarkSource: model.benchmarkSource ?? null,
@@ -234,6 +236,7 @@ export class BillingStore {
         modalities: json(row.modalities),
         capabilities: json(row.capabilities),
         usageClass: String(row.usage_class),
+        ...(metadata.nativeInputPricing ? { nativeInputPricing: metadata.nativeInputPricing } : {}),
         recommendationTags: json(row.recommendation_tags),
         measuredQuality: row.measured_quality === null ? null : Number(row.measured_quality),
         measuredLatencyMs:
@@ -284,7 +287,118 @@ export class BillingStore {
     providerRef?: string;
     costUsd?: number;
     modelId?: string;
+    reserveAgainstCaps?: boolean;
+    codingReservationId?: string;
+    settleReservation?: boolean;
   }): Promise<void> {
+    if (input.codingReservationId) {
+      const { codingReservationId, ...usage } = input;
+      await this.database.transaction(async (tx) => {
+        await tx.query('SELECT id FROM users WHERE id=$1 FOR UPDATE', [input.userId]);
+        const call = (
+          await tx.query(
+            `SELECT c.* FROM coding_family_calls c
+          WHERE c.id=$1 AND c.original_task_id=$2 AND c.user_id=$3 FOR UPDATE OF c`,
+            [codingReservationId, input.taskId ?? null, input.userId]
+          )
+        ).rows[0];
+        if (!call || input.kind !== 'model_inference' || input.state !== 'settled')
+          throw new AthanorError(
+            'coding_usage_invalid',
+            'The coding usage receipt does not belong to this task',
+            409
+          );
+        const charged = { ...usage };
+        if (!call.task_id) {
+          delete charged.taskId;
+          delete charged.workspaceId;
+        }
+        await new BillingStore(tx).recordUsage(charged);
+        await tx.query(
+          `UPDATE coding_family_calls c SET usage_id=u.id
+          FROM usage_entries u WHERE c.id=$1 AND u.idempotency_key=$2 AND u.task_id IS NOT DISTINCT FROM c.task_id
+          AND (c.usage_id IS NULL OR c.usage_id=u.id)`,
+          [codingReservationId, input.idempotencyKey]
+        );
+      });
+      return;
+    }
+    if (input.reserveAgainstCaps) {
+      if (
+        input.state !== 'reserved' ||
+        input.kind !== 'model_inference' ||
+        !input.resourceClass.startsWith('media:') ||
+        !Number.isFinite(input.costUsd) ||
+        Number(input.costUsd) < 0
+      )
+        throw new AthanorError(
+          'media_reservation_invalid',
+          'Choose a valid provider spend reservation',
+          400
+        );
+      const { reserveAgainstCaps: _reserve, ...reserved } = input;
+      await this.database.transaction(async (tx) => {
+        await tx.query('SELECT id FROM users WHERE id=$1 FOR UPDATE', [input.userId]);
+        const existing = await tx.query('SELECT id FROM usage_entries WHERE idempotency_key=$1', [
+          input.idempotencyKey
+        ]);
+        if (existing.rows.length)
+          throw new AthanorError(
+            'media_submission_exists',
+            'This media submission already has a reservation; do not submit it again',
+            409
+          );
+        const decision = await this.spendGuardIn(tx, {
+          userId: input.userId,
+          ...(input.taskId ? { taskId: input.taskId } : {}),
+          estimateUsd: input.costUsd!,
+          includeOpenCommitments: true
+        });
+        if (decision.outcome === 'deny')
+          throw new AthanorError(
+            'spend_cap_reached',
+            'The media reservation exceeds the remaining spending allowance',
+            402
+          );
+        await new BillingStore(tx).recordUsage(reserved);
+      });
+      return;
+    }
+    if (input.settleReservation) {
+      if (
+        !['settled', 'released'].includes(input.state) ||
+        !Number.isFinite(input.costUsd) ||
+        Number(input.costUsd) < 0 ||
+        !Number.isFinite(input.quantity) ||
+        input.quantity < 0
+      )
+        throw new AthanorError(
+          'media_cost_invalid',
+          'A media settlement requires a valid cost',
+          400
+        );
+      const updated = await this.database.query(
+        `UPDATE usage_entries SET state=$3,cost_usd=$4,provider_ref=$5,quantity=$8
+        WHERE idempotency_key=$1 AND user_id=$2 AND state='reserved' AND kind='model_inference' AND resource_class=$6 AND task_id IS NOT DISTINCT FROM $7`,
+        [
+          input.idempotencyKey,
+          input.userId,
+          input.state,
+          input.costUsd,
+          input.providerRef ?? null,
+          input.resourceClass,
+          input.taskId ?? null,
+          input.quantity
+        ]
+      );
+      if (updated.rowCount !== 1)
+        throw new AthanorError(
+          'media_reservation_missing',
+          'The media reservation could not be settled',
+          409
+        );
+      return;
+    }
     await this.database.query(
       `INSERT INTO usage_entries(
         id,user_id,workspace_id,task_id,kind,resource_class,quantity,unit,credits,state,
@@ -310,6 +424,36 @@ export class BillingStore {
         input.modelId ?? providerRefModelId(input.providerRef)
       ]
     );
+  }
+
+  async settleNativeInputUsage(input: {
+    userId: string;
+    idempotencyKey: string;
+    costUsd: number;
+    credits: number;
+    quantity: number;
+  }): Promise<void> {
+    if (
+      ![input.costUsd, input.credits, input.quantity].every(
+        (value) => Number.isFinite(value) && value >= 0
+      )
+    )
+      throw new AthanorError(
+        'native_input_usage_invalid',
+        'Native input usage must contain finite nonnegative amounts',
+        400
+      );
+    const result = await this.database.query(
+      `UPDATE usage_entries SET state='settled', cost_usd=$3, credits=$4, quantity=$5
+      WHERE user_id=$1 AND idempotency_key=$2 AND state='reserved' AND kind='model_inference' AND resource_class='media:native-input'`,
+      [input.userId, input.idempotencyKey, input.costUsd, input.credits, input.quantity]
+    );
+    if (result.rowCount !== 1)
+      throw new AthanorError(
+        'native_input_usage_missing',
+        'The native input reservation could not be settled',
+        409
+      );
   }
 
   async transitionUsage(idempotencyKey: string, from: string, to: string): Promise<boolean> {
@@ -347,7 +491,7 @@ export class BillingStore {
   async mediaSpendForTask(taskId: string): Promise<number> {
     const result = await this.database.query(
       `SELECT COALESCE(SUM(cost_usd),0) AS cost FROM usage_entries
-       WHERE task_id=$1 AND state='settled' AND cost_usd>0 AND resource_class LIKE 'media:%'`,
+       WHERE task_id=$1 AND state IN ('settled','reserved') AND cost_usd>0 AND resource_class LIKE 'media:%'`,
       [taskId]
     );
     return Number(result.rows[0]?.cost ?? 0);
@@ -563,9 +707,13 @@ export class BillingStore {
 
   private async spendTotalIn(db: Database, userId: string, from: Date, to: Date): Promise<number> {
     const result = await db.query(
-      `SELECT COALESCE(SUM(cost_usd),0) AS cost_usd FROM usage_entries
-       WHERE user_id=$1 AND state='settled' AND cost_usd>0
-         AND created_at>=$2 AND created_at<$3`,
+      `SELECT COALESCE(SUM(cost_usd),0) AS cost_usd FROM (
+         SELECT cost_usd FROM usage_entries WHERE user_id=$1 AND state='settled' AND cost_usd>0
+           AND created_at>=$2 AND created_at<$3
+         UNION ALL SELECT c.actual_usd FROM coding_family_calls c
+           WHERE c.user_id=$1 AND c.usage_id IS NULL AND c.actual_usd>0
+           AND c.created_at>=$2 AND c.created_at<$3
+       ) charges`,
       [userId, from.toISOString(), to.toISOString()]
     );
     return Number(result.rows[0]?.cost_usd ?? 0);
@@ -597,11 +745,18 @@ export class BillingStore {
       `SELECT COALESCE(SUM(GREATEST(t.max_spend_usd - COALESCE(s.spent,0),0)),0) AS pending
        FROM tasks t
        LEFT JOIN LATERAL (
-         SELECT COALESCE(SUM(u.cost_usd),0) AS spent FROM usage_entries u
-         WHERE u.task_id=t.id AND u.state='settled' AND u.cost_usd>0
+         SELECT COALESCE(SUM(charges.cost_usd),0) AS spent FROM (
+           SELECT u.cost_usd FROM usage_entries u JOIN tasks member ON member.id=u.task_id
+             WHERE (member.id=t.id OR (member.parent_mission_id IS NOT NULL AND member.parent_task_id=t.id))
+             AND u.state='settled' AND u.cost_usd>0
+           UNION ALL SELECT c.actual_usd FROM coding_family_calls c WHERE c.parent_task_id=t.id
+             AND c.usage_id IS NULL AND c.actual_usd>0
+         ) charges
        ) s ON TRUE
-       WHERE t.user_id=$1 AND t.max_spend_usd IS NOT NULL
-         AND t.status IN ${COMMITTED_TASK_STATUSES}
+       WHERE t.user_id=$1 AND t.max_spend_usd IS NOT NULL AND t.parent_mission_id IS NULL
+         AND (t.status IN ${COMMITTED_TASK_STATUSES} OR EXISTS (
+           SELECT 1 FROM tasks child WHERE child.parent_mission_id IS NOT NULL AND child.parent_task_id=t.id
+             AND child.status IN ${COMMITTED_TASK_STATUSES}))
          AND ($2::uuid IS NULL OR t.id<>$2::uuid)`,
       [userId, excludeTaskId ?? null]
     );
@@ -656,20 +811,44 @@ export class BillingStore {
       bounds.monthly.start,
       bounds.monthly.end
     );
-    const pending = input.includeOpenCommitments
-      ? await this.openSpendCommitmentIn(db, input.userId, input.taskId)
-      : 0;
     const task = input.taskId
       ? await db.query(
-          `SELECT t.max_spend_usd,
-             (SELECT COALESCE(SUM(u.cost_usd),0) FROM usage_entries u
-               WHERE u.task_id=t.id AND u.state='settled' AND u.cost_usd>0) AS spent
-           FROM tasks t WHERE t.id=$1`,
-          [input.taskId]
+          `
+      SELECT root.id,root.max_spend_usd,
+        (SELECT COALESCE(SUM(charges.cost_usd),0) FROM (
+          SELECT u.cost_usd FROM usage_entries u JOIN tasks member ON member.id=u.task_id
+          WHERE (member.id=root.id OR (member.parent_mission_id IS NOT NULL AND member.parent_task_id=root.id))
+            AND u.state='settled' AND u.cost_usd>0
+          UNION ALL SELECT c.actual_usd FROM coding_family_calls c WHERE c.parent_task_id=root.id
+            AND c.usage_id IS NULL AND c.actual_usd>0
+        ) charges) AS spent
+      FROM tasks requested JOIN tasks root ON root.id=CASE WHEN requested.parent_mission_id IS NULL THEN requested.id ELSE requested.parent_task_id END
+      WHERE requested.id=$1 AND requested.user_id=$2`,
+          [input.taskId, input.userId]
         )
       : null;
-
     const taskRow = task?.rows[0];
+    const rootTaskId = taskRow ? String(taskRow.id) : input.taskId;
+    const taskPending = input.includeOpenCommitments
+      ? await this.openSpendCommitmentIn(db, input.userId, rootTaskId)
+      : 0;
+    const reservations = await db.query(
+      `SELECT
+      COALESCE(SUM(CASE WHEN $3::boolean AND root.id IS NOT NULL AND root.id<>$2::uuid
+        AND root.max_spend_usd IS NOT NULL AND (root.status IN ${COMMITTED_TASK_STATUSES} OR EXISTS (
+          SELECT 1 FROM tasks child WHERE child.parent_mission_id IS NOT NULL AND child.parent_task_id=root.id
+          AND child.status IN ${COMMITTED_TASK_STATUSES})) THEN 0 ELSE held.cost_usd END),0) AS pending,
+      COALESCE(SUM(CASE WHEN root.id=$2::uuid THEN held.cost_usd ELSE 0 END),0) AS task_pending
+      FROM (
+        SELECT u.task_id,u.cost_usd FROM usage_entries u WHERE u.user_id=$1 AND u.state='reserved' AND u.resource_class LIKE 'media:%'
+        UNION ALL SELECT c.task_id,c.reserved_usd FROM coding_family_calls c
+          WHERE c.user_id=$1 AND c.actual_usd IS NULL AND c.usage_id IS NULL
+      ) held LEFT JOIN tasks t ON t.id=held.task_id
+      LEFT JOIN tasks root ON root.id=CASE WHEN t.parent_mission_id IS NULL THEN t.id ELSE t.parent_task_id END`,
+      [input.userId, rootTaskId ?? null, input.includeOpenCommitments ?? false]
+    );
+    const pending = taskPending + Number(reservations.rows[0]?.pending ?? 0);
+
     const taskCapUsd =
       input.taskCapUsd !== undefined
         ? input.taskCapUsd
@@ -701,6 +880,7 @@ export class BillingStore {
       windows.unshift({
         name: 'task',
         spentUsd: Number(taskRow?.spent ?? 0),
+        pendingUsd: Number(reservations.rows[0]?.task_pending ?? 0),
         capUsd: taskCapUsd
       });
 

@@ -8,6 +8,11 @@
       "types": "./src/agent.ts",
       "development": "./src/agent.ts",
       "default": "./dist/agent.js"
+    },
+    "./media-jobs": {
+      "types": "./src/media-jobs.ts",
+      "development": "./src/media-jobs.ts",
+      "default": "./dist/media-jobs.js"
     }
   },
   "scripts": {

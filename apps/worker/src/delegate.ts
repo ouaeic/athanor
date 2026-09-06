@@ -693,6 +693,9 @@ ${clockLine(new Date(), timeZone)}
         ),
       state: 'settled',
       idempotencyKey: `delegate:${task.id}:${parentCallId}:${missionIndex}:${step}`,
+      ...(response.codingReservationId
+        ? { codingReservationId: response.codingReservationId }
+        : {}),
       providerRef: `${response.metadata.provider}:${response.metadata.model}`
     });
     messages.push({

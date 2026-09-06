@@ -457,7 +457,8 @@ describe('the size of the catalogue the model is sent', () => {
     // sentence would go to a two-core laptop and a ninety-six-core server. Its home is the runtime
     // block in apps/worker/src/context.ts, which is already dynamic, already states the machine's
     // storage, and costs this cached prefix nothing.
-    expect(bytes).toBeLessThan(55_700);
+    // Durable provider jobs and resumable shell jobs; complete wire measures 56,294 bytes.
+    expect(bytes).toBeLessThan(56_400);
     // Where the bytes actually are, because it is not where it looks. connector_action is now the
     // largest entry at ~6.6 kB, and 5.0 kB of that is one `input` object declaring 48 fields - the
     // union of what twenty-four actions across mail, calendar and repositories accept. Those are
@@ -595,7 +596,7 @@ describe('the size of the catalogue the model is sent', () => {
      *
      * Three facts, each carried by the operating contract in the same request, each of which was
      * also being paid for down here: which binary controls where a page breaks, that this computer
-     * generates no video and edits the owner's own with ffmpeg, and what an anti-bot challenge
+     * runs no local model weights and edits existing video with ffmpeg, and what an anti-bot challenge
      * closes and for how long. The contract is message 0 of every window, so the model reads them
      * either way; the catalogue copy bought nothing, and the typst one was worse than nothing - it
      * was unconditional, while the contract's is gated on the box actually having a document
@@ -603,13 +604,13 @@ describe('the size of the catalogue the model is sent', () => {
      * the route for a PDF that matters.
      *
      * What stays in a description is the part the contract cannot say: the name of the field a
-     * challenge arrives in (`botWall`), and that asking generate_media for a clip will not work.
+     * challenge arrives in (`botWall`), and the per-job retention requirement for video.
      * The direction of the check is deliberate - it asserts the contract still carries each fact
      * before it forbids the duplicate, so deleting the original turns this red rather than green.
      */
     const paidForInTheContract: ReadonlyArray<readonly [string, RegExp]> = [
       ['typeset with typst', /\btypst\b/i],
-      ['no video generation here at all', /\bffmpeg\b|model weights/i],
+      ['No model weights run on this computer', /\bffmpeg\b|model weights/i],
       ['anti-bot challenge', /until the user clears it|carry on with the rest/i]
     ];
     for (const [carried, restated] of paidForInTheContract) {
@@ -811,7 +812,8 @@ describe('the wire a box without a browser or a screen is sent', () => {
      * so they are paid for here too. 44,000 against a measured 43,981, up from 43,908. The gap to
      * the provisioned wire is still exactly 11,692, because the same 73 bytes landed on both.
      */
-    expect(Buffer.byteLength(JSON.stringify(bare))).toBeLessThan(44_000);
+    // The same job controls on a bare box measure 44,376 bytes.
+    expect(Buffer.byteLength(JSON.stringify(bare))).toBeLessThan(44_500);
     // The other direction, and the one that fails silently. A gate wired to nothing returns the
     // unconditional constant on every box; this is the assertion that would go red if it did.
     expect(Buffer.byteLength(JSON.stringify(bare))).toBeLessThan(
@@ -985,7 +987,8 @@ describe('the wire a box is sent about the services it has actually connected', 
     // memories as one without. 54,307 measured, up from 54,147. Then by the same 73 as those two
     // ceilings, on the same rule: `shell` is on every wire, so a box with a mailbox connected can
     // start a six-hour background job exactly as one without can. 54,380 measured.
-    expect(Buffer.byteLength(JSON.stringify(mailAndCalendar))).toBeLessThan(54_400);
+    // The same job controls with connected mail/calendar measure 55,001 bytes.
+    expect(Buffer.byteLength(JSON.stringify(mailAndCalendar))).toBeLessThan(55_100);
     // The other direction, and the one that fails silently. A gate wired to nothing returns the
     // unconditional catalogue on every box; this is the assertion that would go red if it did.
     expect(Buffer.byteLength(JSON.stringify(mailAndCalendar))).toBeLessThan(
@@ -1370,48 +1373,6 @@ describe('the catalogue as the model reads it', () => {
         ).toBe(true);
       }
     expect(resolved).toBeGreaterThan(0);
-  });
-
-  it('offers no media kind the provider cannot actually produce', () => {
-    // Both media tools listed video in their kind enum and sold it in their first sentence, while
-    // every route to it threw: there is no zero-retention video API, so the catalogue entry has no
-    // model id at all. The model spent a call finding that out, in front of the owner.
-    const kinds = (name: string): string[] =>
-      (
-        (agentTools.find((tool) => tool.name === name)?.parameters.properties ?? {}) as Record<
-          string,
-          { enum?: string[] }
-        >
-      ).kind?.enum ?? [];
-    const offered = new Set(kinds('generate_media'));
-    expect(offered.size).toBeGreaterThan(0);
-    for (const kind of offered) {
-      const entry = managedMediaCatalog[kind as keyof typeof managedMediaCatalog];
-      expect(entry, `no catalogue entry for the offered kind ${kind}`).toBeDefined();
-      expect(entry.modelId, `${kind} is offered with no reviewed model behind it`).not.toBe('');
-    }
-    for (const [kind, entry] of Object.entries(managedMediaCatalog))
-      if (!entry.modelId) {
-        expect(offered.has(kind), `${kind} has no model and is still offered`).toBe(false);
-        for (const name of ['generate_media']) {
-          const sentences = (agentTools.find((tool) => tool.name === name)?.description ?? '')
-            .split(/(?<=[.;])\s+/)
-            .filter((sentence) => new RegExp(`\\b${kind}\\b`, 'i').test(sentence));
-          // It may say the kind cannot be made; it may not mention it any other way.
-          for (const sentence of sentences)
-            expect(sentence, `${name} mentions ${kind} without refusing it`).toMatch(
-              /\bcannot\b|\bnot\b|\bno\b/i
-            );
-        }
-      }
-    // durationSeconds only ever meant a video length; nothing else on either tool used it.
-    for (const name of ['generate_media'])
-      expect(
-        Object.keys(
-          (agentTools.find((tool) => tool.name === name)?.parameters.properties ?? {}) as object
-        ),
-        name
-      ).not.toContain('durationSeconds');
   });
 
   it('prices a generation itself instead of believing the number the model sent', () => {

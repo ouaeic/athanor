@@ -7,8 +7,11 @@ import type {
   WorkspaceSnapshot
 } from '@athanor/contracts';
 import { del, get, isNativeClient, post } from '../client.js';
+import { previewIsolated, previewUrl } from '../preview-url';
 import { stepUp } from '../auth.js';
 import { bytes, message } from './format.js';
+import Computation from './Computation';
+import DebugSessions from './DebugSessions';
 
 interface Process {
   sessionId: string;
@@ -20,6 +23,17 @@ interface Process {
   deadlineAt?: string;
   exitCode?: number;
   service?: { name?: string; listening?: string[] };
+  lifetime?: 'task' | 'service' | 'job';
+  job?: {
+    jobId: string;
+    name: string;
+    state: string;
+    checkpointResumable: boolean;
+    createdAt: string;
+    startedAt: string;
+    restarts: number;
+    lastExit?: { code?: number; reason?: string };
+  };
 }
 interface ProcessList {
   processes: Process[];
@@ -27,14 +41,6 @@ interface ProcessList {
   reachableFromOutsideThisComputer?: string[];
   note?: string;
 }
-const previewUrl = (value: string): string => {
-  const url = new URL(value);
-  if (!['http:', 'https:'].includes(url.protocol))
-    throw new Error('The preview address is not a web address.');
-  return isNativeClient() && url.pathname.startsWith('/__athanor/preview/')
-    ? `${url.pathname}${url.search}${url.hash}`
-    : url.href;
-};
 
 export function Operations({
   workspace,
@@ -61,7 +67,7 @@ export function Operations({
   const [logs, setLogs] = useState<Record<string, string>>({});
   const [confirm, setConfirm] = useState<{
     id: string;
-    action: 'restore' | 'delete' | 'publish' | 'stop';
+    action: 'restore' | 'delete' | 'publish' | 'stop' | 'rotate';
   } | null>(null);
   const [confirmName, setConfirmName] = useState('');
   const [opened, setOpened] = useState<WorkspacePreview | null>(null);
@@ -115,6 +121,8 @@ export function Operations({
     if (!confirm) return;
     if (confirm.action === 'stop')
       await post(`${base}/processes/${encodeURIComponent(confirm.id)}`, { action: 'kill' });
+    if (confirm.action === 'rotate')
+      setOpened(await post<WorkspacePreview>(`/v1/previews/${confirm.id}/rotate-access`, {}));
     if (confirm.action === 'publish') {
       await stepUp();
       const result = await post<WorkspacePreview>(`/v1/previews/${confirm.id}/publish`, {
@@ -171,7 +179,9 @@ export function Operations({
                 ? 'Restore this recovery point? Current computer files will be replaced. Enter the computer name to continue.'
                 : confirm.action === 'stop'
                   ? 'Stop this process? A stopped service will not restart automatically.'
-                  : 'Delete this saved item?'}
+                  : confirm.action === 'rotate'
+                    ? 'Reset private links? Existing links to this preview will stop working. A new private link will open here.'
+                    : 'Delete this saved item?'}
           </p>
           {confirm.action === 'restore' && (
             <label>
@@ -199,7 +209,9 @@ export function Operations({
                   ? 'Restore computer'
                   : confirm.action === 'stop'
                     ? 'Stop process'
-                    : 'Delete'}
+                    : confirm.action === 'rotate'
+                      ? 'Reset private links'
+                      : 'Delete'}
             </button>
           </div>
         </div>
@@ -283,13 +295,22 @@ export function Operations({
                     Open
                   </button>
                   {preview.visibility === 'private' ? (
-                    <button
-                      className="button"
-                      disabled={preview.status !== 'active' || busy}
-                      onClick={() => setConfirm({ id: preview.id, action: 'publish' })}
-                    >
-                      Publish
-                    </button>
+                    <>
+                      <button
+                        className="button"
+                        disabled={preview.status !== 'active' || busy}
+                        onClick={() => setConfirm({ id: preview.id, action: 'publish' })}
+                      >
+                        Publish
+                      </button>
+                      <button
+                        className="button"
+                        disabled={busy || preview.status !== 'active'}
+                        onClick={() => setConfirm({ id: preview.id, action: 'rotate' })}
+                      >
+                        Reset private links
+                      </button>
+                    </>
                   ) : (
                     <button
                       className="button"
@@ -325,9 +346,17 @@ export function Operations({
                 <strong>{opened.label}</strong>
                 <a
                   className="button"
-                  href={previewUrl(opened.url)}
+                  href={previewUrl(opened.url, false)}
                   target="_blank"
                   rel="noreferrer"
+                  onClick={(event) => {
+                    if (!isNativeClient()) return;
+                    event.preventDefault();
+                    void run(async () => {
+                      const { openPreviewBrowser } = await import('../native');
+                      await openPreviewBrowser(previewUrl(opened.url, false));
+                    });
+                  }}
                 >
                   Open in new tab ↗
                 </a>
@@ -339,7 +368,7 @@ export function Operations({
                 title={opened.label}
                 className="computer-preview"
                 src={previewUrl(opened.url)}
-                sandbox="allow-scripts allow-forms allow-modals allow-downloads allow-popups"
+                sandbox={`allow-scripts allow-forms allow-modals allow-downloads allow-popups${previewIsolated(opened.url) ? ' allow-same-origin' : ''}`}
                 referrerPolicy="no-referrer"
               />
             </div>
@@ -359,9 +388,16 @@ export function Operations({
             processes.processes.map((process) => (
               <article className="computer-item stack" key={process.sessionId}>
                 <div className="row">
-                  <strong>{process.service?.name || process.sessionId}</strong>
+                  <strong>{process.job?.name || process.service?.name || process.sessionId}</strong>
+                  <span className="badge">
+                    {process.lifetime === 'job'
+                      ? 'Long-running job'
+                      : process.lifetime === 'service' || process.service
+                        ? 'Persistent service'
+                        : 'Task process'}
+                  </span>
                   <span className="muted">
-                    {process.status}
+                    {process.job?.state ?? process.status}
                     {process.exitCode !== undefined ? ` · exit ${process.exitCode}` : ''} ·{' '}
                     {Math.floor(process.ranForMs / 1000)}s
                   </span>
@@ -375,6 +411,15 @@ export function Operations({
                       ? ' · persistent service'
                       : ''}
                 </p>
+                {process.job && (
+                  <p className="muted">
+                    {process.job.state === 'completed'
+                      ? 'Finished. This job will not be started again automatically.'
+                      : process.job.checkpointResumable
+                        ? 'Continues beyond the agent turn. An interrupted run can recover using its declared checkpoint command.'
+                        : 'Continues beyond the agent turn. An interrupted run is kept for inspection and will not be restarted blindly.'}
+                  </p>
+                )}
                 {process.service?.listening && (
                   <p className="muted">
                     Listening: {process.service.listening.join(', ') || 'No listening ports'}
@@ -402,9 +447,30 @@ export function Operations({
                   >
                     Read output
                   </button>
+                  {process.job?.state === 'interrupted' && process.job.checkpointResumable && (
+                    <button
+                      className="button"
+                      disabled={busy}
+                      onClick={() =>
+                        void run(async () => {
+                          await post(
+                            `${base}/processes/${encodeURIComponent(process.sessionId)}/resume`,
+                            {}
+                          );
+                        })
+                      }
+                    >
+                      Resume checkpoint
+                    </button>
+                  )}
                   <button
                     className="button"
-                    disabled={busy || ['completed', 'killed'].includes(process.status)}
+                    disabled={
+                      busy ||
+                      ['completed', 'killed', 'failed', 'timed_out', 'stopped'].includes(
+                        process.job?.state ?? process.status
+                      )
+                    }
                     onClick={() => setConfirm({ id: process.sessionId, action: 'stop' })}
                   >
                     Stop
@@ -420,6 +486,8 @@ export function Operations({
           ) : (
             <p className="empty">No background processes are reported by this computer.</p>
           )}
+          <Computation key={workspace.id} workspaceId={workspace.id} />
+          <DebugSessions key={`debug-${workspace.id}`} workspaceId={workspace.id} />
         </>
       )}
       {tool === 'checkpoints' && (

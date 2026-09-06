@@ -1,8 +1,10 @@
+import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { constants } from 'node:fs';
-import { access, mkdir, rm, writeFile } from 'node:fs/promises';
+import { access, chmod, lstat, mkdir, readdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { Invocation } from './limits.js';
+import { assertMissionWorkspaceOpen, createMissionLease } from './mission-processes.js';
 
 /**
  * The privileged half of the agent sandbox. Running a command as a different Unix account needs
@@ -40,7 +42,42 @@ export interface AgentSandbox {
    * uses.
    */
   confineFilesystem?: boolean;
+  /** Measured helper support for supervised PID namespace teardown. */
+  processIsolation?: boolean;
+  /** Measured helper support for a private network namespace. */
+  networkIsolation?: boolean;
 }
+
+export const probeNativeIsolation = (
+  sandbox: AgentSandbox
+): Promise<{ processIsolation: boolean; networkIsolation: boolean }> =>
+  new Promise((resolve) => {
+    execFile(
+      sandbox.elevate,
+      ['-n', sandbox.helper, 'check'],
+      { timeout: 5000, maxBuffer: 8192 },
+      (error, output) =>
+        resolve({
+          processIsolation: !error && /^process-isolation=yes$/m.test(output),
+          networkIsolation: !error && /^network-isolation=yes$/m.test(output)
+        })
+    );
+  });
+
+export const probeMissionProcessIsolation = async (sandbox: AgentSandbox): Promise<boolean> =>
+  (await probeNativeIsolation(sandbox)).processIsolation;
+
+export const isCodingMissionWorkspace = async (root: string): Promise<boolean> => {
+  try {
+    const marker = await lstat(path.join(root, '.athanor', 'coding-parent.json'));
+    if (!marker.isFile() || marker.isSymbolicLink())
+      throw new Error('Invalid private coding mission marker');
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+};
 
 const SUDO_EXECUTABLE = '/usr/bin/sudo';
 
@@ -108,11 +145,8 @@ export const agentSandbox = (
  * Resolves the configured helper, refusing to start rather than silently running agent commands
  * as the runner's own account. A box that cannot sandbox has to say so.
  *
- * The spec directory is emptied and remade here. The helper unlinks every spec it reads and every
- * spec it refuses once it has vouched for the file as the runner's own, so a file still there at
- * startup is one the helper never saw or would not vouch for - sudo itself refused the
- * invocation, the runner died between writing it and spawning, or the file was not in the form
- * the helper reads. Nothing is in flight when the runner starts, so nothing there is still wanted.
+ * Unconsumed command specifications may be discarded at startup. Mission leases remain until
+ * their native namespace supervisor proves that no child can still write to a workspace.
  */
 export const resolveAgentSandbox = async (
   helper: string | undefined,
@@ -127,8 +161,13 @@ export const resolveAgentSandbox = async (
       `AGENT_SANDBOX_HELPER points at ${helper}, which is not executable. Agent commands would run as the runner's own account, so the runner will not start.`
     );
   }
-  await rm(specDirectory, { recursive: true, force: true });
   await mkdir(specDirectory, { recursive: true, mode: SPEC_DIRECTORY_MODE });
+  const info = await lstat(specDirectory);
+  if (!info.isDirectory() || info.isSymbolicLink())
+    throw new Error('Sandbox specifications require a private real directory');
+  await chmod(specDirectory, SPEC_DIRECTORY_MODE);
+  for (const name of await readdir(specDirectory))
+    if (/^[a-f0-9]+\.spec$/.test(name)) await rm(path.join(specDirectory, name), { force: true });
   return agentSandbox(helper, confineFilesystem, specDirectory);
 };
 
@@ -214,28 +253,48 @@ export const sandboxedInvocation = async (
   sandbox: AgentSandbox,
   isolateNetwork: boolean,
   confinementRoot: string | null,
-  cwd: string
-): Promise<Invocation> => {
+  cwd: string,
+  superviseProcessTree = false
+): Promise<Invocation & { processTreeLease?: string }> => {
+  if (confinementRoot) assertMissionWorkspaceOpen(confinementRoot);
   assertSandboxableCommand(invocation, env);
   if (cwd.includes('\0'))
     throw new Error('A command, its arguments and its environment may not contain a NUL byte');
   if (!path.isAbsolute(cwd))
     throw new Error('The directory a sandboxed command runs in must be an absolute path');
   const confined = sandbox.confineFilesystem === true && confinementRoot !== null;
+  const mission = confinementRoot !== null && (await isCodingMissionWorkspace(confinementRoot));
+  if (mission && sandbox.networkIsolation !== true)
+    throw new Error('Coding missions require measured native network isolation');
+  const networkIsolated = mission || isolateNetwork;
+  const supervised = mission || superviseProcessTree;
+  if (supervised && (!confined || sandbox.processIsolation !== true))
+    throw new Error(
+      'Coding missions require measured native filesystem and process-tree isolation'
+    );
   const specPath = await writeSpec(sandbox.specDirectory, [
     cwd,
     ...environmentArguments(env),
     invocation.executable,
     ...invocation.args
   ]);
+  const processTreeLease = supervised ? specPath.replace(/\.spec$/, '.lease') : undefined;
+  if (processTreeLease)
+    await createMissionLease(
+      confinementRoot!,
+      processTreeLease,
+      sandbox,
+      mission ? 'mission' : 'session'
+    );
   return {
+    ...(processTreeLease ? { processTreeLease } : {}),
     executable: sandbox.elevate,
     args: [
       '-n',
       sandbox.helper,
       'run',
-      isolateNetwork ? 'isolated' : 'network',
-      confined ? 'confine' : 'open',
+      networkIsolated ? 'isolated' : 'network',
+      supervised ? 'mission' : confined ? 'confine' : 'open',
       confined ? confinementRoot : NO_CONFINEMENT_ROOT,
       '--spec',
       specPath

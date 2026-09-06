@@ -1,3 +1,5 @@
+import { continueTaskOperation } from '../task-continuation.js';
+import { stopCodingMissionFamily, removeCodingMissionFamily } from '../coding-mission-cleanup.js';
 /**
  * Conversations: starting one, sending to it, reading it back, and the plan it is working to.
  *
@@ -8,7 +10,6 @@
 
 import { randomUUID } from 'node:crypto';
 import {
-  ContinueTaskRequest,
   CreateTaskRequest,
   TaskPageQuery,
   UpdateSecurityModeRequest,
@@ -18,7 +19,6 @@ import {
 import type { TaskPage, TaskPlanStep } from '@athanor/contracts';
 import {
   AthanorError,
-  decryptJson,
   encryptJson,
   inferModelTask,
   modelFit,
@@ -26,11 +26,12 @@ import {
   unwrapDataKey
 } from '@athanor/core';
 import type { RoutableModel } from '@athanor/core';
-import { startTurnState } from '@athanor/worker';
 import { ownerPriceCeiling, resumableTaskStatuses, taskResponse } from '../context.js';
+import { withTaskDeliveryStatus } from '../task-delivery-status.js';
 import { requireUser } from '../http/auth-hook.js';
 import type { RouteContext } from '../http/server-context.js';
 import { errorFields } from '../log.js';
+import { validateTaskReasoning } from '../task-reasoning.js';
 import { recordSecurityEvent } from '../security-events.js';
 
 export const registerTaskRoutes = (context: RouteContext): void => {
@@ -38,6 +39,7 @@ export const registerTaskRoutes = (context: RouteContext): void => {
     log,
     app,
     store,
+    database,
     masterKey,
     privateTaskResponse,
     privateTaskPlanResponse,
@@ -82,7 +84,7 @@ export const registerTaskRoutes = (context: RouteContext): void => {
     ]);
     return {
       tasks: await Promise.all(
-        page.tasks.map((task) =>
+        (await withTaskDeliveryStatus(database, user.id, page.tasks)).map((task) =>
           privateTaskResponse(
             task,
             workspaces.find((workspace) => workspace.id === task.workspaceId)
@@ -240,6 +242,7 @@ export const registerTaskRoutes = (context: RouteContext): void => {
           'The selected model is not available for this privacy route'
         );
       }
+      const reasoningEffort = validateTaskReasoning(input.reasoningEffort ?? 'auto', selected);
       const dataKey = unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id);
       const title =
         input.title ?? input.prompt.trim().split(/\s+/).slice(0, 10).join(' ').slice(0, 160);
@@ -249,6 +252,7 @@ export const registerTaskRoutes = (context: RouteContext): void => {
         titleCiphertext: encryptJson({ title }, dataKey, `task-title:${workspace.id}`),
         nameIndex: nameIndexFor(title, input.prompt, dataKey),
         modelId: selected.id,
+        reasoningEffort,
         privacyRoute: input.privacyRoute,
         maxComputeCredits: Math.max(
           input.maxComputeCredits,
@@ -366,204 +370,15 @@ export const registerTaskRoutes = (context: RouteContext): void => {
   app.post<{ Params: { taskId: string } }>('/v1/tasks/:taskId/messages', async (request, reply) => {
     const user = requireUser(request.user);
     return idempotent(request, reply, user, async () => {
-      const input = ContinueTaskRequest.parse(request.body);
-      /*
-       * The conversation, the money and the catalogue, started together.
-       *
-       * The guard is keyed on the id in the path rather than on the row, which is the same string
-       * - `getTask` looks the row up by it - and is what lets the guard start before the row has
-       * come back.
-       *
-       * That is a read of a conversation row this caller has not yet been shown to own, so it is
-       * worth being exact about what it can and cannot become. `spendGuard` uses it to work out
-       * headroom and returns a verdict; nothing from that row is written, and nothing from it is
-       * ever put in a response, because the ownership check below is unwrapped first and throws
-       * `task_not_found` before the guard's answer is looked at. Chaining the guard onto the row
-       * instead would put it behind a round trip it does not need and would buy no boundary that
-       * the check below does not already hold.
-       */
-      const taskRead = started(store.getTask(user.id, request.params.taskId));
-      const guarded = started(
-        resolveSpendCeiling(user.id, input.maxSpendUsd).then(async (ceilingUsd) => {
-          await assertSpendCeilingAllowed({
-            userId: user.id,
-            ceilingUsd,
-            taskId: request.params.taskId
-          });
-          return ceilingUsd;
-        })
-      );
-      const catalogRead = started(modelsForUser(user));
-      const task = (await taskRead)();
-      if (!task) throw new AthanorError('task_not_found', 'Task not found');
-      if (task.userId !== user.id)
-        throw new AthanorError(
-          'task_owner_required',
-          'Start a new task to continue work created by another team member',
-          403
-        );
-      const activeTask = ['queued', 'planning', 'running', 'awaiting_user', 'paused'].includes(
-        task.status
-      );
-      /**
-       * A stopped conversation continues like a finished one.
-       *
-       * Stop tells the owner "the work so far is kept - send a message to continue from here", and
-       * that sentence has to be true: cancelling releases the reservations and ends the run, but
-       * the agent state it wrote is intact, so the next message resumes the same conversation
-       * rather than silently opening a new one and abandoning what they were reading.
-       */
-      if (
-        !activeTask &&
-        !['completed', 'failed', 'awaiting_resource', 'cancelled'].includes(task.status)
-      )
-        throw new AthanorError(
-          'task_not_continuable',
-          'This task cannot accept another message; branch it or start a new task',
-          409
-        );
-      const workspace = await store.getWorkspace(user.id, task.workspaceId);
-      if (!workspace?.wrappedKey)
-        throw new AthanorError('workspace_not_found', 'Workspace not found');
-      if (workspace.status !== 'running')
-        throw new AthanorError('workspace_unavailable', 'Workspace is not running');
-      const privacyRoute = input.privacyRoute ?? task.privacyRoute;
-      /**
-       * A follow-up brings its own ceiling: the store anchors it to what the task has already
-       * spent, so `additionalSpendUsd` is headroom for this turn rather than a new total. The task
-       * itself is excluded from the open commitments it is checked against, for the same reason.
-       */
-      const spendCeilingUsd = (await guarded)();
-      const catalog = (await catalogRead)();
-      const selected = catalog.find((model) => model.id === (input.modelId ?? task.modelId));
-      if (
-        !selected ||
-        selected.availability !== 'available' ||
-        selected.privacyRoute !== privacyRoute
-      )
-        throw new AthanorError(
-          'model_unavailable',
-          'The selected model is not available for this privacy route'
-        );
-      const dataKey = unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id);
-      if (activeTask) {
-        const messageId = randomUUID();
-        const queued = await store.enqueueTaskMessage({
-          id: messageId,
-          taskId: task.id,
-          userId: user.id,
-          modelId: selected.id,
-          privacyRoute,
-          maxComputeCredits: Math.max(
-            input.maxComputeCredits,
-            computeAllowanceFor(selected, config.TASK_MAX_STEPS)
-          ),
-          maxSpendUsd: spendCeilingUsd,
-          resourceClass: selected.usageClass,
-          reservationKey: `task:${task.id}:message:${messageId}:reservation`,
-          ...(input.interrupt ? { interrupt: true } : {}),
-          promptCiphertext: encryptJson(
-            { prompt: input.prompt },
-            dataKey,
-            `task-message:${task.id}`
-          ),
-          queuedEventCiphertext: encryptJson(
-            { markdown: input.prompt, position: task.queuedMessageCount + 1 },
-            dataKey,
-            `task-event:${task.id}`
-          )
-        });
-        if (!queued)
-          throw new AthanorError(
-            'task_message_queue_conflict',
-            'The task changed while this message was being queued; send it again',
-            409
-          );
-        /*
-         * A reply to a conversation parked on a question is the thing it is parked for.
-         *
-         * Nothing re-leases `awaiting_user` - the lease query only ever hands out queued, planning
-         * and running - and until the agent had a way to ask, the only thing that ever put a task
-         * into that state was an approval, which the approval card takes it back out of. A question
-         * is answered by writing, so without this the answer would sit in the message queue for
-         * ever and the conversation could never be reached again from any door.
-         *
-         * A live approval is deliberately excluded. That card is the way to answer it and the
-         * worker resumes into the pending call expecting a decision; requeueing on a message would
-         * spend a lease discovering the approval is still pending and park again. Ordinary
-         * follow-ups to a working task are untouched: only a task that has actually stopped for the
-         * owner is moved, and the message it just queued is what the resumed turn reads.
-         */
-        const unparked =
-          task.status === 'awaiting_user' &&
-          !(await store.listApprovals(user.id, 'pending')).some(
-            (approval) => String(approval.taskId) === task.id
-          ) &&
-          (await store.setTaskStatusForUser(user.id, task.id, 'queued'));
-        // Re-read only when it moved. `enqueueTaskMessage` returns the row as it was before the
-        // status changed, and that row is what the client decides from - answering a question and
-        // being told the conversation is still waiting for you is the wrong sentence to end on.
-        return privateTaskResponse(
-          unparked ? ((await store.getTask(user.id, task.id)) ?? queued) : queued,
-          workspace
-        );
-      }
-      if (!task.agentStateCiphertext || task.agentStateCiphertext.aad !== `task-state:${task.id}`)
-        throw new AthanorError(
-          'task_context_unavailable',
-          'This task stopped before a resumable conversation checkpoint was saved',
-          409
-        );
-      const previousState = decryptJson<
-        Record<string, unknown> & {
-          messages: Array<Record<string, unknown>>;
-          step: number;
-          credits: number;
-          turn?: number;
-        }
-      >(task.agentStateCiphertext, dataKey);
-      if (!Array.isArray(previousState.messages))
-        throw new AthanorError('task_context_invalid', 'Task conversation state is invalid');
-      const nextTurn = Math.max(0, Number(previousState.turn ?? 0)) + 1;
-      const reservationKey = `task:${task.id}:turn:${nextTurn}:reservation`;
-      // The same reset the worker's own door performs, from the same function. These two had
-      // drifted: this one cleared four fields where that one clears eleven and deletes three, and
-      // this is the door an ordinary reply comes through - so the common case was the broken one.
-      const nextState = startTurnState(previousState as unknown as Record<string, unknown>, {
-        prompt: input.prompt,
-        turn: nextTurn,
-        reservationKey
-      });
-      const updated = await store.continueTask({
-        id: task.id,
-        userId: user.id,
-        modelId: selected.id,
-        privacyRoute,
-        additionalComputeCredits: input.maxComputeCredits,
-        additionalSpendUsd: spendCeilingUsd,
-        agentStateCiphertext: encryptJson(nextState, dataKey, `task-state:${task.id}`),
-        reservationKey,
-        resourceClass: selected.usageClass,
-        userMessageCiphertext: encryptJson(
-          { markdown: input.prompt },
-          dataKey,
-          `task-event:${task.id}`
-        )
-      });
-      if (!updated)
-        throw new AthanorError(
-          'task_continue_conflict',
-          'This task changed before the follow-up could be queued',
-          409
-        );
-      return privateTaskResponse(updated, workspace);
+      return continueTaskOperation(context, user, request.params.taskId, request.body);
     });
   });
 
   app.get<{ Params: { taskId: string } }>('/v1/tasks/:taskId', async (request) => {
-    const task = await store.getTask(requireUser(request.user).id, request.params.taskId);
+    const user = requireUser(request.user);
+    const task = await store.getTask(user.id, request.params.taskId);
     if (!task) throw new AthanorError('task_not_found', 'Task not found');
-    return privateTaskResponse(task);
+    return privateTaskResponse((await withTaskDeliveryStatus(database, user.id, [task]))[0]!);
   });
 
   app.patch<{ Params: { taskId: string } }>('/v1/tasks/:taskId', async (request, reply) => {
@@ -606,6 +421,16 @@ export const registerTaskRoutes = (context: RouteContext): void => {
       if (!task) throw new AthanorError('task_not_found', 'Task not found');
       if (['queued', 'planning', 'running'].includes(task.status))
         throw new AthanorError('task_active', 'Stop this task before deleting it', 409);
+      if (task.parentMissionId)
+        throw new AthanorError(
+          'coding_mission_scoped',
+          'Remove isolated specialist work through its parent task',
+          409
+        );
+      if (task.hasCodingFamily) {
+        await store.cancelTaskAndReleaseReservations(user.id, task.id);
+        await removeCodingMissionFamily(context, task);
+      }
       return { deleted: await store.deleteTask(user.id, task.id) };
     });
   });
@@ -647,6 +472,12 @@ export const registerTaskRoutes = (context: RouteContext): void => {
     if (!workspace?.wrappedKey)
       throw new AthanorError('workspace_not_found', 'Workspace not found');
     const input = UpdateTaskPlanRequest.parse(request.body);
+    const previousPlan =
+      input.outputs === undefined ? await store.getLatestTaskPlan(task.id) : null;
+    const previousOutputs = previousPlan
+      ? (await privateTaskPlanResponse(previousPlan, workspace)).outputs
+      : undefined;
+    const outputs = input.outputs ?? previousOutputs;
     const steps: TaskPlanStep[] = input.steps.map((step) => ({
       id: step.id ?? randomUUID(),
       title: step.title,
@@ -661,7 +492,7 @@ export const registerTaskRoutes = (context: RouteContext): void => {
         ...(input.parentVersion ? { parentVersion: input.parentVersion } : {}),
         branchName: input.branchName,
         stepsCiphertext: encryptJson(
-          { steps, branchName: input.branchName },
+          { steps, branchName: input.branchName, ...(outputs === undefined ? {} : { outputs }) },
           key,
           `task-plan:${task.id}`
         ),
@@ -688,7 +519,8 @@ export const registerTaskRoutes = (context: RouteContext): void => {
             planId: created.id,
             version: created.version,
             branchName: input.branchName,
-            steps
+            steps,
+            ...(outputs === undefined ? {} : { outputs })
           }
         },
         key,
@@ -720,8 +552,10 @@ export const registerTaskRoutes = (context: RouteContext): void => {
             409
           );
         const status = action === 'pause' ? 'paused' : 'queued';
-        if (action === 'cancel') await store.cancelTaskAndReleaseReservations(user.id, task.id);
-        else await store.setTaskStatusForUser(user.id, task.id, status);
+        if (action === 'cancel') {
+          await store.cancelTaskAndReleaseReservations(user.id, task.id);
+          await stopCodingMissionFamily(context, task);
+        } else await store.setTaskStatusForUser(user.id, task.id, status);
         log.info('task.action', { taskId: task.id, userId: user.id, kind: action, status });
         return privateTaskResponse((await store.getTask(user.id, task.id))!);
       });

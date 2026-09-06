@@ -195,6 +195,28 @@ describe('what the runner measured, and what it could not', () => {
     expect(prepared.preparedSeconds).toBe(5400);
   });
 
+  it('bounds prepared audio before buffering a provider-sized upload, even without a length header', async () => {
+    const cancel = vi.fn();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(new Uint8Array(25 * 1024 * 1024));
+                controller.enqueue(new Uint8Array([1]));
+              },
+              cancel
+            })
+          )
+      )
+    );
+    await expect(
+      client.prepareAudio(workspaceId, taskId, { path: 'workspace/meeting.ogg' })
+    ).rejects.toThrow(/exceed|limit/i);
+    expect(cancel).toHaveBeenCalledOnce();
+  });
   it('reads the length when the runner did measure one', async () => {
     audio({
       'x-audio-start-seconds': '0',
@@ -299,5 +321,42 @@ describe('who a request is signed for', () => {
     );
     // And the client that was asked is not changed by asking.
     expect(await subjectOf(client)).toBe(taskId);
+  });
+});
+
+describe('bounded workspace file uploads', () => {
+  it('bounds streamed bytes even when the length header is absent', async () => {
+    const cancel = vi.fn();
+    vi.stubGlobal(
+      'fetch',
+      async () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new Uint8Array(6));
+              controller.enqueue(new Uint8Array(6));
+            },
+            cancel
+          })
+        )
+    );
+    await expect(
+      client.readBytes(workspaceId, taskId, 'workspace/reference.mp4', 10)
+    ).rejects.toMatchObject({ code: 'file_too_large' });
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+  it('reads a bounded upload and refuses invalid limits before contacting the runner', async () => {
+    const fetch = vi.fn(
+      async () => new Response(Buffer.from('clip'), { headers: { 'content-type': 'video/mp4' } })
+    );
+    vi.stubGlobal('fetch', fetch);
+    await expect(client.readBytes(workspaceId, taskId, 'reference.mp4', 4)).resolves.toEqual({
+      mimeType: 'video/mp4',
+      bytes: Buffer.from('clip')
+    });
+    await expect(client.readBytes(workspaceId, taskId, 'reference.mp4', -1)).rejects.toMatchObject({
+      code: 'file_size_limit_invalid'
+    });
+    expect(fetch).toHaveBeenCalledOnce();
   });
 });

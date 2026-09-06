@@ -32,6 +32,9 @@ use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream,
 };
 
+#[path = "preview_proxy.rs"]
+mod preview_proxy;
+
 const RETRYABLE_BODY_LIMIT: usize = 16 * 1024 * 1024;
 const SERVER_SESSION_COOKIE: &str = "__Host-athanor_session";
 const LOCAL_SESSION_COOKIE: &str = "athanor_native_session";
@@ -72,6 +75,7 @@ pub struct ClientState {
     pairing_code: RwLock<Option<PendingPairing>>,
     local_origin: RwLock<String>,
     installer_origin: RwLock<String>,
+    preview: preview_proxy::PreviewState,
     /*
      * Why the connection last failed, for the owner rather than for stderr.
      *
@@ -83,6 +87,23 @@ pub struct ClientState {
 }
 
 impl ClientState {
+    pub async fn authorization_browser_url(self: &Arc<Self>, raw: &str) -> Result<String, String> {
+        let active = self.current().await?;
+        checked_authorization_browser_url(raw, &active.profile.endpoints)
+    }
+    pub async fn preview_browser_url(self: &Arc<Self>, raw: &str) -> Result<String, String> {
+        let active = self.current().await?;
+        let preview = preview_proxy::connection(self, &active).await;
+        checked_preview_browser_url(
+            raw,
+            canonical_origin(&active),
+            preview
+                .as_ref()
+                .map(|connection| connection.remote.origin().ascii_serialization())
+                .as_deref(),
+        )
+    }
+
     pub fn load(profile_path: PathBuf, pending_pairing_path: PathBuf) -> Result<Arc<Self>, String> {
         let profile = load_profile(&profile_path)?;
         let pairing_code = load_pending_pairing(&pending_pairing_path, SystemTime::now())?;
@@ -95,6 +116,7 @@ impl ClientState {
             pairing_code: RwLock::new(pairing_code),
             local_origin: RwLock::new(String::new()),
             installer_origin: RwLock::new(String::new()),
+            preview: preview_proxy::PreviewState::default(),
             last_error: RwLock::new(None),
         }))
     }
@@ -132,7 +154,7 @@ impl ClientState {
             .read()
             .await
             .clone()
-            .ok_or("Paste the one-time connection ticket from your athanor server")?;
+            .ok_or("Paste the one-time connection ticket from your garden server")?;
         match self.activate(profile).await {
             Ok(active) => {
                 *self.last_error.write().await = None;
@@ -217,7 +239,7 @@ impl ClientState {
     ) -> Result<(), String> {
         let mut profile_guard = self.profile.write().await;
         let Some(profile) = profile_guard.as_mut() else {
-            return Err("Connect an athanor server before saving network preferences".into());
+            return Err("Connect an garden server before saving network preferences".into());
         };
         profile.network_preference = preference;
         let profile_path = self.profile_path.clone();
@@ -231,6 +253,59 @@ impl ClientState {
         }
         Ok(())
     }
+}
+
+fn checked_preview_browser_url(
+    raw: &str,
+    owner: &str,
+    preview: Option<&str>,
+) -> Result<String, String> {
+    let url = url::Url::parse(raw).map_err(|_| "Invalid preview browser address")?;
+    let origin = url.origin().ascii_serialization();
+    if raw.len() > 16384
+        || url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !is_preview_path(url.path())
+        || (origin != owner && preview != Some(origin.as_str()))
+    {
+        return Err("Browser results must use this garden server's preview address".into());
+    }
+    // Retain the grant-bearing URL; the external browser must perform its own cookie exchange.
+    Ok(raw.to_owned())
+}
+
+fn checked_authorization_browser_url(raw: &str, endpoints: &[String]) -> Result<String, String> {
+    let url = url::Url::parse(raw).map_err(|_| "Invalid browser authorization address")?;
+    if raw.len() > 8192
+        || url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || !endpoints.iter().any(|endpoint| {
+            url::Url::parse(endpoint).is_ok_and(|endpoint| endpoint.origin() == url.origin())
+        })
+    {
+        return Err("Browser authorization must use this garden server".into());
+    }
+    let fields: Vec<_> =
+        url::form_urlencoded::parse(url.fragment().unwrap_or("").as_bytes()).collect();
+    if fields.is_empty()
+        || fields.len() > 2
+        || fields[0].0 != "native-auth"
+        || uuid::Uuid::parse_str(&fields[0].1).is_err()
+        || (fields.len() == 2
+            && (fields[1].0 != "native-onboard"
+                || fields[1].1.is_empty()
+                || !fields[1]
+                    .1
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')))
+    {
+        return Err("This address is not a garden device authorization".into());
+    }
+    Ok(url.to_string())
 }
 
 #[derive(Deserialize)]
@@ -293,7 +368,7 @@ pub async fn start(state: Arc<ClientState>) -> Result<String, String> {
             ));
     tauri::async_runtime::spawn(async move {
         if let Err(error) = axum::serve(installer_listener, installer_router).await {
-            eprintln!("athanor secure installer stopped: {error}");
+            eprintln!("garden secure installer stopped: {error}");
         }
     });
 
@@ -337,6 +412,7 @@ pub async fn start(state: Arc<ClientState>) -> Result<String, String> {
     }
     let origin = format!("http://localhost:{}", address.port());
     *state.local_origin.write().await = origin.clone();
+    preview_proxy::start(state.clone()).await?;
     let router = Router::new()
         .route("/__athanor/client/status", get(client_status))
         .route("/__athanor/client/pair", post(pair))
@@ -354,7 +430,7 @@ pub async fn start(state: Arc<ClientState>) -> Result<String, String> {
         ));
     tauri::async_runtime::spawn(async move {
         if let Err(error) = axum::serve(listener, router).await {
-            eprintln!("athanor private client gateway stopped: {error}");
+            eprintln!("garden private client gateway stopped: {error}");
         }
     });
     Ok(origin)
@@ -450,7 +526,7 @@ async fn only_this_gateway(State(port): State<u16>, request: Request, next: Next
             Json(serde_json::json!({
                 "error": {
                     "code": "invalid_client_host",
-                    "message": "This address is not the athanor client gateway"
+                    "message": "This address is not the garden client gateway"
                 }
             })),
         )
@@ -470,7 +546,7 @@ async fn pair(
             Json(serde_json::json!({
                 "error": {
                     "code": "invalid_client_origin",
-                    "message": "Connection tickets are accepted only from the athanor client"
+                    "message": "Connection tickets are accepted only from the garden client"
                 }
             })),
         )
@@ -503,7 +579,7 @@ async fn save_network_preference(
             Json(serde_json::json!({
                 "error": {
                     "code": "invalid_client_origin",
-                    "message": "Network preferences are accepted only from the athanor client"
+                    "message": "Network preferences are accepted only from the garden client"
                 }
             })),
         )
@@ -528,7 +604,7 @@ async fn forget_server(State(state): State<Arc<ClientState>>, headers: HeaderMap
             Json(serde_json::json!({
                 "error": {
                     "code": "invalid_client_origin",
-                    "message": "Disconnecting a server is accepted only from the athanor client"
+                    "message": "Disconnecting a server is accepted only from the garden client"
                 }
             })),
         )
@@ -614,7 +690,7 @@ async fn probe_ssh(
         return installer_error(
             StatusCode::FORBIDDEN,
             "invalid_installer_origin",
-            "SSH checks are accepted only from the secure athanor installer".into(),
+            "SSH checks are accepted only from the secure garden installer".into(),
         );
     }
     match ssh_install::probe(request.host, request.port).await {
@@ -629,7 +705,7 @@ async fn choose_ssh_key(State(state): State<Arc<ClientState>>, headers: HeaderMa
         return installer_error(
             StatusCode::FORBIDDEN,
             "invalid_installer_origin",
-            "Private keys can be selected only from the secure athanor installer".into(),
+            "Private keys can be selected only from the secure garden installer".into(),
         );
     }
     let selected = rfd::AsyncFileDialog::new()
@@ -658,7 +734,7 @@ async fn install_server(
         return installer_error(
             StatusCode::FORBIDDEN,
             "invalid_installer_origin",
-            "Server installation is accepted only from the secure athanor installer".into(),
+            "Server installation is accepted only from the secure garden installer".into(),
         );
     }
     match ssh_install::install(request).await {
@@ -674,7 +750,7 @@ async fn install_server(
             Err(message) => installer_error(
                 StatusCode::BAD_GATEWAY,
                 "server_pairing_failed",
-                format!("athanor installed, but its private HTTPS connection failed: {message}"),
+                format!("garden installed, but its private HTTPS connection failed: {message}"),
             ),
         },
         Err(message) => installer_error(StatusCode::BAD_REQUEST, "server_install_failed", message),
@@ -771,6 +847,19 @@ fn local_set_cookie(raw: &str) -> Option<HeaderValue> {
     HeaderValue::from_str(&translated).ok()
 }
 
+fn issued_server_session(path: &str, status: StatusCode, headers: &HeaderMap) -> bool {
+    let prefix = format!("{SERVER_SESSION_COOKIE}=");
+    path.starts_with("/v1/auth/")
+        && status.is_success()
+        && headers.get_all(SET_COOKIE).iter().any(|value| {
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| value.strip_prefix(&prefix))
+                .is_some_and(|value| !value.split(';').next().unwrap_or("").is_empty())
+        })
+}
+
 fn upstream_url(active: &ActiveServer, path_and_query: &str) -> String {
     format!(
         "{}{}",
@@ -785,6 +874,62 @@ fn upstream_url(active: &ActiveServer, path_and_query: &str) -> String {
 
 fn canonical_origin(active: &ActiveServer) -> &str {
     &active.profile.endpoints[0]
+}
+
+fn is_preview_path(path: &str) -> bool {
+    let Some(remainder) = path.strip_prefix("/__athanor/preview/") else {
+        return false;
+    };
+    let slug = remainder.split('/').next().unwrap_or("");
+    slug.len() == 32
+        && slug
+            .bytes()
+            .all(|value| value.is_ascii_digit() || (b'a'..=b'f').contains(&value))
+}
+
+fn native_preview_policy(raw: &str, trusted_origin: &str, local_origin: &str) -> String {
+    raw.split_inclusive([';', ','])
+        .map(|part| {
+            let directive = part.trim_end_matches([';', ',']);
+            if !directive
+                .split_ascii_whitespace()
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case("frame-ancestors"))
+            {
+                return part.to_owned();
+            }
+            let mut mapped = directive
+                .split_inclusive(|value: char| value.is_ascii_whitespace())
+                .map(|piece| {
+                    let source = piece.trim_end_matches(|value: char| value.is_ascii_whitespace());
+                    if source == trusted_origin {
+                        format!("{local_origin}{}", &piece[source.len()..])
+                    } else {
+                        piece.to_owned()
+                    }
+                })
+                .collect::<String>();
+            mapped.push_str(&part[directive.len()..]);
+            mapped
+        })
+        .collect()
+}
+
+fn native_location(raw: &str, endpoints: &[String], local_origin: &str) -> Option<String> {
+    let destination = url::Url::parse(raw).ok()?;
+    if !destination.username().is_empty()
+        || destination.password().is_some()
+        || !endpoints.iter().any(|endpoint| {
+            url::Url::parse(endpoint).is_ok_and(|trusted| trusted.origin() == destination.origin())
+        })
+    {
+        return None;
+    }
+    let mut local = url::Url::parse(local_origin).ok()?;
+    local.set_path(destination.path());
+    local.set_query(destination.query());
+    local.set_fragment(destination.fragment());
+    Some(local.to_string())
 }
 
 fn should_buffer_for_retry(
@@ -836,6 +981,9 @@ fn upstream_response(
     response: reqwest::Response,
     active: &ActiveServer,
     local_origin: &str,
+    request_path: &str,
+    preview: Option<&preview_proxy::Connection>,
+    preview_local_origin: &str,
 ) -> Response {
     let status = response.status();
     let mut builder = Response::builder().status(status);
@@ -844,8 +992,54 @@ fn upstream_response(
             HeaderName::from_static("x-athanor-native-client"),
             HeaderValue::from_static("1"),
         );
+        if let Ok(origin) = HeaderValue::from_str(canonical_origin(active)) {
+            headers.insert(HeaderName::from_static("x-athanor-server-origin"), origin);
+        }
+        if let Some(preview) = preview {
+            headers.insert(
+                HeaderName::from_static("x-athanor-preview-origin"),
+                HeaderValue::from_str(&preview.remote.origin().ascii_serialization()).unwrap(),
+            );
+            headers.insert(
+                HeaderName::from_static("x-athanor-preview-local-origin"),
+                HeaderValue::from_str(&preview.local).unwrap(),
+            );
+        }
         for (name, value) in response.headers() {
             if !is_hop_by_hop(name) && name != CONTENT_LENGTH {
+                if matches!(
+                    name.as_str(),
+                    "x-athanor-native-client"
+                        | "x-athanor-server-origin"
+                        | "x-athanor-preview-origin"
+                        | "x-athanor-preview-local-origin"
+                ) {
+                    continue;
+                }
+                if name.as_str() == "content-security-policy" && is_preview_path(request_path) {
+                    if let Some(policy) = value.to_str().ok().and_then(|raw| {
+                        HeaderValue::from_str(&native_preview_policy(
+                            raw,
+                            canonical_origin(active),
+                            local_origin,
+                        ))
+                        .ok()
+                    }) {
+                        headers.append(name.clone(), policy);
+                        continue;
+                    }
+                }
+                if name.as_str() == "content-security-policy" && request_path == "/" {
+                    if let Ok(raw) = value.to_str() {
+                        if let Ok(policy) = HeaderValue::from_str(&preview_proxy::app_policy(
+                            raw,
+                            preview_local_origin,
+                        )) {
+                            headers.append(name.clone(), policy);
+                            continue;
+                        }
+                    }
+                }
                 if name == SET_COOKIE {
                     if let Some(value) = value.to_str().ok().and_then(local_set_cookie) {
                         headers.append(name.clone(), value);
@@ -856,10 +1050,8 @@ fn upstream_response(
                 }
                 if name == LOCATION {
                     if let Ok(raw) = value.to_str() {
-                        let rewritten = active.profile.endpoints.iter().find_map(|endpoint| {
-                            raw.strip_prefix(endpoint)
-                                .map(|suffix| format!("{local_origin}{suffix}"))
-                        });
+                        let rewritten =
+                            native_location(raw, &active.profile.endpoints, local_origin);
                         if let Some(rewritten) = rewritten {
                             if let Ok(rewritten) = HeaderValue::from_str(&rewritten) {
                                 headers.append(name.clone(), rewritten);
@@ -918,7 +1110,7 @@ async fn proxy(State(state): State<Arc<ClientState>>, request: Request) -> Respo
             Json(serde_json::json!({
                 "error": {
                     "code": "invalid_client_origin",
-                    "message": "This request did not come from the athanor client"
+                    "message": "This request did not come from the garden client"
                 }
             })),
         )
@@ -965,6 +1157,8 @@ async fn proxy(State(state): State<Arc<ClientState>>, request: Request) -> Respo
     }
 
     let (parts, body) = request.into_parts();
+    let request_path = parts.uri.path().to_owned();
+    let request_method = parts.method.clone();
     let path_and_query = parts
         .uri
         .path_and_query()
@@ -1035,12 +1229,21 @@ async fn proxy(State(state): State<Arc<ClientState>>, request: Request) -> Respo
 
     match response {
         Ok((response, used)) => {
-            if path_and_query == "/v1/auth/register/verify" && response.status().is_success() {
+            preview_proxy::observe(&state, &used, &request_path, &request_method, &response).await;
+            let preview = preview_proxy::connection(&state, &used).await;
+            if issued_server_session(&path_and_query, response.status(), response.headers()) {
                 if let Err(error) = state.clear_pairing_code().await {
-                    eprintln!("athanor could not remove the consumed pairing code: {error}");
+                    eprintln!("garden could not remove the consumed pairing code: {error}");
                 }
             }
-            upstream_response(response, &used, &state.local_origin().await)
+            upstream_response(
+                response,
+                &used,
+                &state.local_origin().await,
+                &request_path,
+                preview.as_ref(),
+                &state.preview.origin.read().await,
+            )
         }
         Err(error) => {
             state.invalidate().await;
@@ -1100,7 +1303,7 @@ async fn websocket_proxy(
         .await
         {
             state.invalidate().await;
-            eprintln!("athanor websocket gateway closed: {error}");
+            eprintln!("garden websocket gateway closed: {error}");
         }
     })
 }
@@ -1170,6 +1373,13 @@ async fn bridge_websocket(
                 .map_err(|retry_error| format!("{first_error}; reconnect failed: {retry_error}"))?
         }
     };
+    relay_websocket_streams(browser, server).await
+}
+
+async fn relay_websocket_streams(
+    browser: WebSocket,
+    server: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+) -> Result<(), String> {
     let (mut browser_out, mut browser_in) = browser.split();
     let (mut server_out, mut server_in) = server.split();
     loop {
@@ -1235,10 +1445,10 @@ fn offline_page(
     <strong>A stable hostname prevents this next time</strong>
     <ol>
       <li>Choose a dynamic-DNS hostname from your router, VPS provider, DuckDNS, or your own DNS provider.</li>
-      <li>Keep that hostname updated to the server's current public IP and ensure TCP 443 reaches athanor.</li>
-      <li>On the server run <code>sudo athanor set-hostname your-name.example.com</code>, then scan the refreshed QR ticket.</li>
+      <li>Keep that hostname updated to the server's current public IP and ensure TCP 443 reaches garden.</li>
+      <li>On the server run <code>sudo garden set-hostname your-name.example.com</code>, then scan the refreshed QR ticket.</li>
     </ol>
-    <p class="privacy">Dynamic DNS learns the hostname and IP required to provide DNS. It never bypasses athanor's pinned identity, passkey, or TLS checks.</p>
+    <p class="privacy">Dynamic DNS learns the hostname and IP required to provide DNS. It never bypasses garden's pinned identity, passkey, or TLS checks.</p>
   </section>"#
             .to_owned(),
     };
@@ -1247,49 +1457,49 @@ fn offline_page(
 <html lang="en">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Connect athanor</title>
+<title>Connect garden</title>
 <style>
   :root {{ color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }}
   * {{ box-sizing: border-box; }}
-  body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; color: #f1f2f2;
-    background: radial-gradient(circle at 50% 0%, #25282b 0, #111315 42%, #090a0b 100%); }}
+  body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; color: #e9eee2;
+    background: #151d19; }}
   main {{ width: min(580px, calc(100vw - 32px)); padding: 36px; border-radius: 24px;
-    border: 1px solid #555a5f; background: rgba(22,24,26,.92);
+    border: 1px solid #48573e; background: #202c24;
     box-shadow: 0 24px 80px #000a, inset 0 1px #ffffff1a; }}
-  .brand {{ font-size: 22px; letter-spacing: .02em; margin-bottom: 44px; }}
-  .eyebrow {{ color: #aeb3b7; text-transform: uppercase; letter-spacing: .14em; font-size: 11px; }}
+  .brand {{ font: 38px Georgia, serif; letter-spacing: -.05em; margin-bottom: 32px; }}
+  .eyebrow {{ color: #adbaa4; text-transform: uppercase; letter-spacing: .14em; font-size: 11px; }}
   h1 {{ font-size: clamp(29px, 5vw, 42px); line-height: 1.05; margin: 10px 0 14px; }}
-  p {{ color: #b9bdc0; line-height: 1.55; }}
+  p {{ color: #adbaa4; line-height: 1.55; }}
   textarea {{ width: 100%; min-height: 120px; resize: vertical; margin: 18px 0 12px; padding: 15px;
-    color: #f4f5f5; background: #0d0f10; border: 1px solid #484d51; border-radius: 14px; outline: none; }}
-  textarea:focus {{ border-color: #d8dbdd; box-shadow: 0 0 0 3px #e9ecef14, 0 0 28px #dfe3e61c; }}
-  button {{ width: 100%; border: 1px solid #e6e9eb; border-radius: 13px; padding: 13px 18px;
-    color: #111315; background: linear-gradient(110deg,#f6f7f7,#bfc4c7,#f3f4f4); font-weight: 720;
-    cursor: pointer; box-shadow: 0 0 24px #eef2f329; }}
+    color: #e9eee2; background: #151d19; border: 1px solid #48573e; border-radius: 14px; outline: none; }}
+  textarea:focus {{ border-color: #d5e8a9; box-shadow: 0 0 0 3px #e9ecef14, 0 0 28px #dfe3e61c; }}
+  button {{ width: 100%; border: 1px solid #d5e8a9; border-radius: 13px; padding: 13px 18px;
+    color: #151d19; background: #d5e8a9; font-weight: 720;
+    cursor: pointer; }}
   button:disabled {{ opacity: .55; cursor: wait; }}
   .error {{ min-height: 24px; margin-top: 12px; color: #e6a8a8; font-size: 13px; }}
   .hint {{ font-size: 13px; }}
-  .network-help {{ margin-top: 22px; padding-top: 20px; border-top: 1px solid #3c4145; }}
+  .network-help {{ margin-top: 22px; padding-top: 20px; border-top: 1px solid #48573e; }}
   .network-help strong {{ display: block; margin-bottom: 4px; }}
-  .network-help ol {{ padding-left: 21px; color: #c7cbcd; line-height: 1.55; }}
-  .network-help code {{ color: #f0f1f2; }}
+  .network-help ol {{ padding-left: 21px; color: #adbaa4; line-height: 1.55; }}
+  .network-help code {{ color: #e9eee2; }}
   .choice-row {{ display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin-top: 12px; }}
   .choice-row button {{ padding: 10px; }}
-  button.secondary {{ color: #eceeef; background: #24272a; border-color: #697075; box-shadow: none; }}
-  button.quiet {{ color: #b9bdc0; background: transparent; border-color: #3e4347; box-shadow: none; }}
+  button.secondary {{ color: #e9eee2; background: #2a382d; border-color: #48573e; box-shadow: none; }}
+  button.quiet {{ color: #adbaa4; background: transparent; border-color: #48573e; box-shadow: none; }}
   .privacy {{ font-size: 12px; }}
-  .install-link {{ display: block; margin-top: 18px; color: #aeb3b7; text-align: center; font-size: 13px; }}
+  .install-link {{ display: block; margin-top: 18px; color: #adbaa4; text-align: center; font-size: 13px; }}
 </style>
 <main>
-  <div class="brand">athanor</div>
+  <div class="brand">garden</div>
   <div class="eyebrow">Private server connection</div>
   <h1>Connect your AI computer</h1>
-  <p>Paste the one-time connection ticket printed after installing athanor. The app will pin your server’s permanent identity and follow its address when the IP changes.</p>
-  <textarea id="ticket" spellcheck="false" autocomplete="off" placeholder="athanor://pair/…"></textarea>
+  <p>Paste the one-time connection ticket printed after installing garden. The app will pin your server’s permanent identity and follow its address when the IP changes.</p>
+  <textarea id="ticket" spellcheck="false" autocomplete="off" placeholder="garden://pair/…"></textarea>
   <button id="connect">Connect securely</button>
   <div class="error" id="error">{safe_message}</div>
   <p class="hint">The server’s SSH login, IP address, and TLS warnings are not needed here.</p>
-  <a class="install-link" href="{installer_url}">Install athanor on a cloud server</a>
+  <a class="install-link" href="{installer_url}">Install garden on a cloud server</a>
   {network_help}
 </main>
 <script>
@@ -1332,6 +1542,82 @@ mod tests {
     use super::*;
     use crate::connection::{save_profile, Discovery, ServerProfile};
     use base64::Engine as _;
+
+    #[test]
+    fn pairing_secret_is_consumed_only_by_successful_session_issuance() {
+        let mut headers = HeaderMap::new();
+        for cookie in [
+            "unrelated=opaque",
+            "__Host-athanor_session_extra=opaque",
+            "__Host-athanor_session=; HttpOnly",
+        ] {
+            headers.insert(SET_COOKIE, HeaderValue::from_str(cookie).unwrap());
+            assert!(!issued_server_session(
+                "/v1/auth/native/redeem",
+                StatusCode::OK,
+                &headers
+            ));
+        }
+        headers.insert(
+            SET_COOKIE,
+            HeaderValue::from_static("__Host-athanor_session=opaque; Secure; HttpOnly"),
+        );
+        assert!(issued_server_session(
+            "/v1/auth/native/redeem",
+            StatusCode::OK,
+            &headers
+        ));
+        assert!(issued_server_session(
+            "/v1/auth/register/verify",
+            StatusCode::OK,
+            &headers
+        ));
+        assert!(!issued_server_session(
+            "/v1/auth/native/redeem",
+            StatusCode::FORBIDDEN,
+            &headers
+        ));
+        assert!(!issued_server_session(
+            "/v1/unrelated",
+            StatusCode::OK,
+            &headers
+        ));
+    }
+
+    #[test]
+    fn authorization_browser_is_bound_to_the_pinned_server_and_exact_flow() {
+        let endpoints = vec!["https://garden.example".to_owned()];
+        let request = "#native-auth=11111111-1111-4111-8111-111111111111";
+        let valid = format!("https://garden.example/{request}");
+        assert_eq!(
+            checked_authorization_browser_url(&valid, &endpoints).unwrap(),
+            valid
+        );
+        assert!(checked_authorization_browser_url(
+            &format!("{valid}&native-onboard=eyJtb2RlIjoicmVnaXN0ZXIifQ"),
+            &endpoints
+        )
+        .is_ok());
+        let denied = [
+            format!("https://outside.example/{request}"),
+            format!("http://garden.example/{request}"),
+            format!("https://garden.example:444/{request}"),
+            format!("https://secret@garden.example/{request}"),
+            format!("https://garden.example/redirect{request}"),
+            format!("https://garden.example/?redirect=https://outside.example{request}"),
+            format!("{valid}&callback=https://outside.example"),
+            format!("{valid}&native-auth=22222222-2222-4222-8222-222222222222"),
+            format!("{valid}&native-onboard=has%2Bpadding%3D"),
+            "https://garden.example/#native-auth=not-a-request".to_owned(),
+        ];
+        assert!(!denied.is_empty());
+        for address in denied {
+            assert!(
+                checked_authorization_browser_url(&address, &endpoints).is_err(),
+                "{address}"
+            );
+        }
+    }
 
     #[test]
     fn strips_hop_by_hop_headers_and_rewrites_browser_origin() {
@@ -1447,6 +1733,174 @@ mod tests {
     }
 
     #[test]
+    fn native_preview_ancestor_mapping_preserves_other_policy_authority() {
+        let trusted = "https://example.test";
+        let local = "http://localhost:41000";
+        let cases = [
+            ("frame-ancestors https://example.test", "frame-ancestors http://localhost:41000"),
+            ("sandbox allow-scripts; frame-ancestors  https://example.test 'self'; object-src 'none'", "sandbox allow-scripts; frame-ancestors  http://localhost:41000 'self'; object-src 'none'"),
+            ("frame-ancestors https://example.test.evil https://example.test:8443 https://example.test/path", "frame-ancestors https://example.test.evil https://example.test:8443 https://example.test/path"),
+            ("connect-src https://example.test; sandbox allow-scripts, frame-ancestors https://example.test", "connect-src https://example.test; sandbox allow-scripts, frame-ancestors http://localhost:41000"),
+            ("frame-ancestors 'none'; sandbox allow-scripts", "frame-ancestors 'none'; sandbox allow-scripts"),
+        ];
+        assert!(!cases.is_empty());
+        for (raw, expected) in cases {
+            assert_eq!(native_preview_policy(raw, trusted, local), expected);
+        }
+    }
+
+    #[test]
+    fn native_preview_browser_open_is_scoped_and_preserves_signed_url() {
+        let owner = "https://garden.test";
+        let preview = "https://garden.test:8443";
+        let path = "/__athanor/preview/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/";
+        let raw = format!("{preview}{path}?access=fixture%2Fsigned%3D&next=%2Findex.html#scene");
+        assert_eq!(
+            checked_preview_browser_url(&raw, owner, Some(preview)).unwrap(),
+            raw
+        );
+        assert!(
+            checked_preview_browser_url(&format!("{owner}{path}?access=old"), owner, None).is_ok()
+        );
+        let denied = [
+            format!("https://garden.test.evil{path}"),
+            format!("https://other.test{path}"),
+            format!("http://localhost:41001{path}"),
+            format!("https://name@garden.test{path}"),
+            format!("{owner}/v1/bootstrap"),
+            "file:///etc/passwd".into(),
+            "javascript:alert(1)".into(),
+        ];
+        assert!(!denied.is_empty());
+        for raw in denied {
+            assert!(
+                checked_preview_browser_url(&raw, owner, Some(preview)).is_err(),
+                "{raw}"
+            );
+        }
+        assert!(checked_preview_browser_url(&raw, owner, None).is_err());
+    }
+
+    #[test]
+    fn native_preview_redirects_match_exact_parsed_origins() {
+        let endpoints = vec!["https://example.test".to_owned()];
+        let local = "http://localhost:41000";
+        assert_eq!(
+            native_location(
+                "https://EXAMPLE.test:443/a%2Fb?q=1#result",
+                &endpoints,
+                local
+            )
+            .as_deref(),
+            Some("http://localhost:41000/a%2Fb?q=1#result")
+        );
+        let denied = [
+            "https://example.test:8443/a",
+            "https://example.test.evil/a",
+            "https://example.test@evil.test/a",
+            "https://name@example.test/a",
+            "http://example.test/a",
+            "/relative",
+            "//example.test/a",
+        ];
+        assert!(!denied.is_empty());
+        for address in denied {
+            assert!(
+                native_location(address, &endpoints, local).is_none(),
+                "{address}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_preview_response_preserves_duplicate_sandbox_headers() {
+        let profile = test_profile();
+        let active = ActiveServer {
+            http: reqwest::Client::new(),
+            websocket_tls: Arc::new(pinned_tls_config(&profile.identity).unwrap()),
+            profile,
+        };
+        let sandbox = "sandbox allow-scripts allow-forms allow-popups allow-downloads allow-modals";
+        let upstream = || {
+            reqwest::Response::from(axum::http::Response::builder()
+            .header("content-security-policy", sandbox)
+            .header("content-security-policy", "frame-ancestors https://example.test")
+            .header("x-athanor-native-client", "forged")
+            .header("x-athanor-server-origin", "https://outside.test")
+            .header("location", "https://example.test:8443/__athanor/preview/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/")
+            .body("preview bytes").unwrap())
+        };
+        let result = upstream_response(
+            upstream(),
+            &active,
+            "http://localhost:41000",
+            "/__athanor/preview/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/index.html",
+            None,
+            "http://localhost:41001",
+        );
+        let csp = result
+            .headers()
+            .get_all("content-security-policy")
+            .iter()
+            .map(|value| value.to_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(csp, vec![sandbox, "frame-ancestors http://localhost:41000"]);
+        assert_eq!(
+            result
+                .headers()
+                .get_all("x-athanor-native-client")
+                .iter()
+                .count(),
+            1
+        );
+        assert_eq!(result.headers()["x-athanor-native-client"], "1");
+        assert_eq!(
+            result.headers()["x-athanor-server-origin"],
+            "https://example.test"
+        );
+        assert_eq!(
+            result.headers()[LOCATION],
+            "https://example.test:8443/__athanor/preview/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/"
+        );
+        assert_eq!(
+            to_bytes(result.into_body(), 1024).await.unwrap().as_ref(),
+            b"preview bytes"
+        );
+        let denied_paths = [
+            "/v1/share",
+            "/__athanor/preview/other/",
+            "/__athanor/preview/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-extra/",
+        ];
+        assert!(!denied_paths.is_empty());
+        for path in denied_paths {
+            let ordinary = upstream_response(
+                upstream(),
+                &active,
+                "http://localhost:41000",
+                path,
+                None,
+                "http://localhost:41001",
+            );
+            assert_eq!(
+                ordinary
+                    .headers()
+                    .get_all("content-security-policy")
+                    .iter()
+                    .map(|value| value.to_str().unwrap())
+                    .collect::<Vec<_>>(),
+                vec![sandbox, "frame-ancestors https://example.test"]
+            );
+        }
+        if let Ok(destination) = std::env::var("GARDEN_PREVIEW_HEADER_EVIDENCE") {
+            std::fs::write(
+                destination,
+                serde_json::to_vec_pretty(&serde_json::json!({"csp":csp})).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
     fn streams_large_or_unknown_mutations_instead_of_rejecting_them() {
         let mut idempotent = HeaderMap::new();
         idempotent.insert("idempotency-key", HeaderValue::from_static("operation-1"));
@@ -1528,7 +1982,7 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    fn test_profile() -> ServerProfile {
+    pub(super) fn test_profile() -> ServerProfile {
         ServerProfile {
             version: 1,
             identity: format!(

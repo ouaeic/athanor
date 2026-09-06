@@ -93,7 +93,7 @@ export function AccessSettings({ onChange }: { onChange: () => void }) {
                 disabled={action.busy}
                 onClick={() =>
                   void action.run(
-                    () => download('/v1/privacy/export', 'athanor-account.json', true),
+                    () => download('/v1/privacy/export', 'garden-account.json', true),
                     'Account export downloaded'
                   )
                 }
@@ -210,7 +210,7 @@ export function AccessSettings({ onChange }: { onChange: () => void }) {
                 src={qr}
                 width={220}
                 height={220}
-                alt="Scan to pair this device with your athanor computer"
+                alt="Scan to pair this device with your garden computer"
               />
             )}
             <SecretResult label="Device invitation" value={enrollment.webUri} link />

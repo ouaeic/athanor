@@ -116,8 +116,14 @@ export const taskNameTokens = (nameIndex: ConversationNameIndex): [string, strin
 export const TASK_LIVE_COUNTS = `
          (SELECT COUNT(*) FROM task_message_queue q
            WHERE q.task_id=t.id AND q.status='queued') AS queued_message_count,
-         (SELECT COALESCE(SUM(u.cost_usd),0) FROM usage_entries u
-           WHERE u.task_id=t.id AND u.state='settled' AND u.cost_usd>0) AS spent_usd,
+         CASE WHEN t.has_coding_family AND t.parent_mission_id IS NULL THEN (
+           SELECT COALESCE(SUM(charges.cost_usd),0) FROM (
+             SELECT u.cost_usd FROM usage_entries u JOIN tasks child ON child.id=u.task_id
+             WHERE (child.id=t.id OR (child.parent_mission_id IS NOT NULL AND child.parent_task_id=t.id)) AND u.state='settled' AND u.cost_usd>0
+             UNION ALL SELECT c.actual_usd FROM coding_family_calls c WHERE c.parent_task_id=t.id AND c.usage_id IS NULL AND c.actual_usd>0
+           ) charges
+         ) ELSE (SELECT COALESCE(SUM(u.cost_usd),0) FROM usage_entries u
+           WHERE u.task_id=t.id AND u.state='settled' AND u.cost_usd>0) END AS spent_usd,
          (SELECT COUNT(*) FROM task_shares s
            WHERE s.task_id=t.id AND s.revoked_at IS NULL
              AND (s.expires_at IS NULL OR s.expires_at > NOW())) AS share_count`;
