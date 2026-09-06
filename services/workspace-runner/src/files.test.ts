@@ -18,6 +18,7 @@ import {
   assertOpenedInPlace,
   assertUserDataPath,
   clearStagedUploads,
+  createWorkspaceFile,
   createWorkspaceFolder,
   ensureWorkspace,
   listFiles,
@@ -294,6 +295,20 @@ describe('workspace files', () => {
 });
 
 describe('a whole-file write that claims what it is replacing', () => {
+  it('reserves a new artifact atomically without replacing a competing writer', async () => {
+    const results = await Promise.allSettled([
+      createWorkspaceFile(root, 'workspace/export.txt', Buffer.from('first'), 100),
+      createWorkspaceFile(root, 'workspace/export.txt', Buffer.from('second'), 100)
+    ]);
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    const failed = results.find((result) => result.status === 'rejected');
+    expect(failed?.status === 'rejected' && failed.reason).toMatchObject({ code: 'EEXIST' });
+    expect(['first', 'second']).toContain(
+      await readFile(path.join(root, 'workspace/export.txt'), 'utf8')
+    );
+  });
+
   let root: string;
   beforeEach(async () => {
     root = await mkdtemp(path.join(tmpdir(), 'athanor-runner-'));
@@ -346,6 +361,36 @@ describe('a whole-file write that claims what it is replacing', () => {
       writeWorkspaceFile(root, 'workspace/new.md', Buffer.from('fresh\n'), 1_000_000)
     ).resolves.toMatchObject({ sizeBytes: 6 });
   });
+
+  it.each([
+    { name: 'a populated file', content: 'the version that was read\n', removeParent: false },
+    { name: 'an empty file', content: '', removeParent: false },
+    { name: 'the containing directory', content: 'the version that was read\n', removeParent: true }
+  ])(
+    'refuses without recreating anything after deletion of $name',
+    async ({ content, removeParent }) => {
+      const directory = path.join(root, 'workspace', 'project');
+      const target = path.join(directory, 'notes.md');
+      await mkdir(directory);
+      await writeFile(target, content);
+      const read = await readWorkspaceFile(root, 'workspace/project/notes.md', 1_000_000);
+      await rm(removeParent ? directory : target, { recursive: true });
+
+      const refusal = await writeWorkspaceFile(
+        root,
+        'workspace/project/notes.md',
+        Buffer.from('stale rewrite\n'),
+        1_000_000,
+        read.sha256,
+        A
+      ).catch((error: unknown) => error);
+      expect(refusal).toBeInstanceOf(WorkspaceFileError);
+      expect(refusal).toMatchObject({ status: 409 });
+      expect((refusal as Error).message).toContain('changed after you read it');
+      await expect(lstat(target)).rejects.toMatchObject({ code: 'ENOENT' });
+      if (removeParent) await expect(lstat(directory)).rejects.toMatchObject({ code: 'ENOENT' });
+    }
+  );
 });
 
 describe('reading a window of a file', () => {

@@ -670,30 +670,45 @@ const MAX_GUARDED_FILE_BYTES = 8 * 1024 ** 2;
  * read of the same file, or by her own pane paging it. The agent, which is the caller this guard is
  * for, names itself on every write it makes here.
  */
-export const writeWorkspaceFile = async (
+const writeFileInWorkspace = async (
   root: string,
   requested: string,
   content: Buffer,
   maxBytes: number,
-  expectSha256?: string,
-  heldTo?: Reader
+  options: { expectSha256?: string; heldTo?: Reader; exclusive?: boolean }
 ): Promise<{ sha256: string; sizeBytes: number }> => {
+  const { expectSha256, heldTo, exclusive = false } = options;
   if (content.length > maxBytes) throw new Error(`File exceeds ${maxBytes} byte write limit`);
   const target = resolveInside(root, requested);
   await rejectSymlinkComponents(root, target, true);
-  await mkdir(path.dirname(target), { recursive: true, mode: SHARED_MODE });
+  if (expectSha256 === undefined)
+    await mkdir(path.dirname(target), { recursive: true, mode: SHARED_MODE });
   await rejectSymlinkComponents(root, target, true);
+  const changedAfterRead = (): WorkspaceFileError =>
+    new WorkspaceFileError(
+      'This file changed after you read it, so writing the whole file would discard that change. Read it again and reapply your edit, or use file_patch, which matches on the surrounding text.',
+      409
+    );
   // Deliberately not O_TRUNC: the descriptor is only known to be the intended file once it has
   // been checked, and truncating first would empty whatever a raced path led to before the check
   // could refuse it.
   // Read-write whenever something below has to look at the old bytes, so every check reads through
   // the very descriptor that then writes and no path swap can happen between them.
   const inspect = expectSha256 !== undefined || heldTo !== undefined;
+  // A hash claims an existing file, including an empty one. Creating it during the check would
+  // leave a file behind on refusal, or accept a deleted empty file as unchanged.
   const handle = await open(
     target,
-    (inspect ? constants.O_RDWR : constants.O_WRONLY) | constants.O_CREAT | constants.O_NOFOLLOW,
+    (inspect ? constants.O_RDWR : constants.O_WRONLY) |
+      (expectSha256 === undefined ? constants.O_CREAT : 0) |
+      (exclusive ? constants.O_EXCL : 0) |
+      constants.O_NOFOLLOW,
     0o660
-  );
+  ).catch((error: unknown) => {
+    if (expectSha256 !== undefined && (error as NodeJS.ErrnoException).code === 'ENOENT')
+      throw changedAfterRead();
+    throw error;
+  });
   let edit: LineEdit | undefined;
   try {
     await assertOpenedInPlace(root, target, handle);
@@ -703,13 +718,7 @@ export const writeWorkspaceFile = async (
     const existing = details === undefined ? undefined : await handle.readFile();
     if (expectSha256 !== undefined && existing !== undefined) {
       const actual = createHash('sha256').update(existing).digest('hex');
-      // A file that did not exist reads as empty; the caller claiming a hash for it is claiming
-      // something that was true and is not, which is the same disagreement.
-      if (actual !== expectSha256)
-        throw new WorkspaceFileError(
-          'This file changed after you read it, so writing the whole file would discard that change. Read it again and reapply your edit, or use file_patch, which matches on the surrounding text.',
-          409
-        );
+      if (actual !== expectSha256) throw changedAfterRead();
     }
     /*
      * The seen-line guard, and it runs second on purpose. A file that moved under the caller is a
@@ -806,6 +815,28 @@ export const writeWorkspaceFile = async (
   }
   return { sha256: createHash('sha256').update(content).digest('hex'), sizeBytes: content.length };
 };
+
+export const writeWorkspaceFile = (
+  root: string,
+  requested: string,
+  content: Buffer,
+  maxBytes: number,
+  expectSha256?: string,
+  heldTo?: Reader
+): Promise<{ sha256: string; sizeBytes: number }> =>
+  writeFileInWorkspace(root, requested, content, maxBytes, {
+    ...(expectSha256 === undefined ? {} : { expectSha256 }),
+    ...(heldTo === undefined ? {} : { heldTo })
+  });
+
+/** Publish a new artifact without replacing a concurrently created file. */
+export const createWorkspaceFile = (
+  root: string,
+  requested: string,
+  content: Buffer,
+  maxBytes: number
+): Promise<{ sha256: string; sizeBytes: number }> =>
+  writeFileInWorkspace(root, requested, content, maxBytes, { exclusive: true });
 
 export const deleteWorkspaceFile = async (root: string, requested: string): Promise<void> => {
   const target = resolveInside(root, requested);
