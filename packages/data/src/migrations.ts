@@ -3290,5 +3290,18 @@ export const migrations = [
       ALTER TABLE notification_destinations ADD COLUMN IF NOT EXISTS sender_ciphertext JSONB;
       ALTER TABLE notification_destinations DROP COLUMN IF EXISTS sender_id;
     `
+  },
+  {
+    version: 83,
+    name: 'memory_source_sealed_provenance',
+    // Source bodies and their evidence links must survive a provenance schema upgrade unchanged.
+    // Empty metadata means no provenance was recorded; it never guesses a locator from content.
+    sql: `
+      ALTER TABLE mem.source ADD COLUMN IF NOT EXISTS origin_ciphertext JSONB NOT NULL
+        DEFAULT '{}'::jsonb;
+      ALTER TABLE mem.source ADD COLUMN IF NOT EXISTS origin_key TEXT;
+      CREATE INDEX IF NOT EXISTS mem_source_origin_idx
+        ON mem.source (workspace_id, origin_key, occurred_at DESC) WHERE origin_key IS NOT NULL;
+    `
   }
 ] as const;
