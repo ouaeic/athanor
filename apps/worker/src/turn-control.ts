@@ -47,7 +47,9 @@ export const drainCorrection = async (
   key: Uint8Array,
   state: AgentState
 ): Promise<boolean> => {
-  const queued = await deps.store.getNextQueuedTaskMessage(task.id).catch(() => null);
+  const queued = await deps.store
+    .getNextQueuedTaskMessage(task.id, { interruptOnly: true })
+    .catch(() => null);
   if (!queued?.interrupt) return false;
   const correction = decryptJson<{ prompt: string }>(queued.promptCiphertext, key).prompt;
   if (!correction.trim()) return false;

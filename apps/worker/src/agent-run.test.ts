@@ -5378,6 +5378,176 @@ describe('a correction sent while the task is working', () => {
   });
 });
 
+describe('queued message spending', () => {
+  it('carries the approved spend cap into a queued follow-up turn', async () => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const promoted: Array<Record<string, unknown>> = [];
+    Object.assign(probe.store, {
+      getNextQueuedTaskMessage: async () =>
+        promoted.length
+          ? null
+          : {
+              id: 'funded-followup',
+              taskId,
+              userId,
+              promptCiphertext: encryptJson(
+                { prompt: 'Check the saved result next.' },
+                dataKey,
+                `task-message:${taskId}`
+              ),
+              modelId: model.id,
+              privacyRoute: 'provider_zdr',
+              maxComputeCredits: 5,
+              maxSpendUsd: 0.25,
+              resourceClass: 'task_compute',
+              reservationKey: 'funded-followup-reservation',
+              status: 'queued',
+              interrupt: false,
+              createdAt: '2026-07-01T00:00:00.000Z',
+              promotedAt: null
+            },
+      promoteQueuedTaskMessage: async (input: Record<string, unknown>) => {
+        promoted.push(input);
+        return task;
+      }
+    });
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        toolFrame('finish-funded-turn', 'finish', {
+          summary: 'The explanation is complete.',
+          verification: {
+            status: 'not_applicable',
+            reason: 'An explanation requires no execution.'
+          }
+        })
+      ],
+      log
+    );
+    await new AgentWorker(probe.store, config(), masterKey, runnerSecret).run(task);
+
+    expect(promoted).toHaveLength(1);
+    expect(promoted[0]).toMatchObject({
+      messageId: 'funded-followup',
+      additionalComputeCredits: 5,
+      additionalSpendUsd: 0.25
+    });
+    const next = decryptJson<{
+      reservationKey: string;
+      messages: Array<{ role: string; content: string }>;
+    }>(promoted[0]?.agentStateCiphertext as Parameters<typeof decryptJson>[0], dataKey);
+    expect(next.reservationKey).toBe('funded-followup-reservation');
+    expect(next.messages.at(-1)).toEqual({ role: 'user', content: 'Check the saved result next.' });
+  });
+
+  it.each([false, true])(
+    'consumes an interrupt before checking spend while preserving an owner-wide cap: %s',
+    async (ownerCapReached) => {
+      const task = makeTask();
+      const probe = probeStore(() => task);
+      const order: string[] = [];
+      let taskCap = 0.35;
+      let consumed = false;
+      Object.assign(probe.store, {
+        getNextQueuedTaskMessage: async (_taskId: string, options?: { interruptOnly?: boolean }) =>
+          consumed
+            ? null
+            : !options?.interruptOnly
+              ? {
+                  id: 'ordinary-followup-ahead',
+                  taskId,
+                  interrupt: false
+                }
+              : {
+                  id: 'funded-correction',
+                  taskId,
+                  userId,
+                  promptCiphertext: encryptJson(
+                    { prompt: 'Run the existing tests and finish.' },
+                    dataKey,
+                    `task-message:${taskId}`
+                  ),
+                  modelId: model.id,
+                  privacyRoute: 'provider_zdr',
+                  maxComputeCredits: 5,
+                  maxSpendUsd: 0.25,
+                  resourceClass: 'task_compute',
+                  reservationKey: 'funded-correction-reservation',
+                  status: 'queued',
+                  interrupt: true,
+                  createdAt: '2026-07-01T00:00:00.000Z',
+                  promotedAt: null
+                },
+        consumeQueuedTaskMessageInTurn: async (input: { additionalSpendUsd?: number }) => {
+          order.push('consume');
+          taskCap += input.additionalSpendUsd ?? 0;
+          consumed = true;
+          return true;
+        },
+        spendGuard: async (input: { estimateUsd: number }) => {
+          order.push('spend');
+          const blockedBy = ownerCapReached
+            ? 'daily'
+            : 0.34544265 + input.estimateUsd > taskCap
+              ? 'task'
+              : null;
+          return {
+            outcome: blockedBy ? 'deny' : 'allow',
+            estimateUsd: input.estimateUsd,
+            blockedBy,
+            warnedBy: [],
+            reason: null,
+            windows: blockedBy
+              ? [
+                  {
+                    name: blockedBy,
+                    spentUsd: 0.34544265,
+                    pendingUsd: 0,
+                    capUsd: ownerCapReached ? 0.35 : taskCap,
+                    warnAtUsd: 0.28,
+                    projectedUsd: 0.34544265 + input.estimateUsd,
+                    state: 'exceeded',
+                    startsAt: null,
+                    endsAt: null
+                  }
+                ]
+              : []
+          };
+        }
+      });
+      const log: FetchLog = { calls: [], modelRequests: [] };
+      installFetch(
+        [
+          toolFrame('finish-corrected-turn', 'finish', {
+            summary: 'The requested explanation is complete.',
+            verification: {
+              status: 'not_applicable',
+              reason: 'An explanation requires no execution.'
+            }
+          })
+        ],
+        log
+      );
+      await new AgentWorker(probe.store, config(), masterKey, runnerSecret).run(task);
+
+      expect(order.slice(0, 2)).toEqual(['consume', 'spend']);
+      expect(taskCap).toBeCloseTo(0.6);
+      if (ownerCapReached) {
+        expect(log.modelRequests).toHaveLength(0);
+        expect(probe.checkpoints.some((entry) => entry.status === 'paused')).toBe(true);
+      } else {
+        expect(log.modelRequests.length).toBeGreaterThan(0);
+        const messages = log.modelRequests[0]?.messages as Array<{ role: string; content: string }>;
+        expect(messages).toContainEqual({
+          role: 'user',
+          content: 'Run the existing tests and finish.'
+        });
+      }
+    }
+  );
+});
+
 describe('a question the agent stops to ask', () => {
   /*
    * The operating contract has always told the model to ask when a missing choice materially

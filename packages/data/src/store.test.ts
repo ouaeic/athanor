@@ -640,6 +640,79 @@ describe('DataStore', () => {
     ]);
   });
 
+  it('selects the oldest correction without consuming ordinary follow-ups or another task queue', async () => {
+    const user = await store.createUser({
+      username: 'queue-corrections',
+      displayName: 'Corrections'
+    });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Corrections'));
+    const task = await store.createTask({ ...taskInput(user.id, workspace.id), maxSpendUsd: 0.35 });
+    const other = await store.createTask(taskInput(user.id, workspace.id));
+    await expect(store.leaseNextTask('correction-worker')).resolves.toMatchObject({ id: task.id });
+    const envelope = { v: 1 as const, iv: 'queue', tag: 'tag', ciphertext: 'cipher' };
+    const messages = [
+      { id: randomUUID(), taskId: other.id, interrupt: true, cap: 7 },
+      { id: randomUUID(), taskId: task.id, interrupt: false, cap: 0.1 },
+      { id: randomUUID(), taskId: task.id, interrupt: true, cap: 0.25 },
+      { id: randomUUID(), taskId: task.id, interrupt: true, cap: 0.4 }
+    ];
+    expect(messages).toHaveLength(4);
+    for (const [index, message] of messages.entries()) {
+      await store.enqueueTaskMessage({
+        id: message.id,
+        taskId: message.taskId,
+        userId: user.id,
+        modelId: 'qwen',
+        privacyRoute: 'provider_zdr',
+        maxComputeCredits: 2,
+        maxSpendUsd: message.cap,
+        resourceClass: 'medium',
+        reservationKey: `message:${message.id}`,
+        promptCiphertext: envelope,
+        queuedEventCiphertext: envelope,
+        interrupt: message.interrupt
+      });
+      await database.query('UPDATE task_message_queue SET created_at=$2 WHERE id=$1', [
+        message.id,
+        new Date(Date.UTC(2026, 6, 1, 0, 0, index))
+      ]);
+    }
+    const ordinary = messages[1]!;
+    const correction = messages[2]!;
+    await expect(store.getNextQueuedTaskMessage(task.id)).resolves.toMatchObject({
+      id: ordinary.id
+    });
+    await expect(
+      store.getNextQueuedTaskMessage(task.id, { interruptOnly: true })
+    ).resolves.toMatchObject({ id: correction.id });
+    expect((await store.getTask(user.id, task.id))?.maxSpendUsd).toBe(0.35);
+    await expect(billing.reservedUsageForTask(task.id)).resolves.toBe(6);
+
+    const consume = (workerId: string) =>
+      store.consumeQueuedTaskMessageInTurn({
+        taskId: task.id,
+        messageId: correction.id,
+        workerId,
+        additionalComputeCredits: 2,
+        additionalSpendUsd: 0.25,
+        userMessageCiphertext: envelope
+      });
+    await expect(consume('not-the-lease-owner')).resolves.toBe(false);
+    await expect(consume('correction-worker')).resolves.toBe(true);
+    await expect(consume('correction-worker')).resolves.toBe(false);
+    expect((await store.getTask(user.id, task.id))?.maxSpendUsd).toBeCloseTo(0.6);
+    await expect(billing.reservedUsageForTask(task.id)).resolves.toBe(6);
+    await expect(store.getNextQueuedTaskMessage(task.id)).resolves.toMatchObject({
+      id: ordinary.id
+    });
+    await expect(
+      store.getNextQueuedTaskMessage(task.id, { interruptOnly: true })
+    ).resolves.toMatchObject({ id: messages[3]!.id });
+    await expect(
+      store.getNextQueuedTaskMessage(other.id, { interruptOnly: true })
+    ).resolves.toMatchObject({ id: messages[0]!.id });
+  });
+
   /**
    * Nothing in this repository has ever built a conversation longer than a handful of events, so
    * the paging the timeline and its stream rest on has only ever been read at a size where one page

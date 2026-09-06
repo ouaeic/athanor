@@ -1704,6 +1704,7 @@ export class AgentWorker {
           modelId: queued.modelId,
           privacyRoute: queued.privacyRoute,
           additionalComputeCredits: queued.maxComputeCredits,
+          ...(queued.maxSpendUsd === null ? {} : { additionalSpendUsd: queued.maxSpendUsd }),
           agentStateCiphertext: encryptJson(nextState, key, `task-state:${task.id}`),
           userMessageCiphertext: encryptJson({ markdown: prompt }, key, `task-event:${task.id}`),
           statusEventCiphertext: encryptJson(

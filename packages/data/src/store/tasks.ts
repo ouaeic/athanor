@@ -651,12 +651,15 @@ export class TaskStore {
     return queued;
   }
 
-  async getNextQueuedTaskMessage(taskId: string): Promise<TaskMessageQueueRecord | null> {
+  async getNextQueuedTaskMessage(
+    taskId: string,
+    options: { interruptOnly?: boolean } = {}
+  ): Promise<TaskMessageQueueRecord | null> {
     const result = await this.database.query(
       `SELECT * FROM task_message_queue
-       WHERE task_id=$1 AND status='queued'
+       WHERE task_id=$1 AND status='queued' AND ($2::boolean = FALSE OR interrupt = TRUE)
        ORDER BY created_at,id LIMIT 1`,
-      [taskId]
+      [taskId, options.interruptOnly === true]
     );
     return result.rows[0] ? mapTaskMessage(result.rows[0]) : null;
   }
