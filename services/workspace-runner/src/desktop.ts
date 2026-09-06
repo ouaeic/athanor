@@ -544,30 +544,17 @@ export const clickCommand = (
 };
 
 /**
- * X11 wheel events go to the window under the pointer, not the focused one, so the pointer is
- * re-asserted before every wheel burst. xdotool's default 12 ms inter-click delay made a ten
- * tick scroll take 120 ms for no reason; a press/release pair needs no delay at all.
+ * Run separately from active-window positioning: an empty xdotool window stack sends physical
+ * wheel input through XTEST instead of window-targeted synthetic events that toolkits can ignore.
  */
 export const scrollCommand = (
-  at: PointerPoint,
   direction: 'up' | 'down' | 'left' | 'right',
   amount: number
 ): string[] => {
   const button = { up: '4', down: '5', left: '6', right: '7' }[direction];
   // A trackpad fling can otherwise queue hundreds of synthetic clicks behind the next action.
   const ticks = Math.max(1, Math.min(12, Math.round(amount)));
-  return [
-    'mousemove',
-    '--sync',
-    round(at.x),
-    round(at.y),
-    'click',
-    '--repeat',
-    String(ticks),
-    '--delay',
-    '0',
-    button
-  ];
+  return ['click', '--repeat', String(ticks), '--delay', '0', button];
 };
 
 const easeInOut = (t: number): number =>
@@ -1692,7 +1679,18 @@ export class DesktopManager {
        */
       await xdotool(typeCommand(action.text), 10_000 + action.text.length * 20);
     } else if (action.type === 'scroll') {
-      await xdotool(scrollCommand(session.pointer, action.direction, action.amount));
+      await xdotool([
+        'getactivewindow',
+        'mousemove',
+        '--sync',
+        '--window',
+        '%1',
+        '--polar',
+        '0',
+        '0'
+      ]);
+      signal.throwIfAborted();
+      await xdotool(scrollCommand(action.direction, action.amount));
     }
     return { ok: true, action: action.type, generation: session.control.generation };
   }

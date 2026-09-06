@@ -473,24 +473,13 @@ describe('desktop input commands', () => {
     ]);
   });
 
-  it('scrolls at a point, on the horizontal buttons, without a per-tick delay', () => {
-    expect(scrollCommand({ x: 400, y: 300 }, 'down', 3)).toEqual([
-      'mousemove',
-      '--sync',
-      '400',
-      '300',
-      'click',
-      '--repeat',
-      '3',
-      '--delay',
-      '0',
-      '5'
-    ]);
-    expect(scrollCommand({ x: 1, y: 2 }, 'left', 1)).toContain('6');
-    expect(scrollCommand({ x: 1, y: 2 }, 'right', 1)).toContain('7');
-    expect(scrollCommand({ x: 1, y: 2 }, 'up', 1)).toContain('4');
+  it('sends physical wheel buttons without changing the pointer or delaying each tick', () => {
+    expect(scrollCommand('down', 3)).toEqual(['click', '--repeat', '3', '--delay', '0', '5']);
+    expect(scrollCommand('left', 1)).toContain('6');
+    expect(scrollCommand('right', 1)).toContain('7');
+    expect(scrollCommand('up', 1)).toContain('4');
     // A trackpad fling must not wedge the queue behind hundreds of synthetic clicks.
-    expect(scrollCommand({ x: 1, y: 2 }, 'down', 100)).toContain('12');
+    expect(scrollCommand('down', 100)).toContain('12');
   });
 
   it('drags with interpolated motion that clears the toolkit drag threshold', () => {

@@ -31,6 +31,7 @@ interface SpawnCall {
   executable: string;
   args: string[];
   stdin: string;
+  signal: AbortSignal | undefined;
 }
 
 /**
@@ -46,11 +47,15 @@ const processes = {
   still: Buffer.from('zoomed-jpeg-bytes'),
   /** Executables that exit non-zero, and the diagnostic they print. */
   fails: new Map<string, string>(),
+  blocked: new Set<string>(),
+  afterExit: undefined as ((call: SpawnCall) => void) | undefined,
   reset(): void {
     processes.calls = [];
     processes.requests = [];
     processes.nodes = [];
     processes.fails = new Map();
+    processes.blocked = new Set();
+    processes.afterExit = undefined;
   },
   argumentsFor(executable: string): string[][] {
     return processes.calls
@@ -115,10 +120,18 @@ class FakeChild extends EventEmitter {
  * One process. A `--serve` bridge stays open and answers a line at a time; everything else is the
  * one-shot shape `run()` expects - write stdin, read stdout, exit, close.
  */
-function fakeSpawn(executable: string, args: readonly string[]): FakeChild {
-  const call: SpawnCall = { executable, args: [...args], stdin: '' };
+function fakeSpawn(
+  executable: string,
+  args: readonly string[],
+  options: { signal?: AbortSignal } = {}
+): FakeChild {
+  const call: SpawnCall = { executable, args: [...args], stdin: '', signal: options.signal };
   processes.calls.push(call);
   const child = new FakeChild();
+  const abort = () => child.kill();
+  options.signal?.addEventListener('abort', abort, { once: true });
+  child.once('exit', () => options.signal?.removeEventListener('abort', abort));
+  if (options.signal?.aborted) queueMicrotask(abort);
   if (args.includes('--serve')) {
     child.stdin = {
       end: () => undefined,
@@ -138,6 +151,7 @@ function fakeSpawn(executable: string, args: readonly string[]): FakeChild {
     end: (data?: string) => {
       call.stdin = data ?? '';
       setImmediate(() => {
+        if (child.exitCode !== null || processes.blocked.has(executable)) return;
         const failure = processes.fails.get(executable);
         if (failure) {
           child.stderr.emit('data', Buffer.from(failure));
@@ -155,6 +169,7 @@ function fakeSpawn(executable: string, args: readonly string[]): FakeChild {
         child.exitCode = 0;
         child.emit('exit', 0, null);
         child.emit('close', 0, null);
+        processes.afterExit?.(call);
       });
     },
     write: () => true
@@ -166,7 +181,8 @@ vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof childProcess>();
   return {
     ...actual,
-    spawn: (executable: string, args: readonly string[]) => fakeSpawn(executable, args)
+    spawn: (executable: string, args: readonly string[], options?: { signal?: AbortSignal }) =>
+      fakeSpawn(executable, args, options)
   };
 });
 
@@ -229,9 +245,13 @@ class PerformManager extends DesktopManager {
   }
 }
 
-const buildHarness = async (actor: 'agent' | 'user' = 'agent'): Promise<Harness> => {
+const buildHarness = async (
+  actor: 'agent' | 'user' = 'agent',
+  settleMs = 500
+): Promise<Harness> => {
   const released: string[] = [];
   const control = new DesktopControl({
+    settleMs,
     // Production wires this to `#releaseAllInput`; `desktop.test.ts` already holds the ordering
     // rules of the control itself, so this records that the handover happened.
     release: async () => {
@@ -404,7 +424,7 @@ for (const actor of ['agent', 'user'] as const) {
       const from = actor === 'agent' ? ['178', '178'] : ['100', '100'];
       expect(args.slice(0, 6)).toEqual(['mousemove', '--sync', ...from, 'mousedown', '1']);
       expect(args.slice(-4)).toEqual(['sleep', '0.05', 'mouseup', '1']);
-      // The pointer ends where the drag did, which is what a following scroll is aimed at.
+      // Coordinate bookkeeping uses display pixels for both actors.
       expect(harness.session.pointer).toEqual(
         actor === 'agent' ? { x: 889, y: 711 } : { x: 500, y: 400 }
       );
@@ -419,10 +439,10 @@ for (const actor of ['agent', 'user'] as const) {
     it('scrolls with a bounded wheel burst', async () => {
       const harness = await buildHarness(actor);
       await act(harness, { type: 'scroll', direction: 'down', amount: 40 }, actor);
-      const args = processes.argumentsFor('/usr/bin/xdotool')[0] ?? [];
+      const args = processes.argumentsFor('/usr/bin/xdotool')[1] ?? [];
       // Bounded at twelve ticks: a trackpad fling otherwise queues hundreds of synthetic clicks
-      // behind the next action. Where the burst lands is the subject of the todo below.
-      expect(args.slice(4)).toEqual(['click', '--repeat', '12', '--delay', '0', '5']);
+      // behind the next action.
+      expect(args).toEqual(['click', '--repeat', '12', '--delay', '0', '5']);
     });
 
     it('waits for the interval it was given, and says how long it waited', async () => {
@@ -869,15 +889,97 @@ describe('an encoder that cannot run', () => {
 });
 
 describe('where a wheel burst lands', () => {
-  /**
-   * `tools.ts:146` tells the model that `scroll` goes "over the focused window". `#perform` aims it
-   * at `session.pointer`, which starts at the centre of the display and moves only when `click_at`
-   * or `drag` moves it - and X11 sends wheel events to the window under the pointer, not the
-   * focused one. So a scroll after clicking inside a modal scrolls the modal, the agent sees
-   * nothing move, and scrolls again: the loop that ends at the repeated-failure ceiling. The fix is
-   * to park the pointer over the focused window's centre first, or to say what it really does.
-   */
-  it.todo('scrolls the window that has focus, as the tool description promises (cu F16)');
+  const targetFocusedWindow = [
+    'getactivewindow',
+    'mousemove',
+    '--sync',
+    '--window',
+    '%1',
+    '--polar',
+    '0',
+    '0'
+  ];
+
+  for (const actor of ['agent', 'user'] as const) {
+    it.each([
+      ['up', '4'],
+      ['down', '5'],
+      ['left', '6'],
+      ['right', '7']
+    ])(
+      `targets the focused window before a physical wheel burst for ${actor}: %s`,
+      async (direction, button) => {
+        const harness = await buildHarness(actor);
+        harness.session.pointer = { x: 12, y: 34 };
+        await act(harness, { type: 'scroll', direction, amount: 3 }, actor);
+        expect(processes.argumentsFor('/usr/bin/xdotool')).toEqual([
+          targetFocusedWindow,
+          ['click', '--repeat', '3', '--delay', '0', button]
+        ]);
+      }
+    );
+  }
+
+  it('does not scroll at the stale pointer when the focused window cannot be resolved', async () => {
+    const harness = await buildHarness();
+    processes.fails.set('/usr/bin/xdotool', 'No active window');
+    await expect(
+      act(harness, { type: 'scroll', direction: 'down', amount: 3 }, 'agent')
+    ).rejects.toThrow('No active window');
+    expect(processes.argumentsFor('/usr/bin/xdotool')).toEqual([targetFocusedWindow]);
+  });
+
+  it('cancels a queued scroll when the owner takes control', async () => {
+    const harness = await buildHarness();
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const active = harness.session.control.submit('agent', async () => gate);
+    const scrolling = act(harness, { type: 'scroll', direction: 'down', amount: 3 }, 'agent');
+    const rejected = expect(scrolling).rejects.toThrow('Desktop control was handed to user');
+    await vi.waitFor(() => expect(harness.session.control.pending).toBe(1));
+    const takeover = harness.manager.setHolder('workspace-1', '/nonexistent', 'user');
+    await vi.waitFor(() => expect(harness.session.control.pending).toBe(0));
+    release();
+    await Promise.all([active, takeover, rejected]);
+    expect(processes.argumentsFor('/usr/bin/xdotool')).toEqual([]);
+    expect(harness.released).toEqual(['released']);
+  });
+
+  it('aborts focus positioning on takeover and sends no wheel input afterward', async () => {
+    const harness = await buildHarness('agent', 1);
+    processes.blocked.add('/usr/bin/xdotool');
+    const scrolling = act(harness, { type: 'scroll', direction: 'down', amount: 3 }, 'agent');
+    const rejected = expect(scrolling).rejects.toThrow();
+    await vi.waitFor(() => expect(processes.argumentsFor('/usr/bin/xdotool')).toHaveLength(1));
+    await harness.manager.setHolder('workspace-1', '/nonexistent', 'user');
+    await rejected;
+    expect(processes.argumentsFor('/usr/bin/xdotool')).toEqual([targetFocusedWindow]);
+    expect(
+      processes.calls.find((call) => call.executable === '/usr/bin/xdotool')?.signal?.aborted
+    ).toBe(true);
+    expect(harness.released).toEqual(['released']);
+    processes.blocked.clear();
+    await act(harness, { type: 'press', key: 'Tab' }, 'user');
+    expect(processes.argumentsFor('/usr/bin/xdotool').at(-1)).toEqual(['key', 'Tab']);
+  });
+
+  it('checks cancellation after positioning succeeds before launching the wheel process', async () => {
+    const harness = await buildHarness();
+    const cancellation = new AbortController();
+    const submit = harness.session.control.submit.bind(harness.session.control);
+    vi.spyOn(harness.session.control, 'submit').mockImplementation((actor, task, options) =>
+      submit(actor, (signal) => task(AbortSignal.any([signal, cancellation.signal])), options)
+    );
+    processes.afterExit = (call) => {
+      if (call.executable === '/usr/bin/xdotool') cancellation.abort();
+    };
+    await expect(
+      act(harness, { type: 'scroll', direction: 'down', amount: 3 }, 'agent')
+    ).rejects.toThrow();
+    expect(processes.argumentsFor('/usr/bin/xdotool')).toEqual([targetFocusedWindow]);
+  });
 });
 
 /**
