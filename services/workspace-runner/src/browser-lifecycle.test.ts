@@ -6,6 +6,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BrowserDownloadHistory, BrowserManager } from './browser.js';
 import { DesktopControl } from './holder.js';
+import { runnerLogger } from './log.js';
 
 const deferred = <T>() => {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -468,6 +469,27 @@ describe('download event receipts', () => {
     expect(secondRead).toBe(true);
     expect(session.downloads.recent).toHaveLength(2);
     expect(session.downloads.recent.every((receipt) => receipt.path !== null)).toBe(true);
+  });
+
+  it('reports failed temporary download cleanup without losing the saved receipt or logging its content', async () => {
+    const { manager, root } = await setup();
+    await mkdir(path.join(root, 'workspace'));
+    const session = await manager.ensure(workspace, root);
+    const item = download('complete');
+    item.delete.mockRejectedValueOnce(new Error('Private export at /owner/private-report.csv'));
+    const warning = vi.spyOn(runnerLogger, 'warn').mockImplementation(() => {});
+    try {
+      contexts[0]!.page.emit('download', item);
+      await Promise.all(session.pendingDownloads);
+      expect(session.downloads.recent).toHaveLength(1);
+      expect(session.downloads.recent[0]?.path).toEqual(expect.any(String));
+      expect(session.downloads.recent[0]?.error).toBeUndefined();
+      expect(warning).toHaveBeenCalledExactlyOnceWith('browser.download_cleanup_failed', {
+        code: 'Error'
+      });
+    } finally {
+      warning.mockRestore();
+    }
   });
 
   it('stops retaining receipts when an action is aborted before its underlying work settles', async () => {

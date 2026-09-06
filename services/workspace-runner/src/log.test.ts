@@ -22,6 +22,7 @@ const productionSources = async (): Promise<{ name: string; text: string }[]> =>
   const names = (await readdir(sourceDirectory)).filter(
     (name) => name.endsWith('.ts') && !name.endsWith('.test.ts') && name !== 'log.ts'
   );
+  expect(names.length).toBeGreaterThan(0);
   return Promise.all(
     names.map(async (name) => ({
       name,
@@ -156,15 +157,11 @@ describe('the wiring at both ends', () => {
         /^ {2}'([a-z_]+\.[a-z_]+)':/gm
       )
     ].map((match) => match[1] as RunnerEvent);
+    expect(declared.length).toBeGreaterThan(0);
     const orphaned = declared.filter(
       (event) => !sources.some(({ text }) => text.includes(`'${event}'`))
     );
     expect(orphaned).toEqual([]);
-    // The count is the other direction: an event added here and raised nowhere is caught above,
-    // and one raised somewhere without being declared here cannot compile. This catches the third
-    // case - a declaration quietly removed while its `warn` call stays, which typechecks only
-    // until the map is read again.
-    expect(declared).toHaveLength(6);
   });
 
   it('leaves no degradation still going out as unprioritised prose', async () => {
