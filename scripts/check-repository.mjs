@@ -853,58 +853,24 @@ else
     `Documented commands: ${instructions} instructions across ${documents.length} documents, all of them names the box offers.`
   );
 
-/**
- * How many API token scopes there are, wherever prose says.
- *
- * Two comments count them, because the point both make is that the form used to offer fewer than
- * the server enforces. Both said thirteen against an enum of eleven, and one of them then did the
- * subtraction and published the wrong difference as well. A count in prose next to the list it
- * counts is exactly the figure `docs/EVALUATION.md` is already held to, and just as cheap.
- */
+// Every server scope needs a selectable home in the access form.
 const scopeEnum = /export const ApiTokenScope = z\.enum\(\[([\s\S]*?)\]\);/.exec(
   read('packages/contracts/src/index.ts')
 );
-const scopeCount = scopeEnum ? [...scopeEnum[1].matchAll(/'[a-z]+:[a-z]+'/g)].length : 0;
-const spelled = [
-  'zero',
-  'one',
-  'two',
-  'three',
-  'four',
-  'five',
-  'six',
-  'seven',
-  'eight',
-  'nine',
-  'ten',
-  'eleven',
-  'twelve',
-  'thirteen',
-  'fourteen',
-  'fifteen',
-  'sixteen',
-  'seventeen',
-  'eighteen',
-  'nineteen',
-  'twenty'
-][scopeCount];
-const scopeClaims = [
-  ['apps/web/src/SelfHostedSettings.tsx', /([A-Za-z]+) scopes are enforced on the server/],
-  ['apps/web/src/api-token-scopes.test.ts', /render ([A-Za-z]+) checkboxes/]
-];
-if (!scopeCount)
-  fail('packages/contracts/src/index.ts no longer declares ApiTokenScope as an enum');
-else {
-  const wrong = [];
-  for (const [relativePath, pattern] of scopeClaims) {
-    const stated = pattern.exec(read(relativePath));
-    if (!stated) wrong.push(`${relativePath} no longer states how many scopes there are`);
-    else if (stated[1].toLowerCase() !== spelled)
-      wrong.push(`${relativePath} says ${stated[1].toLowerCase()}, and the enum has ${spelled}`);
-  }
-  if (wrong.length) fail(wrong.join('; '));
-  else say(`API token scopes: ${scopeCount} enforced, and both comments that count them say so.`);
-}
+const offeredScopes = /const scopes: ApiTokenScope\[\] = \[([\s\S]*?)\];/.exec(
+  read('apps/web/src/settings/Access.tsx')
+);
+const scopeNames = (body) =>
+  [...body.matchAll(/'([a-z]+:[a-z]+)'/g)].map((match) => match[1]).sort();
+const enforcedScopes = scopeNames(scopeEnum?.[1] ?? '');
+const renderedScopes = scopeNames(offeredScopes?.[1] ?? '');
+if (!enforcedScopes.length || !renderedScopes.length)
+  fail('API token scopes: the server enum or access form no longer declares a non-empty list');
+else if (enforcedScopes.join(',') !== renderedScopes.join(','))
+  fail(
+    'API token scopes: the access form does not offer exactly the scopes enforced by the server'
+  );
+else say(`API token scopes: all ${enforcedScopes.length} enforced scopes are selectable.`);
 
 /**
  * Every file a fresh install puts on a box is a file an update puts there too.
@@ -1133,6 +1099,14 @@ const keysAtTopLevel = (body) =>
 
 const copiedConstants = [
   {
+    what: 'the encrypted share size bounds',
+    owner: 'packages/contracts/src/index.ts',
+    copy: 'apps/web/src/share-crypto.ts',
+    find: /SHARE_LIMITS = \{([\s\S]*?)\} as const;/,
+    findInCopy: /SHARE_BOUNDS = \{([\s\S]*?)\} as const;/,
+    normalise: (body) => body.replace(/\/\*[\s\S]*?\*\//g, '')
+  },
+  {
     what: 'the host disk floor',
     owner: 'services/workspace-runner/src/host-storage.ts',
     copy: 'apps/web/src/usage-model.ts',
@@ -1164,7 +1138,7 @@ const copiedConstants = [
   {
     what: 'the coordinate space the private browser works in',
     owner: 'services/workspace-runner/src/browser.ts',
-    copy: 'apps/web/src/Inspector.tsx',
+    copy: 'apps/web/src/computer/transport.ts',
     // The object body, so both the width and the height are compared and neither the `as const`
     // nor the name is. The runner launches the browser at this size, publishes the screencast at
     // it and reads every agent-side coordinate off a screenshot of it; the pane divides a human

