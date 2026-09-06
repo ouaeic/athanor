@@ -10,9 +10,10 @@
  * its policy off and a `<meta>` policy cannot carry `frame-ancestors`. `script-src 'self'` and no
  * inline script: the viewer is a built file under `/v1/shares/assets/`, which is the one prefix
  * the installed app's service worker hands to the network rather than answering with the app
- * shell. `connect-src 'self'` is what lets it fetch the ciphertext and nothing else; `frame-src
- * blob:` is what lets an HTML artifact render, inside a sandboxed frame from a blob URL the viewer
- * minted, on an opaque origin - never as a document on this box's own origin.
+ * shell. `connect-src 'self'` lets it fetch the ciphertext and nothing else. Inline styles let
+ * decrypted static HTML keep its presentation in an opaque, scriptless srcdoc frame. That frame
+ * prepends its own restrictive policy, allowing inline styles and local blob/data media only.
+ * `frame-src blob:` also allows local file previews without making them same-origin documents.
  */
 
 import { readFile } from 'node:fs/promises';
@@ -28,7 +29,7 @@ export const SHARE_PAGE_TITLE = 'A shared athanor conversation';
 export const shareViewerHeaders: ReadonlyArray<readonly [string, string]> = [
   [
     'content-security-policy',
-    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; " +
+    "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; " +
       "media-src blob:; connect-src 'self'; frame-src blob:; object-src 'none'; base-uri 'none'; " +
       "form-action 'none'; frame-ancestors 'none'"
   ],

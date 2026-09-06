@@ -52,6 +52,23 @@ export interface SnapshotArtifact {
   bytes: Buffer;
 }
 
+/** The generation time is incidental; every field a reader receives is bound explicitly. */
+export const sharePreviewDigest = (snapshot: ShareSnapshot): string =>
+  sha256(
+    JSON.stringify({
+      v: snapshot.v,
+      title: snapshot.title,
+      events: snapshot.events.map(({ kind, at, text }) => ({ kind, at, text })),
+      artifacts: snapshot.artifacts.map(({ n, name, mimeType, sizeBytes, sha256 }) => ({
+        n,
+        name,
+        mimeType,
+        sizeBytes,
+        sha256
+      }))
+    })
+  );
+
 /** How much of a tool result the owner may opt into. Past this the viewer gets a note, not a dump. */
 const TOOL_RESULT_TEXT_CHARS = 20_000;
 

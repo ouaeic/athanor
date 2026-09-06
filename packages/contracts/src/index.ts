@@ -859,7 +859,12 @@ export const CreateShareRequest = z.object({
   /** The artifacts the owner ticked. Each must belong to the task being shared. */
   artifactIds: z.array(Id).max(SHARE_LIMITS.artifacts).default([]),
   /** A name for the viewer's page, sealed inside the snapshot with everything else. */
-  publicTitle: z.string().trim().min(1).max(160).optional()
+  publicTitle: z.string().trim().min(1).max(160).optional(),
+  /** Binds creation to the content the owner reviewed, including artifact bytes. */
+  expectedPreviewDigest: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional()
 });
 export type CreateShareRequest = z.input<typeof CreateShareRequest>;
 
@@ -930,6 +935,11 @@ export const ShareSnapshot = z.object({
   )
 });
 export type ShareSnapshot = z.infer<typeof ShareSnapshot>;
+
+export const SharePreviewResponse = ShareSnapshot.extend({
+  previewDigest: z.string().regex(/^[a-f0-9]{64}$/)
+});
+export type SharePreviewResponse = z.infer<typeof SharePreviewResponse>;
 
 /**
  * What the public blob route answers with: the sealed snapshot, and for each artifact the public

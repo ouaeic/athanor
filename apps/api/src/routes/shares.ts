@@ -21,13 +21,18 @@ import {
   SHARE_TOKEN_PATTERN,
   type ShareBlob,
   type ShareRecord,
-  type ShareSnapshot
+  type SharePreviewResponse
 } from '@athanor/contracts';
 import { AthanorError, sha256 } from '@athanor/core';
 import type { TaskShareRecord } from '@athanor/data';
 import { requireUser } from '../http/auth-hook.js';
 import type { RouteContext } from '../http/server-context.js';
-import { buildShareSnapshot, sealShareSnapshot, shareUrl } from '../share-snapshot.js';
+import {
+  buildShareSnapshot,
+  sealShareSnapshot,
+  sharePreviewDigest,
+  shareUrl
+} from '../share-snapshot.js';
 import {
   SHARE_VIEWER_FILES,
   defaultViewerDir,
@@ -225,6 +230,15 @@ export const registerShareRoutes = (context: RouteContext): void => {
       artifactIds: body.artifactIds,
       publicTitle: body.publicTitle
     });
+    if (
+      body.expectedPreviewDigest &&
+      body.expectedPreviewDigest !== sharePreviewDigest(built.snapshot)
+    )
+      throw new AthanorError(
+        'preview_changed',
+        'This work changed after you reviewed it. Review the snapshot again before creating a link.',
+        409
+      );
     const sealed = sealShareSnapshot(built);
     const share = await store.createShare({
       userId,
@@ -251,11 +265,11 @@ export const registerShareRoutes = (context: RouteContext): void => {
 
   /**
    * The exact document a link would carry, in the clear, for the owner to read before it exists.
-   * Bytes are not fetched: the preview lists what the artifacts are, not what they contain.
+   * Artifact bytes are verified and their hashes bind the review to the files a link would carry.
    */
   app.post<{ Params: { taskId: string } }>(
     '/v1/tasks/:taskId/shares/preview',
-    async (request): Promise<ShareSnapshot> => {
+    async (request): Promise<SharePreviewResponse> => {
       const user = requireUser(request.user);
       requireSharing();
       const body = CreateShareRequest.parse(request.body ?? {});
@@ -265,7 +279,7 @@ export const registerShareRoutes = (context: RouteContext): void => {
         artifactIds: body.artifactIds,
         publicTitle: body.publicTitle
       });
-      return built.snapshot;
+      return { ...built.snapshot, previewDigest: sharePreviewDigest(built.snapshot) };
     }
   );
 

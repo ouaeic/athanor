@@ -21,6 +21,7 @@ import { gunzipSync } from 'node:zlib';
 import {
   SHARE_LIMITS,
   type ShareBlob,
+  type SharePreviewResponse,
   type ShareSnapshot,
   type TaskEventKind
 } from '@athanor/contracts';
@@ -369,7 +370,22 @@ describe('the public side of a share link', () => {
     const page = await harness.app.inject({ method: 'GET', url: `/v1/shares/${token}` });
     expect(page.statusCode).toBe(200);
     expect(page.headers['content-type']).toContain('text/html');
+    expect(shareViewerHeaders.length).toBeGreaterThan(0);
     for (const [name, value] of shareViewerHeaders) expect(page.headers[name]).toBe(value);
+    const policy = Object.fromEntries<string[]>(
+      String(page.headers['content-security-policy'])
+        .split(';')
+        .map((directive) => {
+          const [name, ...sources] = directive.trim().split(/\s+/);
+          return [name ?? '', sources];
+        })
+    );
+    expect(policy['style-src']).toEqual(["'self'", "'unsafe-inline'"]);
+    expect(policy['script-src']).toEqual(["'self'"]);
+    expect(policy['connect-src']).toEqual(["'self'"]);
+    expect(policy['default-src']).toEqual(["'none'"]);
+    expect(policy['frame-src']).toEqual(['blob:']);
+    expect(policy['form-action']).toEqual(["'none'"]);
     expect(page.headers['set-cookie']).toBeUndefined();
     expect(page.body).toContain('/v1/shares/assets/share.js');
     expect(page.body).not.toContain('<script>');
@@ -839,15 +855,102 @@ describe('what a share carries', () => {
     });
     expect(preview.statusCode, preview.body).toBe(200);
     await harness.database.query('UPDATE sessions SET step_up_at=NOW()');
-    const { token, key } = parseLink(
-      (await createShare(harness, taskId)).json<{ url: string }>().url
-    );
+    const shown = preview.json<SharePreviewResponse>();
+    expect(shown.previewDigest).toMatch(/^[a-f0-9]{64}$/);
+    const repeated = await harness.app.inject({
+      method: 'POST',
+      url: `/v1/tasks/${taskId}/shares/preview`,
+      headers: { cookie: harness.cookie },
+      payload: {}
+    });
+    expect(repeated.statusCode, repeated.body).toBe(200);
+    expect(repeated.json<SharePreviewResponse>().previewDigest).toBe(shown.previewDigest);
+    const created = await createShare(harness, taskId, {
+      expectedPreviewDigest: shown.previewDigest
+    });
+    expect(created.statusCode, created.body).toBe(200);
+    const { token, key } = parseLink(created.json<{ url: string }>().url);
     const blob = await harness.app.inject({ method: 'GET', url: `/v1/shares/${token}/blob` });
     const stored = openSnapshot(blob.json<ShareBlob>(), token, key);
-    const shown = preview.json<ShareSnapshot>();
     expect(shown.events).toEqual(stored.events);
     expect(shown.artifacts).toEqual(stored.artifacts);
     expect(shown.title).toBe(stored.title);
+  });
+
+  it('refuses changed content before creating a share or replacing an existing link', async () => {
+    const harness = await buildHarness();
+    const taskId = await harness.task();
+    await harness.event(taskId, 'user_message', 'Reviewed message', {
+      markdown: 'Reviewed message'
+    });
+    const original = await createShare(harness, taskId);
+    expect(original.statusCode, original.body).toBe(200);
+    const old = original.json<{ share: { id: string }; url: string }>();
+    const preview = await harness.app.inject({
+      method: 'POST',
+      url: `/v1/tasks/${taskId}/shares/preview`,
+      headers: { cookie: harness.cookie },
+      payload: {}
+    });
+    expect(preview.statusCode, preview.body).toBe(200);
+    const expectedPreviewDigest = preview.json<SharePreviewResponse>().previewDigest;
+    await harness.event(taskId, 'assistant_message', 'Unreviewed addition', {
+      markdown: 'Unreviewed addition'
+    });
+    const refused = await createShare(harness, taskId, { expectedPreviewDigest });
+    expect(refused.statusCode, refused.body).toBe(409);
+    expect(refused.json<{ error: { code: string } }>().error.code).toBe('preview_changed');
+    const replacement = await harness.app.inject({
+      method: 'POST',
+      url: `/v1/shares/${old.share.id}/refresh`,
+      headers: { cookie: harness.cookie, 'idempotency-key': 'stale-replacement' },
+      payload: { expectedPreviewDigest }
+    });
+    expect(replacement.statusCode, replacement.body).toBe(409);
+    const shares = await harness.store.listSharesForTask(harness.userId, taskId);
+    expect(shares).toHaveLength(1);
+    expect(shares[0]!.revokedAt).toBeNull();
+    const { token } = parseLink(old.url);
+    const oldBlob = await harness.app.inject({ method: 'GET', url: `/v1/shares/${token}/blob` });
+    expect(oldBlob.statusCode, oldBlob.body).toBe(200);
+  });
+
+  it('binds the preview to artifact hashes even when names and sizes are identical', async () => {
+    const harness = await buildHarness();
+    const taskId = await harness.task();
+    const reviewedFile = await harness.artifact(
+      taskId,
+      'result.txt',
+      'text/plain',
+      Buffer.from('A')
+    );
+    const changedFile = await harness.artifact(
+      taskId,
+      'result.txt',
+      'text/plain',
+      Buffer.from('B')
+    );
+    const preview = await harness.app.inject({
+      method: 'POST',
+      url: `/v1/tasks/${taskId}/shares/preview`,
+      headers: { cookie: harness.cookie },
+      payload: { artifactIds: [reviewedFile] }
+    });
+    expect(preview.statusCode, preview.body).toBe(200);
+    const shown = preview.json<SharePreviewResponse>();
+    expect(shown.artifacts).toHaveLength(1);
+    expect(shown.artifacts[0]!.sha256).toBe(sha256('A'));
+    const refused = await createShare(harness, taskId, {
+      artifactIds: [changedFile],
+      expectedPreviewDigest: shown.previewDigest
+    });
+    expect(refused.statusCode, refused.body).toBe(409);
+    expect(await harness.store.listSharesForTask(harness.userId, taskId)).toEqual([]);
+    const created = await createShare(harness, taskId, {
+      artifactIds: [reviewedFile],
+      expectedPreviewDigest: shown.previewDigest
+    });
+    expect(created.statusCode, created.body).toBe(200);
   });
 });
 
