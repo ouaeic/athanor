@@ -6,7 +6,7 @@ import { BrowserAction } from '@athanor/contracts';
 import {
   BotWallLedger,
   BrowserManager,
-  type BrowserDownloadRecord,
+  BrowserDownloadHistory,
   type BrowserStreamState
 } from './browser.js';
 import { DesktopControl } from './holder.js';
@@ -129,7 +129,7 @@ interface HarnessSession {
   control: DesktopControl;
   tabs: Map<string, { url: () => string; isClosed: () => boolean }>;
   walls: BotWallLedger;
-  downloads: BrowserDownloadRecord[];
+  downloads: BrowserDownloadHistory;
   /**
    * Playwright's `Dialog` handle, in the two shapes the tests need: `type`/`message` are what the
    * stream state projects and are optional here because most cases only answer the thing.
@@ -249,7 +249,7 @@ const buildHarness = (): Harness => {
   };
   const cdpSessions: FakeCdp[] = [];
   const hooks: Harness['hooks'] = { onAttachCdp: null };
-  const downloads: BrowserDownloadRecord[] = [];
+  const downloads = new BrowserDownloadHistory();
   const tabs = new Map<string, ReturnType<typeof makePage>>();
   let nextTabId = 1;
 
@@ -277,11 +277,12 @@ const buildHarness = (): Harness => {
         say(`${line} ${selector}`);
         if (element.stalls && line.startsWith('keys ')) return new Promise<never>(() => undefined);
         if (element.fails) throw new Error(element.fails);
-        if (element.downloadUrl)
-          downloads.push({
+        if (element.downloadUrl) {
+          downloads.record({
             path: 'workspace/downloads/2026-01-01/invoice.pdf',
             url: element.downloadUrl
           });
+        }
       };
       const self = {
         first: () => self,
@@ -476,11 +477,11 @@ type BatchResult = Extract<ActResult, { steps: unknown }>;
 type StepResult = Exclude<ActResult, { steps: unknown }>;
 
 const batchResult = (result: ActResult): BatchResult => {
-  if (result.steps === undefined) throw new Error('expected a batch result');
+  if (!('steps' in result)) throw new Error('expected a batch result');
   return result;
 };
 const stepResult = (result: ActResult): StepResult => {
-  if (result.steps !== undefined) throw new Error('expected a single-action result');
+  if ('steps' in result) throw new Error('expected a single-action result');
   return result;
 };
 
@@ -1229,30 +1230,57 @@ describe('downloads a step starts', () => {
     ]);
   });
 
-  /**
-   * `act` captures `session.downloads.length` at entry and slices from it, while `#saveDownload`
-   * splices the front of that same array once it passes `DOWNLOAD_HISTORY_LIMIT` (25). Past that
-   * point the slice starts at or beyond the array's new end, so a scraping run is told nothing
-   * arrived on every file it saves after the twenty-fifth, and the path it needs is recoverable
-   * only from the next snapshot. The fix is a monotonic sequence rather than a length; this case is
-   * written against it and enabled by the step that lands it.
-   */
-  it.todo(
-    'still reports the file it just saved once the session has passed 25 downloads (#22, cu F22)'
-  );
+  it('reports new files when recent download history is full', async () => {
+    const harness = buildHarness();
+    for (let index = 0; index < 25; index += 1) {
+      harness.session.downloads.record({
+        path: `workspace/downloads/old-${index}.pdf`,
+        url: `https://93.184.216.34/old-${index}.pdf`
+      });
+    }
+    harness.elements.set(REF, { downloadUrl: 'https://93.184.216.34/new.pdf' });
+    const result = await act(harness, { type: 'click', selector: REF }, 'agent');
+    expect(result.downloads.map((record) => record.url)).toEqual(['https://93.184.216.34/new.pdf']);
+    expect(harness.session.downloads.recent).toHaveLength(25);
+  });
 });
 
 describe('waiting for something to go away', () => {
-  /**
-   * `#waitFor` resolves the ref before it waits, and `resolveBrowserTarget` refuses a ref matching
-   * zero elements. `state: 'detached'` is a wait for exactly that condition, so waiting for a
-   * spinner to disappear throws when the spinner has already gone - the common case on a fast
-   * response - and inside a batch that ends the batch with the remaining fields unfilled. `hidden`
-   * has the same shape. The fix is to skip the refusal for those two states and let Playwright's
-   * own semantics answer.
-   */
-  it.todo(
-    'succeeds immediately when the element a wait_for detached names is already gone (#24, cu F24)'
+  it.each(['detached', 'hidden'] as const)(
+    'succeeds when a generated ref is already absent for %s',
+    async (state) => {
+      const harness = buildHarness();
+      harness.elements.set(REF, { count: 0 });
+      const result = stepResult(
+        await act(harness, { type: 'wait_for', selector: REF, state, timeoutMs: 100 }, 'agent')
+      );
+      expect(result.waited).toBe(`${REF} is ${state}`);
+      expect(harness.trace).toEqual([`tab-1 await-${state} ${REF}`]);
+    }
+  );
+
+  it.each(['attached', 'visible'] as const)(
+    'still rejects a missing generated ref for %s',
+    async (state) => {
+      const harness = buildHarness();
+      harness.elements.set(REF, { count: 0 });
+      await expect(
+        act(harness, { type: 'wait_for', selector: REF, state, timeoutMs: 100 }, 'agent')
+      ).rejects.toThrow('no longer on the page');
+      expect(harness.trace).toEqual([]);
+    }
+  );
+
+  it.each(['detached', 'hidden'] as const)(
+    'still rejects an ambiguous generated ref for %s',
+    async (state) => {
+      const harness = buildHarness();
+      harness.elements.set(REF, { count: 2 });
+      await expect(
+        act(harness, { type: 'wait_for', selector: REF, state, timeoutMs: 100 }, 'agent')
+      ).rejects.toThrow('matches 2 elements');
+      expect(harness.trace).toEqual([]);
+    }
   );
 });
 

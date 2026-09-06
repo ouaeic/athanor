@@ -42,6 +42,7 @@ const events = {
   'command.limits_unavailable':
     'the resource limiter is missing, so commands run without memory, file-size and process limits. Install util-linux to restore them.',
   'browser.frame_scan_failed': 'a frame could not be scanned for controls',
+  'browser.download_cleanup_failed': 'a temporary browser download could not be removed',
   'browser.reduced_launch': 'the browser started after the preferred configuration was refused',
   'browser.isolated_sandbox_off':
     'the isolated browser started with the renderer sandbox off after the preferred configuration was refused',

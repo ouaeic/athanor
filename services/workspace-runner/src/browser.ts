@@ -1,5 +1,6 @@
 import path from 'node:path';
-import { access, mkdir, rm } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { rm } from 'node:fs/promises';
 import type {
   Browser,
   BrowserContext,
@@ -21,6 +22,7 @@ import { assertPublicHttpUrl, isPublicHttpUrl, isPublicInternetAddress } from '@
 import {
   assertUserDataPath,
   clearStagedUploads,
+  createWorkspaceFile,
   stageUserFileForUpload,
   writeWorkspaceFile
 } from './files.js';
@@ -77,6 +79,54 @@ export interface BrowserDownloadRecord {
   path: string | null;
   url: string;
   error?: string;
+}
+
+interface BrowserDownloadReceipts {
+  downloads: BrowserDownloadRecord[];
+  downloadsOmitted: number;
+  downloadErrorsOmitted: number;
+  downloadsCancelled: number;
+}
+
+/** Recent session history and the bounded receipts accumulated during each running action. */
+export class BrowserDownloadHistory {
+  readonly recent: BrowserDownloadRecord[] = [];
+  readonly #collectors = new Set<BrowserDownloadReceipts>();
+
+  record(download: BrowserDownloadRecord, cancelled = false): void {
+    this.recent.push(download);
+    if (this.recent.length > DOWNLOAD_HISTORY_LIMIT)
+      this.recent.splice(0, this.recent.length - DOWNLOAD_HISTORY_LIMIT);
+    for (const receipts of this.#collectors) {
+      if (cancelled) receipts.downloadsCancelled += 1;
+      if (receipts.downloads.length < DOWNLOAD_RECEIPT_LIMIT) receipts.downloads.push(download);
+      else if (download.error) receipts.downloadErrorsOmitted += 1;
+      else receipts.downloadsOmitted += 1;
+    }
+  }
+
+  async collect<T>(
+    work: (receipts: BrowserDownloadReceipts) => Promise<T>,
+    signal: AbortSignal
+  ): Promise<T> {
+    const receipts: BrowserDownloadReceipts = {
+      downloads: [],
+      downloadsOmitted: 0,
+      downloadErrorsOmitted: 0,
+      downloadsCancelled: 0
+    };
+    const stop = () => {
+      this.#collectors.delete(receipts);
+    };
+    if (!signal.aborted) this.#collectors.add(receipts);
+    signal.addEventListener('abort', stop, { once: true });
+    try {
+      return await work(receipts);
+    } finally {
+      stop();
+      signal.removeEventListener('abort', stop);
+    }
+  }
 }
 
 interface Session {
@@ -137,7 +187,8 @@ interface Session {
   failedRequests: BrowserFailedRequest[];
   stream?: BrowserStream;
   downloadsDirectory: string;
-  downloads: BrowserDownloadRecord[];
+  downloadPublication: Promise<void>;
+  downloads: BrowserDownloadHistory;
   pendingDownloads: Set<Promise<void>>;
 }
 
@@ -284,6 +335,10 @@ export const shouldAdoptNewPage = (current: Pick<Page, 'isClosed'> | undefined):
 const DOWNLOAD_SETTLE_MS = 15_000;
 const DOWNLOAD_START_GRACE_MS = 250;
 const DOWNLOAD_HISTORY_LIMIT = 25;
+// A page can start many downloads from one click. Bound retained receipts and concurrent saves
+// independently; omitted successful receipts remain recoverable in the workspace download folder.
+const DOWNLOAD_RECEIPT_LIMIT = 100;
+const DOWNLOAD_SAVE_LIMIT = 64;
 const SNAPSHOT_FRAME_LIMIT = 12;
 const SNAPSHOT_ELEMENT_LIMIT = 250;
 /** Matches the `innerText` bound beside the scans this covers (`browser.ts` `#scanPage`). */
@@ -390,6 +445,34 @@ const withDeadline = async <T>(work: Promise<T>, milliseconds: number, fallback:
   ]);
   if (timer) clearTimeout(timer);
   return settled;
+};
+
+const captureScreenshot = async (page: Page, type: 'jpeg' | 'png'): Promise<Buffer> => {
+  const capture = () => page.screenshot(type === 'jpeg' ? { type, quality: 72 } : { type });
+  return capture().catch(async (error: unknown) => {
+    if (
+      !(error instanceof Error) ||
+      !error.message.includes(
+        'Protocol error (Page.captureScreenshot): Unable to capture screenshot'
+      ) ||
+      page.isClosed()
+    )
+      throw error;
+    // A headed renderer can refuse its first capture before its compositor presents a frame.
+    // Give that frame a bounded opportunity to render, then make exactly one further attempt.
+    await withDeadline(
+      page.evaluate(
+        () =>
+          new Promise<void>((resolve) => {
+            requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+          })
+      ),
+      250,
+      undefined
+    );
+    if (page.isClosed()) throw error;
+    return capture();
+  });
 };
 
 /**
@@ -502,18 +585,27 @@ export const downloadFileName = (suggested: string): string => {
   return cleaned.slice(0, 120) || 'download';
 };
 
-const uniqueDownloadName = async (directory: string, name: string): Promise<string> => {
+const saveDownloadFile = async (
+  root: string,
+  directory: string,
+  name: string,
+  content: Buffer,
+  maxBytes: number
+): Promise<string> => {
   const extension = path.extname(name);
   const stem = name.slice(0, name.length - extension.length) || 'download';
-  for (let attempt = 0; attempt < 50; attempt += 1) {
-    const candidate = attempt === 0 ? name : `${stem}-${attempt}${extension}`;
+  for (let attempt = 0; attempt <= 50; attempt += 1) {
+    const candidate =
+      attempt === 0 ? name : `${stem}-${attempt === 50 ? randomUUID() : attempt}${extension}`;
+    const relative = path.join(directory, candidate);
     try {
-      await access(path.join(directory, candidate));
-    } catch {
-      return candidate;
+      await createWorkspaceFile(root, relative, content, maxBytes);
+      return relative;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     }
   }
-  return `${stem}-${Date.now()}${extension}`;
+  throw new Error('A new download filename could not be reserved');
 };
 
 /** The frame ordinal baked into a snapshot ref, used as the first place to look for it. */
@@ -529,7 +621,11 @@ export const refFrameOrdinal = (selector: string): number | null => {
  * scanned from. The main-frame locator remains the fallback so a ref for an element that has
  * not rendered yet still gets Playwright's normal auto-waiting.
  */
-export const resolveBrowserTarget = async (page: Page, selector: string): Promise<Locator> => {
+export const resolveBrowserTarget = async (
+  page: Page,
+  selector: string,
+  allowAbsent = false
+): Promise<Locator> => {
   const frames = page.frames();
   const preferredOrdinal = refFrameOrdinal(selector);
   // A hand-written selector is the caller's own, and Playwright's auto-wait is exactly what it
@@ -552,6 +648,7 @@ export const resolveBrowserTarget = async (page: Page, selector: string): Promis
         `${selector} matches ${count} elements, so it no longer names one control - snapshot the page again`
       );
   }
+  if (allowAbsent) return (preferred ?? page).locator(selector);
   // A ref that has gone is the ordinary consequence of the page moving on. Said plainly and
   // immediately, rather than spending the turn's clock inside Playwright's auto-wait for an element
   // that is never coming back.
@@ -1773,7 +1870,8 @@ export class BrowserManager {
           'downloads',
           new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
         ),
-        downloads: [],
+        downloads: new BrowserDownloadHistory(),
+        downloadPublication: Promise.resolve(),
         pendingDownloads: new Set(),
         tabs: new Map(),
         nextTabId: 1,
@@ -1861,6 +1959,29 @@ export class BrowserManager {
         candidate.on('domcontentloaded', republish);
         candidate.on('load', republish);
         candidate.on('download', (download) => {
+          if (session.pendingDownloads.size >= DOWNLOAD_SAVE_LIMIT) {
+            const url = download.url().slice(0, 2_000);
+            void download.cancel().then(
+              () =>
+                session.downloads.record(
+                  {
+                    path: null,
+                    url,
+                    error:
+                      'Download cancelled because too many files are still saving; retry after they complete'
+                  },
+                  true
+                ),
+              () =>
+                session.downloads.record({
+                  path: null,
+                  url,
+                  error:
+                    'Download refused because too many files are still saving; cancellation failed'
+                })
+            );
+            return;
+          }
           const saving = this.#saveDownload(session, root, download);
           session.pendingDownloads.add(saving);
           void saving.finally(() => session.pendingDownloads.delete(saving));
@@ -1910,23 +2031,57 @@ export class BrowserManager {
   async #saveDownload(session: Session, root: string, download: Download): Promise<void> {
     const url = download.url().slice(0, 2_000);
     try {
-      const directory = path.join(root, session.downloadsDirectory);
-      await mkdir(directory, { recursive: true, mode: 0o700 });
-      const name = await uniqueDownloadName(
-        directory,
-        downloadFileName(download.suggestedFilename())
-      );
-      await download.saveAs(path.join(directory, name));
-      session.downloads.push({ path: path.join(session.downloadsDirectory, name), url });
+      const stream = await download.createReadStream();
+      let readFailure: Error | undefined;
+      const onError = (cause: Error) => {
+        readFailure = cause;
+      };
+      stream.on('error', onError);
+      try {
+        // Completed transfers can arrive together; publication must not multiply the file buffer
+        // allowance by the number of concurrent downloads.
+        const publication = session.downloadPublication.then(async () => {
+          if (readFailure) throw readFailure;
+          const chunks: Buffer[] = [];
+          let size = 0;
+          for await (const part of stream) {
+            const value: unknown = part;
+            if (typeof value !== 'string' && !(value instanceof Uint8Array))
+              throw new Error('Download stream returned an unsupported chunk');
+            const chunk: Buffer = Buffer.from(value);
+            size += chunk.length;
+            if (size > this.options.maxFileBytes)
+              throw new Error(`Download exceeds ${this.options.maxFileBytes} byte file limit`);
+            chunks.push(chunk);
+          }
+          const saved = await saveDownloadFile(
+            root,
+            session.downloadsDirectory,
+            downloadFileName(download.suggestedFilename()),
+            Buffer.concat(chunks, size),
+            this.options.maxFileBytes
+          );
+          session.downloads.record({ path: saved, url });
+        });
+        session.downloadPublication = publication.catch(() => undefined);
+        await publication;
+      } finally {
+        stream.destroy();
+        stream.off('error', onError);
+      }
     } catch (cause) {
-      session.downloads.push({
+      session.downloads.record({
         path: null,
         url,
         error: cause instanceof Error ? cause.message.slice(0, 300) : 'Download could not be saved'
       });
+    } finally {
+      await download
+        .delete()
+        .catch((cause: unknown) =>
+          runnerLogger.warn('browser.download_cleanup_failed', { code: failureCode(cause) })
+        );
     }
-    if (session.downloads.length > DOWNLOAD_HISTORY_LIMIT)
-      session.downloads.splice(0, session.downloads.length - DOWNLOAD_HISTORY_LIMIT);
   }
 
   async #settleDownloads(session: Session): Promise<void> {
@@ -2015,7 +2170,7 @@ export class BrowserManager {
         text: botWallMessage(wall)
       });
     }
-    const screenshot = await page.screenshot({ type: 'jpeg', quality: 72 });
+    const screenshot = await captureScreenshot(page, 'jpeg');
     const images = await withDeadline(
       page.evaluate(() =>
         Array.from(document.images)
@@ -2042,7 +2197,7 @@ export class BrowserManager {
       framesOmitted: scan.framesOmitted,
       tabs: await sessionTabs(session),
       // A download that outlived the action that started it is only discoverable here.
-      downloads: session.downloads.slice(-10),
+      downloads: session.downloads.recent.slice(-10),
       pendingDialog: session.pendingDialog
         ? { type: session.pendingDialog.type(), message: session.pendingDialog.message() }
         : null,
@@ -2743,7 +2898,10 @@ export class BrowserManager {
     shared?.authorize(actor);
     const session = await this.ensure(workspaceId, root);
     return this.#adopt(session, shared).submit(actor, (signal) =>
-      this.#raceTakeover(signal, this.#act(session, root, action, actor, consequentialApproved))
+      this.#raceTakeover(
+        signal,
+        this.#act(session, root, action, actor, consequentialApproved, signal)
+      )
     );
   }
 
@@ -2769,63 +2927,66 @@ export class BrowserManager {
     root: string,
     action: BrowserAction,
     actor: 'agent' | 'user',
-    consequentialApproved: boolean
+    consequentialApproved: boolean,
+    signal: AbortSignal
   ) {
-    const startedDownloads = session.downloads.length;
-    if (action.type === 'batch') {
-      const steps: Array<{
-        index: number;
-        type: BrowserPrimitiveAction['type'];
-        ok: boolean;
-        url?: string;
-        error?: string;
-      }> = [];
-      for (const [index, primitive] of action.actions.entries()) {
-        try {
-          if (actor === 'agent') {
-            await this.#guardStep(session, primitive);
-            this.#enforce(
-              await this.#classify(session, primitive),
-              consequentialApproved,
-              ` (batch step ${index + 1}, ${primitive.type})`
-            );
+    return session.downloads.collect(async (receipts) => {
+      if (action.type === 'batch') {
+        const steps: Array<{
+          index: number;
+          type: BrowserPrimitiveAction['type'];
+          ok: boolean;
+          url?: string;
+          error?: string;
+        }> = [];
+        for (const [index, primitive] of action.actions.entries()) {
+          try {
+            if (actor === 'agent') {
+              await this.#guardStep(session, primitive);
+              this.#enforce(
+                await this.#classify(session, primitive),
+                consequentialApproved,
+                ` (batch step ${index + 1}, ${primitive.type})`
+              );
+            }
+            const result = await this.#perform(session, root, primitive);
+            steps.push({ index, type: primitive.type, ok: true, url: result.url });
+          } catch (cause) {
+            steps.push({
+              index,
+              type: primitive.type,
+              ok: false,
+              error: cause instanceof Error ? cause.message.slice(0, 400) : 'Browser step failed'
+            });
+            // Stopping here rather than pressing on: the steps after a failed one were written
+            // against a page state that never happened.
+            break;
           }
-          const result = await this.#perform(session, root, primitive);
-          steps.push({ index, type: primitive.type, ok: true, url: result.url });
-        } catch (cause) {
-          steps.push({
-            index,
-            type: primitive.type,
-            ok: false,
-            error: cause instanceof Error ? cause.message.slice(0, 400) : 'Browser step failed'
-          });
-          // Stopping here rather than pressing on: the steps after a failed one were written
-          // against a page state that never happened.
-          break;
         }
+        if (session.pendingDownloads.size) await this.#settleDownloads(session);
+        return {
+          url: session.page.url(),
+          title: await session.page.title().catch(() => ''),
+          tabId: tabIdFor(session, session.page),
+          steps,
+          completed: steps.filter((step) => step.ok).length,
+          ...receipts,
+          downloadsDirectory: session.downloadsDirectory
+        };
       }
-      if (session.pendingDownloads.size) await this.#settleDownloads(session);
-      return {
-        url: session.page.url(),
-        title: await session.page.title().catch(() => ''),
-        tabId: tabIdFor(session, session.page),
-        steps,
-        completed: steps.filter((step) => step.ok).length,
-        downloads: session.downloads.slice(startedDownloads)
-      };
-    }
-    if (actor === 'agent') {
-      await this.#guardStep(session, action);
-      this.#enforce(await this.#classify(session, action), consequentialApproved, '');
-    }
-    const performed = await this.#perform(session, root, action);
-    // `#perform` has already paid for the title of the tab it acted on, so the pane gets it for
-    // nothing. The page's own `load` events cover a navigation nobody here asked for; this covers
-    // the far more common case of one that something here did.
-    this.#adoptStreamTitle(session, performed.tabId, performed.title);
-    if (DOWNLOAD_TRIGGERING_ACTIONS.includes(action.type) || session.pendingDownloads.size)
-      await this.#settleDownloads(session);
-    return { ...performed, downloads: session.downloads.slice(startedDownloads) };
+      if (actor === 'agent') {
+        await this.#guardStep(session, action);
+        this.#enforce(await this.#classify(session, action), consequentialApproved, '');
+      }
+      const performed = await this.#perform(session, root, action);
+      // `#perform` has already paid for the title of the tab it acted on, so the pane gets it for
+      // nothing. The page's own `load` events cover a navigation nobody here asked for; this covers
+      // the far more common case of one that something here did.
+      this.#adoptStreamTitle(session, performed.tabId, performed.title);
+      if (DOWNLOAD_TRIGGERING_ACTIONS.includes(action.type) || session.pendingDownloads.size)
+        await this.#settleDownloads(session);
+      return { ...performed, ...receipts, downloadsDirectory: session.downloadsDirectory };
+    }, signal);
   }
 
   /**
@@ -3038,7 +3199,7 @@ export class BrowserManager {
         // its own, which would resolve it a second time after the check.
         this.#assertReadablePage(page, session.control.holder === 'agent' ? 'agent' : 'user');
         const relativePath = assertUserDataPath(root, action.path);
-        const image = await page.screenshot({ type: 'png' });
+        const image = await captureScreenshot(page, 'png');
         await writeWorkspaceFile(root, relativePath, image, this.options.maxFileBytes);
         return {
           url: page.url(),
@@ -3110,7 +3271,11 @@ export class BrowserManager {
     const timeout = action.timeoutMs;
     if (action.selector) {
       await (
-        await resolveBrowserTarget(page, action.selector)
+        await resolveBrowserTarget(
+          page,
+          action.selector,
+          action.state === 'detached' || action.state === 'hidden'
+        )
       ).waitFor({
         state: action.state,
         timeout

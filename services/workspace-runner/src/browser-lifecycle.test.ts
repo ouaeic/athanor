@@ -1,9 +1,10 @@
 import { EventEmitter } from 'node:events';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { Readable } from 'node:stream';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { BrowserManager } from './browser.js';
+import { BrowserDownloadHistory, BrowserManager } from './browser.js';
 import { DesktopControl } from './holder.js';
 
 const deferred = <T>() => {
@@ -17,8 +18,18 @@ const deferred = <T>() => {
 const driver = vi.hoisted(() => ({ launchPersistentContext: vi.fn() }));
 vi.mock('./playwright.js', () => ({ chromiumDriver: () => Promise.resolve(driver) }));
 
+class Page extends EventEmitter {
+  readonly url = vi.fn(() => 'about:blank');
+  readonly title = vi.fn(async () => '');
+  readonly locator = vi.fn(() => ({ innerText: async () => '' }));
+  readonly frames = vi.fn(() => []);
+  readonly isClosed = vi.fn(() => false);
+  readonly evaluate = vi.fn(async () => []);
+  readonly screenshot = vi.fn(async () => Buffer.from('captured frame'));
+}
+
 class Context extends EventEmitter {
-  readonly page = new EventEmitter();
+  readonly page = new Page();
   readonly close = vi.fn(async () => {
     this.emit('close');
   });
@@ -201,4 +212,381 @@ describe('persistent browser ownership', () => {
     expect(context.close).toHaveBeenCalledTimes(2);
     expect(driver.launchPersistentContext).toHaveBeenCalledTimes(2);
   });
+});
+
+describe('first browser frame recovery', () => {
+  const unavailable = () =>
+    new Error(
+      'page.screenshot: Protocol error (Page.captureScreenshot): Unable to capture screenshot'
+    );
+
+  it('captures a real frame after the compositor first refuses a screenshot', async () => {
+    const { manager, root } = await setup();
+    await manager.ensure(workspace, root);
+    const page = contexts[0]!.page;
+    const frame = Buffer.from('newly rendered frame');
+    page.screenshot.mockRejectedValueOnce(unavailable()).mockResolvedValueOnce(frame);
+    const snapshot = await manager.snapshot(workspace, root, 'user');
+    expect(snapshot.screenshotBase64).toBe(frame.toString('base64'));
+    expect(page.screenshot).toHaveBeenCalledTimes(2);
+    expect(page.screenshot.mock.invocationCallOrder[0]).toBeLessThan(
+      page.evaluate.mock.invocationCallOrder[0]!
+    );
+    expect(page.evaluate.mock.invocationCallOrder[0]).toBeLessThan(
+      page.screenshot.mock.invocationCallOrder[1]!
+    );
+  });
+
+  it('saves the recovered PNG through the screenshot action file boundary', async () => {
+    const { manager, root } = await setup();
+    await mkdir(path.join(root, 'workspace'));
+    await manager.ensure(workspace, root);
+    const page = contexts[0]!.page;
+    const frame = Buffer.from('recovered PNG bytes');
+    page.screenshot.mockRejectedValueOnce(unavailable()).mockResolvedValueOnce(frame);
+    const result = await manager.act(
+      workspace,
+      root,
+      { type: 'screenshot', path: 'proof.png' },
+      'agent'
+    );
+    expect('path' in result && result.path).toBe(path.join('workspace', 'proof.png'));
+    expect(await readFile(path.join(root, 'workspace', 'proof.png'))).toEqual(frame);
+    expect(page.screenshot).toHaveBeenNthCalledWith(1, { type: 'png' });
+    expect(page.screenshot).toHaveBeenNthCalledWith(2, { type: 'png' });
+  });
+
+  it.each([
+    'Timeout 30000ms exceeded',
+    'Permission denied',
+    'Target page, context or browser has been closed'
+  ])('propagates %s without a retry', async (message) => {
+    const { manager, root } = await setup();
+    await manager.ensure(workspace, root);
+    const page = contexts[0]!.page;
+    const failure = new Error(`page.screenshot: ${message}`);
+    page.screenshot.mockRejectedValue(failure);
+    await expect(manager.snapshot(workspace, root, 'user')).rejects.toBe(failure);
+    expect(page.screenshot).toHaveBeenCalledOnce();
+    expect(page.evaluate).not.toHaveBeenCalled();
+  });
+
+  it('propagates a repeated compositor failure after one retry', async () => {
+    const { manager, root } = await setup();
+    await manager.ensure(workspace, root);
+    const page = contexts[0]!.page;
+    const failure = unavailable();
+    page.screenshot.mockRejectedValue(failure);
+    await expect(manager.snapshot(workspace, root, 'user')).rejects.toBe(failure);
+    expect(page.screenshot).toHaveBeenCalledTimes(2);
+  });
+
+  it('bounds a stalled rendering opportunity before retrying the frame', async () => {
+    const { manager, root } = await setup();
+    await manager.ensure(workspace, root);
+    const page = contexts[0]!.page;
+    page.screenshot.mockRejectedValueOnce(unavailable());
+    page.evaluate.mockImplementationOnce(() => new Promise<[]>(() => {}));
+    const snapshot = await manager.snapshot(workspace, root, 'user');
+    expect(snapshot.screenshotBase64).toBe(Buffer.from('captured frame').toString('base64'));
+    expect(page.screenshot).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not retry a page closed while waiting for rendering', async () => {
+    const { manager, root } = await setup();
+    await manager.ensure(workspace, root);
+    const page = contexts[0]!.page;
+    const failure = unavailable();
+    page.screenshot.mockRejectedValueOnce(failure);
+    page.evaluate.mockImplementationOnce(async () => {
+      page.isClosed.mockReturnValue(true);
+      return [];
+    });
+    await expect(manager.snapshot(workspace, root, 'user')).rejects.toBe(failure);
+    expect(page.screenshot).toHaveBeenCalledOnce();
+    expect(page.evaluate).toHaveBeenCalledOnce();
+  });
+
+  it('does not retry a page closed while its first capture was pending', async () => {
+    const { manager, root } = await setup();
+    await manager.ensure(workspace, root);
+    const page = contexts[0]!.page;
+    const failure = unavailable();
+    page.screenshot.mockImplementationOnce(async () => {
+      page.isClosed.mockReturnValue(true);
+      throw failure;
+    });
+    await expect(manager.snapshot(workspace, root, 'user')).rejects.toBe(failure);
+    expect(page.screenshot).toHaveBeenCalledOnce();
+    expect(page.evaluate).not.toHaveBeenCalled();
+  });
+});
+
+describe('download event receipts', () => {
+  const download = (body: string, filename = 'report.txt') => ({
+    url: () => 'https://93.184.216.34/report.txt',
+    suggestedFilename: () => filename,
+    createReadStream: async () => Readable.from([Buffer.from(body)]),
+    saveAs: async (destination: string) => writeFile(destination, body),
+    delete: vi.fn(async () => {}),
+    cancel: vi.fn(async () => {})
+  });
+
+  it('refuses a download directory symlink without creating anything outside the workspace', async () => {
+    const { manager, root } = await setup();
+    await mkdir(path.join(root, 'workspace'));
+    const outside = await mkdtemp(path.join(tmpdir(), 'athanor-download-outside-'));
+    roots.push(outside);
+    await symlink(outside, path.join(root, 'workspace', 'downloads'));
+    const session = await manager.ensure(workspace, root);
+    const item = download('private export');
+    contexts[0]!.page.emit('download', item);
+    await Promise.all(session.pendingDownloads);
+    expect(session.downloads.recent).toHaveLength(1);
+    expect(session.downloads.recent[0]?.path).toBeNull();
+    expect(session.downloads.recent[0]?.error).toEqual(expect.any(String));
+    expect(await readdir(outside)).toEqual([]);
+    expect(item.delete).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses an oversized download and releases its browser artifact', async () => {
+    const { manager, root } = await setup({ maxFileBytes: 8 });
+    await mkdir(path.join(root, 'workspace'));
+    const session = await manager.ensure(workspace, root);
+    const item = download('more than eight bytes');
+    contexts[0]!.page.emit('download', item);
+    await Promise.all(session.pendingDownloads);
+    expect(session.downloads.recent).toHaveLength(1);
+    expect(session.downloads.recent[0]).toMatchObject({ path: null, url: item.url() });
+    expect(session.downloads.recent[0]?.error).toContain('8 byte file limit');
+    await expect(lstat(path.join(root, session.downloadsDirectory))).rejects.toMatchObject({
+      code: 'ENOENT'
+    });
+    expect(item.delete).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not follow a dangling symlink at the downloaded filename', async () => {
+    const { manager, root } = await setup();
+    await mkdir(path.join(root, 'workspace'));
+    const outside = await mkdtemp(path.join(tmpdir(), 'athanor-download-outside-'));
+    roots.push(outside);
+    const session = await manager.ensure(workspace, root);
+    const directory = path.join(root, session.downloadsDirectory);
+    await mkdir(directory, { recursive: true });
+    await symlink(path.join(outside, 'target.txt'), path.join(directory, 'report.txt'));
+    const item = download('private export');
+    contexts[0]!.page.emit('download', item);
+    await Promise.all(session.pendingDownloads);
+    expect(session.downloads.recent).toHaveLength(1);
+    expect(session.downloads.recent[0]?.path).toBeNull();
+    expect(session.downloads.recent[0]?.error).toEqual(expect.any(String));
+    expect(await readdir(outside)).toEqual([]);
+    expect(item.delete).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves existing files while concurrent downloads choose the same name', async () => {
+    const { manager, root } = await setup();
+    await mkdir(path.join(root, 'workspace'));
+    const session = await manager.ensure(workspace, root);
+    const directory = path.join(root, session.downloadsDirectory);
+    await mkdir(directory, { recursive: true });
+    await writeFile(path.join(directory, 'report.txt'), 'owner copy');
+    const items = [download('first export'), download('second export')];
+    for (const item of items) contexts[0]!.page.emit('download', item);
+    await Promise.all(session.pendingDownloads);
+    expect(session.downloads.recent).toHaveLength(2);
+    expect(session.downloads.recent.every((receipt) => receipt.path !== null)).toBe(true);
+    const files = await readdir(directory);
+    expect(files).toHaveLength(3);
+    expect(await readFile(path.join(directory, 'report.txt'), 'utf8')).toBe('owner copy');
+    expect(
+      new Set(await Promise.all(files.map((file) => readFile(path.join(directory, file), 'utf8'))))
+    ).toEqual(new Set(['owner copy', 'first export', 'second export']));
+    for (const item of items) expect(item.delete).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not publish a partial stream and continues with the next download', async () => {
+    const { manager, root } = await setup();
+    await mkdir(path.join(root, 'workspace'));
+    const session = await manager.ensure(workspace, root);
+    const broken = download('partial', 'broken.txt');
+    broken.createReadStream = async () =>
+      Readable.from(
+        (async function* () {
+          yield Buffer.from('partial');
+          throw new Error('transfer failed');
+        })()
+      );
+    const valid = download('complete', 'valid.txt');
+    contexts[0]!.page.emit('download', broken);
+    contexts[0]!.page.emit('download', valid);
+    await Promise.all(session.pendingDownloads);
+    expect(session.downloads.recent).toHaveLength(2);
+    expect(session.downloads.recent[0]).toMatchObject({ path: null, error: 'transfer failed' });
+    expect(await readdir(path.join(root, session.downloadsDirectory))).toEqual(['valid.txt']);
+    expect(await readFile(path.join(root, session.downloadsDirectory, 'valid.txt'), 'utf8')).toBe(
+      'complete'
+    );
+    expect(broken.delete).toHaveBeenCalledTimes(1);
+    expect(valid.delete).toHaveBeenCalledTimes(1);
+  });
+
+  it('buffers only one completed download at a time', async () => {
+    const { manager, root } = await setup();
+    await mkdir(path.join(root, 'workspace'));
+    const session = await manager.ensure(workspace, root);
+    const reading = deferred<void>();
+    const release = deferred<void>();
+    let secondRead = false;
+    const first = download('first', 'first.txt');
+    first.createReadStream = async () =>
+      Readable.from(
+        (async function* () {
+          reading.resolve();
+          yield Buffer.from('first');
+          await release.promise;
+        })()
+      );
+    const second = download('second', 'second.txt');
+    second.createReadStream = async () =>
+      Readable.from(
+        (async function* () {
+          secondRead = true;
+          yield Buffer.from('second');
+        })()
+      );
+    contexts[0]!.page.emit('download', first);
+    contexts[0]!.page.emit('download', second);
+    try {
+      await reading.promise;
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(secondRead).toBe(false);
+    } finally {
+      release.resolve();
+    }
+    await Promise.all(session.pendingDownloads);
+    expect(secondRead).toBe(true);
+    expect(session.downloads.recent).toHaveLength(2);
+    expect(session.downloads.recent.every((receipt) => receipt.path !== null)).toBe(true);
+  });
+
+  it('stops retaining receipts when an action is aborted before its underlying work settles', async () => {
+    const history = new BrowserDownloadHistory();
+    const controller = new AbortController();
+    const gate = deferred<void>();
+    const first = { path: 'workspace/first.txt', url: 'https://93.184.216.34/first.txt' };
+    const work = history.collect(async (receipts) => {
+      await gate.promise;
+      return receipts;
+    }, controller.signal);
+    history.record(first);
+    controller.abort();
+    history.record({ path: 'workspace/later.txt', url: 'https://93.184.216.34/later.txt' });
+    gate.resolve();
+    expect((await work).downloads).toEqual([first]);
+    expect(history.recent).toHaveLength(2);
+  });
+
+  it('caps pending saves and accounts for cancelled overflow without growing receipts', async () => {
+    const { manager, root } = await setup();
+    await mkdir(path.join(root, 'workspace'));
+    const session = await manager.ensure(workspace, root);
+    const page = contexts[0]!.page;
+    const gate = deferred<void>();
+    const cancel = vi.fn(async () => {});
+    page.screenshot.mockImplementationOnce(async () => {
+      for (let index = 0; index < 180; index += 1) {
+        page.emit('download', {
+          url: () => `https://93.184.216.34/part-${index}.txt`,
+          suggestedFilename: () => `part-${index}.txt`,
+          cancel,
+          delete: async () => {},
+          createReadStream: async () => {
+            await gate.promise;
+            return Readable.from([Buffer.from(`part ${index}`)]);
+          },
+          saveAs: async (destination: string) => {
+            await gate.promise;
+            await writeFile(destination, `part ${index}`);
+          }
+        });
+      }
+      return Buffer.from('frame');
+    });
+    const action = manager.act(workspace, root, { type: 'screenshot', path: 'burst.png' }, 'agent');
+    try {
+      await vi.waitFor(() => expect(cancel).toHaveBeenCalledTimes(116));
+      expect(session.pendingDownloads.size).toBe(64);
+    } finally {
+      gate.resolve();
+    }
+    const result = await action;
+    expect(result.downloads).toHaveLength(100);
+    expect(result.downloadsCancelled).toBe(116);
+    expect(result.downloadsOmitted + result.downloadErrorsOmitted + result.downloads.length).toBe(
+      180
+    );
+    expect(
+      result.downloads.filter((record) => record.path !== null).length + result.downloadsOmitted
+    ).toBe(64);
+    expect(
+      result.downloads.filter((record) => record.error).length + result.downloadErrorsOmitted
+    ).toBe(116);
+    expect(await readdir(path.join(root, result.downloadsDirectory))).toHaveLength(64);
+    expect(session.pendingDownloads.size).toBe(0);
+    expect(session.downloads.recent).toHaveLength(25);
+  });
+
+  it.each([30, 120])(
+    'accounts for %i saved files and releases finished action receipts',
+    async (count) => {
+      const { manager, root } = await setup();
+      await mkdir(path.join(root, 'workspace'));
+      const session = await manager.ensure(workspace, root);
+      const page = contexts[0]!.page;
+      page.screenshot.mockImplementationOnce(async () => {
+        for (let index = 0; index < count; index += 1) {
+          page.emit('download', {
+            url: () => `https://93.184.216.34/part-${index}.txt`,
+            suggestedFilename: () => `part-${index}.txt`,
+            delete: async () => {},
+            createReadStream: async () => Readable.from([Buffer.from(`part ${index}`)]),
+            saveAs: async (destination: string) => writeFile(destination, `part ${index}`)
+          });
+          await Promise.all(session.pendingDownloads);
+        }
+        return Buffer.from('frame');
+      });
+      const first = await manager.act(
+        workspace,
+        root,
+        { type: 'screenshot', path: 'first.png' },
+        'agent'
+      );
+      expect(first.downloads).toHaveLength(Math.min(count, 100));
+      expect(session.downloads.recent).toHaveLength(25);
+      expect(first.downloadsOmitted).toBe(Math.max(0, count - 100));
+      expect(first.downloadErrorsOmitted).toBe(0);
+      expect(first.downloadsCancelled).toBe(0);
+      expect(path.isAbsolute(first.downloadsDirectory)).toBe(false);
+      expect(first.downloadsDirectory.startsWith('workspace/')).toBe(true);
+      const files = await readdir(path.join(root, first.downloadsDirectory));
+      expect(files).toHaveLength(count);
+      const bodies = await Promise.all(
+        files.map((file) => readFile(path.join(root, first.downloadsDirectory, file), 'utf8'))
+      );
+      expect(new Set(bodies)).toEqual(
+        new Set(Array.from({ length: count }, (_, index) => `part ${index}`))
+      );
+      const second = await manager.act(
+        workspace,
+        root,
+        { type: 'screenshot', path: 'second.png' },
+        'agent'
+      );
+      expect(second.downloads).toEqual([]);
+      session.downloads.record({ path: null, url: 'https://93.184.216.34/later.txt' });
+      expect(first.downloads).toHaveLength(Math.min(count, 100));
+    }
+  );
 });
