@@ -14,6 +14,7 @@ import { isProviderWall, type ModelGateway, type ModelToolCall } from '@athanor/
 import type { AgentState } from './agent-state.js';
 import { estimatedInferenceCostUsd, usageCredit } from './billing.js';
 import { routeTo, usableCapabilities } from './routing.js';
+import { sanitiseUntrustedText, untrustedEnvelope } from './sanitise.js';
 import { event, type ImageObservation } from './tool-recording.js';
 import { VISION_SPECIALIST_ATTEMPTS, VISION_SPECIALIST_MIN_CONTEXT_TOKENS } from './turn-bounds.js';
 import { withRequestDeadline } from './turn-lifecycle.js';
@@ -116,12 +117,17 @@ export const routeImageObservation = async (
   leadModel: ModelRelease,
   catalog: ModelRelease[]
 ): Promise<void> => {
-  const imageLabel =
+  const sourceLabel =
     call.name === 'image_read'
       ? `Workspace image from ${textValue(call.arguments.path)}`
       : call.name === 'desktop_observe'
         ? 'Current private Linux desktop screenshot'
-        : 'Current private browser screenshot';
+        : call.name === 'desktop_action'
+          ? 'Cropped private Linux desktop screenshot'
+          : 'Current private browser screenshot';
+  const imageLabel = image.screen
+    ? `${sourceLabel}. Screenshot geometry (region is in display pixels): ${JSON.stringify(image.screen)}`
+    : sourceLabel;
   const current = await currentCatalog(deps, catalog);
   const currentLead = current.find((entry) => entry.id === leadModel.id) ?? leadModel;
   if (usableCapabilities(currentLead, task.privacyRoute).has('vision')) {
@@ -373,7 +379,10 @@ export const routeImageObservation = async (
       );
       state.messages.push({
         role: 'system',
-        content: `VISION SPECIALIST HANDOFF\nLead model: ${leadModel.displayName}\nVision model: ${specialist.displayName}\nSource: ${imageLabel}\nObservation:\n${response.text}`
+        content: `VISION SPECIALIST HANDOFF\nLead model: ${leadModel.displayName}\nVision model: ${specialist.displayName}\nSource: ${imageLabel}\n${untrustedEnvelope(
+          'vision specialist observation',
+          sanitiseUntrustedText(response.text)
+        )}`
       });
       // Recorded only where it answered. A candidate that failed is not an incumbent, and the
       // ranking is the right thing to consult for the next image rather than the memory of who

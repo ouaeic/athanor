@@ -43,6 +43,7 @@ import {
 import { spillOverflow, spillRecovery } from './output-spill.js';
 import { sanitiseUntrusted, sanitiseUntrustedText, untrustedEnvelope } from './sanitise.js';
 import { boundedToolResultForModel } from './streaming.js';
+import { surfaceActionVerb } from './surface-actions.js';
 import type { BotWall } from './provenance.js';
 import {
   failingCallKey,
@@ -72,6 +73,14 @@ export interface ImageObservation {
    * takes a photograph's location and camera off it, so this is never the bytes the file holds.
    */
   convertedFrom?: string;
+  screen?: {
+    region?: { x: number; y: number; width: number; height: number };
+    width?: number;
+    height?: number;
+    displayWidth?: number;
+    displayHeight?: number;
+    scale?: number;
+  };
 }
 
 /**
@@ -437,13 +446,42 @@ export const recordToolResult = async (
   let image: ImageObservation | undefined;
   if (call.name === 'image_read' && result && typeof result === 'object')
     image = result as ImageObservation;
-  if (
-    ['browser_snapshot', 'desktop_observe'].includes(call.name) &&
-    result &&
-    typeof result === 'object'
-  ) {
-    const screenshot = textValue((result as Record<string, unknown>).screenshotBase64);
-    if (screenshot) image = { mimeType: 'image/jpeg', base64: screenshot };
+  const surfaceScreenshot =
+    ['browser_snapshot', 'desktop_observe'].includes(call.name) ||
+    (call.name === 'desktop_action' && surfaceActionVerb(call.arguments) === 'zoom');
+  const surface = asRecord(result);
+  if (surfaceScreenshot && surface && !isHarnessAnswer(result)) {
+    const screenshot = textValue(surface.screenshotBase64);
+    const mimeType = textValue(surface.screenshotMimeType, 'image/jpeg');
+    if (screenshot && ['image/jpeg', 'image/png', 'image/webp'].includes(mimeType)) {
+      const screen: NonNullable<ImageObservation['screen']> = {};
+      for (const field of ['width', 'height', 'displayWidth', 'displayHeight', 'scale'] as const) {
+        const value = surface[field];
+        if (typeof value === 'number' && Number.isFinite(value) && value > 0) screen[field] = value;
+      }
+      const region = asRecord(surface.region);
+      if (
+        region &&
+        ['x', 'y', 'width', 'height'].every(
+          (field) => typeof region[field] === 'number' && Number.isFinite(region[field])
+        ) &&
+        Number(region.x) >= 0 &&
+        Number(region.y) >= 0 &&
+        Number(region.width) > 0 &&
+        Number(region.height) > 0
+      )
+        screen.region = {
+          x: Number(region.x),
+          y: Number(region.y),
+          width: Number(region.width),
+          height: Number(region.height)
+        };
+      image = {
+        mimeType,
+        base64: screenshot,
+        ...(Object.keys(screen).length ? { screen } : {})
+      };
+    }
   }
   const imageSummary =
     call.name === 'image_read' && image

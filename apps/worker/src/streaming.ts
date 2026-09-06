@@ -81,6 +81,19 @@ export const createStreamFlusher = (
  * Image bytes reach the model as an attached data URL, so the serialised tool result carries only
  * metadata; repeating the base64 here would burn most of the context window.
  */
+const withoutScreenshotBytes = (result: unknown): unknown => {
+  if (Array.isArray(result)) return result.map(withoutScreenshotBytes);
+  if (!result || typeof result !== 'object') return result;
+  return Object.fromEntries(
+    Object.entries(result).map(([key, value]) => [
+      key,
+      key === 'screenshotBase64'
+        ? '[screenshot available in timeline]'
+        : withoutScreenshotBytes(value)
+    ])
+  );
+};
+
 export const boundedToolResultForModel = (
   toolName: string,
   result: unknown,
@@ -89,14 +102,9 @@ export const boundedToolResultForModel = (
   if (imageSummary)
     return { ...imageSummary, image: '[attached to this conversation for inspection]' };
   if (
-    ['browser_snapshot', 'desktop_observe'].includes(toolName) &&
-    result &&
-    typeof result === 'object'
+    ['browser_snapshot', 'desktop_observe', 'browser_action', 'desktop_action'].includes(toolName)
   )
-    return {
-      ...(result as Record<string, unknown>),
-      screenshotBase64: '[screenshot available in timeline]'
-    };
+    return withoutScreenshotBytes(result);
   return result;
 };
 
