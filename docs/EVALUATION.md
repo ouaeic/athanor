@@ -104,7 +104,7 @@ the whole block on every `pnpm check`. Accept a new baseline and this page fails
 is re-derived, naming the value it should now carry. The instruction is no longer advice.
 
 ```baseline
-fixtures                                                                             74
+fixtures                                                                             75
 long-a-finished-phase-is-never-declared.modelCalls                                   38
 long-a-finished-phase-is-never-declared.promptTokens                          1,462,301
 long-a-finished-phase-is-never-declared.catalogueTokens                         477,204

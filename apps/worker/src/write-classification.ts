@@ -28,6 +28,7 @@ import {
   WRITING_GIT_SUBCOMMANDS
 } from './command-classification.js';
 import { textValue } from './values.js';
+import { surfaceActionVerb } from './surface-actions.js';
 
 /** Tools whose successful result is a check, not a change; everything else here changes something. */
 const NON_MUTATING_TOOLS = new Set([
@@ -84,6 +85,8 @@ const NON_MUTATING_TOOLS = new Set([
  */
 export const isMutatingToolCall = (name: string, args: Record<string, unknown> = {}): boolean => {
   if (NON_MUTATING_TOOLS.has(name)) return false;
+  // Zoom returns captured pixels without sending input or writing a workspace artifact.
+  if (name === 'desktop_action' && surfaceActionVerb(args) === 'zoom') return false;
   if (name === 'shell') {
     // Deliberately asymmetric. A command wrongly called a change costs nothing but a second check;
     // a verification command wrongly called a change can never satisfy the rule it is meant to

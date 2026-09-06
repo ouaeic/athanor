@@ -4123,6 +4123,66 @@ export const fixtures: readonly Fixture[] = [
     }
   },
   {
+    id: 'research-desktop-zoom-finishes-with-its-own-observation',
+    shape: 'research',
+    request:
+      'Look at the desktop, zoom into the small region at 640, 400, and tell me what is visible.',
+    why: 'A desktop zoom only captures pixels. Its returned image must remain citable without another observation or an unrelated file acceptance check, while the image keeps its untrusted provenance.',
+    visionSpecialist: true,
+    runner: {
+      desktopNodes: [{ role: 'frame', name: 'Empty desktop' }],
+      desktopZoom: {
+        request: { type: 'zoom', x: 640, y: 400, width: 16, height: 16 },
+        response: {
+          // A real 16 by 16 black JPEG, matching the crop described by the fixture.
+          screenshotBase64:
+            '/9j/4AAQSkZJRgABAgAAAQABAAD//gAQTGF2YzYyLjI4LjEwMAD/2wBDAAgEBAQEBAUFBQUFBQYGBgYGBgYGBgYGBgYHBwcICAgHBwcGBgcHCAgICAkJCQgICAgJCQoKCgwMCwsODg4RERT/xABLAAEBAAAAAAAAAAAAAAAAAAAACAEBAAAAAAAAAAAAAAAAAAAAABABAAAAAAAAAAAAAAAAAAAAABEBAAAAAAAAAAAAAAAAAAAAAP/AABEIABAAEAMBIgACEQADEQD/2gAMAwEAAhEDEQA/AJ/AB//Z',
+          screenshotMimeType: 'image/jpeg',
+          region: { x: 640, y: 400, width: 16, height: 16 },
+          displayWidth: 1280,
+          displayHeight: 800
+        }
+      }
+    },
+    model: ({ vision, index }) =>
+      vision
+        ? { text: 'The crop contains an empty black background with no readable content.' }
+        : sequence(
+            { calls: [{ id: 'call-observe', name: 'desktop_observe', args: {} }] },
+            {
+              calls: [
+                {
+                  id: 'call-zoom',
+                  name: 'desktop_action',
+                  args: { action: 'zoom', x: 640, y: 400, width: 16, height: 16 }
+                }
+              ]
+            },
+            {
+              text: 'The zoomed region is an empty black background with no readable content.',
+              calls: finishCall('call-finish', {
+                summary: 'Inspected the requested desktop crop.',
+                verification: evidence(
+                  'call-zoom',
+                  'The captured region contains an empty black background'
+                )
+              })
+            }
+          )({ index }),
+    expect: {
+      modelCalls: 4,
+      proposed: ['desktop_observe', 'desktop_action', 'finish'],
+      tools: ['desktop_observe', 'desktop_action'],
+      commandsRun: 0,
+      status: 'completed',
+      verification: 'verified',
+      askedOwner: false,
+      untrusted: true,
+      warnings: ['Untrusted content entered this turn from desktop application'],
+      holds: ['vision_routed']
+    }
+  },
+  {
     id: 'research-desktop-content-cannot-grant-memory-authority',
     shape: 'research',
     request: 'Look at the desktop and tell me what the open window says.',

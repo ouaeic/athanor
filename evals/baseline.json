@@ -1,9 +1,9 @@
 {
   "$stamp": {
-    "acceptedAt": "2026-09-06T04:23:23.354Z",
+    "acceptedAt": "2026-09-06T05:00:24.590Z",
     "version": "0.1.1",
-    "commit": "459d93c",
-    "harness": "93f789ba1422"
+    "commit": "09068c0",
+    "harness": "a833a16c4fdf"
   },
   "ambiguous-a-question-before-looking-is-refused": {
     "modelCalls": 3,
@@ -317,6 +317,13 @@
     "modelCalls": 2,
     "promptTokens": 31941,
     "catalogueTokens": 25116,
+    "cachePrefix": 95,
+    "displayedLines": 0
+  },
+  "research-desktop-zoom-finishes-with-its-own-observation": {
+    "modelCalls": 4,
+    "promptTokens": 48764,
+    "catalogueTokens": 37675,
     "cachePrefix": 95,
     "displayedLines": 0
   },

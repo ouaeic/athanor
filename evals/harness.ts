@@ -33,7 +33,11 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import type { ModelRelease, SpendDecision } from '../packages/contracts/src/index.js';
+import {
+  DesktopAction,
+  type ModelRelease,
+  type SpendDecision
+} from '../packages/contracts/src/index.js';
 import {
   decryptJson,
   encryptJson,
@@ -718,6 +722,22 @@ export interface RunnerStub {
     readonly role: string;
     readonly name: string;
   }>;
+  /** An explicit zoom request and the captured image the runner answers it with. */
+  readonly desktopZoom?: {
+    readonly request: Extract<DesktopAction, { type: 'zoom' }>;
+    readonly response: {
+      readonly screenshotBase64: string;
+      readonly screenshotMimeType: 'image/jpeg';
+      readonly region: {
+        readonly x: number;
+        readonly y: number;
+        readonly width: number;
+        readonly height: number;
+      };
+      readonly displayWidth: number;
+      readonly displayHeight: number;
+    };
+  };
 }
 
 const json = (body: unknown): Response =>
@@ -1106,6 +1126,26 @@ const runnerResponse = (
       nodesOmitted: 0,
       windowTitle: nodes[0]?.name ?? 'desktop'
     });
+  }
+  if (url.endsWith('/desktop/preflight') || url.endsWith('/desktop/action')) {
+    const zoom = stub.desktopZoom;
+    const action = DesktopAction.safeParse(body);
+    if (
+      !zoom ||
+      !action.success ||
+      action.data.type !== 'zoom' ||
+      Object.entries(zoom.request).some(([key, value]) => body[key] !== value)
+    ) {
+      state.unstubbed.push(routeName(url, init));
+      return new Response(JSON.stringify({ error: 'desktop action is not modelled' }), {
+        status: 400
+      });
+    }
+    return json(
+      url.endsWith('/desktop/preflight')
+        ? { consequential: false, sensitiveInput: false, preview: 'Inspect the screen region' }
+        : zoom.response
+    );
   }
   if (url.includes('/browser/search'))
     return json({

@@ -4,6 +4,7 @@ import type { ModelRelease } from '@athanor/contracts';
 import type { DataStore, TaskRecord } from '@athanor/data';
 import { ModelGateway, OpenAICompatibleAdapter, type ModelToolCall } from '@athanor/model-gateway';
 import type { AgentState } from './agent-state.js';
+import { completionVerification } from './completion.js';
 import { recordToolResult, type ToolRecordingDeps } from './tool-recording.js';
 import { executeSurfaceTool } from './tools/web.js';
 import type { ToolContext } from './tool-dispatch.js';
@@ -214,6 +215,19 @@ describe('surface observations at the model request boundary', () => {
       expect(text).toContain('2560');
       expect(text).not.toContain(pixels);
       expect(observed.events.find((entry) => entry.payload.result)?.payload.result).toEqual(crop);
+      expect(observed.state.turnToolResults?.['call-observe']?.mutating).toBe(false);
+      expect(
+        completionVerification(observed.state, {
+          status: 'verified',
+          evidence: [
+            {
+              claim: 'Inspected the desktop crop.',
+              source: 'tool_result',
+              toolCallId: 'call-observe'
+            }
+          ]
+        })
+      ).toMatchObject({ ok: true, verification: { status: 'verified' } });
     }
   );
 

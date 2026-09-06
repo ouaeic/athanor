@@ -9,6 +9,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { approvalRequirement } from './approval-policy.js';
+import { desktopActionProperties } from './surface-actions.js';
 import {
   deferredExecutionPaths,
   isMutatingToolCall,
@@ -18,6 +19,32 @@ import {
 const shell = (executable: string, ...args: string[]) => ({ executable, args });
 
 describe('what a call changed', () => {
+  it.each([{ action: 'zoom' }, { type: 'zoom' }, { action: 'zoom', type: 'press' }])(
+    'treats the executed desktop zoom as an observation: %j',
+    (args) => {
+      expect(isMutatingToolCall('desktop_action', args)).toBe(false);
+    }
+  );
+
+  it('keeps every other desktop action and browser file capture on the mutation clock', () => {
+    const actions = (desktopActionProperties.action as { enum: string[] }).enum;
+    expect(actions).toContain('zoom');
+    const mutations = actions.filter((action) => action !== 'zoom');
+    expect(mutations.length).toBeGreaterThan(0);
+    for (const action of mutations) {
+      expect(isMutatingToolCall('desktop_action', { action }), action).toBe(true);
+      expect(isMutatingToolCall('desktop_action', { type: action }), action).toBe(true);
+      expect(isMutatingToolCall('desktop_action', { action, type: 'zoom' }), action).toBe(true);
+    }
+    expect(isMutatingToolCall('desktop_action', {})).toBe(true);
+    expect(isMutatingToolCall('desktop_action', { action: 'unsupported', type: 'zoom' })).toBe(
+      true
+    );
+    expect(
+      isMutatingToolCall('browser_action', { action: 'screenshot', path: 'workspace/screen.png' })
+    ).toBe(true);
+  });
+
   /*
    * `finish` dates its evidence against the last change, so a call that changed the computer and
    * reports itself as a check lets an agent cite a result from before it. `git config --global
