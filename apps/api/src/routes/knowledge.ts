@@ -576,20 +576,7 @@ export const registerKnowledgeRoutes = (context: RouteContext): void => {
           `Your block holds ${OWNER_BLOCK_MAX_BYTES} bytes and this is ${bytes}. Shorten it - nothing here is dropped to make room.`
         );
       const ownerKey = ownerKnowledgeKey(user.id);
-      if (!input.text) {
-        const cleared = await store.clearOwnerBlock(user.id, input.expectedVersion);
-        const remaining = cleared ? null : await store.readOwnerBlock(user.id);
-        // Not deleted and nothing left is "it was already empty", which is what the owner asked
-        // for. Not deleted and something still there is a stale tab, and it is told so rather than
-        // being allowed to try again with a version it has no reason to trust either.
-        if (!cleared && remaining)
-          throw new AthanorError(
-            'owner_block_conflict',
-            'Your block changed somewhere else since this screen loaded. Reload it before saving.',
-            409
-          );
-        return ownerBlockResponse(null, ownerKey);
-      }
+      // Empty text remains sealed so clearing cannot recycle a version held by another device.
       const written = await store.writeOwnerBlock({
         userId: user.id,
         ciphertext: encryptBytes(Buffer.from(input.text, 'utf8'), ownerKey, ownerBlockAad(user.id)),

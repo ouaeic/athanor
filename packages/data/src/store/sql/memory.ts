@@ -535,7 +535,9 @@ WHERE user_id = $1::uuid`;
  */
 export const OWNER_BLOCK_WRITE_SQL = `
 INSERT INTO owner_blocks(user_id, ciphertext, version)
-VALUES ($1::uuid, $2::jsonb, 1)
+SELECT $1::uuid, $2::jsonb, 1
+WHERE $3::int = 0
+   OR EXISTS (SELECT 1 FROM owner_blocks WHERE user_id=$1::uuid AND version=$3::int)
 ON CONFLICT (user_id) DO UPDATE
   SET ciphertext = EXCLUDED.ciphertext,
       version = owner_blocks.version + 1,

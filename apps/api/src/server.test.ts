@@ -2669,7 +2669,7 @@ describe('memory about the owner', () => {
       ).json<{ text: string }>().text
     ).toBe(text);
 
-    // And emptying it is emptying it: the row goes, so an owner who clears the block pays nothing.
+    // Empty content consumes no prompt bytes while its sealed version prevents stale resurrection.
     const cleared = await app.inject({
       method: 'PUT',
       url: '/v1/account/memory-block',
@@ -2677,9 +2677,82 @@ describe('memory about the owner', () => {
       payload: { text: '', expectedVersion: 1 }
     });
     expect(cleared.statusCode, cleared.body).toBe(200);
-    expect(cleared.json()).toMatchObject({ text: '', bytes: 0, version: 0 });
-    expect((await database.query('SELECT * FROM owner_blocks')).rows).toHaveLength(0);
+    expect(cleared.json()).toMatchObject({ text: '', bytes: 0, version: 2 });
+    const emptyRows = await database.query<{ ciphertext: EncryptedEnvelope }>(
+      'SELECT * FROM owner_blocks'
+    );
+    expect(emptyRows.rows).toHaveLength(1);
+    expect(
+      decryptBytes(
+        emptyRows.rows[0]!.ciphertext,
+        ownerKey,
+        ownerBlockAad(workspace.userId)
+      ).toString('utf8')
+    ).toBe('');
   });
+
+  test.each([false, true])(
+    'refuses stale owner-block writes after clearing, including recreation=%s',
+    async (recreate) => {
+      stubProviderFetch();
+      const directory = await mkdtemp(join(tmpdir(), 'athanor-owner-block-clear-'));
+      disposers.push(() => rm(directory, { recursive: true, force: true }));
+      const { app, database, store } = await buildServer(isolatedConfig(directory), { masterKey });
+      disposers.push(() => app.close());
+      const { cookie, workspaceId } = await seedOwner(app, 'owner-block-clear');
+      const write = (text: string, expectedVersion: number) =>
+        app.inject({
+          method: 'PUT',
+          url: '/v1/account/memory-block',
+          headers: { cookie },
+          payload: { text, expectedVersion }
+        });
+      const first = await write('Original words', 0);
+      expect(first.statusCode, first.body).toBe(200);
+      const initialVersion = first.json<{ version: number }>().version;
+      const cleared = await write('', initialVersion);
+      expect(cleared.statusCode, cleared.body).toBe(200);
+      const clearedVersion = cleared.json<{ version: number }>().version;
+      let expectedText = '';
+      let expectedVersion = clearedVersion;
+      if (recreate) {
+        expectedText = 'New words after clearing';
+        const recreated = await write(expectedText, clearedVersion);
+        expect(recreated.statusCode, recreated.body).toBe(200);
+        expectedVersion = recreated.json<{ version: number }>().version;
+      }
+      const before = sha256(
+        JSON.stringify((await database.query('SELECT * FROM owner_blocks')).rows)
+      );
+      const stale = await write('Stale tab resurrected the original words', initialVersion);
+      expect(stale.statusCode, stale.body).toBe(409);
+      expect(stale.json<{ error: { code: string } }>().error.code).toBe('owner_block_conflict');
+      const after = await database.query<{ ciphertext: EncryptedEnvelope }>(
+        'SELECT * FROM owner_blocks'
+      );
+      expect(sha256(JSON.stringify(after.rows))).toBe(before);
+      expect(after.rows).toHaveLength(1);
+      const workspace = (await store.getWorkspaceById(workspaceId))!;
+      const key = userMemoryKey(masterKey, workspace.userId);
+      expect(
+        decryptBytes(after.rows[0]!.ciphertext, key, ownerBlockAad(workspace.userId)).toString(
+          'utf8'
+        )
+      ).toBe(expectedText);
+      const read = await app.inject({
+        method: 'GET',
+        url: '/v1/account/memory-block',
+        headers: { cookie }
+      });
+      expect(read.json()).toMatchObject({
+        text: expectedText,
+        version: expectedVersion,
+        bytes: Buffer.byteLength(expectedText)
+      });
+      expect(clearedVersion).toBeGreaterThan(initialVersion);
+      if (recreate) expect(expectedVersion).toBeGreaterThan(clearedVersion);
+    }
+  );
 
   /**
    * A direction the owner cannot see, arriving through the one door this design trusts absolutely.

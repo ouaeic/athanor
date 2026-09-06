@@ -184,22 +184,30 @@ describe('the owner block', () => {
     }
   });
 
-  /**
-   * A clear that finds nothing is not the same answer as a clear that was refused.
-   *
-   * Both return false from one statement, so the caller has to distinguish them by reading back -
-   * and it matters, because one is "your block is already empty, we are done" and the other is
-   * "somebody else changed it, do not overwrite them".
-   */
-  it('answers a clear on an empty block the same way it answers a stale one, and no other way', async () => {
-    expect(await store.clearOwnerBlock(userId, 0)).toBe(false);
+  it('keeps a sealed empty block without reusing prior versions', async () => {
     expect(await store.readOwnerBlock(userId)).toBeNull();
-
-    await store.writeOwnerBlock({ userId, ciphertext: seal('here'), expectedVersion: 0 });
-    expect(await store.clearOwnerBlock(userId, 7)).toBe(false);
-    expect(await store.readOwnerBlock(userId)).not.toBeNull();
-    expect(await store.clearOwnerBlock(userId, 1)).toBe(true);
-    expect(await store.readOwnerBlock(userId)).toBeNull();
+    expect(
+      await store.writeOwnerBlock({ userId, ciphertext: seal(''), expectedVersion: 0 })
+    ).toMatchObject({ version: 1, contentBytes: 0 });
+    expect(
+      await store.writeOwnerBlock({ userId, ciphertext: seal(''), expectedVersion: 7 })
+    ).toBeNull();
+    expect(
+      await store.writeOwnerBlock({ userId, ciphertext: seal('here'), expectedVersion: 1 })
+    ).toMatchObject({ version: 2 });
+    const cleared = await store.writeOwnerBlock({
+      userId,
+      ciphertext: seal(''),
+      expectedVersion: 2
+    });
+    expect(cleared).toMatchObject({ version: 3, contentBytes: 0 });
+    expect(decryptBytes(cleared!.ciphertext, ownerKey, aad).toString('utf8')).toBe('');
+    expect(
+      await store.writeOwnerBlock({ userId, ciphertext: seal('stale'), expectedVersion: 1 })
+    ).toBeNull();
+    expect(
+      await store.writeOwnerBlock({ userId, ciphertext: seal('new'), expectedVersion: 3 })
+    ).toMatchObject({ version: 4 });
   });
 
   /**
@@ -320,11 +328,51 @@ describe('the owner block', () => {
       await store.writeOwnerBlock({ userId, ciphertext: seal('stale tab'), expectedVersion: 1 })
     ).toBeNull();
     expect(await stored()).toBe(before);
-    expect(await store.clearOwnerBlock(userId, 1)).toBe(false);
+    expect(
+      await store.writeOwnerBlock({ userId, ciphertext: seal(''), expectedVersion: 1 })
+    ).toBeNull();
     expect(await stored()).toBe(before);
 
-    expect(await store.clearOwnerBlock(userId, 2)).toBe(true);
+    expect(
+      await store.writeOwnerBlock({ userId, ciphertext: seal(''), expectedVersion: 2 })
+    ).toMatchObject({ version: 3, contentBytes: 0 });
+  });
+
+  it('refuses a stale creation when the owner has no block', async () => {
+    expect(
+      await store.writeOwnerBlock({
+        userId,
+        ciphertext: seal('stale words'),
+        expectedVersion: 4
+      })
+    ).toBeNull();
     expect(await store.readOwnerBlock(userId)).toBeNull();
+  });
+
+  it('isolates encrypted empty blocks by owner and permits only one concurrent revision', async () => {
+    const other = await store.createUser({ username: 'other', displayName: 'Other' });
+    const otherKey = userMemoryKey(masterKey, other.id);
+    const otherAad = ownerBlockAad(other.id);
+    await store.writeOwnerBlock({
+      userId: other.id,
+      ciphertext: encryptBytes(Buffer.from('Other owner words'), otherKey, otherAad),
+      expectedVersion: 0
+    });
+    const otherBefore = await store.readOwnerBlock(other.id);
+    await store.writeOwnerBlock({ userId, ciphertext: seal('Owner words'), expectedVersion: 0 });
+    const raced = await Promise.all([
+      store.writeOwnerBlock({ userId, ciphertext: seal(''), expectedVersion: 1 }),
+      store.writeOwnerBlock({ userId, ciphertext: seal('Concurrent edit'), expectedVersion: 1 })
+    ]);
+    expect(raced.filter(Boolean)).toHaveLength(1);
+    const current = (await store.readOwnerBlock(userId))!;
+    expect(current.version).toBe(2);
+    expect(await store.readOwnerBlock(other.id)).toEqual(otherBefore);
+    expect(() => decryptBytes(current.ciphertext, otherKey, otherAad)).toThrow();
+    expect(
+      await store.writeOwnerBlock({ userId, ciphertext: seal(''), expectedVersion: 2 })
+    ).toMatchObject({ version: 3, contentBytes: 0 });
+    expect(await store.readOwnerBlock(other.id)).toEqual(otherBefore);
   });
 
   /**
@@ -439,19 +487,17 @@ describe('the owner block', () => {
       return found.sort();
     };
 
-    expect(await mentions(/\b(writeOwnerBlock|clearOwnerBlock)\b/)).toEqual([
+    expect(await mentions(/\bwriteOwnerBlock\b/)).toEqual([
       'apps/api/src/routes/knowledge.ts',
       'packages/data/src/store.ts',
       'packages/data/src/store/memory.ts'
     ]);
     /*
      * And the table by its own name, because a caller that wanted round the store would not use the
-     * store's method names to do it. Two statements and one migration know this table exists; a
-     * fourth file writing `owner_blocks` in a string is the shape this second assertion is for.
+     * store's method names to do it. Only the schema and its read/write SQL may name this table.
      */
     expect(await mentions(/\bowner_blocks\b/)).toEqual([
       'packages/data/src/migrations.ts',
-      'packages/data/src/store/memory.ts',
       'packages/data/src/store/sql/memory.ts'
     ]);
     /*

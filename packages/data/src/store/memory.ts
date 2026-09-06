@@ -3093,24 +3093,4 @@ export class MemoryStore {
     ]);
     return result.rows[0] ? mapOwnerBlock(result.rows[0]) : null;
   }
-
-  /**
-   * Empties the block, which is a deletion rather than a write of nothing.
-   *
-   * An empty block must cost zero resident bytes, and the honest way to say that is that the row is
-   * gone: a zero-length ciphertext row would still be a row the window has to read and decide about
-   * every turn.
-   *
-   * It states a version for the same reason a rewrite does, and emptying is the write where it
-   * matters most - a settings tab left open since yesterday must not be able to delete what the
-   * owner typed this morning. One statement, so there is no gap between deciding and deleting; a
-   * caller that gets `false` re-reads to learn whether it was stale or the block was already gone.
-   */
-  async clearOwnerBlock(userId: string, expectedVersion: number): Promise<boolean> {
-    const result = await this.database.query(
-      'DELETE FROM owner_blocks WHERE user_id=$1::uuid AND version=$2::int',
-      [userId, expectedVersion]
-    );
-    return result.rowCount === 1;
-  }
 }

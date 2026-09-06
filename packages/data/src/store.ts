@@ -500,10 +500,6 @@ export class DataStore {
     return this.#memory.writeOwnerBlock(...args);
   }
 
-  clearOwnerBlock(...args: Parameters<MemoryStore['clearOwnerBlock']>) {
-    return this.#memory.clearOwnerBlock(...args);
-  }
-
   syncMemoryPredicates(...args: Parameters<MemoryStore['syncMemoryPredicates']>) {
     return this.#memory.syncMemoryPredicates(...args);
   }
