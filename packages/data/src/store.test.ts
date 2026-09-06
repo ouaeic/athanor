@@ -713,6 +713,176 @@ describe('DataStore', () => {
     ).resolves.toMatchObject({ id: messages[0]!.id });
   });
 
+  describe('promoted message reservations', () => {
+    const envelope = { v: 1 as const, iv: 'message', tag: 'tag', ciphertext: 'sealed' };
+    const running = async () => {
+      const user = await store.createUser({ username: 'reservation-owner', displayName: 'Owner' });
+      const workspace = await store.createWorkspace(workspaceInput(user.id, 'Reservations'));
+      const task = await store.createTask({
+        ...taskInput(user.id, workspace.id),
+        maxSpendUsd: 0.35
+      });
+      await expect(store.leaseNextTask('reservation-worker')).resolves.toMatchObject({
+        id: task.id
+      });
+      const enqueue = async (credits: number, interrupt: boolean) => {
+        const id = randomUUID();
+        await store.enqueueTaskMessage({
+          id,
+          taskId: task.id,
+          userId: user.id,
+          modelId: 'qwen',
+          privacyRoute: 'provider_zdr',
+          maxComputeCredits: credits,
+          maxSpendUsd: 0.25,
+          resourceClass: 'medium',
+          reservationKey: `message:${id}`,
+          promptCiphertext: envelope,
+          queuedEventCiphertext: envelope,
+          interrupt
+        });
+        return id;
+      };
+      for (const [credits, interrupt] of [
+        [2, true],
+        [3, false]
+      ] as const) {
+        const messageId = await enqueue(credits, interrupt);
+        await expect(
+          store.consumeQueuedTaskMessageInTurn({
+            taskId: task.id,
+            messageId,
+            workerId: 'reservation-worker',
+            additionalComputeCredits: credits,
+            additionalSpendUsd: 0.25,
+            userMessageCiphertext: envelope
+          })
+        ).resolves.toBe(true);
+      }
+      await store.recordUsage({
+        userId: user.id,
+        workspaceId: workspace.id,
+        taskId: task.id,
+        kind: 'model',
+        resourceClass: 'medium',
+        quantity: 1,
+        unit: 'call',
+        credits: 1,
+        costUsd: 0.1,
+        state: 'settled',
+        idempotencyKey: `settled:${task.id}`
+      });
+      const otherOwner = await store.createUser({
+        username: 'other-reservation-owner',
+        displayName: 'Other'
+      });
+      const otherWorkspace = await store.createWorkspace(workspaceInput(otherOwner.id, 'Other'));
+      const other = await store.createTask(taskInput(otherOwner.id, otherWorkspace.id));
+      await store.recordUsage({
+        userId: otherOwner.id,
+        workspaceId: otherWorkspace.id,
+        taskId: other.id,
+        kind: 'task_compute',
+        resourceClass: 'medium',
+        quantity: 11,
+        unit: 'credits',
+        credits: 11,
+        state: 'reserved',
+        idempotencyKey: `other:${other.id}`
+      });
+      await expect(billing.reservedUsageForTask(task.id)).resolves.toBe(5);
+      const retained = async () => {
+        await expect(billing.reservedUsageForTask(other.id)).resolves.toBe(11);
+        expect(
+          (
+            await database.query(
+              'SELECT state,cost_usd FROM usage_entries WHERE idempotency_key=$1',
+              [`settled:${task.id}`]
+            )
+          ).rows
+        ).toEqual([{ state: 'settled', cost_usd: 0.1 }]);
+      };
+      const complete = (workerId = 'reservation-worker') =>
+        store.completeTaskIfNoQueued({
+          id: task.id,
+          workerId,
+          actualComputeCredits: 1,
+          agentStateCiphertext: envelope
+        });
+      return { task, user, enqueue, complete, retained };
+    };
+
+    it('releases consumed correction and question-answer reservations only after leased completion', async () => {
+      const { task, user, complete, retained } = await running();
+      await expect(complete('not-the-lease-owner')).resolves.toBe(false);
+      await expect(billing.reservedUsageForTask(task.id)).resolves.toBe(5);
+      await expect(complete()).resolves.toBe(true);
+      await expect(billing.reservedUsageForTask(task.id)).resolves.toBe(0);
+      await expect(complete()).resolves.toBe(false);
+      expect((await store.getTask(user.id, task.id))?.maxSpendUsd).toBeCloseTo(0.85);
+      await retained();
+    });
+
+    it('releases completed-turn reservations at handoff while keeping queued and next-turn reservations', async () => {
+      const { task, user, enqueue, complete, retained } = await running();
+      const next = await enqueue(7, false);
+      const last = await enqueue(13, false);
+      await expect(complete()).resolves.toBe(false);
+      await expect(billing.reservedUsageForTask(task.id)).resolves.toBe(25);
+      const promote = (messageId: string, credits: number, workerId = 'reservation-worker') =>
+        store.promoteQueuedTaskMessage({
+          taskId: task.id,
+          messageId,
+          workerId,
+          modelId: 'qwen',
+          privacyRoute: 'provider_zdr',
+          additionalComputeCredits: credits,
+          additionalSpendUsd: 0.25,
+          agentStateCiphertext: envelope,
+          userMessageCiphertext: envelope,
+          statusEventCiphertext: envelope
+        });
+      await expect(promote(next, 7, 'not-the-lease-owner')).resolves.toBeNull();
+      await expect(billing.reservedUsageForTask(task.id)).resolves.toBe(25);
+      await expect(promote(next, 7)).resolves.toMatchObject({
+        status: 'queued',
+        queuedMessageCount: 1
+      });
+      await expect(billing.reservedUsageForTask(task.id)).resolves.toBe(20);
+      await expect(promote(next, 7)).resolves.toBeNull();
+      await expect(billing.reservedUsageForTask(task.id)).resolves.toBe(20);
+      await expect(store.leaseNextTask('reservation-worker')).resolves.toMatchObject({
+        id: task.id
+      });
+      await expect(promote(last, 13)).resolves.toMatchObject({
+        status: 'queued',
+        queuedMessageCount: 0
+      });
+      await expect(billing.reservedUsageForTask(task.id)).resolves.toBe(13);
+      await expect(store.leaseNextTask('reservation-worker')).resolves.toMatchObject({
+        id: task.id
+      });
+      await expect(complete()).resolves.toBe(true);
+      await expect(billing.reservedUsageForTask(task.id)).resolves.toBe(0);
+      expect((await store.getTask(user.id, task.id))?.maxSpendUsd).toBeCloseTo(1.35);
+      await retained();
+    });
+
+    it.each(['failed', 'cancelled'] as const)(
+      'releases promoted reservations when a %s task has no queued messages to strand',
+      async (status) => {
+        const { task, retained } = await running();
+        await expect(store.strandQueuedTaskMessages(task.id)).resolves.toEqual([]);
+        await expect(billing.reservedUsageForTask(task.id)).resolves.toBe(5);
+        await store.updateTask({ id: task.id, status, clearLease: true });
+        await expect(store.strandQueuedTaskMessages(task.id)).resolves.toEqual([]);
+        await expect(billing.reservedUsageForTask(task.id)).resolves.toBe(0);
+        await expect(store.strandQueuedTaskMessages(task.id)).resolves.toEqual([]);
+        await retained();
+      }
+    );
+  });
+
   /**
    * Nothing in this repository has ever built a conversation longer than a handful of events, so
    * the paging the timeline and its stream rest on has only ever been read at a size where one page
@@ -6950,7 +7120,8 @@ describe('the upgrade path onto rows an older athanor wrote', () => {
     57: 2,
     62: 1,
     76: 1,
-    78: 1
+    78: 1,
+    84: 1
   };
 
   /**

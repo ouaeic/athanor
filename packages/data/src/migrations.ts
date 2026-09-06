@@ -3303,5 +3303,18 @@ export const migrations = [
       CREATE INDEX IF NOT EXISTS mem_source_origin_idx
         ON mem.source (workspace_id, origin_key, occurred_at DESC) WHERE origin_key IS NOT NULL;
     `
+  },
+  {
+    version: 84,
+    name: 'release_finished_message_reservations',
+    // Promoted messages have finished with their terminal task. Queued work keeps its capacity,
+    // and settled provider charges remain billing history rather than refundable reservations.
+    sql: `
+      UPDATE usage_entries u SET state='released'
+      FROM task_message_queue q JOIN tasks t ON t.id=q.task_id AND t.user_id=q.user_id
+      WHERE q.status='promoted' AND t.status IN ('completed','failed','cancelled')
+        AND u.idempotency_key=q.reservation_key AND u.task_id=q.task_id AND u.user_id=q.user_id
+        AND u.kind='task_compute' AND u.state='reserved';
+    `
   }
 ] as const;

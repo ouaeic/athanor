@@ -32,6 +32,17 @@ import {
   WORKSPACE_IS_FREE_FOR
 } from './sql/tasks.js';
 
+async function releasePromotedMessageReservations(tx: Database, taskId: string): Promise<void> {
+  await tx.query(
+    `UPDATE usage_entries u SET state='released'
+     FROM task_message_queue q JOIN tasks t ON t.id=q.task_id AND t.user_id=q.user_id
+     WHERE q.task_id=$1 AND q.status='promoted'
+       AND u.idempotency_key=q.reservation_key AND u.task_id=q.task_id AND u.user_id=q.user_id
+       AND u.kind='task_compute' AND u.state='reserved'`,
+    [taskId]
+  );
+}
+
 /** Payload is the task id, so a stream only wakes for the conversation it is showing. */
 export const TASK_EVENT_CHANNEL = 'athanor_task_event';
 /** Payload is the task id, but every worker slot wakes: whichever leases it first wins. */
@@ -743,6 +754,11 @@ export class TaskStore {
    */
   async strandQueuedTaskMessages(taskId: string): Promise<TaskMessageQueueRecord[]> {
     return this.database.transaction(async (tx) => {
+      const stopped = await tx.query(
+        `SELECT id FROM tasks WHERE id=$1 AND status IN ('failed','cancelled') FOR UPDATE`,
+        [taskId]
+      );
+      if (!stopped.rows[0]) return [];
       const stranded = await tx.query(
         `UPDATE task_message_queue SET status='undelivered'
          WHERE task_id=$1 AND status='queued'
@@ -758,6 +774,7 @@ export class TaskStore {
            WHERE state='reserved' AND idempotency_key = ANY($1::text[])`,
           [stranded.rows.map((row) => String(row.reservation_key))]
         );
+      await releasePromotedMessageReservations(tx, taskId);
       return stranded.rows.map(mapTaskMessage);
     });
   }
@@ -847,6 +864,8 @@ export class TaskStore {
         [input.messageId, input.taskId]
       );
       if (!queued.rows[0]) return null;
+      // The next message still owns its reservation; only the finished turn's messages release.
+      await releasePromotedMessageReservations(tx, input.taskId);
       await tx.query(
         `UPDATE task_message_queue SET status='promoted',promoted_at=NOW() WHERE id=$1`,
         [input.messageId]
@@ -948,6 +967,7 @@ export class TaskStore {
         ]
       );
       if (result.rowCount !== 1) return null;
+      await releasePromotedMessageReservations(tx, input.id);
       return { wasHeld: locked.rows[0].was_held === true };
     });
     if (completed?.wasHeld) this.#signalWorkspaceRelease(input.id);
