@@ -1,10 +1,10 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { captureSpawnFailure, spawnFailureMessage } from './spawn-guard.js';
 import { chromiumDriver } from './playwright.js';
-import { once } from 'node:events';
 import { existsSync } from 'node:fs';
 import { readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import type { DesktopAction, DesktopHolder, DesktopLaunchRequest } from '@athanor/contracts';
 import {
   DISPLAY_PROTOCOL,
@@ -19,6 +19,7 @@ import {
   encodeVideoConfig,
   newModeArguments,
   parseRandrState,
+  prepareStillCapture,
   resolveTargetGeometry,
   shouldApplyGeometry,
   stillCaptureArguments,
@@ -372,8 +373,12 @@ const run = async (
   child.stdin.end(options.stdin);
   const timeout = setTimeout(() => child.kill('SIGKILL'), options.timeoutMs ?? 20_000);
   timeout.unref();
-  const { exitCode: code } = await awaitChildExit(child);
-  clearTimeout(timeout);
+  let code: number | null;
+  try {
+    ({ exitCode: code } = await awaitChildExit(child));
+  } finally {
+    clearTimeout(timeout);
+  }
   const error = Buffer.concat(stderr).toString('utf8').trim();
   if (code !== 0) throw new Error(error || `${path.basename(executable)} exited with ${code}`);
   return { stdout: Buffer.concat(stdout), stderr: error };
@@ -817,6 +822,12 @@ const launchAdvice = async (
 
 export class DesktopManager {
   readonly #sessions = new Map<string, DesktopSession>();
+  readonly #starting = new Map<string, Promise<DesktopSession>>();
+  readonly #closing = new Map<string, Promise<void>>();
+  readonly #reservedDisplays = new Set<string>();
+  readonly #failedStarts = new Map<string, () => Promise<void>>();
+  readonly #closed = new WeakSet<DesktopSession>();
+  readonly #lifetimes = new WeakMap<DesktopSession, AbortController>();
 
   constructor(
     private readonly bridgeExecutable?: string,
@@ -865,8 +876,30 @@ export class DesktopManager {
   }
 
   async ensure(workspaceId: string, root: string): Promise<DesktopSession> {
+    while (this.#closing.has(workspaceId)) await this.#closing.get(workspaceId);
+    if (this.#failedStarts.has(workspaceId)) {
+      await this.close(workspaceId);
+      return this.ensure(workspaceId, root);
+    }
+    const pending = this.#starting.get(workspaceId);
+    if (pending) return pending;
     const existing = this.#sessions.get(workspaceId);
-    if (existing && existing.process.exitCode === null) return existing;
+    if (existing && this.#closed.has(existing)) {
+      await this.close(workspaceId);
+      return this.ensure(workspaceId, root);
+    }
+    if (existing && existing.process.exitCode === null && existing.process.signalCode === null)
+      return existing;
+    const starting = this.#start(workspaceId, root);
+    this.#starting.set(workspaceId, starting);
+    try {
+      return await starting;
+    } finally {
+      if (this.#starting.get(workspaceId) === starting) this.#starting.delete(workspaceId);
+    }
+  }
+
+  async #start(workspaceId: string, root: string): Promise<DesktopSession> {
     if (!this.configured)
       throw new Error('GUI desktop runtime is not enabled on this workspace runner');
     const usedDisplays = new Set(
@@ -874,159 +907,186 @@ export class DesktopManager {
         String(session.env.DISPLAY ?? '').replace(':', '')
       )
     );
-    const display = String(
-      Array.from({ length: 100 }, (_, index) => String(90 + index)).find(
-        (candidate) =>
-          !usedDisplays.has(candidate) &&
-          !existsSync(`/tmp/.X${candidate}-lock`) &&
-          !existsSync(`/tmp/.X11-unix/X${candidate}`)
-      ) ?? 190
+    const display = Array.from({ length: 101 }, (_, index) => String(90 + index)).find(
+      (candidate) =>
+        !usedDisplays.has(candidate) &&
+        !this.#reservedDisplays.has(candidate) &&
+        !existsSync(`/tmp/.X${candidate}-lock`) &&
+        !existsSync(`/tmp/.X11-unix/X${candidate}`)
     );
-    const envFile = path.join(root, '.athanor', 'desktop', 'environment');
-    await rm(envFile, { force: true });
-    const process = spawn(this.sessionExecutable!, [root, display], {
-      cwd: root,
-      env: { ...processEnv(root) },
-      // The session's own stderr is the only account of why it did not come up, and discarding it
-      // left "GUI desktop session failed to start" as the whole story - which cost a long
-      // afternoon the first time a real box refused. Kept to a few kilobytes because this is a
-      // failure path, not a log.
-      stdio: ['ignore', 'ignore', 'pipe'],
-      shell: false
-    });
-    // Same reason as the launch path below, and reachable by the same call: this spawn is followed
-    // by an await, so a session script that is missing or not executable would emit its error with
-    // nobody listening and take the runner down before the loop could report anything.
-    const sessionFailure = captureSpawnFailure(process);
-    let complaint = '';
-    process.stderr?.setEncoding('utf8');
-    process.stderr?.on('data', (chunk: string) => {
-      if (complaint.length < 4_000) complaint += chunk;
-    });
-    let serialized = '';
-    for (let attempt = 0; attempt < 80; attempt += 1) {
-      const failedToSpawn = sessionFailure();
-      // Checked before `exitCode`, because a spawn that never happened has no exit code at all and
-      // would otherwise spin out the whole eight seconds before reporting the wrong sentence.
-      if (failedToSpawn)
-        throw new Error(
-          `GUI desktop session failed to start: ${spawnFailureMessage(this.sessionExecutable!, failedToSpawn)}`
-        );
-      if (process.exitCode !== null)
-        throw new Error(
-          `GUI desktop session failed to start${complaint.trim() ? `: ${complaint.trim().split('\n').slice(-3).join(' ')}` : ''}`
-        );
-      try {
-        serialized = await readFile(envFile, 'utf8');
-        if (serialized.includes('DBUS_SESSION_BUS_ADDRESS=')) break;
-      } catch {
-        // The session writes its environment only after X11 and D-Bus are ready.
-      }
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    if (!serialized) {
-      process.kill('SIGTERM');
-      throw new Error(
-        `GUI desktop session did not become ready${complaint.trim() ? `: ${complaint.trim().split('\n').slice(-3).join(' ')}` : ''}`
-      );
-    }
-    const values = Object.fromEntries(
-      serialized
-        .trim()
-        .split('\n')
-        .map((line) => {
-          const separator = line.indexOf('=');
-          if (separator < 1) throw new Error('GUI desktop environment is malformed');
-          return [line.slice(0, separator), line.slice(separator + 1)] as [string, string];
-        })
-    );
-    // The control and the session reference each other: the control's release callback needs the
-    // session, and the session holds the control. The binding is therefore declared before it can
-    // be assigned and captured by the closure below, which const cannot express.
-    // eslint-disable-next-line prefer-const
+    if (!display) throw new Error('No GUI desktop display is available');
+    // A starting X server has not created its socket or entered the session map yet.
+    this.#reservedDisplays.add(display);
+    let child: ChildProcess | undefined;
     let session: DesktopSession | undefined;
-    const control = new DesktopControl({
-      release: async () => {
-        if (session) await this.#releaseAllInput(session);
-      },
-      onChange: () => {
-        if (!session) return;
-        this.#broadcastState(session);
-        this.#syncEncoder(session);
-      }
-    });
-    const boot = parseGeometry(values.ATHANOR_BOOT_RES, DEFAULT_BOOT_GEOMETRY);
-    const env: NodeJS.ProcessEnv = {
-      ...processEnv(root),
-      DISPLAY: values.DISPLAY,
-      DBUS_SESSION_BUS_ADDRESS: values.DBUS_SESSION_BUS_ADDRESS,
-      XDG_RUNTIME_DIR: values.XDG_RUNTIME_DIR,
-      NO_AT_BRIDGE: '0',
-      GTK_MODULES: 'gail:atk-bridge',
-      QT_ACCESSIBILITY: '1',
-      QT_LINUX_ACCESSIBILITY_ALWAYS_ON: '1',
-      SAL_ACCESSIBILITY_ENABLED: '1'
-    };
-    session = {
-      root,
-      process,
-      env,
-      control,
-      subscribers: new Map(),
-      applicationGroups: new Set(),
-      activeApplication: '',
-      lastAction: '',
-      geometry: boot,
-      bootGeometry: boot,
-      ceiling: parseGeometry(values.ATHANOR_MAX_RES, DEFAULT_CEILING),
-      outputName: 'screen',
-      currentMode: null,
-      codec: 'avc1',
-      congested: false,
-      atspi: true,
-      // Nothing has been served yet, and `#adoptDisplay` below takes a generation of its own
-      // bringing the display down to the boot size - so a fixed starting number here would refuse
-      // the agent's first action for a resize that happened before it ever looked.
-      observedGeneration: null,
-      bridgeServe: true,
-      bridgeQueue: Promise.resolve(),
-      pointer: { x: Math.round(boot.width / 2), y: Math.round(boot.height / 2) },
-      encoder: new DisplayEncoder({
-        executable: '/usr/bin/ffmpeg',
-        spawn: (executable, args) =>
-          spawn(executable, [...args], {
-            env,
-            stdio: ['ignore', 'pipe', 'pipe'],
-            shell: false
-          }),
-        onFrame: (frame) => {
-          if (session) this.#publish(session, frame);
-        },
-        /**
-         * An encoder that cannot run is the pane going still, and it used to be silent.
-         *
-         * `onFailure` was declared, documented and never supplied, so a host with no
-         * `/usr/bin/ffmpeg` restarted the child every half second for as long as anybody watched,
-         * wrote nothing to the journal, and left the owner looking at a frozen screenshot with a
-         * healthy socket. The encoder now backs off, and this is the line that says why - which is
-         * the whole difference between "the Computer pane is broken" and "install ffmpeg".
-         */
-        onFailure: (cause) => {
-          runnerLogger.warn('desktop.encoder_failed', {
-            code: failureCode(cause),
-            executable: '/usr/bin/ffmpeg'
-          });
+    try {
+      const envFile = path.join(root, '.athanor', 'desktop', 'environment');
+      await rm(envFile, { force: true });
+      const process = spawn(this.sessionExecutable!, [root, display], {
+        cwd: root,
+        env: { ...processEnv(root) },
+        // The session's own stderr is the only account of why it did not come up, and discarding it
+        // left "GUI desktop session failed to start" as the whole story - which cost a long
+        // afternoon the first time a real box refused. Kept to a few kilobytes because this is a
+        // failure path, not a log.
+        stdio: ['ignore', 'ignore', 'pipe'],
+        shell: false
+      });
+      child = process;
+      // Same reason as the launch path below, and reachable by the same call: this spawn is followed
+      // by an await, so a session script that is missing or not executable would emit its error with
+      // nobody listening and take the runner down before the loop could report anything.
+      const sessionFailure = captureSpawnFailure(process);
+      let complaint = '';
+      process.stderr?.setEncoding('utf8');
+      process.stderr?.on('data', (chunk: string) => {
+        if (complaint.length < 4_000) complaint += chunk;
+      });
+      let serialized = '';
+      let ready = false;
+      for (let attempt = 0; attempt < 80; attempt += 1) {
+        const failedToSpawn = sessionFailure();
+        // Checked before `exitCode`, because a spawn that never happened has no exit code at all and
+        // would otherwise spin out the whole eight seconds before reporting the wrong sentence.
+        if (failedToSpawn)
+          throw new Error(
+            `GUI desktop session failed to start: ${spawnFailureMessage(this.sessionExecutable!, failedToSpawn)}`
+          );
+        if (process.exitCode !== null || process.signalCode !== null)
+          throw new Error(
+            `GUI desktop session failed to start${complaint.trim() ? `: ${complaint.trim().split('\n').slice(-3).join(' ')}` : ''}`
+          );
+        try {
+          serialized = await readFile(envFile, 'utf8');
+          if (serialized.includes('DBUS_SESSION_BUS_ADDRESS=')) {
+            ready = true;
+            break;
+          }
+        } catch {
+          // The session writes its environment only after X11 and D-Bus are ready.
         }
-      })
-    };
-    const active = session;
-    process.once('exit', () => {
-      this.#teardown(active);
-      this.#sessions.delete(workspaceId);
-    });
-    this.#sessions.set(workspaceId, session);
-    await this.#adoptDisplay(session);
-    return session;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      if (!ready) {
+        throw new Error(
+          `GUI desktop session did not become ready${complaint.trim() ? `: ${complaint.trim().split('\n').slice(-3).join(' ')}` : ''}`
+        );
+      }
+      const values = Object.fromEntries(
+        serialized
+          .trim()
+          .split('\n')
+          .map((line) => {
+            const separator = line.indexOf('=');
+            if (separator < 1) throw new Error('GUI desktop environment is malformed');
+            return [line.slice(0, separator), line.slice(separator + 1)] as [string, string];
+          })
+      );
+      // The control and the session reference each other: the control's release callback needs the
+      // session, and the session holds the control. The binding is therefore declared before it can
+      // be assigned and captured by the closure below, which const cannot express.
+      const control = new DesktopControl({
+        release: async () => {
+          if (session) await this.#releaseAllInput(session);
+        },
+        onChange: () => {
+          if (!session) return;
+          this.#broadcastState(session);
+          this.#syncEncoder(session);
+        }
+      });
+      const boot = parseGeometry(values.ATHANOR_BOOT_RES, DEFAULT_BOOT_GEOMETRY);
+      const env: NodeJS.ProcessEnv = {
+        ...processEnv(root),
+        DISPLAY: values.DISPLAY,
+        DBUS_SESSION_BUS_ADDRESS: values.DBUS_SESSION_BUS_ADDRESS,
+        XDG_RUNTIME_DIR: values.XDG_RUNTIME_DIR,
+        NO_AT_BRIDGE: '0',
+        GTK_MODULES: 'gail:atk-bridge',
+        QT_ACCESSIBILITY: '1',
+        QT_LINUX_ACCESSIBILITY_ALWAYS_ON: '1',
+        SAL_ACCESSIBILITY_ENABLED: '1'
+      };
+      session = {
+        root,
+        process,
+        env,
+        control,
+        subscribers: new Map(),
+        applicationGroups: new Set(),
+        activeApplication: '',
+        lastAction: '',
+        geometry: boot,
+        bootGeometry: boot,
+        ceiling: parseGeometry(values.ATHANOR_MAX_RES, DEFAULT_CEILING),
+        outputName: 'screen',
+        currentMode: null,
+        codec: 'avc1',
+        congested: false,
+        atspi: true,
+        // Nothing has been served yet, and `#adoptDisplay` below takes a generation of its own
+        // bringing the display down to the boot size - so a fixed starting number here would refuse
+        // the agent's first action for a resize that happened before it ever looked.
+        observedGeneration: null,
+        bridgeServe: true,
+        bridgeQueue: Promise.resolve(),
+        pointer: { x: Math.round(boot.width / 2), y: Math.round(boot.height / 2) },
+        encoder: new DisplayEncoder({
+          executable: '/usr/bin/ffmpeg',
+          spawn: (executable, args) =>
+            spawn(executable, [...args], {
+              env,
+              stdio: ['ignore', 'pipe', 'pipe'],
+              shell: false
+            }),
+          onFrame: (frame) => {
+            if (session) this.#publish(session, frame);
+          },
+          /**
+           * An encoder that cannot run is the pane going still, and it used to be silent.
+           *
+           * `onFailure` was declared, documented and never supplied, so a host with no
+           * `/usr/bin/ffmpeg` restarted the child every half second for as long as anybody watched,
+           * wrote nothing to the journal, and left the owner looking at a frozen screenshot with a
+           * healthy socket. The encoder now backs off, and this is the line that says why - which is
+           * the whole difference between "the Computer pane is broken" and "install ffmpeg".
+           */
+          onFailure: (cause) => {
+            runnerLogger.warn('desktop.encoder_failed', {
+              code: failureCode(cause),
+              executable: '/usr/bin/ffmpeg'
+            });
+          }
+        })
+      };
+      const active = session;
+      process.once('exit', () => {
+        this.#teardown(active);
+        if (this.#sessions.get(workspaceId) === active) this.#sessions.delete(workspaceId);
+      });
+      await this.#adoptDisplay(session);
+      if (process.exitCode !== null || process.signalCode !== null)
+        throw new Error('GUI desktop session exited during startup');
+      this.#sessions.set(workspaceId, session);
+      return session;
+    } catch (cause) {
+      if (session) this.#teardown(session);
+      if (child) {
+        try {
+          await this.#stopProcess(child);
+        } catch (cleanupFailure) {
+          const unfinished = child;
+          this.#failedStarts.set(workspaceId, async () => {
+            await this.#stopProcess(unfinished);
+            this.#reservedDisplays.delete(display);
+          });
+          throw new AggregateError([cause, cleanupFailure], 'GUI desktop startup cleanup failed');
+        }
+      }
+      throw cause;
+    } finally {
+      if (!this.#failedStarts.has(workspaceId)) this.#reservedDisplays.delete(display);
+    }
   }
 
   /** Reads the real RandR state, then brings the display down to the boot size that the
@@ -1060,10 +1120,12 @@ export class DesktopManager {
    */
   async #bridge(session: DesktopSession, body: unknown): Promise<BridgeResult> {
     const request = session.bridgeQueue.then(async () => {
+      this.#assertOpen(session);
       if (session.bridgeServe) {
         try {
           return await this.#bridgeOverChannel(session, body);
         } catch (cause) {
+          this.#assertOpen(session);
           if (!(cause instanceof BridgeChannelError)) throw cause;
           session.bridgeServe = false;
         }
@@ -1088,6 +1150,7 @@ export class DesktopManager {
   }
 
   async #openBridge(session: DesktopSession): Promise<BridgeChannel> {
+    this.#assertOpen(session);
     const child = spawn('/usr/bin/python3', [this.bridgeExecutable!, '--serve'], {
       env: session.env,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -1117,12 +1180,14 @@ export class DesktopManager {
       // Doubles as a readiness handshake: a bridge that does not understand --serve waits for
       // end-of-input and never answers, which is exactly what this detects.
       const ready = await this.#sendToBridge(session, channel, { operation: 'ping' }, 8_000);
+      this.#assertOpen(session);
       // The answer the probe was always giving and nobody was reading. A bridge that starts but
       // cannot import pyatspi can serve nothing semantic, so the session records it once here
       // rather than rediscovering it on every observation.
       session.atspi = (ready.result as { atspi?: boolean } | undefined)?.atspi !== false;
     } catch (cause) {
       this.#closeBridge(session);
+      this.#assertOpen(session);
       throw new BridgeChannelError(
         cause instanceof Error ? cause.message : 'Desktop accessibility bridge did not start'
       );
@@ -1150,6 +1215,7 @@ export class DesktopManager {
     body: unknown,
     timeoutMs: number
   ): Promise<BridgeResult> {
+    this.#assertOpen(session);
     return new Promise<BridgeResult>((resolve, reject) => {
       const stdin = channel.child.stdin;
       if (!stdin) {
@@ -1157,8 +1223,7 @@ export class DesktopManager {
         return;
       }
       const timer = setTimeout(() => {
-        this.#closeBridge(session);
-        reject(new Error('Desktop accessibility bridge timed out'));
+        this.#closeBridge(session, new Error('Desktop accessibility bridge timed out'));
       }, timeoutMs);
       timer.unref();
       channel.pending = { resolve, reject, timer };
@@ -1171,13 +1236,19 @@ export class DesktopManager {
     });
   }
 
-  #closeBridge(session: DesktopSession): void {
+  #closeBridge(
+    session: DesktopSession,
+    cause: Error = new BridgeChannelError('Desktop accessibility bridge connection closed')
+  ): void {
     const channel = session.bridge;
     if (!channel) return;
     delete session.bridge;
     const pending = channel.pending;
     channel.pending = null;
-    if (pending) clearTimeout(pending.timer);
+    if (pending) {
+      clearTimeout(pending.timer);
+      pending.reject(cause);
+    }
     channel.child.kill('SIGKILL');
   }
 
@@ -1214,12 +1285,13 @@ export class DesktopManager {
         .slice(0, 100)
         .map((name, index) => ({ id: `x11:${index}`, name, role: 'window' }));
     } catch {
+      this.#assertOpen(session);
       return [];
     }
   }
 
   async #run(
-    _session: DesktopSession,
+    session: DesktopSession,
     executable: string,
     args: string[],
     options: {
@@ -1230,7 +1302,27 @@ export class DesktopManager {
       signal?: AbortSignal;
     } = {}
   ) {
-    return run(executable, args, options);
+    const lifetime = this.#lifetime(session);
+    const result = await run(executable, args, {
+      ...options,
+      signal: options.signal ? AbortSignal.any([lifetime.signal, options.signal]) : lifetime.signal
+    });
+    this.#assertOpen(session);
+    return result;
+  }
+
+  #assertOpen(session: DesktopSession): void {
+    if (this.#closed.has(session)) throw new Error('Desktop session is closed');
+  }
+
+  #lifetime(session: DesktopSession): AbortController {
+    this.#assertOpen(session);
+    let lifetime = this.#lifetimes.get(session);
+    if (!lifetime) {
+      lifetime = new AbortController();
+      this.#lifetimes.set(session, lifetime);
+    }
+    return lifetime;
   }
 
   async #releaseAllInput(session: DesktopSession): Promise<void> {
@@ -1266,6 +1358,7 @@ export class DesktopManager {
       };
     const session = await this.ensure(workspaceId, root);
     const holder = session.control.holder;
+    this.#assertOpen(session);
     if (holder === 'secure_input' && actor === 'agent')
       throw new Error('Desktop is in secure input mode');
     if (holder === 'user' && actor === 'agent') throw new Error('Desktop is held by the user');
@@ -1303,6 +1396,7 @@ export class DesktopManager {
       try {
         observation = await this.#bridge(session, { operation: 'observe', maxNodes: 900 });
       } catch (error) {
+        this.#assertOpen(session);
         mode = 'visual_fallback';
         reason = `accessibility bridge failed: ${error instanceof Error ? error.message : String(error)}`;
       }
@@ -1316,6 +1410,7 @@ export class DesktopManager {
         : 'nothing is on screen yet';
     }
     const screenshot = await this.#capture(session, image).catch(() => Buffer.alloc(0));
+    this.#assertOpen(session);
     session.activeApplication = observation.activeApplication ?? session.activeApplication;
     // Scaled first, then selected, because the bounds decide whether a node is on screen and the
     // agent's coordinate space is the one that answers that.
@@ -1387,6 +1482,7 @@ export class DesktopManager {
     const extraArgs = /(?:chromium|chrome|electron)$/i.test(path.basename(request.executable))
       ? ['--force-renderer-accessibility=complete']
       : [];
+    this.#assertOpen(session);
     const child = spawn(request.executable, [...extraArgs, ...request.args], {
       cwd,
       env: { ...session.env, ...safeEnv },
@@ -1400,6 +1496,7 @@ export class DesktopManager {
     const spawnFailure = captureSpawnFailure(child);
     if (child.pid) session.applicationGroups.add(child.pid);
     await new Promise((resolve) => setTimeout(resolve, 350));
+    this.#assertOpen(session);
     const failed = spawnFailure();
     if (failed) throw new Error(await launchAdvice(request.executable, failed));
     if (child.exitCode !== null && child.exitCode !== 0)
@@ -1433,6 +1530,7 @@ export class DesktopManager {
    * and the action refer to the same widget.
    */
   async #classify(session: DesktopSession, action: DesktopAction): Promise<DesktopActionPreflight> {
+    this.#assertOpen(session);
     // A coordinate click is looked up against the tree before it is judged, so a click that lands
     // on a control the computer can name is treated as what it is rather than as a blind one.
     if (action.type === 'click_at' || action.type === 'text_input') {
@@ -1443,6 +1541,7 @@ export class DesktopManager {
             () => ({}) as BridgeResult
           )
         : ({} as BridgeResult);
+      this.#assertOpen(session);
       const image = agentImageGeometry(session.geometry, AGENT_IMAGE_LIMIT);
       const scaled = scaleNodeBounds(observed.nodes ?? [], session.geometry, image);
       const target =
@@ -1508,12 +1607,15 @@ export class DesktopManager {
     actor: 'agent' | 'user',
     signal: AbortSignal
   ): Promise<unknown> {
+    this.#assertOpen(session);
     session.lastAction = classifyDesktopAction(action).preview;
     this.#broadcastState(session);
     if (['invoke', 'focus', 'set_text'].includes(action.type))
       return this.#bridge(session, { operation: 'act', action });
     if (action.type === 'wait') {
-      await new Promise((resolve) => setTimeout(resolve, action.milliseconds));
+      await delay(action.milliseconds, undefined, {
+        signal: AbortSignal.any([signal, this.#lifetime(session).signal])
+      });
       return { waitedMilliseconds: action.milliseconds };
     }
     if (action.type === 'zoom') {
@@ -1532,24 +1634,24 @@ export class DesktopManager {
         width: Math.max(16, corner.x - origin.x),
         height: Math.max(16, corner.y - origin.y)
       };
-      const pixels = await this.#run(
-        session,
-        '/usr/bin/ffmpeg',
-        stillCaptureArguments({
-          display: session.env.DISPLAY ?? '',
-          geometry: session.geometry,
-          image,
-          quality: STILL_JPEG_QUALITY,
-          region
-        }),
-        { env: session.env, timeoutMs: 10_000, signal }
-      );
+      const capture = prepareStillCapture({
+        display: session.env.DISPLAY ?? '',
+        geometry: session.geometry,
+        image,
+        quality: STILL_JPEG_QUALITY,
+        region
+      });
+      const pixels = await this.#run(session, '/usr/bin/ffmpeg', capture.args, {
+        env: session.env,
+        timeoutMs: 10_000,
+        signal
+      });
       return {
         // Named so the worker attaches it as an image the way it does a snapshot, and reported in
         // display pixels so the model can tell how much closer it is actually looking.
         screenshotBase64: pixels.stdout.toString('base64'),
         screenshotMimeType: 'image/jpeg',
-        region,
+        region: capture.region,
         displayWidth: session.geometry.width,
         displayHeight: session.geometry.height
       };
@@ -1611,6 +1713,14 @@ export class DesktopManager {
     viewport: DisplayViewport
   ): Promise<{ width: number; height: number; generation: number; applied: boolean }> {
     const session = await this.ensure(workspaceId, root);
+    return this.#resizeSession(session, viewport);
+  }
+
+  async #resizeSession(
+    session: DesktopSession,
+    viewport: DisplayViewport
+  ): Promise<{ width: number; height: number; generation: number; applied: boolean }> {
+    this.#assertOpen(session);
     const target = resolveTargetGeometry(viewport, {
       ceiling: session.ceiling,
       maximum: MAXIMUM_GEOMETRY,
@@ -1635,6 +1745,7 @@ export class DesktopManager {
   }
 
   async #applyGeometry(session: DesktopSession, target: DisplayGeometry): Promise<void> {
+    this.#assertOpen(session);
     const mode = cvtReducedBlankingMode(target.width, target.height);
     const xrandr = async (args: string[]) =>
       this.#run(session, '/usr/bin/xrandr', args, { env: session.env, timeoutMs: 5_000 });
@@ -1642,6 +1753,7 @@ export class DesktopManager {
     await xrandr(newModeArguments(mode)).catch(() => undefined);
     await xrandr(['--addmode', session.outputName, mode.name]).catch(() => undefined);
     await xrandr(['--output', session.outputName, '--mode', mode.name]);
+    this.#assertOpen(session);
     const previous = session.currentMode;
     session.currentMode = mode.name;
     session.geometry = target;
@@ -1674,6 +1786,7 @@ export class DesktopManager {
   }
 
   #broadcastState(session: DesktopSession): void {
+    if (this.#closed.has(session)) return;
     const state = this.#state(session);
     for (const subscriber of session.subscribers.keys()) subscriber.state(state);
   }
@@ -1693,6 +1806,7 @@ export class DesktopManager {
   }
 
   #announceVideoConfig(session: DesktopSession): void {
+    if (this.#closed.has(session)) return;
     const state = this.#state(session);
     const config = this.#videoConfig(session);
     for (const [subscriber, queue] of session.subscribers) {
@@ -1724,6 +1838,7 @@ export class DesktopManager {
    * the mode ends.
    */
   #syncEncoder(session: DesktopSession): void {
+    if (this.#closed.has(session)) return;
     const subscribers = [...session.subscribers.keys()];
     // One encoder serves every viewer, so the transport is the lowest common denominator: one
     // client without a `VideoDecoder` puts the session on JPEG rather than leaving that client
@@ -1772,6 +1887,7 @@ export class DesktopManager {
   }
 
   #publish(session: DesktopSession, frame: DisplayStreamFrame): void {
+    if (this.#closed.has(session)) return;
     if (frame.generation !== session.control.generation) return;
     const state = this.#state(session);
     let starved = false;
@@ -1817,13 +1933,15 @@ export class DesktopManager {
     subscriber: DesktopSubscriber
   ): Promise<() => Promise<void>> {
     const session = await this.ensure(workspaceId, root);
+    this.#assertOpen(session);
     if (session.restore) {
       clearTimeout(session.restore);
       delete session.restore;
     }
     session.subscribers.set(subscriber, new DisplayFrameQueue(BACKPRESSURE_QUEUE_SIZE));
     if (subscriber.viewport)
-      await this.resize(workspaceId, root, subscriber.viewport).catch(() => undefined);
+      await this.#resizeSession(session, subscriber.viewport).catch(() => undefined);
+    this.#assertOpen(session);
     subscriber.state(this.#state(session));
     subscriber.frame(this.#videoConfig(session), this.#state(session));
     this.#syncEncoder(session);
@@ -1834,6 +1952,7 @@ export class DesktopManager {
     }
     return async () => {
       session.subscribers.delete(subscriber);
+      if (this.#closed.has(session)) return;
       if (session.subscribers.size) return;
       session.encoder.stop();
       if (session.poll) {
@@ -1843,6 +1962,7 @@ export class DesktopManager {
       if (session.restore) clearTimeout(session.restore);
       session.restore = setTimeout(() => {
         delete session.restore;
+        if (this.#closed.has(session)) return;
         if (
           session.geometry.width === session.bootGeometry.width &&
           session.geometry.height === session.bootGeometry.height
@@ -1855,39 +1975,75 @@ export class DesktopManager {
   }
 
   async close(workspaceId: string): Promise<void> {
+    const pending = this.#closing.get(workspaceId);
+    if (pending) return pending;
+    const closing = this.#close(workspaceId);
+    this.#closing.set(workspaceId, closing);
+    try {
+      await closing;
+    } finally {
+      if (this.#closing.get(workspaceId) === closing) this.#closing.delete(workspaceId);
+    }
+  }
+
+  async #close(workspaceId: string): Promise<void> {
+    await this.#starting.get(workspaceId)?.catch(() => undefined);
+    const cleanup = this.#failedStarts.get(workspaceId);
+    if (cleanup) {
+      await cleanup();
+      this.#failedStarts.delete(workspaceId);
+    }
     const session = this.#sessions.get(workspaceId);
     if (!session) return;
-    this.#sessions.delete(workspaceId);
     this.#teardown(session);
-    if (session.process.exitCode !== null) {
-      this.#signalApplications(session, 'SIGKILL');
-      return;
-    }
-    const exited = once(session.process, 'exit').then(() => undefined);
-    session.process.kill('SIGTERM');
-    await Promise.race([
-      exited,
-      new Promise<void>((resolve) => {
-        const timeout = setTimeout(resolve, 2_000);
-        timeout.unref();
-      })
-    ]);
-    if (session.process.exitCode === null) {
-      session.process.kill('SIGKILL');
-      await Promise.race([
-        exited,
-        new Promise<void>((resolve) => {
-          const timeout = setTimeout(resolve, 1_000);
-          timeout.unref();
-        })
-      ]);
-    }
+    await this.#stopProcess(session.process);
+    if (this.#sessions.get(workspaceId) === session) this.#sessions.delete(workspaceId);
     this.#signalApplications(session, 'SIGKILL');
   }
 
+  async #stopProcess(child: ChildProcess): Promise<void> {
+    if (child.exitCode !== null || child.signalCode !== null || child.pid === undefined) return;
+    let exited: (() => void) | undefined;
+    const exit = new Promise<void>((resolve) => {
+      exited = resolve;
+      child.once('exit', resolve);
+    });
+    const wait = async (milliseconds: number) => {
+      let timeout: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          exit,
+          new Promise<void>((resolve) => {
+            timeout = setTimeout(resolve, milliseconds);
+            timeout.unref();
+          })
+        ]);
+      } finally {
+        if (timeout) clearTimeout(timeout);
+      }
+    };
+    try {
+      child.kill('SIGTERM');
+      await wait(2_000);
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGKILL');
+        await wait(1_000);
+      }
+      if (child.exitCode === null && child.signalCode === null)
+        throw new Error('GUI desktop session did not exit');
+    } finally {
+      if (exited) child.off('exit', exited);
+    }
+  }
+
   #teardown(session: DesktopSession): void {
+    if (this.#closed.has(session)) return;
+    this.#closed.add(session);
+    this.#lifetimes.get(session)?.abort();
     session.encoder.stop();
-    this.#closeBridge(session);
+    this.#closeBridge(session, new Error('Desktop session is closed'));
+    for (const queue of session.subscribers.values()) queue.clear();
+    session.subscribers.clear();
     if (session.poll) clearInterval(session.poll);
     if (session.restore) clearTimeout(session.restore);
     delete session.poll;

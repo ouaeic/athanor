@@ -1572,6 +1572,9 @@ export const releaseBrowserInput = async (page: Page): Promise<void> => {
 
 export class BrowserManager {
   readonly #sessions = new Map<string, Session>();
+  readonly #starting = new Map<string, Promise<Session>>();
+  readonly #closing = new Map<string, Promise<void>>();
+  readonly #failedStarts = new Map<string, () => Promise<void>>();
   /**
    * The last challenge the search route walked into, per workspace, and when. Kept apart from the
    * session's own ledger on purpose: a wall the search route hit must not close that host for the
@@ -1665,8 +1668,25 @@ export class BrowserManager {
   }
 
   async ensure(workspaceId: string, root: string): Promise<Session> {
+    while (this.#closing.has(workspaceId)) await this.#closing.get(workspaceId);
+    if (this.#failedStarts.has(workspaceId)) {
+      await this.close(workspaceId);
+      return this.ensure(workspaceId, root);
+    }
+    const pending = this.#starting.get(workspaceId);
+    if (pending) return pending;
     const existing = this.#sessions.get(workspaceId);
     if (existing) return existing;
+    const starting = this.#start(workspaceId, root);
+    this.#starting.set(workspaceId, starting);
+    try {
+      return await starting;
+    } finally {
+      if (this.#starting.get(workspaceId) === starting) this.#starting.delete(workspaceId);
+    }
+  }
+
+  async #start(workspaceId: string, root: string): Promise<Session> {
     const profile = path.join(root, '.athanor', 'browser');
     // systemd kills the runner's full process group on restart. Chromium can
     // nevertheless leave these exact profile locks behind after a crash.
@@ -1710,6 +1730,17 @@ export class BrowserManager {
       }
     }
     if (!context) throw refused instanceof Error ? refused : new Error('Browser did not start');
+    let closed = false;
+    let active: Session | undefined;
+    // Page creation and desktop control can both await while Chromium exits.
+    context.once('close', () => {
+      closed = true;
+      if (!active) return;
+      active.detachControl?.();
+      delete active.detachControl;
+      this.#attached.delete(active);
+      if (this.#sessions.get(workspaceId) === active) this.#sessions.delete(workspaceId);
+    });
     // Worth saying out loud rather than degrading quietly: headless changes what pages serve, and
     // an unsandboxed renderer is a weaker boundary on the process that browses arbitrary content.
     if (settled !== ladder[0])
@@ -1719,140 +1750,152 @@ export class BrowserManager {
         sandbox: settled?.chromiumSandbox,
         code: failureCode(refused)
       });
-    const page = context.pages()[0] ?? (await context.newPage());
-    const session: Session = {
-      context,
-      page,
-      root,
-      // The desktop was started a few lines above, by `#displayEnvironment`, precisely so this
-      // browser could run on its screen - so if this workspace has a desktop at all its control
-      // exists by now and this browser joins it rather than minting a rival.
-      control:
-        (await this.#sharedControl(workspaceId, root)) ??
-        new DesktopControl({ subject: 'Browser control' }),
-      streamQueue: Promise.resolve(),
-      streamTitle: '',
-      consoleMessages: [],
-      failedRequests: [],
-      // One directory per browser session keeps a re-download of the same file from silently
-      // overwriting the copy an earlier session handed the user.
-      downloadsDirectory: path.join(
-        'workspace',
-        'downloads',
-        new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
-      ),
-      downloads: [],
-      pendingDownloads: new Set(),
-      tabs: new Map(),
-      nextTabId: 1,
-      walls: new BotWallLedger()
-    };
-    const attachPage = (candidate: Page) => {
-      const tabId = `tab-${session.nextTabId}`;
-      session.nextTabId += 1;
-      session.tabs.set(tabId, candidate);
-      candidate.on('close', () => {
-        session.tabs.delete(tabId);
-        session.walls.forgetTab(tabId);
-      });
-      candidate.on('console', (message) => {
-        session.consoleMessages.push({
-          level: message.type(),
-          text: message.text().slice(0, 2_000),
-          url: message.location().url.slice(0, 2_000),
-          at: new Date().toISOString()
-        });
-        if (session.consoleMessages.length > 200) session.consoleMessages.splice(0, 50);
-      });
-      candidate.on('pageerror', (error) => {
-        session.consoleMessages.push({
-          level: 'pageerror',
-          text: error.message.slice(0, 2_000),
-          url: candidate.url().slice(0, 2_000),
-          at: new Date().toISOString()
-        });
-        if (session.consoleMessages.length > 200) session.consoleMessages.splice(0, 50);
-      });
-      /*
-       * Observation only. `page.on('response')` and `page.on('requestfailed')` are events Chromium
-       * is already emitting; `page.route()` would be the other way to see this and it turns on
-       * `Network.setCacheDisabled` and `Fetch.enable('*')` for the whole session, making every
-       * navigation a cold fetch - which `docs/design/browser-automation.md` lists as a pitfall by
-       * name. Nothing here modifies, blocks or re-issues a request.
-       */
-      candidate.on('response', (response) => {
-        const status = response.status();
-        if (status >= 400) {
-          recordFailedRequest(session, response.request().method(), status, response.url());
-          return;
-        }
-        // A redirect that crosses an origin is how a submit ends up at an auth wall while every
-        // status on the way is a success. The landing page then looks like the site rejecting the
-        // values, which sends the agent back to re-type fields that were already right.
-        //
-        // The URL recorded is where it was SENT, not what was asked for: `302 GET
-        // accounts.example.com/login` says what happened, where the requested address would read
-        // as an ordinary page. The status is what marks it as a redirect rather than a failure.
-        if (status < 300 || status >= 400) return;
-        const location = response.headers()['location'];
-        if (!location) return;
-        try {
-          if (new URL(location, response.url()).origin === new URL(response.url()).origin) return;
-        } catch {
-          return;
-        }
-        recordFailedRequest(session, response.request().method(), status, location);
-      });
-      candidate.on('requestfailed', (request) => {
-        // No response arrived at all: a CORS rejection, a DNS failure, a connection reset or an
-        // abort. Reported as status 0 because that is what the model needs to tell "the server
-        // said no" from "the request never landed".
-        recordFailedRequest(session, request.method(), 0, request.url());
-      });
-      candidate.on('dialog', (dialog) => {
-        session.pendingDialog = dialog;
-        // Parking the handle suppresses Playwright's auto-dismiss, so the page is stopped from
-        // here until something answers. Telling the pane is the whole of the owner's way out.
-        this.#notifyStreamState(session);
-      });
-      /*
-       * The two events that can change what the pane is showing without anything here asking.
-       *
-       * The title used to be re-read per frame, which paid for freshness thirty times a second
-       * and gated the frame ack on it. Reading it when the page says it has one costs two bounded
-       * reads per navigation instead - and only for the tab actually being watched, because
-       * background tabs are not on the stream.
-       */
-      const republish = () => {
-        if (candidate === session.page) void this.#refreshStreamState(session);
+    try {
+      const page = context.pages()[0] ?? (await context.newPage());
+      const session: Session = {
+        context,
+        page,
+        root,
+        // The desktop was started a few lines above, by `#displayEnvironment`, precisely so this
+        // browser could run on its screen - so if this workspace has a desktop at all its control
+        // exists by now and this browser joins it rather than minting a rival.
+        control:
+          (await this.#sharedControl(workspaceId, root)) ??
+          new DesktopControl({ subject: 'Browser control' }),
+        streamQueue: Promise.resolve(),
+        streamTitle: '',
+        consoleMessages: [],
+        failedRequests: [],
+        // One directory per browser session keeps a re-download of the same file from silently
+        // overwriting the copy an earlier session handed the user.
+        downloadsDirectory: path.join(
+          'workspace',
+          'downloads',
+          new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+        ),
+        downloads: [],
+        pendingDownloads: new Set(),
+        tabs: new Map(),
+        nextTabId: 1,
+        walls: new BotWallLedger()
       };
-      candidate.on('domcontentloaded', republish);
-      candidate.on('load', republish);
-      candidate.on('download', (download) => {
-        const saving = this.#saveDownload(session, root, download);
-        session.pendingDownloads.add(saving);
-        void saving.finally(() => session.pendingDownloads.delete(saving));
+      const attachPage = (candidate: Page) => {
+        const tabId = `tab-${session.nextTabId}`;
+        session.nextTabId += 1;
+        session.tabs.set(tabId, candidate);
+        candidate.on('close', () => {
+          session.tabs.delete(tabId);
+          session.walls.forgetTab(tabId);
+        });
+        candidate.on('console', (message) => {
+          session.consoleMessages.push({
+            level: message.type(),
+            text: message.text().slice(0, 2_000),
+            url: message.location().url.slice(0, 2_000),
+            at: new Date().toISOString()
+          });
+          if (session.consoleMessages.length > 200) session.consoleMessages.splice(0, 50);
+        });
+        candidate.on('pageerror', (error) => {
+          session.consoleMessages.push({
+            level: 'pageerror',
+            text: error.message.slice(0, 2_000),
+            url: candidate.url().slice(0, 2_000),
+            at: new Date().toISOString()
+          });
+          if (session.consoleMessages.length > 200) session.consoleMessages.splice(0, 50);
+        });
+        /*
+         * Observation only. `page.on('response')` and `page.on('requestfailed')` are events Chromium
+         * is already emitting; `page.route()` would be the other way to see this and it turns on
+         * `Network.setCacheDisabled` and `Fetch.enable('*')` for the whole session, making every
+         * navigation a cold fetch - which `docs/design/browser-automation.md` lists as a pitfall by
+         * name. Nothing here modifies, blocks or re-issues a request.
+         */
+        candidate.on('response', (response) => {
+          const status = response.status();
+          if (status >= 400) {
+            recordFailedRequest(session, response.request().method(), status, response.url());
+            return;
+          }
+          // A redirect that crosses an origin is how a submit ends up at an auth wall while every
+          // status on the way is a success. The landing page then looks like the site rejecting the
+          // values, which sends the agent back to re-type fields that were already right.
+          //
+          // The URL recorded is where it was SENT, not what was asked for: `302 GET
+          // accounts.example.com/login` says what happened, where the requested address would read
+          // as an ordinary page. The status is what marks it as a redirect rather than a failure.
+          if (status < 300 || status >= 400) return;
+          const location = response.headers()['location'];
+          if (!location) return;
+          try {
+            if (new URL(location, response.url()).origin === new URL(response.url()).origin) return;
+          } catch {
+            return;
+          }
+          recordFailedRequest(session, response.request().method(), status, location);
+        });
+        candidate.on('requestfailed', (request) => {
+          // No response arrived at all: a CORS rejection, a DNS failure, a connection reset or an
+          // abort. Reported as status 0 because that is what the model needs to tell "the server
+          // said no" from "the request never landed".
+          recordFailedRequest(session, request.method(), 0, request.url());
+        });
+        candidate.on('dialog', (dialog) => {
+          session.pendingDialog = dialog;
+          // Parking the handle suppresses Playwright's auto-dismiss, so the page is stopped from
+          // here until something answers. Telling the pane is the whole of the owner's way out.
+          this.#notifyStreamState(session);
+        });
+        /*
+         * The two events that can change what the pane is showing without anything here asking.
+         *
+         * The title used to be re-read per frame, which paid for freshness thirty times a second
+         * and gated the frame ack on it. Reading it when the page says it has one costs two bounded
+         * reads per navigation instead - and only for the tab actually being watched, because
+         * background tabs are not on the stream.
+         */
+        const republish = () => {
+          if (candidate === session.page) void this.#refreshStreamState(session);
+        };
+        candidate.on('domcontentloaded', republish);
+        candidate.on('load', republish);
+        candidate.on('download', (download) => {
+          const saving = this.#saveDownload(session, root, download);
+          session.pendingDownloads.add(saving);
+          void saving.finally(() => session.pendingDownloads.delete(saving));
+        });
+      };
+      for (const candidate of context.pages()) attachPage(candidate);
+      context.on('page', (candidate) => {
+        attachPage(candidate);
+        // An ad or oauth popup opens a page too; it stays a background tab the agent can
+        // select deliberately instead of hijacking the one being driven.
+        if (!shouldAdoptNewPage(session.page)) return;
+        session.page = candidate;
+        void this.#retargetStream(session).catch(() => undefined);
       });
-    };
-    for (const candidate of context.pages()) attachPage(candidate);
-    context.on('page', (candidate) => {
-      attachPage(candidate);
-      // An ad or oauth popup opens a page too; it stays a background tab the agent can
-      // select deliberately instead of hijacking the one being driven.
-      if (!shouldAdoptNewPage(session.page)) return;
-      session.page = candidate;
-      void this.#retargetStream(session).catch(() => undefined);
-    });
-    // Nothing here masks automation. The switch that used to suppress `navigator.webdriver`
-    // (`--disable-blink-features=AutomationControlled`) has been removed, because masking it is
-    // bot-defence evasion, which SECURITY.md places out of scope and which the owner would be
-    // the one exposed for. Sites that refuse automation are recognised and handed to the owner.
-    this.#sessions.set(workspaceId, session);
-    context.on('close', () => this.#sessions.delete(workspaceId));
-    // Registered the moment the session exists rather than at its first action, so a handover that
-    // arrives while this browser has only ever been watched still lifts what it is holding down.
-    this.#controlOf(session);
-    return session;
+      // Nothing here masks automation. The switch that used to suppress `navigator.webdriver`
+      // (`--disable-blink-features=AutomationControlled`) has been removed, because masking it is
+      // bot-defence evasion, which SECURITY.md places out of scope and which the owner would be
+      // the one exposed for. Sites that refuse automation are recognised and handed to the owner.
+      if (closed) throw new Error('Browser context closed during startup');
+      active = session;
+      this.#sessions.set(workspaceId, session);
+      // Registered the moment the session exists rather than at its first action, so a handover that
+      // arrives while this browser has only ever been watched still lifts what it is holding down.
+      this.#controlOf(session);
+      return session;
+    } catch (cause) {
+      try {
+        await context.close();
+      } catch (cleanupFailure) {
+        const unfinished = context;
+        this.#failedStarts.set(workspaceId, () => unfinished.close());
+        throw new AggregateError([cause, cleanupFailure], 'Browser startup cleanup failed');
+      }
+      throw cause;
+    }
   }
 
   async #displayEnvironment(
@@ -3203,6 +3246,24 @@ export class BrowserManager {
   }
 
   async close(workspaceId: string): Promise<void> {
+    const pending = this.#closing.get(workspaceId);
+    if (pending) return pending;
+    const closing = this.#close(workspaceId);
+    this.#closing.set(workspaceId, closing);
+    try {
+      await closing;
+    } finally {
+      if (this.#closing.get(workspaceId) === closing) this.#closing.delete(workspaceId);
+    }
+  }
+
+  async #close(workspaceId: string): Promise<void> {
+    await this.#starting.get(workspaceId)?.catch(() => undefined);
+    const cleanup = this.#failedStarts.get(workspaceId);
+    if (cleanup) {
+      await cleanup();
+      this.#failedStarts.delete(workspaceId);
+    }
     // The search backoff belongs to the workspace rather than to the session, so closing the
     // browser is the one moment it is unambiguously stale: whatever the engine decided, it decided
     // it about work that is now over.

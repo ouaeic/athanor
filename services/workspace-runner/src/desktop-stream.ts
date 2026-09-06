@@ -637,7 +637,10 @@ export interface StillCaptureRequest {
   region?: { x: number; y: number; width: number; height: number };
 }
 
-export const stillCaptureArguments = (request: StillCaptureRequest): string[] => {
+export const prepareStillCapture = (
+  request: StillCaptureRequest
+): { args: string[]; region: StillCaptureRequest['region'] } => {
+  let region: StillCaptureRequest['region'];
   const args = [
     '-hide_banner',
     '-loglevel',
@@ -661,6 +664,7 @@ export const stillCaptureArguments = (request: StillCaptureRequest): string[] =>
     const height = Math.max(16, Math.min(request.region.height, request.geometry.height));
     const x = Math.max(0, Math.min(request.region.x, request.geometry.width - width));
     const y = Math.max(0, Math.min(request.region.y, request.geometry.height - height));
+    region = { x, y, width, height };
     /*
      * And bounded at the far end too, which the clamp above did not do and the comment above was
      * read as doing. `scale=` sat in the `else` below and therefore never ran for a region, so a
@@ -687,19 +691,25 @@ export const stillCaptureArguments = (request: StillCaptureRequest): string[] =>
     request.image.height !== request.geometry.height
   )
     args.push('-vf', `scale=${request.image.width}:${request.image.height}:flags=lanczos`);
-  return [
-    ...args,
-    '-f',
-    'image2pipe',
-    '-c:v',
-    'mjpeg',
-    '-pix_fmt',
-    'yuvj420p',
-    '-q:v',
-    String(request.quality),
-    'pipe:1'
-  ];
+  return {
+    region,
+    args: [
+      ...args,
+      '-f',
+      'image2pipe',
+      '-c:v',
+      'mjpeg',
+      '-pix_fmt',
+      'yuvj420p',
+      '-q:v',
+      String(request.quality),
+      'pipe:1'
+    ]
+  };
 };
+
+export const stillCaptureArguments = (request: StillCaptureRequest): string[] =>
+  prepareStillCapture(request).args;
 
 export interface AgentImage extends DisplayGeometry {
   /** Uniform factor the display was reduced by; 1 when the display already fits. */

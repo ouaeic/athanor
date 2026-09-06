@@ -1006,6 +1006,27 @@ describe('what the desktop stream negotiates with the client watching it', () =>
  * that a bound proved in the builder is also proved to be reached.
  */
 describe('a zoom that asks for more pixels than a screenshot carries', () => {
+  it.each([
+    { name: 'right edge', x: 1439, y: 20, capturedX: 1424, capturedY: 20 },
+    { name: 'bottom edge', x: 20, y: 899, capturedX: 20, capturedY: 884 },
+    { name: 'bottom right corner', x: 1439, y: 899, capturedX: 1424, capturedY: 884 },
+    { name: 'interior', x: 100, y: 200, capturedX: 100, capturedY: 200 }
+  ])(
+    'reports the rectangle actually captured at the $name',
+    async ({ x, y, capturedX, capturedY }) => {
+      const harness = await buildHarness();
+      harness.session.geometry = { width: 1440, height: 900 };
+      const result = await act(harness, { type: 'zoom', x, y, width: 16, height: 16 }, 'agent');
+      const calls = processes.argumentsFor('/usr/bin/ffmpeg');
+      expect(calls).toHaveLength(1);
+      const args = calls[0]!;
+      expect(args[args.indexOf('-vf') + 1]).toBe(`crop=16:16:${capturedX}:${capturedY}`);
+      expect(result).toMatchObject({
+        region: { x: capturedX, y: capturedY, width: 16, height: 16 }
+      });
+    }
+  );
+
   it('crops the region and reduces it into the box the full still is bounded to', async () => {
     const harness = await buildHarness();
     // The whole screen, in the agent's own coordinates. 1440x900 of image is the whole of a
