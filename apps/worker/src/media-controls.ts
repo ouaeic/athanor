@@ -148,5 +148,5 @@ export const describeMediaControls = () => ({
     frameImages: 'frame_images'
   },
   instruction:
-    'Put advanced controls in options. Use only settings supported by the selected route. Video requires options.modelId and options.duration. Native edit/extend also require options.sourceJobId and the unchanged source size; edit uses the full source duration, extend uses the added seconds. Unknown pricing requires options.maxCostUsd. Reference paths must be inside this workspace.'
+    'Put advanced controls in options. Use only settings supported by the selected route. Omit image width/height to use its imageDimensions defaults. Video requires options.modelId and options.duration. Native edit/extend also require options.sourceJobId and the unchanged source size; edit uses the full source duration, extend uses the added seconds. Unknown pricing requires options.maxCostUsd. Reference paths must be inside this workspace.'
 });

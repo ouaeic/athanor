@@ -1413,8 +1413,8 @@ export const agentTools: ModelTool[] = [
           type: 'string',
           description: 'Workspace output path.'
         },
-        width: { type: 'integer', minimum: 256, maximum: 4096, default: 1024 },
-        height: { type: 'integer', minimum: 256, maximum: 4096, default: 1024 },
+        width: { type: 'integer', minimum: 256, maximum: 4096 },
+        height: { type: 'integer', minimum: 256, maximum: 4096 },
         seed: { type: 'integer', minimum: 0, maximum: 2147483647 },
         options: {
           type: 'object',

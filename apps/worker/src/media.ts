@@ -3,6 +3,7 @@ import {
   managedMediaModels,
   nativeTranscriptionBound,
   quoteMediaPrice,
+  resolveImageDimensions,
   type TranscriptionBound
 } from '@athanor/model-gateway';
 
@@ -192,6 +193,14 @@ const clamp = (value: unknown, minimum: number, maximum: number, fallback: numbe
 
 /** The bounds `generate_media` declares, applied before anything is priced. */
 export const mediaDimension = (value: unknown): number => clamp(value, 256, 4_096, 1_024);
+export const mediaImageDimensions = (input: MediaEstimateInput) =>
+  resolveImageDimensions({
+    model: input.model?.modelId ?? '',
+    capabilities: input.model?.route?.capabilities,
+    width: input.width === undefined ? undefined : mediaDimension(input.width),
+    height: input.height === undefined ? undefined : mediaDimension(input.height),
+    resolution: typeof input.resolution === 'string' ? input.resolution : undefined
+  });
 const mediaCharacterCount = (value: unknown): number => clamp(value, 1, 20_000, 1_000);
 
 /**
@@ -221,10 +230,14 @@ export interface MediaEstimateInput {
   model?: ResolvedMediaModel;
 }
 export const mediaQuoteUsd = (input: MediaEstimateInput): number | null => {
+  const { width, height } =
+    input.kind === 'image'
+      ? mediaImageDimensions(input)
+      : { width: mediaDimension(input.width), height: mediaDimension(input.height) };
   if (input.model?.route?.pricing?.length)
     return quoteMediaPrice(input.model.route.pricing, {
-      width: mediaDimension(input.width),
-      height: mediaDimension(input.height),
+      width,
+      height,
       count: Math.max(1, Math.min(10, Number(input.count) || 1)),
       characters: mediaCharacterCount(input.characterCount),
       ...(input.kind === 'video' && Number.isFinite(Number(input.duration))
@@ -244,8 +257,6 @@ export const mediaQuoteUsd = (input: MediaEstimateInput): number | null => {
     });
   if (!input.model?.priceKnown) return null;
   if (input.kind === 'image') {
-    const width = mediaDimension(input.width);
-    const height = mediaDimension(input.height);
     const base = input.model.usdPerImage;
     if (base === null) return null;
     return (

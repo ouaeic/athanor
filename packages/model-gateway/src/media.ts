@@ -1,3 +1,4 @@
+import { imageCapabilities, resolveImageDimensions } from './image-dimensions.js';
 import {
   decodeMediaBase64,
   downloadMedia,
@@ -224,6 +225,7 @@ export class MediaClient {
         input.height > 8192)
     )
       throw new Error('Choose valid image dimensions');
+    if (input.kind === 'image') resolveImageDimensions(input);
     if (
       input.count !== undefined &&
       (!Number.isInteger(input.count) || input.count < 1 || input.count > 10)
@@ -314,10 +316,14 @@ export class MediaClient {
         ? { size: `${input.width}x${input.height}` }
         : {})
     };
-    if (input.capabilities)
+    const capabilities =
+      input.kind === 'image' && input.capabilities
+        ? imageCapabilities(input.model, input.capabilities)
+        : input.capabilities;
+    if (capabilities)
       for (const [key, value] of Object.entries(values)) {
         if (value === undefined) continue;
-        const parameter = input.capabilities.parameters[key];
+        const parameter = capabilities.parameters[key];
         if (
           !parameter ||
           (parameter.type === 'enum' &&
@@ -528,7 +534,7 @@ export class MediaClient {
       model: input.model,
       prompt: input.prompt,
       size: `${input.width}x${input.height}`,
-      output_format: format,
+      ...(input.outputFormat ? { output_format: input.outputFormat } : {}),
       ...(this.options.apiProtocol === 'openai' || this.options.openRouter === false
         ? {}
         : { seed: input.seed }),
@@ -658,7 +664,9 @@ export class MediaClient {
         outputs.push({
           filename: name,
           bytes: decodeMediaBase64(item.b64_json),
-          mimeType: item.media_type ?? `image/${format}`
+          mimeType:
+            item.media_type ??
+            (input.outputFormat ? `image/${input.outputFormat}` : 'application/octet-stream')
         });
       else if (item.url)
         outputs.push({

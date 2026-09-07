@@ -12,6 +12,91 @@ const nativeArtifactKinds = new Map([
   ['libathanor_desktop_lib.a', 'ios']
 ]);
 
+function printable(value, limit = 200) {
+  return value.slice(0, limit).replace(/[^\x20-\x7e]/g, '?');
+}
+
+// Read archive metadata only; member names never become filesystem paths.
+function archiveMemberAt(bytes, position) {
+  if (bytes.subarray(0, 8).toString('ascii') !== '!<arch>\n') return null;
+  let offset = 8;
+  let names = null;
+  while (offset + 60 <= bytes.length) {
+    const header = bytes.subarray(offset, offset + 60);
+    const sizeText = header.subarray(48, 58).toString('ascii').trim();
+    if (header.subarray(58).toString('ascii') !== '`\n' || !/^\d+$/.test(sizeText)) return null;
+    const size = Number(sizeText);
+    const start = offset + 60;
+    const end = start + size;
+    if (!Number.isSafeInteger(end) || end > bytes.length) return null;
+    let name = header.subarray(0, 16).toString('ascii').trim();
+    let content = start;
+    if (name.startsWith('#1/')) {
+      const lengthText = name.slice(3);
+      if (!/^\d+$/.test(lengthText)) return null;
+      const length = Number(lengthText);
+      if (length > size) return null;
+      name = bytes
+        .subarray(start, start + Math.min(length, 200))
+        .toString('latin1')
+        .replace(/\0+$/, '');
+      content += length;
+    } else if (name === '//') {
+      names = bytes.subarray(start, end);
+    } else if (/^\/\d+$/.test(name) && names) {
+      const index = Number(name.slice(1));
+      if (index >= names.length) return null;
+      const terminator = names.indexOf('\n', index);
+      name = names
+        .subarray(index, Math.min(index + 200, terminator < 0 ? names.length : terminator))
+        .toString('latin1')
+        .replace(/\/$/, '');
+    } else if (name.endsWith('/') && name !== '/') {
+      name = name.slice(0, -1);
+    }
+    if (position >= offset && position < end)
+      return {
+        name: printable(name),
+        headerOffset: offset,
+        contentOffset: content,
+        memberOffset: position >= content ? position - content : null,
+        location: position >= content ? 'content' : 'name-or-header'
+      };
+    offset = end + (size % 2);
+  }
+  return null;
+}
+
+function pathDiagnostics(bytes, text, prefix, pattern) {
+  const matches = [];
+  const expression = prefix ? null : new RegExp(pattern.source, `${pattern.flags}g`);
+  let cursor = 0;
+  while (matches.length < 3) {
+    const match = expression?.exec(text);
+    const position = prefix ? text.indexOf(prefix, cursor) : (match?.index ?? -1);
+    if (position < 0) break;
+    let end = position;
+    const knownEnd = position + (prefix?.length ?? 0);
+    const pathCharacter = (offset) =>
+      bytes[offset] >= 33 && bytes[offset] <= 126 && !'"\'<>|=;,'.includes(text[offset]);
+    while (
+      end < bytes.length &&
+      end < position + 320 &&
+      ((end < knownEnd && bytes[end] >= 32 && bytes[end] <= 126) || pathCharacter(end))
+    )
+      end++;
+    matches.push({
+      byteOffset: position,
+      pathToken: text.slice(position, end),
+      truncatedAfter: end < bytes.length && (end < knownEnd || pathCharacter(end)),
+      archiveMember: archiveMemberAt(bytes, position)
+    });
+    cursor = Math.max(end, position + (prefix?.length ?? match[0].length));
+    if (expression) expression.lastIndex = cursor;
+  }
+  return matches;
+}
+
 async function findReleaseExecutables(root) {
   const matches = [];
   async function visit(directory) {
@@ -67,7 +152,7 @@ export async function checkNativeBinaries(
     const leakedPattern = genericHomePatterns.find((pattern) => pattern.test(text));
     if (leakedPrefix || leakedPattern) {
       throw new Error(
-        `Native release artifact contains a build-machine path (${leakedPrefix ?? leakedPattern}): ${path}`
+        `Native release artifact contains a build-machine path (${leakedPrefix ?? leakedPattern}): ${path}\nPath diagnostics: ${JSON.stringify(pathDiagnostics(bytes, text, leakedPrefix, leakedPattern))}`
       );
     }
   }

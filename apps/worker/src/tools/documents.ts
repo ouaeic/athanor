@@ -10,7 +10,12 @@ import { requireMediaGenerationApproval } from '../media-approval.js';
 import { currentRunnerAbortSignal } from '../runner-client.js';
 import { spendHalt } from '../turn-bounds.js';
 import { textValue } from '../values.js';
-import { mediaDimension, mediaQuoteUsd, resolvedMediaModel } from '../media.js';
+import {
+  mediaDimension,
+  mediaImageDimensions,
+  mediaQuoteUsd,
+  resolvedMediaModel
+} from '../media.js';
 import { type ToolContext } from '../tool-dispatch.js';
 import { clampNumber } from './numbers.js';
 import { GenerationControls, mediaArguments, describeMediaControls } from '../media-controls.js';
@@ -193,8 +198,16 @@ export async function executeDocumentTool(
       const modelId = media.modelId;
       const prompt = textValue(args.prompt).trim();
       if (!prompt) throw new AthanorError('media_prompt_empty', 'A media prompt is required');
-      const width = mediaDimension(args.width);
-      const height = mediaDimension(args.height);
+      const { width, height } =
+        kind === 'image'
+          ? mediaImageDimensions({
+              kind,
+              width: args.width,
+              height: args.height,
+              resolution: controls.resolution,
+              model: media
+            })
+          : { width: mediaDimension(args.width), height: mediaDimension(args.height) };
       const quotedUsd = mediaQuoteUsd({
         kind,
         width,

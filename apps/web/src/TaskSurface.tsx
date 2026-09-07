@@ -495,20 +495,6 @@ export default function TaskSurface({
                 <MediaJobs taskId={task.id} onDelivered={reload} />
               </Suspense>
               {presentation && (
-                <WorkTrace
-                  progress={presentation.progress}
-                  {...(presentation.surface ? { surface: presentation.surface } : {})}
-                  onEvidence={(id) => void inspectEvidence(id)}
-                  onResult={(kind, id) => {
-                    if (kind === 'artifact') showArtifact(id);
-                    else
-                      document
-                        .getElementById(`preview-${id}`)
-                        ?.scrollIntoView({ block: 'center', behavior: 'smooth' });
-                  }}
-                />
-              )}
-              {presentation && (
                 <TaskOutputs
                   events={events}
                   artifacts={artifacts}
@@ -528,6 +514,20 @@ export default function TaskSurface({
                       : presentation
                   }
                   onArtifact={(id) => showArtifact(id)}
+                />
+              )}
+              {presentation && (
+                <WorkTrace
+                  progress={presentation.progress}
+                  {...(presentation.surface ? { surface: presentation.surface } : {})}
+                  onEvidence={(id) => void inspectEvidence(id)}
+                  onResult={(kind, id) => {
+                    if (kind === 'artifact') showArtifact(id);
+                    else
+                      document
+                        .getElementById(`preview-${id}`)
+                        ?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+                  }}
                 />
               )}
               {presentation?.surface &&

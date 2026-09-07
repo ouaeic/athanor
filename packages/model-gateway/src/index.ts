@@ -10,6 +10,7 @@ export * from './license-manifest.js';
 export * from './media.js';
 export * from './gateway.js';
 export * from './media-capabilities.js';
+export * from './image-dimensions.js';
 export { describeOpenRouterImageModel } from './media-catalog.js';
 export * from './openrouter-transcription.js';
 export * from './video.js';

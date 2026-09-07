@@ -684,6 +684,7 @@ const installFetch = (
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   vi.useRealTimers();
 });
 
@@ -6654,6 +6655,7 @@ describe('the warnings that are the owner’s business', () => {
 
   /** A worker whose journal can be read back, which is how the two tests below read it. */
   const journalled = (): { logger: Logger; lines: string[] } => {
+    vi.stubEnv('JOURNAL_STREAM', undefined);
     const lines: string[] = [];
     return {
       logger: createLogger({ level: 'info', service: 'worker', write: (line) => lines.push(line) }),

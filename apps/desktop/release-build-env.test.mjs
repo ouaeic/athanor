@@ -71,6 +71,117 @@ test('native artifact audit rejects a build home and accepts remapped output', a
   }
 });
 
+function archiveEntry(name, content) {
+  const header = `${name.padEnd(16)}${'0'.padEnd(12)}${'0'.padEnd(6)}${'0'.padEnd(6)}${'644'.padEnd(8)}${String(content.length).padEnd(10)}\x60\n`;
+  assert.equal(Buffer.byteLength(header), 60);
+  return Buffer.concat([
+    Buffer.from(header),
+    content,
+    ...(content.length % 2 ? [Buffer.from('\n')] : [])
+  ]);
+}
+
+test('native artifact audit attributes leaked paths to BSD and GNU archive objects', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'garden-native-members-'));
+  const artifact = join(directory, 'release', 'libathanor_desktop_lib.a');
+  const name = 'garden-native-compiler.swift.o';
+  const payload = Buffer.from(
+    '\0DO_NOT_PRINT_OTHER_STRINGS\0DW_AT_comp_dir=/Users/builder/work/project OWNER_PRIVATE_DATA\0'
+  );
+  const nameBytes = Buffer.from(name);
+  const variants = [
+    {
+      expectedName: name,
+      members: [archiveEntry(`#1/${nameBytes.length}`, Buffer.concat([nameBytes, payload]))]
+    },
+    {
+      expectedName: name,
+      members: [archiveEntry('//', Buffer.from(`${name}/\n`)), archiveEntry('/0', payload)]
+    },
+    { expectedName: 'native.o', members: [archiveEntry('native.o/', payload)] }
+  ];
+  try {
+    await mkdir(join(directory, 'release'));
+    for (const { expectedName, members } of variants) {
+      const archive = Buffer.concat([Buffer.from('!<arch>\n'), ...members]);
+      await writeFile(artifact, archive);
+      await assert.rejects(
+        checkNativeBinaries(directory, { HOME: '/Users/builder' }, 'ios'),
+        (error) => {
+          assert.match(error.message, /build-machine path/);
+          const details = JSON.parse(error.message.split('\nPath diagnostics: ')[1]);
+          assert.equal(details.length, 1);
+          assert.equal(details[0].archiveMember.name, expectedName);
+          assert.equal(details[0].archiveMember.location, 'content');
+          assert.equal(details[0].archiveMember.memberOffset, payload.indexOf('/Users/builder'));
+          assert.equal(details[0].byteOffset, archive.indexOf('/Users/builder'));
+          assert.equal(details[0].pathToken, '/Users/builder/work/project');
+          assert.ok(!error.message.includes('DO_NOT_PRINT_OTHER_STRINGS'));
+          assert.ok(!error.message.includes('OWNER_PRIVATE_DATA'));
+          assert.ok(!error.message.includes('DW_AT_comp_dir'));
+          return true;
+        }
+      );
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('native artifact audit bounds printable diagnostics and still rejects malformed archives', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'garden-native-diagnostic-bound-'));
+  const artifact = join(directory, 'release', 'libathanor_desktop_lib.a');
+  try {
+    await mkdir(join(directory, 'release'));
+    const fragment = '/Users/builder/work/' + 'x'.repeat(400);
+    await writeFile(
+      artifact,
+      `!<arch>\nmalformed\0${(fragment + '\0').repeat(8)}\x1bSECRET_TRAILER`
+    );
+    await assert.rejects(
+      checkNativeBinaries(directory, { HOME: '/Users/builder' }, 'ios'),
+      (error) => {
+        assert.match(error.message, /build-machine path/);
+        const details = JSON.parse(error.message.split('\nPath diagnostics: ')[1]);
+        assert.equal(details.length, 3);
+        for (const item of details) {
+          assert.equal(item.archiveMember, null);
+          assert.equal(item.truncatedAfter, true);
+          assert.ok(item.pathToken.length <= 320);
+          assert.match(item.pathToken, /^[\x20-\x7e]+$/);
+        }
+        assert.ok(error.message.length < 2000);
+        assert.ok(!error.message.includes('SECRET_TRAILER'));
+        assert.ok(!error.message.includes('\x1b'));
+        return true;
+      }
+    );
+    await writeFile(artifact, 'DW_AT_name=/home/another/.cargo/registry/native.c\0');
+    await assert.rejects(
+      checkNativeBinaries(directory, { HOME: '/Users/builder' }, 'ios'),
+      (error) => {
+        const details = JSON.parse(error.message.split('\nPath diagnostics: ')[1]);
+        assert.equal(details.length, 1);
+        assert.equal(details[0].pathToken, '/home/another/.cargo/registry/native.c');
+        return true;
+      }
+    );
+    await writeFile(artifact, 'option=/Users/build owner/.cargo/source.c PRIVATE_ARGUMENT\0');
+    await assert.rejects(
+      checkNativeBinaries(directory, { HOME: '/Users/build owner' }, 'ios'),
+      (error) => {
+        const details = JSON.parse(error.message.split('\nPath diagnostics: ')[1]);
+        assert.equal(details.length, 1);
+        assert.equal(details[0].pathToken, '/Users/build owner/.cargo/source.c');
+        assert.ok(!error.message.includes('PRIVATE_ARGUMENT'));
+        return true;
+      }
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test(
   'Swift package remapping preserves compiler arguments and removes its temporary tools',
   {

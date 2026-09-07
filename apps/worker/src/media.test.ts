@@ -2,6 +2,9 @@ import { describe, expect, it } from 'vitest';
 import { AUDIO_READ_MAX_SECONDS, type MediaModelOption } from '@athanor/contracts';
 import {
   mediaDimension,
+  mediaImageDimensions,
+  mediaQuoteUsd,
+  resolvedMediaModel,
   resolvedTranscriptionRoute,
   transcriptionEstimateUsd,
   transcriptionRate,
@@ -34,6 +37,21 @@ const native = (overrides: Partial<MediaModelOption> = {}) =>
   });
 const resolve = (route: MediaModelOption, connection = true) =>
   resolvedTranscriptionRoute({ transcription: route }, connection);
+
+it('prices the same model-specific image default used by execution and rejects undersized requests', () => {
+  const model = resolvedMediaModel('image', {
+    image: option({
+      providerModelId: 'bytedance-seed/seedream-4.5',
+      modality: 'image',
+      pricing: [{ billable: 'output_image', unit: 'megapixel', costUsd: 0.01 }]
+    })
+  });
+  const request = { kind: 'image', model };
+  expect(mediaImageDimensions(request)).toEqual({ width: 2048, height: 2048 });
+  expect(mediaQuoteUsd(request)).toBe(0.04194304);
+  expect(mediaQuoteUsd({ ...request, resolution: '4K' })).toBe(0.16777216);
+  expect(() => mediaQuoteUsd({ ...request, width: 1024, height: 1024 })).toThrow('pixels');
+});
 
 describe('complete recording request cost evidence', () => {
   it('rounds a published duration quote up to the billing minute', () => {

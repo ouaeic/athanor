@@ -1,5 +1,6 @@
 import { AthanorError } from '@athanor/core';
 import { seedMediaModels } from './catalog.js';
+import { imageCapabilities } from './image-dimensions.js';
 import { readBoundedMediaBody } from './media-output.js';
 import { refreshOpenRouterTranscriptionModel } from './openrouter-transcription.js';
 import {
@@ -90,6 +91,7 @@ export const refreshOpenRouterMediaCatalog = async (
           });
       }
     let capabilities = readMediaCapabilities(raw.supported_parameters, raw.supports_streaming);
+    if (modality === 'image') capabilities = imageCapabilities(raw.id, capabilities);
     if (modality === 'video') {
       const parameters: Record<string, unknown> = {};
       for (const [key, field] of [
@@ -246,9 +248,9 @@ export const describeOpenRouterImageModel = async (
         providerEndpointTag: endpoint.provider_tag,
         metadataVerifiedAt: (options.now ?? new Date()).toISOString(),
         ...(privateTags ? { zeroDataRetentionAvailable: true } : {}),
-        capabilities: readMediaCapabilities(
-          endpoint.supported_parameters,
-          endpoint.supports_streaming
+        capabilities: imageCapabilities(
+          model.providerModelId,
+          readMediaCapabilities(endpoint.supported_parameters, endpoint.supports_streaming)
         ),
         pricing,
         priceSource: pricing.length ? ('provider' as const) : ('unknown' as const),

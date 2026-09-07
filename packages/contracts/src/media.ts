@@ -12,9 +12,20 @@ export const MediaParameter = z.discriminatedUnion('type', [
   z.object({ type: z.literal('boolean') })
 ]);
 export type MediaParameter = z.infer<typeof MediaParameter>;
+export const ImageDimensions = z.object({
+  defaultWidth: z.number().int().positive().max(8192),
+  defaultHeight: z.number().int().positive().max(8192),
+  minPixels: z.number().int().positive(),
+  maxPixels: z.number().int().positive(),
+  minAspectRatio: z.number().positive(),
+  maxAspectRatio: z.number().positive(),
+  squareSizeByResolution: z.record(z.string().max(32), z.number().int().positive().max(8192))
+});
+export type ImageDimensions = z.infer<typeof ImageDimensions>;
 export const MediaCapabilities = z.object({
   parameters: z.record(z.string().regex(/^[a-z][a-z0-9_]{0,63}$/), MediaParameter),
-  supportsStreaming: z.boolean()
+  supportsStreaming: z.boolean(),
+  imageDimensions: ImageDimensions.optional()
 });
 export type MediaCapabilities = z.infer<typeof MediaCapabilities>;
 export const MediaPriceLine = z.object({

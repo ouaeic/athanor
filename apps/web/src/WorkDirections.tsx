@@ -18,7 +18,10 @@ export function WorkDirections({
       <article className="garden-direction">
         <header>
           <strong>{current.queued ? 'Next direction · queued' : 'Your direction'}</strong>
-          <Button onClick={() => onRevisit(current.eventId, current.sequence)}>
+          <Button
+            className="quiet-button"
+            onClick={() => onRevisit(current.eventId, current.sequence)}
+          >
             Edit / revisit
           </Button>
         </header>
@@ -37,8 +40,7 @@ export function WorkDirections({
           </Button>
         )}
         <p className="garden-acknowledgment">
-          <small>garden</small>
-          <br />
+          <small>garden</small>{' '}
           {surface.report?.content.acknowledgment ??
             current.acknowledgment ??
             (current.queued ? 'Queued for the next turn.' : 'Waiting for the next update.')}
