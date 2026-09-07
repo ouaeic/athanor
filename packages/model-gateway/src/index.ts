@@ -16,6 +16,8 @@ export * from './openrouter-transcription.js';
 export * from './video.js';
 export * from './openai-media-catalog.js';
 export * from './native-media-library.js';
+export { planUsageFor, type PlanUsage } from './plan-usage.js';
+export { resolveVisionInputRoutes } from './vision-input.js';
 
 export { readBoundedMediaBody } from './media-output.js';
 

@@ -25,6 +25,7 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
     privateTaskResponse,
     privateScheduleResponse,
     providerSpend,
+    planUsage,
     requiresZeroDataRetention,
     modelsForUser,
     webSearchRouteFor,
@@ -81,7 +82,8 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
       drafts,
       enforceZeroDataRetention,
       webSearch,
-      spend
+      spend,
+      plan
     ] = await Promise.all([
       workspacesRead,
       store.listWorkspaceMetadata(user.id),
@@ -93,7 +95,8 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
       openDrafts(),
       requiresZeroDataRetention(user.id),
       webSearchRouteFor(user.id),
-      providerSpend(user.id)
+      providerSpend(user.id),
+      planUsage(user.id)
     ]);
     const metadata = new Map(workspaceMetadata.map((workspace) => [workspace.id, workspace]));
     const hostStorage = new Map(
@@ -193,7 +196,8 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
         reservedCredits: usage.reserved,
         storageBytes: workspaces.reduce((sum, workspace) => sum + workspace.storageBytes, 0),
         storageLimitBytes: serverLimits.storageBytes,
-        providerSpend: spend
+        providerSpend: spend,
+        plan: plan
       }
     };
     reply.header('x-athanor-preview-base-url', config.PREVIEW_BASE_URL);

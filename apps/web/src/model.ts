@@ -70,6 +70,16 @@ export interface Bootstrap {
     reservedCredits: number;
     storageBytes: number;
     storageLimitBytes: number;
+    plan: {
+      provider: 'ollama-cloud' | 'openrouter';
+      windows: {
+        label: string;
+        used: number | null;
+        limit: number | null;
+        resetsAt: string | null;
+      }[];
+      queriedAt: string;
+    } | null;
   };
 }
 export interface Decision {

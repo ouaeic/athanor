@@ -53,7 +53,8 @@ const bootstrap = (tasks: Task[], cursor: string | null): Bootstrap => ({
     consumedCredits: 0,
     reservedCredits: 0,
     storageBytes: 0,
-    storageLimitBytes: 0
+    storageLimitBytes: 0,
+    plan: null
   }
 });
 

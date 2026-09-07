@@ -40,12 +40,15 @@ import {
   wrapDataKey
 } from '@athanor/core';
 import type { ModelTaskKind, RoutableModel } from '@athanor/core';
+import type { MediaModelOption } from '@athanor/contracts';
 import type { UserRecord, WorkspaceRecord } from '@athanor/data';
 import {
   OpenAICompatibleAdapter,
   MediaRouteResolver,
   applyOpenRouterPrivacyPolicy,
   refreshOpenRouterCatalog,
+  planUsageFor,
+  resolveVisionInputRoutes,
   seedModels,
   isNativeOpenAIEndpoint
 } from '@athanor/model-gateway';
@@ -116,6 +119,17 @@ export const createServerSupport = (context: ServerBase) => {
         ])
       ) as Record<(typeof PROVIDER_SPEND_WINDOWS)[number], { used: number; resetsAt: string }>
     };
+  };
+  /**
+   * What the connected provider's own plan endpoint says, read live so the strip beside CPU and
+   * RAM is the plan's current state rather than this box's own bookkeeping. A provider that will
+   * not answer arrives as null - the strip renders nothing for it - because an outage should
+   * cost the owner a missing number, not their first paint.
+   */
+  const planUsage = async (userId: string) => {
+    const { secret, configured } = await inferenceCredential(userId);
+    if (!configured) return null;
+    return planUsageFor(secret.provider, secret.apiKey);
   };
 
   /**
@@ -384,8 +398,10 @@ export const createServerSupport = (context: ServerBase) => {
           return (
             model.provider === 'custom' &&
             model.recommendationTags.includes('Ollama Cloud') &&
-            model.reasoning?.supportedEfforts === undefined &&
-            record.supportsReasoningEffort !== false
+            // Either half of the native metadata can be missing: an older build wrote rows
+            // that knew thinking and nothing else, so the modality list is repaired by the
+            // same loop rather than by a second one.
+            (model.reasoning?.supportedEfforts === undefined || !model.modalities.includes('image'))
           );
         });
         if (!missing.length) return;
@@ -400,15 +416,22 @@ export const createServerSupport = (context: ServerBase) => {
         const described = await adapter.describe(AbortSignal.timeout(20_000));
         const repaired = missing.flatMap((record) => {
           const model = described.find((entry) => entry.id === record.providerModelId);
-          return model && model.supportsReasoningEffort !== null
-            ? [
-                {
-                  ...record,
-                  supportsReasoningEffort: model.supportsReasoningEffort,
-                  ...(model.reasoning ? { reasoning: model.reasoning } : {})
-                }
-              ]
-            : [];
+          if (!model) return [];
+          const knowsEffort = model.supportsReasoningEffort !== null;
+          const knowsModalities = Array.isArray(model.inputModalities);
+          if (!knowsEffort && !knowsModalities) return [];
+          return [
+            {
+              ...record,
+              ...(knowsEffort
+                ? {
+                    supportsReasoningEffort: model.supportsReasoningEffort,
+                    ...(model.reasoning ? { reasoning: model.reasoning } : {})
+                  }
+                : {}),
+              ...(knowsModalities ? { modalities: model.inputModalities } : {})
+            }
+          ];
         });
         if (repaired.length) await store.upsertModels(repaired);
       })().catch((error: unknown) => {
@@ -687,9 +710,36 @@ export const createServerSupport = (context: ServerBase) => {
     const { secret } = await inferenceCredential(userId);
     const selection = overrideSelection ?? secret.mediaModels ?? {};
     const { options, routes } = await mediaRouting.resolve(secret, selection);
+    // A provider whose chat models take images but publishes no media feed still has image-input
+    // routes: its own catalogue rows marked vision-capable, priced as unknown because the image
+    // rides the chat request. Empty for every provider whose feed already answers.
+    const visionOptions =
+      secret.provider === 'ollama-cloud'
+        ? resolveVisionInputRoutes(
+            (await store.listModels())
+              .map((record) => ModelRelease.parse(record))
+              .filter((model) => model.provider === 'custom')
+          )
+        : [];
+    const imageOptions = [
+      ...options.filter((option) => option.modality === 'image'),
+      ...visionOptions
+    ];
+    const resolveImageRoute = (): MediaModelOption | null => {
+      const choice = selection.image ?? { automatic: true, preference: 'balanced', modelId: '' };
+      if (!choice.automatic && choice.modelId) {
+        const pinned =
+          imageOptions.find((option) => option.id === choice.modelId) ??
+          imageOptions.find((option) => option.providerModelId === choice.modelId);
+        return pinned ?? routes.image ?? null;
+      }
+      return routes.image ?? null;
+    };
     const modality = (kind: 'image' | 'audio' | 'transcription' | 'video'): MediaModalityState => {
-      const forKind = options.filter((option) => option.modality === kind);
+      const forKind =
+        kind === 'image' ? imageOptions : options.filter((option) => option.modality === kind);
       const choice = selection[kind] ?? { automatic: true, preference: 'balanced', modelId: '' };
+      const effective = kind === 'image' ? resolveImageRoute() : (routes[kind] ?? null);
       return {
         modality: kind,
         available: forKind.some((option) => !option.unavailableReason),
@@ -698,7 +748,7 @@ export const createServerSupport = (context: ServerBase) => {
           : 'No currently verified route is available from this provider account.',
         options: forKind,
         choice,
-        effective: routes[kind] ?? null
+        effective
       };
     };
     return {
@@ -883,6 +933,7 @@ export const createServerSupport = (context: ServerBase) => {
     providerSpend,
     computeAllowanceFor,
     resolveSpendCeiling,
+    planUsage,
     assertSpendCeilingAllowed,
     pickModelUnderPriceCeiling,
     requiresZeroDataRetention,

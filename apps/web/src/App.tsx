@@ -1056,11 +1056,12 @@ function ComputerStatus({
   workspace: Workspace | null;
 }) {
   const computer = bootstrap.computer;
+  const plan = bootstrap.usage.plan;
   const disk =
     workspace?.hostStorageTotalBytes && workspace.hostStorageAvailableBytes !== undefined
       ? `${Math.round((1 - workspace.hostStorageAvailableBytes / workspace.hostStorageTotalBytes) * 100)}%`
       : null;
-  if (!computer && !disk) return null;
+  if (!computer && !disk && !bootstrap.usage.plan) return null;
   return (
     <div className="garden-computer-status" aria-label="Computer health">
       {computer && (
@@ -1084,6 +1085,31 @@ function ComputerStatus({
           Disk {disk}
         </span>
       )}
+      {plan?.windows.map((window, index) => {
+        const percent =
+          window.used === null || window.limit === null || window.limit === 0
+            ? null
+            : Math.round((window.used / window.limit) * 100);
+        const label = window.label.startsWith('Session')
+          ? 'Session'
+          : window.label.startsWith('Weekly')
+            ? 'Week'
+            : window.label;
+        return (
+          <span
+            key={`${window.label}-${index}`}
+            title={`${window.label}: ${window.used === null ? 'unavailable' : `${Math.round(window.used * 100)}% of plan${window.limit !== null && window.limit !== 1 ? ` of ${window.limit}` : ''}`}${window.resetsAt ? `, resets at ${new Date(window.resetsAt).toLocaleString()}` : ''}`}
+          >
+            <Gauge size={13} />
+            {label}{' '}
+            {percent === null
+              ? '—'
+              : window.limit === 1
+                ? `${Math.round((window.used ?? 0) * 100)}%`
+                : `${percent}%`}
+          </span>
+        );
+      })}
     </div>
   );
 }

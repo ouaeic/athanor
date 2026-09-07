@@ -811,7 +811,10 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
     for (let offset = 0; offset < described.length; offset += 4) {
       await Promise.all(
         described.slice(offset, offset + 4).map(async (model) => {
-          if (model.reasoning?.supportedEfforts !== undefined) return;
+          // Both halves of /api/show are read every time a model is missing either, so a
+          // catalogue written by an older build that only knew thinking is repaired by the same
+          // loop that repairs one that knows nothing.
+          if (model.reasoning?.supportedEfforts !== undefined && model.inputModalities) return;
           try {
             const timeout = AbortSignal.timeout(5_000);
             const response = await this.#fetch(`${endpoint.origin}/api/show`, {
@@ -824,9 +827,17 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
             if (!response.ok) return;
             const body: unknown = await response.json();
             if (!isRecord(body) || !Array.isArray(body.capabilities)) return;
-            const thinking = body.capabilities.includes('thinking');
+            const capabilities: string[] = body.capabilities;
+            const thinking = capabilities.includes('thinking');
             const gptOss = /^gpt-oss(?::|$)/.test(model.id);
+            // Vision is a capability the native endpoint publishes and the OpenAI-shaped list
+            // never did; the modality list is what every image-input gate reads, so the
+            // capability is translated at the edge rather than read again downstream.
+            const modalities = capabilities.includes('vision')
+              ? (['text', 'image'] as const)
+              : (['text'] as const);
             Object.assign(model, {
+              inputModalities: [...modalities],
               supportsReasoningEffort: thinking,
               ...(thinking
                 ? {
