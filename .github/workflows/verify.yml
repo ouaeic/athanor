@@ -325,8 +325,10 @@ jobs:
             { printf '%s must hide /home with tmpfs, not true\n' "$unit" >&2; exit 1; }
           grep -q '^BindPaths=/home/athanor$' "$unit" ||
             { printf '%s hides /home without binding the workspace root back\n' "$unit" >&2; exit 1; }
-          grep -Eq '^ReadWritePaths=/home' "$unit" &&
-            { printf '%s reopens /home with ReadWritePaths, which cannot reopen a mounted-over path\n' "$unit" >&2; exit 1; }
+          if grep -Eq '^ReadWritePaths=/home' "$unit"; then
+            printf '%s reopens /home with ReadWritePaths, which cannot reopen a mounted-over path\n' "$unit" >&2
+            exit 1
+          fi
 
       # The directives above, RUN rather than read. A unit that carries every hardening line and
       # cannot open its own workspace is the shape this drill exists to catch, and it is the shape
@@ -615,7 +617,7 @@ jobs:
       - run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked --all-targets
       - run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --locked --all-targets -- -D warnings
       - run: pnpm native:configure
-      - run: pnpm --filter @athanor/desktop native:build -- --no-bundle
+      - run: pnpm --filter @athanor/desktop native:build --bundles app
 
   ios:
     if: github.event_name != 'schedule'
@@ -642,7 +644,7 @@ jobs:
         env:
           CI: true
           CARGO_TARGET_DIR: ${{ runner.temp }}/athanor-target
-        run: pnpm --filter @athanor/desktop ios:build -- --target aarch64-sim --ci
+        run: pnpm --filter @athanor/desktop ios:build --target aarch64-sim --no-sign --ci
 
   android:
     if: github.event_name != 'schedule'
@@ -672,7 +674,11 @@ jobs:
         with:
           targets: aarch64-linux-android
       - name: Install pinned Android SDK components
-        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;29.0.14206865'
+        run: |
+          set -eu
+          sdkmanager="${ANDROID_HOME:?}/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$sdkmanager"
+          "$sdkmanager" --sdk_root="$ANDROID_HOME" 'platforms;android-36' 'build-tools;36.0.0' 'ndk;29.0.14206865'
       - name: Export the pinned NDK path
         run: echo "NDK_HOME=${ANDROID_HOME}/ndk/29.0.14206865" >> "$GITHUB_ENV"
       - run: pnpm install --frozen-lockfile
@@ -682,7 +688,7 @@ jobs:
           CI: true
           CARGO_TARGET_DIR: ${{ runner.temp }}/athanor-target
           GRADLE_USER_HOME: ${{ runner.temp }}/athanor-gradle
-        run: pnpm --filter @athanor/desktop android:build -- --apk --target aarch64 --ci
+        run: pnpm --filter @athanor/desktop android:build --apk --target aarch64 --ci
 
   supply-chain:
     if: github.event_name != 'schedule'

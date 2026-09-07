@@ -240,7 +240,11 @@ jobs:
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
       - name: Install pinned Android SDK components
-        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;29.0.14206865'
+        run: |
+          set -eu
+          sdkmanager="${ANDROID_HOME:?}/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$sdkmanager"
+          "$sdkmanager" --sdk_root="$ANDROID_HOME" 'platforms;android-36' 'build-tools;36.0.0' 'ndk;29.0.14206865'
       - name: Export the pinned NDK path
         run: echo "NDK_HOME=${ANDROID_HOME}/ndk/29.0.14206865" >> "$GITHUB_ENV"
       - run: pnpm install --frozen-lockfile
@@ -270,7 +274,7 @@ jobs:
           ATHANOR_ANDROID_KEY_ALIAS: ${{ secrets.ATHANOR_ANDROID_KEY_ALIAS }}
           ATHANOR_ANDROID_KEY_PASSWORD: ${{ secrets.ATHANOR_ANDROID_KEY_PASSWORD }}
           ATHANOR_ANDROID_REQUIRE_SIGNED: '1'
-        run: pnpm --filter @athanor/desktop android:build -- --apk --aab --ci
+        run: pnpm --filter @athanor/desktop android:build --apk --aab --ci
       - name: Attach signed Android artifacts to the draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -324,7 +328,7 @@ jobs:
           IOS_MOBILE_PROVISION: ${{ secrets.ATHANOR_IOS_MOBILE_PROVISION }}
           APPLE_DEVELOPMENT_TEAM: ${{ secrets.ATHANOR_APPLE_TEAM_ID }}
         run: >-
-          pnpm --filter @athanor/desktop ios:build --
+          pnpm --filter @athanor/desktop ios:build
           --target aarch64
           --ci
           --export-method app-store-connect

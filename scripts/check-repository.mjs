@@ -200,6 +200,15 @@ if (acpBridge.status !== 0)
   );
 else say(acpBridge.stdout.trim());
 
+// Build admission and argument forwarding can be checked without mobile SDKs or signing keys.
+const ciContracts = spawnSync(process.execPath, ['--test', 'scripts/check-ci.test.mjs'], {
+  cwd: repositoryRoot,
+  encoding: 'utf8'
+});
+if (ciContracts.status !== 0)
+  fail(`CI build contracts failed:\n${[ciContracts.stdout, ciContracts.stderr].join('\n').trim()}`);
+else say(ciContracts.stdout.trim());
+
 say(
   `Shipped programs: ${byInterpreter.shell.length} shell, ${byInterpreter.python.length} Python, ${byInterpreter.node.length} Node parse.`
 );

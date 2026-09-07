@@ -120,8 +120,10 @@ for (const [path, source] of [
   }
 }
 
-const releaseTag = process.env.ATHANOR_RELEASE_TAG ?? process.env.GITHUB_REF_NAME;
-if (releaseTag && releaseTag !== `v${expectedVersion}`) {
+const releaseTag =
+  process.env.ATHANOR_RELEASE_TAG ??
+  (process.env.GITHUB_REF_TYPE === 'tag' ? (process.env.GITHUB_REF_NAME ?? '') : undefined);
+if (releaseTag !== undefined && releaseTag !== `v${expectedVersion}`) {
   throw new Error(`Release tag ${releaseTag} does not match v${expectedVersion}`);
 }
 
