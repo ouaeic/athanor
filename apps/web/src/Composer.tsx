@@ -496,7 +496,12 @@ export default function Composer({
             </option>
             {models.map((model) => (
               <option key={model.id} value={model.id}>
-                {model.displayName}
+                {model.displayName} ·{' '}
+                {model.recommendationTags.includes('Ollama Cloud')
+                  ? 'Ollama Cloud'
+                  : model.provider === 'openrouter'
+                    ? 'OpenRouter'
+                    : 'Connected endpoint'}
               </option>
             ))}
           </select>

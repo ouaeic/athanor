@@ -8,6 +8,9 @@ import {
   FileText,
   FolderOpen,
   Grid2X2,
+  Gauge,
+  HardDrive,
+  MemoryStick,
   PanelLeft,
   X,
   Sparkles,
@@ -30,6 +33,7 @@ import {
   hasOngoingWork,
   needsAttention,
   money,
+  bytes,
   shortDate,
   taskStatusLabel,
   mergeTaskRefresh
@@ -594,6 +598,7 @@ function WorkspaceApp() {
             </Button>
           ))}
         </nav>
+        <ComputerStatus bootstrap={bootstrap} workspace={workspace} />
         <div className="garden-masthead-end">
           <Button
             className="global-search"
@@ -1041,6 +1046,45 @@ function Brand() {
     <span className="brand">
       <span>garden</span>
     </span>
+  );
+}
+function ComputerStatus({
+  bootstrap,
+  workspace
+}: {
+  bootstrap: Bootstrap;
+  workspace: Workspace | null;
+}) {
+  const computer = bootstrap.computer;
+  const disk =
+    workspace?.hostStorageTotalBytes && workspace.hostStorageAvailableBytes !== undefined
+      ? `${Math.round((1 - workspace.hostStorageAvailableBytes / workspace.hostStorageTotalBytes) * 100)}%`
+      : null;
+  if (!computer && !disk) return null;
+  return (
+    <div className="garden-computer-status" aria-label="Computer health">
+      {computer && (
+        <span title={`CPU load: ${computer.cpuPercent}%`}>
+          <Gauge size={13} />
+          CPU {computer.cpuPercent}%
+        </span>
+      )}
+      {computer && (
+        <span
+          title={`${bytes(computer.memoryUsedBytes)} of ${bytes(computer.memoryTotalBytes)} memory used`}
+        >
+          <MemoryStick size={13} />
+          RAM{' '}
+          {Math.round((computer.memoryUsedBytes / Math.max(1, computer.memoryTotalBytes)) * 100)}%
+        </span>
+      )}
+      {disk && (
+        <span title={`${bytes(workspace!.hostStorageAvailableBytes!)} free on host disk`}>
+          <HardDrive size={13} />
+          Disk {disk}
+        </span>
+      )}
+    </div>
   );
 }
 function WorkCard({

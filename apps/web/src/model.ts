@@ -50,6 +50,7 @@ export interface Bootstrap {
     | 'availability'
     | 'privacyRoute'
     | 'reasoning'
+    | 'recommendationTags'
   > &
     Partial<Pick<ModelRelease, 'modalities' | 'nativeInputPricing'>>)[];
   instance: {
@@ -57,6 +58,11 @@ export interface Bootstrap {
     providerConfigured: boolean;
     enforceZeroDataRetention: boolean;
     webSearch: unknown;
+  };
+  computer?: {
+    cpuPercent: number;
+    memoryUsedBytes: number;
+    memoryTotalBytes: number;
   };
   usage: {
     providerSpend: unknown;

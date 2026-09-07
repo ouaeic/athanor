@@ -7,6 +7,7 @@
  */
 
 import { decryptJson, unwrapDataKey } from '@athanor/core';
+import { cpus, freemem, loadavg, totalmem } from 'node:os';
 import { workspaceResponse } from '../context.js';
 import type { HostStorage } from '../context.js';
 import { requireUser } from '../http/auth-hook.js';
@@ -147,6 +148,7 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
         // checked at the surface the client actually receives, and a boundary that can only be
         // asserted server-side is one nobody notices breaking.
         provider: model.provider,
+        recommendationTags: model.recommendationTags,
         availability: model.availability,
         privacyRoute: model.privacyRoute,
         modalities: model.modalities,
@@ -170,6 +172,14 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
          * computer" beside the box it is typed in without asking again.
          */
         webSearch
+      },
+      computer: {
+        cpuPercent: Math.max(
+          0,
+          Math.min(100, Math.round(((loadavg()[0] ?? 0) / Math.max(1, cpus().length)) * 100))
+        ),
+        memoryUsedBytes: Math.max(0, totalmem() - freemem()),
+        memoryTotalBytes: totalmem()
       },
       legal: {
         applicationLicense: 'AGPL-3.0-only',
