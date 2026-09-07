@@ -333,10 +333,22 @@ describe('athanor-office-convert refuses to report a conversion that did not hap
   });
 
   it('says what to install when LibreOffice is genuinely absent', () => {
-    const result = runPython([script('athanor-office-convert'), 'input.docx', 'out.pdf'], {
-      cwd: root,
-      env: { ATHANOR_SOFFICE: '', PATH: root }
-    });
+    const result = runPython(
+      [
+        '-c',
+        [
+          'import runpy, sys',
+          'from unittest.mock import patch',
+          'sys.argv = sys.argv[1:]',
+          'with patch("os.access", return_value=False), patch("shutil.which", return_value=None):',
+          '    runpy.run_path(sys.argv[0], run_name="__main__")'
+        ].join('\n'),
+        script('athanor-office-convert'),
+        'input.docx',
+        'out.pdf'
+      ],
+      { cwd: root, env: { ATHANOR_SOFFICE: '' } }
+    );
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain('apt-get install -y libreoffice-writer');
   });

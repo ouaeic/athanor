@@ -137,13 +137,14 @@ describe('binary probing', () => {
   });
 
   it('does not count a file the agent could not execute', async () => {
+    const binary = `athanor-probe-${path.basename(root)}`;
     const tools = path.join(root, 'workspace', '.athanor', 'tools', 'node_modules', '.bin');
     await mkdir(tools, { recursive: true });
-    await writeFile(path.join(tools, 'typst'), '#!/bin/sh\n');
-    await chmod(path.join(tools, 'typst'), 0o644);
-    expect((await probeBinaries(root, ['typst'])).has('typst')).toBe(false);
-    await chmod(path.join(tools, 'typst'), 0o755);
-    expect((await probeBinaries(root, ['typst'])).has('typst')).toBe(true);
+    await writeFile(path.join(tools, binary), '#!/bin/sh\n');
+    await chmod(path.join(tools, binary), 0o644);
+    expect((await probeBinaries(root, [binary])).has(binary)).toBe(false);
+    await chmod(path.join(tools, binary), 0o755);
+    expect((await probeBinaries(root, [binary])).has(binary)).toBe(true);
   });
 
   // Given longer than the probe's own PROBE_TIMEOUT_MS ceiling, because this one asks the real host

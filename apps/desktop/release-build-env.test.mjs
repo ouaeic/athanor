@@ -116,6 +116,12 @@ test(
       }
       assert.ok(forwarded.includes('-file-prefix-map'));
       assert.ok(forwarded.includes('-debug-prefix-map'));
+      assert.deepEqual(forwarded.slice(-4), [
+        '-Xswiftc',
+        '-Xfrontend',
+        '-Xswiftc',
+        '-no-serialize-debugging-options'
+      ]);
       execFileSync(wrapper, ['-target', 'arm64-apple-ios15.0', '-print-target-info'], {
         env: prepared.environment
       });

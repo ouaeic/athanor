@@ -8,7 +8,7 @@ import { readFileSync } from 'node:fs';
 import { buildLabel } from '@athanor/contracts';
 import { AthanorError } from '@athanor/core';
 import type { ModelMessage } from '@athanor/model-gateway';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { acceptanceCommandRefusal } from './acceptance.js';
 import {
   buildIdentity,
@@ -291,6 +291,9 @@ describe('the journal record a failed turn leaves', () => {
  * oversight is a missing value and not a disclosure.
  */
 describe('the journal every process writes', () => {
+  beforeEach(() => {
+    vi.stubEnv('JOURNAL_STREAM', undefined);
+  });
   afterEach(() => {
     vi.unstubAllEnvs();
   });
@@ -388,7 +391,7 @@ describe('the journal every process writes', () => {
     expect(JSON.parse(lines[0]!.slice(3))).toMatchObject({ level: 'error' });
     expect(journalLevelPrefix('warn')).toBe('<4>');
     expect(journalLevelPrefix('info')).toBe('<6>');
-    vi.unstubAllEnvs();
+    vi.stubEnv('JOURNAL_STREAM', undefined);
     // In a terminal there is no journal to file anything in, so the line is JSON and nothing else.
     logger.error('worker.lease_failed', { code: 'ECONNREFUSED' });
     expect(lines[1]!.startsWith('{')).toBe(true);

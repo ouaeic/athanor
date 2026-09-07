@@ -66,6 +66,7 @@ const readRecords = async (root: string): Promise<Record<string, unknown>[]> => 
  * teaches people to re-run a gate rather than trust it.
  */
 afterEach(async () => {
+  vi.unstubAllEnvs();
   await Promise.all(
     roots
       .splice(0)
@@ -128,6 +129,7 @@ describe('service registry', () => {
    * problem would ever pass.
    */
   it('files a record it could not write where a priority filter will find it', async () => {
+    vi.stubEnv('JOURNAL_STREAM', '8:1234567');
     const root = await workspace();
     // A regular file where the registry needs a directory. ENOTDIR stands in for the real causes -
     // a full disk, a read-only mount - none of which a test can arrange on the machine running it.
@@ -160,7 +162,8 @@ describe('service registry', () => {
     } finally {
       stdout.mockRestore();
     }
-    expect(JSON.parse(lines[0]!)).toMatchObject({
+    expect(lines[0]!.startsWith('<4>')).toBe(true);
+    expect(JSON.parse(lines[0]!.slice(3))).toMatchObject({
       level: 'warn',
       service: 'runner',
       event: 'services.record_write_failed',

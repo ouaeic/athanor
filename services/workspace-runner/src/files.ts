@@ -234,7 +234,7 @@ export const withWorkspaceDirectory = async <T>(
   root: string,
   directory: string,
   create: boolean,
-  work: (anchored: string) => Promise<T>
+  work: (anchored: string, held?: FileHandle) => Promise<T>
 ): Promise<T> => {
   const target = resolveInside(root, directory);
   if (process.platform !== 'linux') {
@@ -265,7 +265,7 @@ export const withWorkspaceDirectory = async <T>(
       await previous.close();
     }
     await assertOpenedInPlace(root, target, current);
-    return await work(path.join('/proc/self/fd', String(current.fd)));
+    return await work(path.join('/proc/self/fd', String(current.fd)), current);
   } finally {
     await current.close();
   }

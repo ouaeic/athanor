@@ -1,7 +1,7 @@
 import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createLogger, failureCode, journalLevelPrefix, type RunnerEvent } from './log.js';
 
 const capture = () => {
@@ -32,6 +32,9 @@ const productionSources = async (): Promise<{ name: string; text: string }[]> =>
 };
 
 describe('the journal this process writes', () => {
+  beforeEach(() => {
+    vi.stubEnv('JOURNAL_STREAM', undefined);
+  });
   afterEach(() => {
     vi.unstubAllEnvs();
   });
@@ -116,7 +119,7 @@ describe('the journal this process writes', () => {
     expect(journalLevelPrefix('info')).toBe('<6>');
     expect(journalLevelPrefix('warn')).toBe('<4>');
     expect(journalLevelPrefix('error')).toBe('<3>');
-    vi.unstubAllEnvs();
+    vi.stubEnv('JOURNAL_STREAM', undefined);
     // Started in a terminal there is no journal to file anything in, so the line is JSON and
     // nothing else - a runner run by hand must not print `<4>` at the owner.
     logger.warn('browser.isolated_sandbox_off', { sandbox: false });

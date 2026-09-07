@@ -56,16 +56,16 @@ jobs:
       #
       # The package names come from the table in scripts/athanor-host.sh, the one the installer
       # reads, so a capability that stops being packaged fails this step rather than quietly
-      # skipping a proof on a box and here alike. Only the document half is installed: PostgreSQL,
+      # skipping a proof on a box and here alike. Document and media tools are installed: PostgreSQL,
       # Nginx and the desktop stack belong to an owner's computer, not to a verification runner.
-      - name: Install the document toolchain the proofs measure
+      - name: Install the document and media toolchain the proofs measure
         run: |
           sudo sh -c '
             set -e
             . scripts/athanor-host.sh
             athanor_detect_host
             packages=""
-            for capability in poppler tesseract tesseract-english \
+            for capability in poppler tesseract tesseract-english ffmpeg \
               office-writer office-impress office-calc \
               python python-pip python-docx python-openpyxl python-pillow \
               python-lxml python-xlsxwriter \

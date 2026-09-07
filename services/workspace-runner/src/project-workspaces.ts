@@ -251,7 +251,9 @@ export class ProjectWorkspaces {
           const stat = await held.stat();
           if (stat.isDirectory()) {
             directories.push({ target: filename, stat });
-            await mkdir(resolveInside(staging, relative), { recursive: true, mode: 0o2770 });
+            // The native parent supplies setgid inheritance; requesting that bit is
+            // rejected by the runner's RestrictSUIDSGID syscall policy.
+            await mkdir(resolveInside(staging, relative), { recursive: true, mode: 0o770 });
             for await (const entry of await opendir(filename, { bufferSize: 32 }))
               await visit(path.join(relative, entry.name), depth + 1);
             await assertOpenedInPlace(source, filename, held);
@@ -265,7 +267,7 @@ export class ProjectWorkspaces {
             await assertHostStorageWrite(staging, stat.size);
             await mkdir(path.dirname(resolveInside(staging, relative)), {
               recursive: true,
-              mode: 0o2770
+              mode: 0o770
             });
             const destination = await open(
               resolveInside(staging, relative),

@@ -10,7 +10,8 @@ import {
   rm,
   chmod,
   lstat,
-  unlink
+  unlink,
+  type FileHandle
 } from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -82,12 +83,20 @@ const relativePath = (value: string): string => {
 };
 const inScope = (file: string, roots: readonly string[]) =>
   roots.some((root) => file === root || file.startsWith(`${root}/`));
-const syncDirectory = async (directory: string): Promise<void> => {
-  const held = await open(directory, constants.O_RDONLY | constants.O_NOFOLLOW);
-  try {
+const syncDirectory = async (directory: string, held?: FileHandle): Promise<void> => {
+  // A Linux anchored path names a kernel descriptor link. Sync its verified open directory directly.
+  if (held) {
     await held.sync();
+    return;
+  }
+  const handle = await open(
+    directory,
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
+  );
+  try {
+    await handle.sync();
   } finally {
-    await held.close();
+    await handle.close();
   }
 };
 const removeJournal = async (filename: string): Promise<void> => {
@@ -674,7 +683,7 @@ export class NativeCodingMissions {
         parent,
         path.dirname(target),
         replacement !== null,
-        async (directory) => {
+        async (directory, directoryHandle) => {
           const anchored = path.join(directory, path.basename(target));
           let current: string | null = null,
             executable: boolean | null = null;
@@ -711,7 +720,7 @@ export class NativeCodingMissions {
             throw new Error('A parent file changed after its integration review');
           if (replacement === null) {
             await unlink(anchored);
-            await syncDirectory(directory);
+            await syncDirectory(directory, directoryHandle);
             return;
           }
           const source = reverse
@@ -758,7 +767,7 @@ export class NativeCodingMissions {
               await destination.close();
             }
             await rename(temporary, anchored);
-            await syncDirectory(directory);
+            await syncDirectory(directory, directoryHandle);
           } finally {
             await sourceHandle.close();
             await rm(temporary, { force: true });

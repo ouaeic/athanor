@@ -1,13 +1,30 @@
 import { randomUUID } from 'node:crypto';
+import type * as FileSystem from 'node:fs/promises';
 import { mkdtemp, mkdir, writeFile, readFile, rm, symlink, readdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ProjectWorkspaces } from './project-workspaces.js';
 import { ensureWorkspace, workspacePath } from './files.js';
 
 const roots: string[] = [];
+const nativePermissions = vi.hoisted(() => ({ restrictSuidSgid: false }));
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const fs = await importOriginal<typeof FileSystem>();
+  return {
+    ...fs,
+    mkdir: async (...args: Parameters<typeof fs.mkdir>) => {
+      const options = args[1];
+      const mode = typeof options === 'object' && options !== null ? options.mode : options;
+      const bits = typeof mode === 'string' ? Number.parseInt(mode, 8) : (mode ?? 0o777);
+      if (nativePermissions.restrictSuidSgid && bits & 0o6000)
+        throw Object.assign(Error('mkdir refused by RestrictSUIDSGID'), { code: 'EPERM' });
+      return fs.mkdir(...args);
+    }
+  };
+});
 afterEach(async () => {
+  nativePermissions.restrictSuidSgid = false;
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 async function fixture() {
@@ -33,6 +50,34 @@ async function fixture() {
   };
 }
 describe('independent project preparation', () => {
+  it('prepares new briefs and nested legacy sources under native restricted creation modes', async () => {
+    const f = await fixture();
+    await writeFile(path.join(f.source, 'workspace/AGENTS.md'), 'Owner project instructions');
+    nativePermissions.restrictSuidSgid = true;
+    await expect(mkdir(path.join(f.root, 'blocked-mode'), { mode: 0o2770 })).rejects.toMatchObject({
+      code: 'EPERM'
+    });
+    const manager = new ProjectWorkspaces(f.root, { ownedWriters: () => [] });
+    const fresh = await manager.prepare(f.sourceWorkspaceId, {
+      ...f.input,
+      kind: 'new',
+      paths: ['workspace/AGENTS.md']
+    });
+    expect(fresh.status).toBe('ready');
+    expect(await readFile(path.join(f.root, f.workspaceId, 'workspace/AGENTS.md'), 'utf8')).toBe(
+      'Owner project instructions'
+    );
+    const legacyId = randomUUID();
+    const legacy = await manager.prepare(f.sourceWorkspaceId, {
+      ...f.input,
+      workspaceId: legacyId
+    });
+    expect(legacy.status).toBe('ready');
+    expect(await readFile(path.join(f.root, legacyId, 'workspace/project-b/main.py'), 'utf8')).toBe(
+      'print("B")\n'
+    );
+    expect((await readdir(f.root)).filter((name) => name.startsWith('.project-'))).toEqual([]);
+  });
   it('copies selected real sources and gives files and browser/home state independent roots', async () => {
     const f = await fixture(),
       manager = new ProjectWorkspaces(f.root, { ownedWriters: () => [] });

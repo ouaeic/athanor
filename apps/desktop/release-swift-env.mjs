@@ -39,6 +39,8 @@ export async function withReleaseSwiftTools(environment = process.env, swiftExec
       `-fdebug-prefix-map=${mapping}`
     ];
   });
+  // Binary Swift modules otherwise retain header-search and compiler paths despite source maps.
+  flags.push('-Xswiftc', '-Xfrontend', '-Xswiftc', '-no-serialize-debugging-options');
   const directory = await mkdtemp(join(tmpdir(), 'garden-release-swift-'));
   try {
     await writeFile(
