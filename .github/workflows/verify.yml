@@ -486,7 +486,7 @@ jobs:
             : >"$writable/.drill" || { echo "$writable is not writable" >&2; exit 1; }
             rm -f "$writable/.drill"
           done
-          if : >/etc/shadow.drill 2>/dev/null; then
+          if ( : >/etc/shadow.drill ) 2>/dev/null; then
             echo 'the rest of /etc is writable; strict is not in force' >&2
             exit 1
           fi

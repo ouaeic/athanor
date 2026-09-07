@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -136,6 +136,7 @@ test('Android provisioning uses the installed SDK executable with the exact SDK 
     const env = { ...process.env, ANDROID_HOME: sdk, SDK_RECEIPT: receipt, PATH: '/usr/bin:/bin' };
     const result = run('/bin/bash', ['-e', '-c', shell], { env });
     assert.equal(result.status, 0, output(result));
+    assert.ok(existsSync(receipt), 'the guarded script must reach the manager check');
     assert.deepEqual(readFileSync(receipt, 'utf8').trimEnd().split('\n'), [
       `--sdk_root=${sdk}`,
       'platforms;android-36',
@@ -147,6 +148,64 @@ test('Android provisioning uses the installed SDK executable with the exact SDK 
     delete env.ANDROID_HOME;
     assert.notEqual(run('/bin/bash', ['-e', '-c', shell], { env }).status, 0);
   }
+});
+
+test('certificate confinement refusal reaches the remaining checks under dash and still rejects writable system paths', (t) => {
+  const directory = temporary(t);
+  const step = workflowStep(verify, 'Drill the certificate renewal under ProtectSystem=strict');
+  const matches = [...step.matchAll(/<<'CERTIFICATE'\n([\s\S]*?)\nCERTIFICATE\n/g)];
+  assert.equal(matches.length, 1, 'expected the actual certificate drill script');
+  let script = matches[0][1];
+  for (const [index, original] of [
+    '/etc/athanor',
+    '/etc/nginx/snippets',
+    '/var/lib/athanor',
+    '/usr/local/lib/athanor'
+  ].entries()) {
+    assert.equal(script.split(original).length, 2, `expected one writable tree: ${original}`);
+    const writable = join(directory, `writable-${index}`);
+    mkdirSync(writable);
+    script = script.replace(original, `"${writable}"`);
+  }
+  assert.equal(script.split('/etc/shadow.drill').length, 2);
+  script = script.replace('/etc/shadow.drill', '"$DENIED_PATH"');
+  const receipt = join(directory, 'systemctl-receipt');
+  const manager = join(directory, 'systemctl');
+  writeFileSync(
+    manager,
+    '#!/bin/sh\nprintf "%s\\n" "$@" > "$SYSTEMCTL_RECEIPT"\nprintf "%s" "$SYSTEMCTL_REPLY"\n',
+    { mode: 0o700 }
+  );
+  const denied = join(directory, 'denied-directory');
+  mkdirSync(denied);
+  const env = {
+    ...process.env,
+    PATH: `${directory}:${process.env.PATH}`,
+    SYSTEMCTL_RECEIPT: receipt,
+    SYSTEMCTL_REPLY: '256',
+    DENIED_PATH: denied
+  };
+  const positive = run('dash', ['-c', script], { env });
+  assert.equal(positive.status, 0, output(positive));
+  assert.match(positive.stdout, /the reload path is open/);
+  assert.ok(existsSync(receipt), 'the guarded script must reach the manager check');
+  assert.deepEqual(readFileSync(receipt, 'utf8').trimEnd().split('\n'), [
+    'show',
+    '--property=Version',
+    '--value'
+  ]);
+
+  rmSync(receipt);
+  const writable = run('dash', ['-c', script], {
+    env: { ...env, DENIED_PATH: join(directory, 'would-be-system-file') }
+  });
+  assert.equal(writable.status, 1, output(writable));
+  assert.match(writable.stderr, /strict is not in force/);
+  assert.throws(() => readFileSync(receipt), { code: 'ENOENT' });
+
+  const disconnected = run('dash', ['-c', script], { env: { ...env, SYSTEMCTL_REPLY: '' } });
+  assert.equal(disconnected.status, 1, output(disconnected));
+  assert.match(disconnected.stderr, /systemctl can no longer reach the manager/);
 });
 
 test('pnpm native build commands deliver the exact bundle, simulator and APK flags to Tauri', (t) => {

@@ -35,10 +35,25 @@ fake_bin="$test_root/bin"
 active="$test_root/active"
 records="$test_root/records"
 state="$test_root/state"
-mkdir -p "$fake_bin" "$active" "$records" "$state"
+host_bin="$test_root/host-bin"
+mkdir -p "$fake_bin" "$active" "$records" "$state" "$host_bin"
+
+# An inherited manager is a trap recorder: fixture dispatch must never reach it.
+cat >"$host_bin/apt-get" <<'HOST_MANAGER'
+#!/bin/sh
+printf 'inherited host manager reached\n' >>"$ATHANOR_TEST_RECORDS/calls"
+exit 97
+HOST_MANAGER
+chmod 0755 "$host_bin/apt-get"
+PATH="$host_bin:$PATH"
+export PATH
 
 failures=0
 checks=0
+
+# Dash makes special-builtin errors match the Linux /bin/sh contract even on another host.
+helper_shell=/bin/sh
+if command -v dash >/dev/null 2>&1; then helper_shell=$(command -v dash); fi
 
 cat >"$fake_bin/id" <<'FAKE_ID'
 #!/bin/sh
@@ -91,7 +106,7 @@ done
 # environment would be the defect this file exists to make impossible.
 helper="$test_root/athanor-system-packages"
 sed \
-  -e "s|^PATH=/usr/sbin:/usr/bin:/sbin:/bin$|PATH='$active:$fake_bin:/usr/bin:/bin'|" \
+  -e "s|^PATH=/usr/sbin:/usr/bin:/sbin:/bin$|PATH='$active:$fake_bin'|" \
   -e "s|^host_definitions=/opt/athanor/scripts/athanor-host.sh$|host_definitions='$repository_root/scripts/athanor-host.sh'|" \
   -e "s|^athanor_state_dir=/var/lib/athanor$|athanor_state_dir='$state'|" \
   -e "s|/usr/bin/|$coreutils/|g" \
@@ -111,7 +126,7 @@ done
 run_helper() {
   rm -f "$records/calls"
   set +e
-  ATHANOR_TEST_RECORDS="$records" "$helper" "$@" >"$records/out" 2>"$records/err"
+  ATHANOR_TEST_RECORDS="$records" "$helper_shell" "$helper" "$@" >"$records/out" 2>"$records/err"
   helper_status=$?
   set -e
 }
@@ -144,6 +159,13 @@ check_contains() {
 # The refresh and the install are both asserted, in order, because the helper runs the index
 # refresh itself: an install that skipped it succeeds on a box whose metadata is a month old and
 # fails on the box the owner is actually watching.
+
+# With the active family empty, neither inherited nor system managers may enter the fixture.
+run_helper update
+check 'an empty fixture refuses before reaching any host manager' "$helper_status" 1
+check_contains 'the empty fixture reports no supported manager' "$(cat "$records/err")" \
+  'no supported package manager found'
+check 'an empty fixture invokes no host manager' "$(calls)" ''
 
 printf '\n# dispatch\n'
 
@@ -227,6 +249,9 @@ check_contains 'with the two it does have' "$(cat "$records/err")" \
 
 run_helper
 check 'no operation at all is refused' "$helper_status" 1
+check_contains 'no operation prints the helper usage' "$(cat "$records/err")" \
+  'Usage: athanor-system-packages {update|install PACKAGE...}'
+check 'no operation invokes no package manager' "$(calls)" ''
 
 # --- the two things that must stop it before it starts ------------------------------------------
 
@@ -249,7 +274,7 @@ sed -e "s|^host_definitions='$repository_root/scripts/athanor-host.sh'$|host_def
 chmod 0755 "$missing_table"
 rm -f "$records/calls"
 set +e
-ATHANOR_TEST_RECORDS="$records" "$missing_table" install nmap >"$records/out" 2>"$records/err"
+ATHANOR_TEST_RECORDS="$records" "$helper_shell" "$missing_table" install nmap >"$records/out" 2>"$records/err"
 helper_status=$?
 set -e
 check 'a missing host table stops the install' "$helper_status" 1

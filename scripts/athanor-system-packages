@@ -42,7 +42,7 @@ athanor_state_dir=/var/lib/athanor
 athanor_detect_package_manager || exit 1
 
 operation="${1:-}"
-shift || true
+[ "$#" -eq 0 ] || shift
 
 # The name check runs here, before the dispatch below, and therefore on every family at once.
 #

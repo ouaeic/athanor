@@ -63,6 +63,26 @@ const generatedIosPbxProject = await readFile(
   new URL('./src-tauri/gen/apple/athanor-desktop.xcodeproj/project.pbxproj', import.meta.url),
   'utf8'
 );
+export const iosBuildPhaseScript = generatedIosProject.match(/^\s*- script: (.+)$/m)?.[1];
+const iosPbxBuildPhases = [
+  ...generatedIosPbxProject.matchAll(/shellScript = ("(?:[^"\\]|\\.)*");/g)
+]
+  .map((match) => JSON.parse(match[1]))
+  .filter((script) => script.includes('ios xcode-script'));
+const iosCliCommand =
+  'node "${SRCROOT:?}/../../../node_modules/@tauri-apps/cli/tauri.js" ios xcode-script ';
+if (
+  !iosBuildPhaseScript?.startsWith(iosCliCommand) ||
+  !iosBuildPhaseScript.includes('--platform "${PLATFORM_DISPLAY_NAME:?}"') ||
+  !iosBuildPhaseScript.includes('--sdk-root "${SDKROOT:?}"') ||
+  !iosBuildPhaseScript.includes('--configuration "${CONFIGURATION:?}"') ||
+  iosPbxBuildPhases.length !== 1 ||
+  iosPbxBuildPhases[0] !== iosBuildPhaseScript
+) {
+  throw new Error(
+    'Both generated iOS build phases must invoke the installed Tauri CLI from SRCROOT and quote scalar Xcode values.'
+  );
+}
 const generatedIosIconDirectory = new URL(
   './src-tauri/gen/apple/Assets.xcassets/AppIcon.appiconset/',
   import.meta.url

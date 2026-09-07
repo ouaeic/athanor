@@ -1,4 +1,10 @@
 import test from 'node:test';
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 /**
  * The operating-system floors, checked where a person will actually see it.
@@ -20,3 +26,84 @@ import test from 'node:test';
 test('the declared operating-system floors still hold', async () => {
   await import('./verify-native-config.mjs');
 });
+
+test(
+  'the generated iOS phase dispatches the installed CLI from the Xcode working directory',
+  {
+    skip: process.platform !== 'darwin'
+  },
+  async () => {
+    const { iosBuildPhaseScript } = await import('./verify-native-config.mjs');
+    const sourceRoot = fileURLToPath(new URL('./src-tauri/gen/apple/', import.meta.url));
+    const output = execFileSync('/bin/sh', ['-c', iosBuildPhaseScript], {
+      cwd: sourceRoot,
+      env: {
+        ...process.env,
+        SRCROOT: sourceRoot,
+        PLATFORM_DISPLAY_NAME: 'iOS Simulator',
+        SDKROOT: '/unused SDK/iPhoneSimulator.sdk',
+        FRAMEWORK_SEARCH_PATHS: 'framework path with spaces',
+        HEADER_SEARCH_PATHS: 'header path with spaces',
+        GCC_PREPROCESSOR_DEFINITIONS: '',
+        CONFIGURATION: 'Release',
+        FORCE_COLOR: '',
+        ARCHS: '--help'
+      },
+      encoding: 'utf8',
+      timeout: 30_000
+    });
+    assert.match(output, /Usage:.*ios xcode-script/s);
+    assert.match(output, /--sdk-root/);
+
+    const directory = mkdtempSync(join(tmpdir(), 'garden-ios-phase-'));
+    try {
+      const capture = join(directory, 'capture.cjs');
+      writeFileSync(
+        capture,
+        'process.stdout.write(JSON.stringify(process.argv.slice(1)));process.exit(0);'
+      );
+      const args = JSON.parse(
+        execFileSync('/bin/sh', ['-c', iosBuildPhaseScript], {
+          cwd: sourceRoot,
+          env: {
+            ...process.env,
+            NODE_OPTIONS: `--require=${JSON.stringify(capture)}`,
+            SRCROOT: sourceRoot,
+            PLATFORM_DISPLAY_NAME: 'iOS Simulator',
+            SDKROOT: '/unused SDK/iPhoneSimulator.sdk',
+            FRAMEWORK_SEARCH_PATHS: 'framework path with spaces',
+            HEADER_SEARCH_PATHS: 'header path with spaces',
+            GCC_PREPROCESSOR_DEFINITIONS: 'FEATURE=1 DEBUG=0',
+            CONFIGURATION: 'Custom Release',
+            FORCE_COLOR: '',
+            ARCHS: 'arm64 x86_64'
+          },
+          encoding: 'utf8',
+          timeout: 30_000
+        })
+      );
+      assert.deepEqual(args, [
+        fileURLToPath(new URL('./node_modules/@tauri-apps/cli/tauri.js', import.meta.url)),
+        'ios',
+        'xcode-script',
+        '-v',
+        '--platform',
+        'iOS Simulator',
+        '--sdk-root',
+        '/unused SDK/iPhoneSimulator.sdk',
+        '--framework-search-paths',
+        'framework path with spaces',
+        '--header-search-paths',
+        'header path with spaces',
+        '--gcc-preprocessor-definitions',
+        'FEATURE=1 DEBUG=0',
+        '--configuration',
+        'Custom Release',
+        'arm64',
+        'x86_64'
+      ]);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+);
