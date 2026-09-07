@@ -55,11 +55,13 @@ import type {
   MemoryCandidateRecord,
   RecallMemoryInput,
   TaskRecord,
+  TaskEventRecord,
   WorkspaceMemoryRecord,
   WorkspaceRecord,
   WorkspaceSkillRecord
 } from '../packages/data/src/index.js';
 import { AgentWorker, PUSHBACK_MARKERS, type PushbackName } from '../apps/worker/src/agent.js';
+import { fixtureMediaRouting } from '../apps/worker/src/media-fixture.js';
 import { buildIdentity } from '../apps/worker/src/build-identity.js';
 import {
   COMPRESSED_TRAJECTORY_MARKER,
@@ -2970,6 +2972,22 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
    */
   let task = taskFor(fixture.request, fixture.maxCredits ?? 50, fixture.securityMode ?? 'balanced');
   const events: Array<{ kind: string; summary: string; payload: unknown }> = [];
+  // Direction-aware reads see the owner's initial message and the same sealed rows writers append.
+  const storedEvents: TaskEventRecord[] = [
+    {
+      id: fixtureUuid(4, 1),
+      taskId,
+      sequence: 1,
+      kind: 'user_message',
+      summary: 'Owner direction',
+      payloadCiphertext: encryptJson(
+        { markdown: fixture.request },
+        dataKey,
+        `task-event:${taskId}`
+      ),
+      createdAt: task.createdAt
+    }
+  ];
   const approvals: string[] = [];
   /**
    * The approvals table, as far as the resume needs it: the row `parkTaskForApproval` wrote, with
@@ -3075,6 +3093,14 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
   }));
 
   const store = {
+    getUserById: async () => ({ preferences: {} }),
+    getProjectModelPreferences: async () => ({
+      projectTaskId: taskId,
+      workspaceId,
+      wrappedKey: workspace.wrappedKey,
+      revision: 0,
+      choicesCiphertext: null
+    }),
     getWorkspaceById: async () => workspace,
     listConnectors: async () => [],
     listModels: async () => (fixture.visionSpecialist ? [model, visionRelease] : [model]),
@@ -3103,6 +3129,19 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
     listWorkspaceSkills: async () => skillRows,
     listMediaJobs: async () => [],
     getLatestTaskPlan: async () => plan,
+    listTaskEvents: async (
+      id: string,
+      after = 0,
+      selection?: { kind: TaskEventRecord['kind']; limit: number }
+    ) => {
+      const rows = storedEvents.filter(
+        (row) =>
+          row.taskId === id && row.sequence > after && (!selection || row.kind === selection.kind)
+      );
+      return selection
+        ? rows.slice(-Math.max(1, Math.min(1_000, Math.trunc(selection.limit))))
+        : rows;
+    },
     createTaskPlan: async (input: Record<string, unknown>) => {
       // The boilerplate fallback is recognised structurally rather than by what it says: it is the
       // plan that appears when the model never asked for one. The loop writes it at the start of any
@@ -3163,7 +3202,7 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
     },
     renewTaskLease: async () => true,
     appendTaskEvent: async (input: {
-      kind: string;
+      kind: TaskEventRecord['kind'];
       payloadCiphertext: Parameters<typeof decryptJson>[0];
     }) => {
       const body = decryptJson<{ summary: string; payload: unknown }>(
@@ -3171,7 +3210,18 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
         dataKey
       );
       events.push({ kind: input.kind, summary: body.summary, payload: body.payload });
-      return { id: 'event', sequence: events.length };
+      const sequence = storedEvents.length + 1;
+      const row: TaskEventRecord = {
+        id: fixtureUuid(4, sequence),
+        taskId,
+        sequence,
+        kind: input.kind,
+        summary: body.summary,
+        payloadCiphertext: input.payloadCiphertext,
+        createdAt: task.createdAt
+      };
+      storedEvents.push(row);
+      return row;
     },
     createAgentNotification: async (input: Record<string, unknown>) => ({
       id: 'notification',
@@ -3787,7 +3837,9 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
         TASK_MAX_SELF_CONTINUATIONS: 0
       },
       masterKey,
-      runnerSecret
+      runnerSecret,
+      undefined,
+      ...(fixture.live ? [] : [fixtureMediaRouting])
     );
   const stepCeiling = fixture.maxSteps ?? 12;
   try {

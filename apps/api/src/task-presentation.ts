@@ -1,3 +1,4 @@
+import { projectWorkSurface } from './work-surface-projection.js';
 import { deliveryFilePath } from '@athanor/contracts';
 export { deliveryFilePath } from '@athanor/contracts';
 import type {
@@ -124,6 +125,7 @@ const successful = (result: Record<string, unknown>): boolean =>
 export interface PresentationInput {
   taskId: string;
   workspaceId: string;
+  sourceWorkspaceId?: string;
   taskStatus: string;
   events: readonly TaskEvent[];
   plan: TaskPlan | null;
@@ -141,7 +143,11 @@ export const buildTaskPresentation = (input: PresentationInput): TaskPresentatio
   const results: TaskResult[] = [];
   for (const preview of input.previews) {
     const evidence = previews.get(preview.id);
-    if (!evidence || preview.workspaceId !== input.workspaceId) continue;
+    if (
+      !evidence ||
+      (preview.workspaceId !== input.workspaceId && preview.workspaceId !== input.sourceWorkspaceId)
+    )
+      continue;
     const expired = preview.expiresAt !== null && Date.parse(preview.expiresAt) <= Date.now();
     const status =
       preview.status === 'active' && !expired
@@ -174,7 +180,12 @@ export const buildTaskPresentation = (input: PresentationInput): TaskPresentatio
     });
   }
   for (const artifact of input.artifacts) {
-    if (artifact.taskId !== input.taskId || artifact.workspaceId !== input.workspaceId) continue;
+    if (
+      artifact.taskId !== input.taskId ||
+      (artifact.workspaceId !== input.workspaceId &&
+        artifact.workspaceId !== input.sourceWorkspaceId)
+    )
+      continue;
     const url = `/v1/artifacts/${encodeURIComponent(artifact.id)}/content`;
     results.push({
       id: `artifact:${artifact.id}`,
@@ -185,6 +196,9 @@ export const buildTaskPresentation = (input: PresentationInput): TaskPresentatio
       downloadUrl: url,
       accessPath: null,
       artifactId: artifact.id,
+      workspaceId: artifact.workspaceId,
+      sha256: artifact.sha256,
+      createdAt: artifact.createdAt,
       mimeType: artifact.mimeType,
       sizeBytes: artifact.sizeBytes,
       version: artifact.version,
@@ -333,8 +347,16 @@ export const buildTaskPresentation = (input: PresentationInput): TaskPresentatio
       );
     }
   }
+  const surface = projectWorkSurface(events, input.plan, results);
   const phases =
-    input.plan?.taskId === input.taskId
+    input.plan?.taskId === input.taskId &&
+    (!surface.direction ||
+      (input.plan.directionEventId
+        ? input.plan.directionEventId === surface.direction.eventId
+        : Date.parse(input.plan.createdAt) >=
+          Date.parse(
+            events.find((event) => event.id === surface.direction?.eventId)?.createdAt ?? ''
+          )))
       ? input.plan.steps.map(({ id, title, status }) => ({ id, title, status }))
       : [];
   const intentKind = outputs?.[0]?.kind;
@@ -365,11 +387,21 @@ export const buildTaskPresentation = (input: PresentationInput): TaskPresentatio
     taskId: input.taskId,
     eventCursor: events.at(-1)?.sequence ?? 0,
     results,
+    surface,
     ...(outputs === undefined ? {} : { outputs }),
     progress: {
       kind,
       phases,
-      current: active ? ([...pending.values()].at(-1) ?? null) : null,
+      current:
+        active && !surface.direction?.queued
+          ? ([...pending.values()]
+              .filter(
+                (item) =>
+                  (events.find((event) => event.id === item.eventId)?.sequence ?? -1) >=
+                  (surface.direction?.sequence ?? 0)
+              )
+              .at(-1) ?? null)
+          : null,
       metrics: [
         { key: 'files', label: 'Files changed', value: paths.size },
         { key: 'sources', label: 'Sources found', value: sources.size },
@@ -382,7 +414,9 @@ export const buildTaskPresentation = (input: PresentationInput): TaskPresentatio
           value: results.filter((r) => r.status === 'ready').length
         }
       ].filter((m) => m.value > 0),
-      milestones: milestones.slice(-24),
+      milestones: milestones
+        .filter((milestone) => milestone.sequence >= (surface.direction?.sequence ?? 0))
+        .slice(-24),
       updatedAt: events.at(-1)?.createdAt ?? null
     }
   };

@@ -44,7 +44,7 @@ export const registerPrivacyRoutes = (context: RouteContext): void => {
     const user = requireUser(request.user);
     await requireRecentStepUp(request, user);
     const base = await store.exportAccount(user.id);
-    const workspaces = await store.listWorkspaces(user.id);
+    const workspaces = await store.listWorkspaceMetadata(user.id);
     const schedules = await store.listTaskSchedules(user.id);
     await recordSecurityEvent(store, {
       userId: user.id,
@@ -66,6 +66,7 @@ export const registerPrivacyRoutes = (context: RouteContext): void => {
         if (!workspace.wrappedKey) continue;
         const key = unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id);
         for (const task of await store.listTasks(user.id, workspace.id)) {
+          if (task.userId !== user.id || task.workspaceId !== workspace.id) continue;
           /*
            * One unreadable row must not truncate the export.
            *

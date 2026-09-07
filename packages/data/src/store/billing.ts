@@ -327,7 +327,7 @@ export class BillingStore {
       if (
         input.state !== 'reserved' ||
         input.kind !== 'model_inference' ||
-        !input.resourceClass.startsWith('media:') ||
+        (!input.resourceClass.startsWith('media:') && input.resourceClass !== 'model:task-title') ||
         !Number.isFinite(input.costUsd) ||
         Number(input.costUsd) < 0
       )
@@ -549,6 +549,32 @@ export class BillingStore {
          DO UPDATE SET body_ciphertext=EXCLUDED.body_ciphertext, updated_at=NOW()`,
       [input.userId, input.workspaceId, taskId, JSON.stringify(input.bodyCiphertext)]
     );
+  }
+
+  /** Drafts retain their execution root, even when that root is hidden from the computer list. */
+  async listOwnerMessageDrafts(userId: string): Promise<
+    Array<{
+      workspaceId: string;
+      taskId: string | null;
+      bodyCiphertext: EncryptedEnvelope;
+      wrappedKey: string;
+      updatedAt: string;
+    }>
+  > {
+    const result = await this.database.query(
+      `SELECT d.*, k.wrapped_key FROM message_drafts d
+       JOIN workspaces w ON w.id=d.workspace_id AND w.user_id=d.user_id
+       JOIN workspace_keys k ON k.workspace_id=w.id
+       WHERE d.user_id=$1 ORDER BY d.updated_at DESC, d.workspace_id, d.task_id`,
+      [userId]
+    );
+    return result.rows.map((row) => ({
+      workspaceId: String(row.workspace_id),
+      taskId: optionalText(row.task_id) ?? null,
+      bodyCiphertext: json<EncryptedEnvelope>(row.body_ciphertext),
+      wrappedKey: String(row.wrapped_key),
+      updatedAt: iso(row.updated_at)
+    }));
   }
 
   async listMessageDrafts(

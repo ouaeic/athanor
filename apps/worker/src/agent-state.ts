@@ -14,7 +14,12 @@
  * Lifted out of `agent.ts` unchanged by Wave 7.1; `agent.ts` re-exports the names it exported
  * before, so nothing outside this package moved on the same commit.
  */
-import type { TaskMode, TaskReasoningEffort, WebToolMode } from '@athanor/contracts';
+import type {
+  MediaModelSelection,
+  TaskMode,
+  TaskReasoningEffort,
+  WebToolMode
+} from '@athanor/contracts';
 import type { ModelMessage, ModelToolCall } from '@athanor/model-gateway';
 import type { AcceptanceRecord } from './acceptance.js';
 import type { WorkerConfig } from './config.js';
@@ -22,10 +27,14 @@ import type { ArtifactLedger, ContextBrief } from './context.js';
 import type { StoredMediaRoutes } from './media.js';
 import type { NativeInputReference, NativeInputApproval } from './native-input.js';
 import type { TranscriptionApproval } from './transcription-approval.js';
+import type { MediaGenerationApproval } from './media-approval.js';
 
 export interface AgentState {
+  /** Last applied project main choice; subsequent explicit turn choices remain authoritative. */
+  mainModelPreference?: string;
   pendingNativeInputs?: NativeInputReference[];
   nativeInputApprovals?: Record<string, NativeInputApproval>;
+  mediaApprovals?: Record<string, MediaGenerationApproval>;
   transcriptionApprovals?: Record<string, TranscriptionApproval>;
   codingMissionWaiting?: boolean;
   codingMissionReviews?: Record<string, { digest: string; generation: number }>;
@@ -439,13 +448,8 @@ export interface InferenceCredential {
   baseUrl: string;
   apiKey?: string;
   enforceZeroDataRetention: boolean;
-  /**
-   * Which model makes an image and which one speaks, already resolved by the screen that has the
-   * catalogue. This process never fetches one - it talks to a provider to run the request in front
-   * of it and for nothing else - so the choice arrives sealed in the same credential as the key,
-   * and a box whose owner has never opened the media section finds nothing here and falls back to
-   * the two reviewed defaults, generating exactly as it did before.
-   */
+  /** Owner preferences are resolved against the same current catalogue as Settings. */
+  mediaModels?: MediaModelSelection;
   mediaRoutes?: StoredMediaRoutes;
 }
 

@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { ensureProjectExecution } from './project-execution.js';
 import { z } from 'zod';
 import { ContinueTaskRequest } from '@athanor/contracts';
 import {
@@ -104,7 +105,7 @@ async function performContinuation(
         })
   );
   const catalogRead = started(modelsForUser(user));
-  const task = (await taskRead)();
+  let task = (await taskRead)();
   if (!task) throw new AthanorError('task_not_found', 'Task not found');
   if (task.userId !== user.id)
     throw new AthanorError(
@@ -146,7 +147,7 @@ async function performContinuation(
       409
     );
   if (task.parentMissionId) return replyToCodingMission(context, task, body);
-  const workspace = await store.getWorkspace(user.id, task.workspaceId);
+  let workspace = await store.getWorkspace(user.id, task.workspaceId);
   if (!workspace?.wrappedKey) throw new AthanorError('workspace_not_found', 'Workspace not found');
   if (workspace.status !== 'running')
     throw new AthanorError('workspace_unavailable', 'Workspace is not running');
@@ -183,9 +184,8 @@ async function performContinuation(
   const privacyRoute = retained ? task.privacyRoute : (input.privacyRoute ?? task.privacyRoute);
   const spendCeilingUsd = (await guarded)();
   const catalog = (await catalogRead)();
-  const selected = catalog.find(
-    (model) => model.id === (retained ? task.modelId : (input.modelId ?? task.modelId))
-  );
+  const selectedModelId = retained ? task.modelId : (input.modelId ?? task.modelId);
+  const selected = catalog.find((model) => model.id === selectedModelId);
   if (!selected || selected.availability !== 'available' || selected.privacyRoute !== privacyRoute)
     throw new AthanorError(
       'model_unavailable',
@@ -197,6 +197,12 @@ async function performContinuation(
       : (input.reasoningEffort ?? task.reasoningEffort ?? 'auto'),
     selected
   );
+  if (!retained && !workspace.parentWorkspaceId && !task.parentMissionId) {
+    task = await ensureProjectExecution(context, task);
+    workspace = await store.getWorkspace(user.id, task.workspaceId);
+    if (!workspace?.wrappedKey)
+      throw new AthanorError('workspace_not_found', 'Workspace not found');
+  }
   if (activeTask) {
     const messageId = retained?.messageId ?? randomUUID();
     const queued = await store.enqueueTaskMessage({
@@ -216,7 +222,7 @@ async function performContinuation(
       ...(retained ? { queuedEventId: messageId } : {}),
       promptCiphertext: encryptJson({ prompt: input.prompt }, dataKey, `task-message:${task.id}`),
       queuedEventCiphertext: encryptJson(
-        { markdown: input.prompt, position: task.queuedMessageCount + 1 },
+        { markdown: input.prompt, messageId, position: task.queuedMessageCount + 1 },
         dataKey,
         `task-event:${task.id}`
       )

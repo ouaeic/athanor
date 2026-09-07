@@ -1,6 +1,7 @@
 import { DebuggerManager } from './debugger.js';
 import { registerDebuggerRoutes } from './debugger-routes.js';
 import { NativeCodingMissions, registerCodingMissionRoutes } from './coding-missions.js';
+import { ProjectWorkspaces, registerProjectWorkspaceRoutes } from './project-workspaces.js';
 import {
   freezeMissionWorkspace,
   managedWorkspaceBusy,
@@ -38,6 +39,7 @@ import {
 import { inspectAudioSource, prepareAudio } from './audio.js';
 import { authenticateRunnerRequest, requireScope } from './auth.js';
 import { BotWallError, BrowserManager, type BrowserStreamState } from './browser.js';
+import { TAB_IDLE_MS, TAB_SWEEP_MS } from './browser-tabs.js';
 import { registerFileDownloadRoutes } from './file-downloads.js';
 import { ComputationManager } from './computation.js';
 import { registerComputationRoutes } from './computation-routes.js';
@@ -56,7 +58,7 @@ import {
 } from './images.js';
 import { commandLimits, resolveCommandLimiter } from './limits.js';
 import { machineReport, type CgroupReading } from './machine.js';
-import { runnerLogger } from './log.js';
+import { failureCode, runnerLogger } from './log.js';
 import { ProcessManager } from './processes.js';
 import { findRenderTools, proveRender, RENDER_SOURCE_MAX_BYTES } from './render-proof.js';
 import {
@@ -641,6 +643,22 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     await authenticate(request);
   });
   registerCodingMissionRoutes(app, missions);
+  const projectWorkspaces = new ProjectWorkspaces(config.WORKSPACE_ROOT, {
+    ownedWriters: (id, taskId) => [
+      ...processes.taskWriters(id, taskId),
+      ...computations
+        .list(id, taskId)
+        .filter((session) => ['starting', 'busy'].includes(session.state))
+        .map((session) => ({ id: session.sessionId, kind: 'computation' })),
+      ...debuggers
+        .list(id, taskId)
+        .filter((session) =>
+          ['initializing', 'configuring', 'running', 'stopped', 'stopping'].includes(session.state)
+        )
+        .map((session) => ({ id: session.sessionId, kind: 'debugger' }))
+    ]
+  });
+  registerProjectWorkspaceRoutes(app, projectWorkspaces);
 
   app.put<{ Params: { workspaceId: string } }>('/v1/workspaces/:workspaceId', async (request) => {
     requireScope(request, 'workspace.manage');
@@ -692,6 +710,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     '/v1/workspaces/:workspaceId',
     async (request, reply) => {
       requireScope(request, 'workspace.manage');
+      await projectWorkspaces.cancelWorkspace(request.params.workspaceId);
       await browser.close(request.params.workspaceId);
       await desktop.close(request.params.workspaceId);
       // `forget` because the workspace is going: a service must not be restarted into a tree that
@@ -2259,7 +2278,26 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
       });
   });
 
+  let sessionSweep: Promise<void> | null = null;
+  const sessionTimer = setInterval(() => {
+    if (sessionSweep) return;
+    sessionSweep = (async () => {
+      await browser.retireIdle(
+        (id) => config.BROWSER_USE_DESKTOP_DISPLAY && desktop.hasSubscribers(id)
+      );
+      await desktop.retireIdle((id) => browser.hasSession(id), TAB_IDLE_MS);
+    })()
+      .catch((error: unknown) => {
+        runnerLogger.warn('sessions.retirement_failed', { code: failureCode(error) });
+      })
+      .finally(() => {
+        sessionSweep = null;
+      });
+  }, TAB_SWEEP_MS);
+  sessionTimer.unref();
   app.addHook('onClose', async () => {
+    clearInterval(sessionTimer);
+    await sessionSweep;
     await computations.close();
     await debuggers.close();
     codeIntelligence.close();

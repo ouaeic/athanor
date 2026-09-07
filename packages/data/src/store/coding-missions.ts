@@ -71,7 +71,7 @@ const map = (r: Record<string, unknown>): CodingMissionRecord => ({
   createdAt: iso(r.created_at),
   updatedAt: iso(r.updated_at)
 });
-const SELECT_MISSIONS = `SELECT m.*,p.workspace_id AS parent_workspace_id,t.status AS child_status,p.status AS parent_status,
+const SELECT_MISSIONS = `SELECT m.*,COALESCE(m.parent_workspace_id,p.workspace_id) AS parent_workspace_id,t.status AS child_status,p.status AS parent_status,
   GREATEST(m.updated_at,t.updated_at) AS updated_at,
   COALESCE((SELECT SUM(c.actual_usd) FROM coding_family_calls c WHERE c.task_id=m.child_task_id),0) AS spent_usd,
   COALESCE((SELECT SUM(c.reserved_usd) FROM coding_family_calls c WHERE c.task_id=m.child_task_id AND c.actual_usd IS NULL),0) AS reserved_usd,
@@ -215,8 +215,8 @@ export class CodingMissionStore {
       );
       await tx.query('UPDATE tasks SET has_coding_family=TRUE WHERE id=$1', [input.parentTaskId]);
       await tx.query(
-        `INSERT INTO coding_missions(id,user_id,parent_task_id,child_task_id,child_workspace_id,request_key,request_hash,manifest_ciphertext,allocated_credits)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)`,
+        `INSERT INTO coding_missions(id,user_id,parent_task_id,child_task_id,child_workspace_id,request_key,request_hash,manifest_ciphertext,allocated_credits,parent_workspace_id)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10)`,
         [
           input.id,
           input.userId,
@@ -226,7 +226,8 @@ export class CodingMissionStore {
           input.requestKey,
           input.requestHash,
           JSON.stringify(input.manifestCiphertext),
-          input.allocatedCredits
+          input.allocatedCredits,
+          parent.workspace_id
         ]
       );
       return (await this.getCodingMission(input.userId, input.id))!;

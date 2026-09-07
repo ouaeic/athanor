@@ -312,6 +312,9 @@ const nativeAuthorization = {
   expiresAt: new Date(Date.now() + 600000).toISOString()
 };
 let nativeStepUp, nativeDecision;
+let approvals = [];
+const approvalRequests = [];
+let approvalFailures = [];
 let transcriptions = [];
 const dictationOptions = {
   available: true,
@@ -371,6 +374,7 @@ const voiceProposal = {
   messageId: null
 };
 let voiceConfirm, voiceReceipt;
+const autonomyChanges = [];
 try {
   const context = await browser.newContext({
     viewport: { width: 1440, height: 1000 },
@@ -456,7 +460,31 @@ try {
       return json({ text: 'Keep the controls easy to reach.' });
     }
     if (path.endsWith('/heartbeat')) return json({ ok: true });
-    if (path === '/v1/approvals' || path.endsWith('/artifacts')) return json([]);
+    if (path === `/v1/tasks/${task.id}/security-mode`) {
+      assert.equal(route.request().method(), 'PATCH');
+      const { securityMode } = route.request().postDataJSON();
+      autonomyChanges.push(securityMode);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      task.securityMode = securityMode;
+      return json(task);
+    }
+    if (path === '/v1/approvals') return json(approvals);
+    const approvalAction = path.match(/^\/v1\/approvals\/([^/]+)\/(approve|deny)$/);
+    if (approvalAction) {
+      const request = route.request();
+      assert.equal(request.method(), 'POST');
+      assert.match(request.headers()['idempotency-key'], /^[0-9a-f-]{36}$/i);
+      approvalRequests.push({
+        id: approvalAction[1],
+        action: approvalAction[2],
+        body: request.postDataJSON()
+      });
+      const failure = approvalFailures.shift();
+      if (failure) return route.fulfill({ status: failure.status, json: { error: failure } });
+      approvals = approvals.filter((approval) => approval.id !== approvalAction[1]);
+      return json({ ok: true });
+    }
+    if (path.endsWith('/artifacts')) return json([]);
     if (path.endsWith('/media-jobs')) return json(path.includes(childTask.id) ? [] : mediaJobs);
     if (path.endsWith('/media-assets')) return json(path.includes(childTask.id) ? [] : mediaAssets);
     if (path.endsWith('/media-batches'))
@@ -569,7 +597,34 @@ try {
     assert(response.ok(), 'An installation icon must be served');
     assert.equal((await response.body()).subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
   }
-  await page.getByRole('button', { name: 'Open in browser', exact: true }).waitFor();
+  await page.getByRole('button', { name: 'Open app', exact: true }).waitFor();
+  await page.locator('.garden-preview-frame').waitFor();
+  assert.equal(await page.locator('.garden-result-map').count(), 0);
+  assert(
+    await page.evaluate(
+      () =>
+        document.querySelector('.garden-top-tools').getBoundingClientRect().top <
+        document.querySelector('.run-summary').getBoundingClientRect().top
+    ),
+    'Project tools must precede the running work'
+  );
+  const autonomy = page.getByRole('slider', { name: 'Autonomy', exact: true });
+  await autonomy.focus();
+  await page.keyboard.press('End');
+  await page.waitForFunction(
+    () =>
+      document.querySelector('.garden-autonomy input')?.getAttribute('aria-valuetext') ===
+      'Autonomous'
+  );
+  assert.equal(autonomyChanges.at(-1), 'autonomous');
+  await page.keyboard.press('ArrowLeft');
+  await page.waitForFunction(
+    () =>
+      document.querySelector('.garden-autonomy input')?.getAttribute('aria-valuetext') ===
+        'Balanced' &&
+      document.querySelector('.garden-autonomy')?.getAttribute('aria-busy') === 'false'
+  );
+  assert.equal(autonomyChanges.at(-1), 'balanced');
   for (const [width, height] of [
     [1440, 1000],
     [1024, 900],
@@ -595,7 +650,7 @@ try {
         main: box('.garden-main'),
         scroll: box('.garden-task-scroll'),
         composer: box('.garden-task-composer'),
-        footer: box('.garden-status-footer')
+        viewportHeight: innerHeight
       };
     });
     assert.equal(layout.document, width, 'The page must not scroll sideways');
@@ -604,8 +659,8 @@ try {
       'The composer must not overlap the work'
     );
     assert(
-      layout.composer.bottom <= layout.footer.top + 1,
-      'The footer must not cover the composer'
+      layout.composer.bottom <= layout.viewportHeight + 1,
+      'The composer must stay inside the viewport'
     );
     assert(
       layout.scroll.height > 0 && layout.composer.height > 0,
@@ -614,6 +669,42 @@ try {
     await page.screenshot({ path: resolve(report, `task-${width}.png`) });
   }
   await page.getByRole('button', { name: 'Show projects', exact: true }).click();
+  const projectLink = page
+    .getByRole('navigation', { name: 'Project work', exact: true })
+    .getByRole('button')
+    .filter({ hasText: task.title });
+  assert.equal(await projectLink.count(), 1);
+  const titleBox = projectLink.locator('.garden-project-title');
+  assert(
+    await titleBox.evaluate(
+      (element) => element.clientHeight <= parseFloat(getComputedStyle(element).lineHeight) + 1
+    ),
+    'Project titles must occupy one line'
+  );
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
+  await projectLink.hover();
+  await page.waitForFunction(() => {
+    const title = document.querySelector('.garden-project-title[data-overflow="true"] strong');
+    return (
+      title &&
+      getComputedStyle(title).transform !== 'none' &&
+      getComputedStyle(title).transform !== 'matrix(1, 0, 0, 1, 0, 0)'
+    );
+  });
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  assert.equal(
+    await titleBox.locator('strong').evaluate((element) => getComputedStyle(element).animationName),
+    'none'
+  );
+  assert(
+    (await projectLink.getAttribute('aria-label')).includes(task.title),
+    'The full title must remain available without animation'
+  );
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
+  await page
+    .getByRole('button', { name: 'Close projects', exact: true })
+    .filter({ has: page.locator('svg') })
+    .focus();
   await page.waitForFunction(() =>
     document.activeElement.classList.contains('garden-sidebar-close')
   );
@@ -631,6 +722,80 @@ try {
       .getAttribute('aria-expanded'),
     'false'
   );
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  assert.equal(
+    await page.locator('.garden-status-footer').count(),
+    0,
+    'Routine work must not reserve a footer for repeated slogans'
+  );
+  assert.equal(
+    await page.getByRole('button', { name: /^Switch to .* theme$/, includeHidden: true }).count(),
+    1,
+    'Appearance has one control'
+  );
+  const alignment = await page.evaluate(() => {
+    const header = document.querySelector('.garden-masthead').getBoundingClientRect();
+    const brand = document.querySelector('.garden-masthead .brand').getBoundingClientRect();
+    return Math.abs((header.top + header.bottom) / 2 - (brand.top + brand.bottom) / 2);
+  });
+  assert(alignment < 3, 'The wordmark must align vertically with its toolbar');
+  const directionInput = page.getByRole('textbox', {
+    name: 'Add direction to this work',
+    exact: true
+  });
+  await directionInput.fill('');
+  const initialHeight = await directionInput.evaluate((element) => element.clientHeight);
+  await directionInput.fill(Array.from({ length: 7 }, (_, i) => `Direction line ${i}`).join('\n'));
+  assert(
+    (await directionInput.evaluate((element) => element.clientHeight)) > initialHeight,
+    'The direction grows automatically with its text'
+  );
+  await directionInput.fill('A longer direction.\n'.repeat(80));
+  assert(
+    await directionInput.evaluate(
+      (element) => element.clientHeight <= 180 && element.scrollHeight > element.clientHeight
+    ),
+    'Long directions stop growing and scroll inside their bound'
+  );
+  assert.equal(
+    await directionInput.evaluate((element) => getComputedStyle(element).resize),
+    'none'
+  );
+  await directionInput.fill('Keep this direction while adjusting options.');
+  assert.equal(
+    await directionInput.evaluate((element) => element.clientHeight),
+    initialHeight,
+    'Removing text shrinks the direction editor'
+  );
+  await page.setViewportSize({ width: 320, height: 600 });
+  await page.getByRole('button', { name: 'Direction options', exact: true }).click();
+  const directionOptions = page.getByRole('dialog', { name: 'Direction options', exact: true });
+  const optionsGeometry = await directionOptions.evaluate((element) => {
+    const box = element.getBoundingClientRect(),
+      fields = [...element.querySelectorAll('.field')].map((field) =>
+        field.getBoundingClientRect()
+      );
+    return {
+      inside: box.left >= 0 && box.right <= innerWidth && box.top >= 0 && box.bottom <= innerHeight,
+      overflow: element.scrollWidth > element.clientWidth + 1,
+      gap: fields[1].top - fields[0].bottom
+    };
+  });
+  assert(
+    optionsGeometry.inside && !optionsGeometry.overflow,
+    'Direction options must fit the phone in their own panel'
+  );
+  assert(optionsGeometry.gap >= 18, 'Option fields must have a clear separation');
+  await directionOptions.getByRole('spinbutton').fill('0.2');
+  await directionOptions.getByRole('spinbutton').press('Enter');
+  assert.equal(
+    await directionInput.inputValue(),
+    'Keep this direction while adjusting options.',
+    'Editing an option must not submit or clear the direction'
+  );
+  await directionOptions
+    .getByRole('button', { name: 'Close Direction options', exact: true })
+    .click();
   await page.setViewportSize({ width: 1440, height: 1000 });
   const effort = page.getByRole('slider', { name: 'Model reasoning effort' });
   await effort.focus();
@@ -687,7 +852,7 @@ try {
       }
     };
   });
-  await page.getByRole('button', { name: 'Open in browser', exact: true }).click();
+  await page.getByRole('button', { name: 'Open app', exact: true }).click();
   await page.waitForFunction(() => window.nativePreviewCalls.length > 0);
   assert.deepEqual(await page.evaluate(() => window.nativePreviewCalls), [
     { command: 'open_preview_browser', args: { url: presentation.results[0].url } }
@@ -699,11 +864,12 @@ try {
   );
   await page.evaluate(() => delete window.__TAURI_INTERNALS__);
   const popupPromise = page.waitForEvent('popup');
-  await page.getByRole('button', { name: 'Open in browser', exact: true }).click();
+  await page.getByRole('button', { name: 'Open app', exact: true }).click();
   const popup = await popupPromise;
   await popup.getByRole('button', { name: '0', exact: true }).click();
   assert.equal(await popup.getByRole('button').textContent(), '1');
   await popup.close();
+  await page.getByRole('button', { name: 'Close embedded preview' }).click();
   await page.getByRole('button', { name: 'View here', exact: true }).click();
   assert.equal(
     (await page.locator('.garden-preview-frame').getAttribute('sandbox')).includes(
@@ -771,19 +937,17 @@ try {
   await isolatedFrame.getByRole('button', { name: '0', exact: true }).click();
   assert.equal(await isolatedFrame.getByRole('button').textContent(), '1');
   await page.getByRole('button', { name: 'Close embedded preview' }).click();
+  await page.getByRole('button', { name: 'Show projects', exact: true }).click();
   await page.getByRole('button', { name: /Switch to light/ }).click();
   await page.screenshot({ path: resolve(report, 'task-light.png') });
   await page.getByRole('button', { name: /Switch to dark/ }).click();
+  await page.getByRole('button', { name: 'Hide projects', exact: true }).click();
   presentation.results = [];
   await page.reload();
-  await page.locator('.garden-trace-detail strong').waitFor();
+  await page.getByText('Recorded activity · latest 2 actions', { exact: true }).click();
+  assert.equal(await page.locator('.garden-recorded-actions strong').count(), 2);
   assert.equal(
-    await page.locator('.garden-trace-detail strong').textContent(),
-    'Verified keyboard controls'
-  );
-  await page.getByRole('button', { name: 'Files: Created maze/index.html' }).click();
-  assert.equal(
-    await page.locator('.garden-trace-detail strong').textContent(),
+    await page.locator('.garden-recorded-actions strong').first().textContent(),
     'Created maze/index.html'
   );
   await page.screenshot({ path: resolve(report, 'recorded-trace.png') });
@@ -795,7 +959,7 @@ try {
     document.querySelector('.run-summary')?.textContent.includes('Generating media')
   );
   assert.match(
-    await page.locator('.garden-project-list').textContent(),
+    await page.locator('.garden-project-list button').first().getAttribute('aria-label'),
     /Generating media/,
     'The project list must not announce pending output as complete'
   );
@@ -1165,9 +1329,159 @@ try {
   await voiceDialog.getByRole('button', { name: 'Close Live voice', exact: true }).click();
   assert.equal(await voicePage.evaluate(() => window.voiceMicrophoneRequests), 0);
   await voicePage.close();
+  const approvalPage = await context.newPage();
+  approvalPage.on('pageerror', (error) => errors.push(error.message));
+  await approvalPage.setViewportSize({ width: 390, height: 844 });
+  const showApproval = async (index, expired = false, samePage = false) => {
+    approvals = [
+      {
+        id: `a0000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+        taskId: task.id,
+        status: 'pending',
+        action: 'Run a command',
+        sideEffect: 'workspace',
+        origin: null,
+        createdAt: time,
+        expiresAt: new Date(Date.now() + (expired ? -60000 : 600000)).toISOString(),
+        preview: {
+          tool: 'shell',
+          command: 'python3 check.py',
+          reason: `Check the result. ${index}`
+        }
+      }
+    ];
+    if (samePage) {
+      await approvalPage.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    } else await approvalPage.goto(`${origin}/?task=${task.id}`);
+    await approvalPage
+      .locator('.decision-card')
+      .getByText(`Check the result. ${index}`, { exact: true })
+      .waitFor();
+    return approvals[0].id;
+  };
+  await showApproval(90);
+  const card = approvalPage.locator('.decision-card');
+  await card.getByText('Add a reason for denying', { exact: true }).click();
+  const note = card.getByRole('textbox', { name: 'Reason for denying (optional)', exact: true });
+  await note.fill('This belongs only to the first request.');
+  const denialId = await showApproval(1, false, true);
+  assert.equal(
+    await note.isVisible(),
+    false,
+    'Replacing a mounted decision must reset its disclosure'
+  );
+  await card.getByText('Add a reason for denying', { exact: true }).click();
+  assert.equal(
+    await note.inputValue(),
+    '',
+    'A new decision must never inherit another decision’s reason'
+  );
+  await note.focus();
+  await approvalPage.keyboard.insertText('n'.repeat(610));
+  assert.equal((await note.inputValue()).length, 600, 'The reason must be bounded while typing');
+  const reason = 'Keep the output in the task folder.\nThen check the saved file.';
+  await note.fill(reason);
+  for (const theme of ['dark', 'light']) {
+    await approvalPage.evaluate((value) => {
+      document.documentElement.dataset.theme = value;
+    }, theme);
+    const colors = await card.evaluate((element) => {
+      const styles = getComputedStyle(element);
+      const luminance = (color) => {
+        const channels = color
+          .match(/[\d.]+/g)
+          .slice(0, 3)
+          .map(Number)
+          .map((value) => {
+            const component = value / 255;
+            return component <= 0.04045 ? component / 12.92 : ((component + 0.055) / 1.055) ** 2.4;
+          });
+        return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
+      };
+      const background = luminance(styles.backgroundColor);
+      const foreground = luminance(styles.color);
+      return {
+        background,
+        contrast:
+          (Math.max(background, foreground) + 0.05) / (Math.min(background, foreground) + 0.05),
+        overflow: element.scrollWidth > element.clientWidth + 1
+      };
+    });
+    assert(colors.contrast >= 4.5, 'Approval text must remain readable in each theme');
+    if (theme === 'dark')
+      assert(colors.background < 0.1, 'Dark approval cards must use a dark surface');
+    assert.equal(colors.overflow, false, 'An expanded denial reason must fit a phone');
+    assert.equal(
+      await approvalPage.evaluate(() => document.documentElement.scrollWidth),
+      390,
+      'The approval must not widen the page'
+    );
+    await card.getByRole('button', { name: 'Deny', exact: true }).scrollIntoViewIfNeeded();
+    const actionsFit = await card.locator('.decision-actions').evaluate((element) => {
+      const scroll = document.querySelector('.garden-task-scroll').getBoundingClientRect();
+      const buttons = [...element.querySelectorAll('button')];
+      return (
+        buttons.length === 2 &&
+        buttons.every((button) => {
+          const box = button.getBoundingClientRect();
+          return (
+            box.left >= 0 &&
+            box.right <= innerWidth &&
+            box.top >= scroll.top &&
+            box.bottom <= scroll.bottom
+          );
+        })
+      );
+    });
+    assert(actionsFit, 'Approval actions must remain in the visible work area above the composer');
+    await card.screenshot({ path: resolve(report, `approval-reason-${theme}-phone.png`) });
+  }
+  approvalFailures = [
+    { status: 503, code: 'temporarily_unavailable', message: 'Please retry this decision.' }
+  ];
+  await card.getByRole('button', { name: 'Deny', exact: true }).click();
+  await card.getByRole('alert').filter({ hasText: 'Please retry this decision.' }).waitFor();
+  assert.equal(await note.inputValue(), reason, 'A failed submission must retain the reason');
+  approvalFailures = [{ status: 403, code: 'step_up_required', message: 'Authenticate again.' }];
+  nativeStepUp = undefined;
+  await card.getByRole('button', { name: 'Deny', exact: true }).click();
+  await card.waitFor({ state: 'hidden' });
+  assert.deepEqual(
+    nativeStepUp,
+    {},
+    'An authentication refusal must actually run step-up before retrying'
+  );
+  assert.deepEqual(
+    approvalRequests,
+    Array.from({ length: 3 }, () => ({ id: denialId, action: 'deny', body: { note: reason } })),
+    'Manual and authentication retries must preserve the exact denial reason'
+  );
+  const approveId = await showApproval(2);
+  await card.getByText('Add a reason for denying', { exact: true }).click();
+  await note.fill('This reason must never be sent with an approval.');
+  await card.getByRole('button', { name: 'Approve once', exact: true }).click();
+  await card.waitFor({ state: 'hidden' });
+  assert.deepEqual(approvalRequests.at(-1), { id: approveId, action: 'approve', body: {} });
+  const plainDenyId = await showApproval(3);
+  await card.getByText('Add a reason for denying', { exact: true }).click();
+  await note.fill('   ');
+  await card.getByRole('button', { name: 'Deny', exact: true }).click();
+  await card.waitFor({ state: 'hidden' });
+  assert.deepEqual(
+    approvalRequests.at(-1),
+    { id: plainDenyId, action: 'deny', body: {} },
+    'A blank reason must preserve plain denial'
+  );
+  await showApproval(4, true);
+  await card.getByText('Add a reason for denying', { exact: true }).click();
+  assert.equal(await note.isEnabled(), false);
+  assert.equal(await card.getByRole('button', { name: 'Deny', exact: true }).isEnabled(), false);
+  assert.equal(await card.getByRole('button', { name: 'Expired', exact: true }).isEnabled(), false);
+  assert.equal(approvalRequests.length, 5, 'Expired decisions must not submit');
+  await approvalPage.close();
   assert.deepEqual(errors, [], 'The browser must not report uncaught errors');
   console.log(
-    'Browser checks passed: viewport layout, phone focus, effort drafts, playable links, downloads, state-preserving expansion, recorded evidence, mission review, media recovery, analysis sessions, device authorization, dictation consent, and live voice recovery.'
+    'Browser checks passed: viewport layout, phone focus, effort drafts, playable links, downloads, state-preserving expansion, recorded evidence, mission review, media recovery, analysis sessions, device authorization, dictation consent, live voice recovery, and denial feedback with authentication retry.'
   );
 } finally {
   await browser.close();

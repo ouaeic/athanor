@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BrowserDownloadHistory, BrowserManager } from './browser.js';
 import { DesktopControl } from './holder.js';
 import { runnerLogger } from './log.js';
+import { TAB_IDLE_MS } from './browser-tabs.js';
 
 const deferred = <T>() => {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -20,6 +21,8 @@ const driver = vi.hoisted(() => ({ launchPersistentContext: vi.fn() }));
 vi.mock('./playwright.js', () => ({ chromiumDriver: () => Promise.resolve(driver) }));
 
 class Page extends EventEmitter {
+  readonly keyboard = { up: vi.fn(async () => undefined) };
+  readonly mouse = { up: vi.fn(async () => undefined) };
   readonly url = vi.fn(() => 'about:blank');
   readonly title = vi.fn(async () => '');
   readonly locator = vi.fn(() => ({ innerText: async () => '' }));
@@ -63,6 +66,40 @@ afterEach(async () => {
 });
 
 describe('persistent browser ownership', () => {
+  it('retires only idle unpinned agent sessions and can reopen them', async () => {
+    let now = 1;
+    const { manager, root } = await setup({ now: () => now });
+    const session = await manager.ensure(workspace, root);
+    session.tabLifecycle!.adopt('tab-1', { owner: 'agent', taskId: 'task' });
+    now += TAB_IDLE_MS + 1;
+    expect(await manager.retireIdle((id) => id === workspace)).toEqual([]);
+    session.tabLifecycle!.pin('tab-1', true);
+    expect(await manager.retireIdle()).toEqual([]);
+    session.tabLifecycle!.pin('tab-1', false);
+    await session.control.transfer('user');
+    expect(await manager.retireIdle()).toEqual([]);
+    await session.control.transfer('agent');
+    const gate = deferred<void>();
+    const active = session.control.submit('agent', () => gate.promise);
+    expect(await manager.retireIdle()).toEqual([]);
+    gate.resolve();
+    await active;
+    expect(await manager.retireIdle()).toEqual([workspace]);
+    expect(contexts[0]!.close).toHaveBeenCalledTimes(1);
+    expect(await manager.ensure(workspace, root)).not.toBe(session);
+  });
+
+  it('keeps owner tabs and a recently accessed session', async () => {
+    let now = 1;
+    const { manager, root } = await setup({ now: () => now });
+    const session = await manager.ensure(workspace, root);
+    now += TAB_IDLE_MS + 1;
+    expect(await manager.retireIdle()).toEqual([]);
+    session.tabLifecycle!.adopt('tab-1', { owner: 'agent', taskId: 'task' });
+    await manager.ensure(workspace, root);
+    expect(await manager.retireIdle()).toEqual([]);
+    expect(contexts[0]!.close).not.toHaveBeenCalled();
+  });
   it('shares one completed startup across simultaneous cold reads', async () => {
     const { manager, root } = await setup();
     const [first, second] = await Promise.all([

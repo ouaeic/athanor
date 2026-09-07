@@ -14,7 +14,8 @@ describe('authenticated task presentation from stored execution evidence', () =>
   const masterKey = Buffer.alloc(32, 3),
     key = Buffer.alloc(32, 7);
   const app = Fastify();
-  let taskId = '',
+  let ownerId = '',
+    taskId = '',
     workspaceId = '',
     previewId = '';
   const reads: string[] = [];
@@ -31,6 +32,7 @@ describe('authenticated task presentation from stored execution evidence', () =>
   beforeAll(async () => {
     await migrateDatabase(database);
     const owner = await store.createUser({ username: 'presentation-owner', displayName: 'Owner' });
+    ownerId = owner.id;
     const outsider = await store.createUser({
       username: 'presentation-outsider',
       displayName: 'Other'
@@ -137,6 +139,135 @@ describe('authenticated task presentation from stored execution evidence', () =>
     );
     expect(response.body).not.toMatch(/untrusted\.test|secret|STREAM-TOKEN/);
     expect(response.headers['cache-control']).toBe('private, no-store');
+  });
+
+  it('merges a ready execution with its original sealed artifacts and live source previews', async () => {
+    const sourceId = randomUUID(),
+      executionId = randomUUID(),
+      sourceKey = Buffer.alloc(32, 11);
+    await store.createWorkspace({
+      id: sourceId,
+      userId: ownerId,
+      name: 'Source',
+      storageLimitBytes: 1_000_000,
+      imageRevision: 'test',
+      region: 'local',
+      wrappedKey: wrapDataKey(sourceKey, masterKey, sourceId)
+    });
+    await store.updateWorkspaceStatus(sourceId, 'running');
+    const task = await store.createTask({
+      userId: ownerId,
+      workspaceId: sourceId,
+      modelId: 'test/model',
+      privacyRoute: 'provider_zdr',
+      securityMode: 'balanced',
+      maxComputeCredits: 1,
+      titleCiphertext: encryptJson({ title: 'Research app' }, sourceKey, `task-title:${sourceId}`),
+      promptCiphertext: encryptJson(
+        { prompt: 'Extend the research app' },
+        sourceKey,
+        `task-prompt:${sourceId}`
+      ),
+      nameIndex: { nameTokens: 'research', openingTokens: 'extend' }
+    });
+    const prepared = await store.beginProjectExecution({
+      userId: ownerId,
+      taskId: task.id,
+      workspaceId: executionId,
+      wrappedKey: wrapDataKey(key, masterKey, executionId),
+      seedKind: 'legacy',
+      sourceManifestCiphertext: encryptJson({ paths: [] }, key)
+    });
+    expect(prepared?.status).toBe('preparing');
+    expect(
+      await store.finishProjectExecution({
+        userId: ownerId,
+        taskId: task.id,
+        workspaceId: executionId,
+        receiptCiphertext: encryptJson({ copied: [] }, key),
+        rewrite: () => ({
+          titleCiphertext: encryptJson({ title: 'Research app' }, key, `task-title:${executionId}`),
+          promptCiphertext: encryptJson(
+            { prompt: 'Extend the research app' },
+            key,
+            `task-prompt:${executionId}`
+          )
+        })
+      })
+    ).toBe(true);
+    expect(await store.getProjectExecution(ownerId, task.id)).toMatchObject({
+      status: 'ready',
+      sourceWorkspaceId: sourceId,
+      workspaceId: executionId
+    });
+    const published = [];
+    for (const [id, dataKey, name, port] of [
+      [sourceId, sourceKey, 'Original research.pdf', 8101],
+      [executionId, key, 'Extended research.pdf', 8102]
+    ] as const) {
+      const artifact = await store.createArtifact({
+        userId: ownerId,
+        workspaceId: id,
+        taskId: task.id,
+        logicalKey: name,
+        nameCiphertext: encryptJson({ name }, dataKey, `artifact-name:${id}`),
+        mimeType: 'application/pdf',
+        sizeBytes: 123,
+        sha256: sha256(name),
+        storageKey: randomUUID()
+      });
+      const preview = await store.createWorkspacePreview({
+        userId: ownerId,
+        workspaceId: id,
+        label: name,
+        port,
+        slug: randomUUID().replaceAll('-', ''),
+        accessTokenHash: sha256(randomUUID())
+      });
+      await store.appendTaskEvent({
+        taskId: task.id,
+        kind: 'preview',
+        summary: 'Published app',
+        payloadCiphertext: encryptJson({ previewId: preview.id }, key, `task-event:${task.id}`)
+      });
+      published.push({
+        workspaceId: id,
+        artifactId: String(artifact.id),
+        previewId: preview.id,
+        name,
+        port
+      });
+    }
+    const response = await app.inject({
+      method: 'GET',
+      url: `/v1/tasks/${task.id}/presentation`,
+      headers: { 'x-test-owner': 'yes' }
+    });
+    expect(response.statusCode).toBe(200);
+    const body = TaskPresentation.parse(response.json<unknown>());
+    expect(body.results.filter((result) => result.kind === 'artifact')).toHaveLength(2);
+    expect(body.results.filter((result) => result.kind === 'preview')).toHaveLength(2);
+    expect(published).toHaveLength(2);
+    for (const result of published) {
+      expect(body.results.find((item) => item.artifactId === result.artifactId)).toMatchObject({
+        title: result.name,
+        workspaceId: result.workspaceId,
+        status: 'ready',
+        sha256: sha256(result.name),
+        url: `/v1/artifacts/${result.artifactId}/content`
+      });
+      expect(body.results.find((item) => item.previewId === result.previewId)).toMatchObject({
+        status: 'ready',
+        accessPath: `/v1/previews/${result.previewId}/access`
+      });
+      expect(runner.request).toHaveBeenCalledWith(
+        expect.objectContaining({
+          workspaceId: result.workspaceId,
+          path: `/v1/workspaces/${result.workspaceId}/preview-check/${result.port}`
+        })
+      );
+    }
+    expect(reads).not.toContain(`/v1/workspaces/${executionId}/preview-check/8101`);
   });
 
   it('rejects an owner-mismatched task before reading its events or files', async () => {

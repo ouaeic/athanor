@@ -475,7 +475,9 @@ export const assemblePreamble = async (deps: WindowDeps, input: PreambleInput): 
   }
   const activeMemoryEntries = memoryRecords.flatMap((record) => {
     const owned = record.keyScope === 'user';
-    const expectedAad = owned ? ownerMemoryAad : `workspace-memory:${task.workspaceId}`;
+    const expectedAad = owned
+      ? ownerMemoryAad
+      : `workspace-memory:${record.workspaceId ?? task.workspaceId}`;
     if (record.contentCiphertext.aad !== expectedAad) return [];
     try {
       const document = decryptJson<MemoryDocument>(
@@ -595,7 +597,7 @@ export const assemblePreamble = async (deps: WindowDeps, input: PreambleInput): 
     if (
       !record.enabled ||
       (record.status !== 'active' && !record.pinned) ||
-      record.documentCiphertext.aad !== `workspace-skill:${task.workspaceId}`
+      record.documentCiphertext.aad !== `workspace-skill:${record.workspaceId ?? task.workspaceId}`
     )
       return [];
     try {

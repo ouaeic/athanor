@@ -6,6 +6,8 @@ import {
   type ModelToolCall
 } from '@athanor/model-gateway';
 import { type ExecObservation } from '../agent-state.js';
+import { requireMediaGenerationApproval } from '../media-approval.js';
+import { currentRunnerAbortSignal } from '../runner-client.js';
 import { spendHalt } from '../turn-bounds.js';
 import { textValue } from '../values.js';
 import { mediaDimension, mediaQuoteUsd, resolvedMediaModel } from '../media.js';
@@ -128,8 +130,11 @@ export async function executeDocumentTool(
     case 'generate_media': {
       // Resolved first because it is the same lookup the old assertion made, and asking for it
       // up front means an unconfigured provider is reported as one rather than as a spend refusal.
-      const secret = await context.inferenceCredential(task);
       const args = mediaArguments(call.arguments);
+      const secret = await context.inferenceCredential(
+        task,
+        !['status', 'library'].includes(textValue(args.action))
+      );
       if (
         args.action !== undefined &&
         (typeof args.action !== 'string' ||
@@ -165,23 +170,23 @@ export async function executeDocumentTool(
           costUsd: job.costUsd
         };
       }
-      if (kind === 'video') return queueVideoGeneration(context, call, secret);
+      if (kind === 'video') {
+        requireMediaGenerationApproval(context.key, task, context.state, call, secret);
+        return queueVideoGeneration(context, call, secret);
+      }
       if (kind !== 'image' && kind !== 'audio')
         throw new AthanorError('media_kind_invalid', 'Choose image or audio');
-      // The owner's choice, or the reviewed default when they have not made one. Read from the
-      // credential rather than from a catalogue because this side has no catalogue: the API
-      // resolved the route at the moment it was chosen, so an automatic mode settles then rather
-      // than drifting between one generation and the next.
       const media = resolvedMediaModel(kind, secret.mediaRoutes);
       const controls = GenerationControls.parse(args);
       const voice = controls.voice ?? media.voice;
       const references = await prepareMediaReferences(context, controls.inputReferences ?? []);
-      if (secret.mediaRoutes && (!media.route || media.route.unavailableReason))
+      if (!media.route || media.route.unavailableReason)
         throw new AthanorError(
           'media_route_unavailable',
           'Choose an available route for this modality in Settings',
           409
         );
+      requireMediaGenerationApproval(context.key, task, context.state, call, secret);
       const preparedMask = controls.mask
         ? (await prepareMediaReferences(context, [controls.mask]))[0]
         : undefined;
@@ -197,6 +202,7 @@ export async function executeDocumentTool(
         characterCount: prompt.length,
         count: controls.count,
         quality: controls.quality,
+        resolution: controls.resolution,
         inputReferenceCount: references.length,
         model: media
       });
@@ -276,6 +282,7 @@ export async function executeDocumentTool(
       })
         .generate({
           id: generation,
+          ...(currentRunnerAbortSignal() ? { signal: currentRunnerAbortSignal()! } : {}),
           kind,
           model: modelId,
           prompt,
@@ -299,6 +306,17 @@ export async function executeDocumentTool(
           // has no way to honour.
           ...(voice ? { voice } : {}),
           onBeforeSubmit: async () => {
+            currentRunnerAbortSignal()?.throwIfAborted();
+            const latest = await context.inferenceCredential(task, true);
+            requireMediaGenerationApproval(context.key, task, context.state, call, latest);
+            const claim = await context.store.taskClaim(task.id);
+            if (claim?.status !== 'running' || claim.leaseOwner !== context.config.WORKER_ID)
+              throw new AthanorError(
+                'media_task_changed',
+                'This worker no longer owns the media request',
+                409
+              );
+            currentRunnerAbortSignal()?.throwIfAborted();
             await context.store.recordUsage({
               ...usage,
               costUsd: estimateUsd,
@@ -306,6 +324,7 @@ export async function executeDocumentTool(
               reserveAgainstCaps: true
             });
             reserved = true;
+            currentRunnerAbortSignal()?.throwIfAborted();
           },
           onUsage: async (receipt) => {
             if (receipt.costKnown && !settled) {
@@ -322,6 +341,7 @@ export async function executeDocumentTool(
           usdPerMillionCharacters: media.usdPerMillionCharacters
         })
         .catch(async (error: unknown) => {
+          if (!reserved && error instanceof AthanorError) throw error;
           if (reserved && !settled && error instanceof MediaProviderRejectionError)
             await context.store.recordUsage({
               ...usage,

@@ -1,108 +1,203 @@
-import type { TaskMilestone, TaskPresentation } from '@athanor/contracts';
-import { useState } from 'react';
+import type { TaskPresentation, WorkEvidence, WorkSurfaceView } from '@athanor/contracts';
 import { Button } from './ui';
+import './presentation.css';
 
-const labels: Record<TaskMilestone['kind'], string> = {
-  change: 'Files',
-  source: 'Sources',
-  check: 'Checks',
-  result: 'Results',
-  approval: 'Decisions',
-  process: 'Processes',
-  checkpoint: 'Recovery'
-};
-
-/** The trace plots recorded order and action kinds, never an estimate of objective completion. */
 export default function WorkTrace({
   progress,
-  onEvidence
+  surface,
+  onEvidence,
+  onResult
 }: {
   progress: TaskPresentation['progress'];
+  surface?: WorkSurfaceView;
   onEvidence: (id: string) => void;
+  onResult?: (kind: 'artifact' | 'preview', id: string) => void;
 }) {
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const milestones = progress.milestones.slice(-6);
-  const selected = milestones.find((item) => item.id === selectedId) ?? milestones.at(-1);
-  const kinds = [...new Set(milestones.map((item) => item.kind))];
-  if (milestones.length < 2) return null;
-  const points = milestones.map((item, index) => ({
-    x: ((index + 0.5) / milestones.length) * 1000,
-    y: ((kinds.indexOf(item.kind) + 0.5) / kinds.length) * 180
-  }));
-  const path = points
-    .map((point, index) => {
-      const prior = points[index - 1];
-      if (!prior) return `M ${point.x},${point.y}`;
-      const middle = (prior.x + point.x) / 2;
-      return `C ${middle},${prior.y} ${middle},${point.y} ${point.x},${point.y}`;
-    })
-    .join(' ');
-  return (
-    <figure className="garden-work-trace">
-      <figcaption>
-        <span className="eyebrow">
-          {progress.kind === 'research'
-            ? 'Following the evidence'
-            : progress.kind === 'analysis'
-              ? 'Inside the analysis'
-              : progress.kind === 'build'
-                ? 'From idea to working result'
-                : 'Your work taking shape'}
-        </span>
-        <small>Recorded order · latest {milestones.length} actions</small>
-      </figcaption>
-      <div
-        className="garden-trace-grid"
-        style={{
-          gridTemplateColumns: `65px repeat(${milestones.length}, minmax(30px, 1fr))`,
-          gridTemplateRows: `repeat(${kinds.length}, 44px)`
-        }}
-      >
-        {kinds.map((kind, index) => (
-          <span
-            key={kind}
-            className="garden-trace-label"
-            style={{ gridColumn: 1, gridRow: index + 1 }}
-          >
-            {labels[kind]}
-          </span>
-        ))}
-        <svg
-          className="garden-trace-line"
-          viewBox="0 0 1000 180"
-          preserveAspectRatio="none"
-          aria-hidden="true"
-          style={{ gridColumn: '2 / -1', gridRow: '1 / -1' }}
-        >
-          <path d={path} />
-        </svg>
-        {milestones.map((item, index) => (
-          <button
-            key={item.id}
-            className={`garden-trace-point ${item.status}`}
-            style={{ gridColumn: index + 2, gridRow: kinds.indexOf(item.kind) + 1 }}
-            onClick={() => setSelectedId(item.id)}
-            aria-pressed={selected?.id === item.id}
-            aria-label={`${labels[item.kind]}: ${item.title}`}
-            title={item.title}
-          >
-            <span />
-            <small>{index + 1}</small>
-          </button>
-        ))}
+  const report = surface?.report;
+  function evidence(references: WorkEvidence[] | undefined) {
+    if (!references?.length) return null;
+    return (
+      <div className="garden-block-evidence">
+        {references.map((reference, index) => {
+          const receipt = surface?.references.find(
+            (entry) =>
+              entry.toolCallId === reference.toolCallId && entry.pointer === reference.pointer
+          );
+          return receipt ? (
+            <Button key={index} onClick={() => onEvidence(receipt.eventId)} title={receipt.label}>
+              Evidence {index + 1}
+            </Button>
+          ) : (
+            <small key={index}>Evidence unavailable</small>
+          );
+        })}
       </div>
-      {selected && (
-        <div className="garden-trace-detail">
-          <div>
-            <small>
-              {labels[selected.kind]} · {selected.status}
-            </small>
-            <strong>{selected.title}</strong>
-            {selected.detail && <p>{selected.detail}</p>}
-          </div>
-          <Button onClick={() => onEvidence(selected.id)}>Inspect</Button>
-        </div>
+    );
+  }
+  const sources =
+    surface && surface.sources.length > 0 ? (
+      <details className="garden-surface-sources">
+        <summary>
+          Sources shown · {surface.sources.filter((source) => source.state === 'read').length} read
+          · {surface.sources.filter((source) => source.state === 'discovered').length} discovered
+        </summary>
+        <p>
+          Sources in the loaded activity window. A discovered page has not been recorded as read.
+        </p>
+        <ul>
+          {surface.sources.map((source) => (
+            <li key={source.url}>
+              <a href={source.url} target="_blank" rel="noreferrer">
+                {source.title}
+              </a>
+              <span>{source.state}</span>
+              <Button onClick={() => onEvidence(source.eventId)}>Inspect</Button>
+            </li>
+          ))}
+        </ul>
+      </details>
+    ) : null;
+  if (!report) {
+    const milestones = progress.milestones.slice(-6);
+    if (milestones.length < 2) return sources;
+    return (
+      <>
+        <details className="garden-recorded-actions">
+          <summary>Recorded activity · latest {milestones.length} actions</summary>
+          {milestones.map((item) => (
+            <div key={item.id}>
+              <strong>{item.title}</strong>
+              <Button onClick={() => onEvidence(item.id)}>Inspect</Button>
+            </div>
+          ))}
+        </details>
+        {sources}
+      </>
+    );
+  }
+  return (
+    <section className="garden-work-surface" aria-label="Current work surface">
+      <h2>{report.content.title}</h2>
+      {report.content.blocks.map((block, index) => (
+        <article className={`garden-work-block garden-block-${block.kind}`} key={index}>
+          <h3>{block.title}</h3>
+          {block.kind === 'sections' && (
+            <div className={`garden-block-sections ${block.layout}`}>
+              {block.items.map((item, itemIndex) => (
+                <section key={itemIndex}>
+                  {item.label && <small>{item.label}</small>}
+                  <h4>{item.title}</h4>
+                  {item.text && <p>{item.text}</p>}
+                  {evidence(item.evidence)}
+                </section>
+              ))}
+            </div>
+          )}
+          {block.kind === 'table' && (
+            // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- The horizontal scroll region must be keyboard reachable.
+            <div className="garden-block-table" tabIndex={0} role="region" aria-label={block.title}>
+              <table>
+                <thead>
+                  <tr>
+                    {block.columns.map((column, columnIndex) => (
+                      <th key={columnIndex}>{column}</th>
+                    ))}
+                    {block.rows.some((row) => row.evidence?.length) && <th>Evidence</th>}
+                  </tr>
+                </thead>
+                <tbody>
+                  {block.rows.map((row, rowIndex) => (
+                    <tr key={rowIndex}>
+                      {row.cells.map((cell, columnIndex) => (
+                        <td key={columnIndex}>{cell}</td>
+                      ))}
+                      {block.rows.some((row) => row.evidence?.length) && (
+                        <td>{evidence(row.evidence)}</td>
+                      )}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {block.kind === 'checklist' && (
+            <ul className="garden-block-checklist">
+              {block.items.map((item, itemIndex) => (
+                <li key={itemIndex}>
+                  <span className={`garden-check-state ${item.status}`}>{item.status}</span>
+                  <div>
+                    <strong>{item.title}</strong>
+                    {item.text && <p>{item.text}</p>}
+                    {evidence(item.evidence)}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+          {block.kind === 'chart' && (
+            <div className="garden-block-chart" aria-label={`${block.title}, ${block.unit}`}>
+              <small>{block.unit} · recorded values</small>
+              {block.points.map((point, pointIndex) => {
+                const value = surface.references.find(
+                  (entry) =>
+                    entry.toolCallId === point.value.toolCallId &&
+                    entry.pointer === point.value.pointer
+                )?.value;
+                const max = Math.max(
+                  ...block.points.map((entry) =>
+                    Math.abs(
+                      Number(
+                        surface.references.find(
+                          (ref) =>
+                            ref.toolCallId === entry.value.toolCallId &&
+                            ref.pointer === entry.value.pointer
+                        )?.value
+                      ) || 0
+                    )
+                  ),
+                  1
+                );
+                return (
+                  <div className="garden-chart-row" key={pointIndex}>
+                    <span>{point.label}</span>
+                    {typeof value === 'number' ? (
+                      <>
+                        <div className="garden-chart-bar-track">
+                          <i
+                            className={value < 0 ? 'negative' : ''}
+                            style={{ width: `${(Math.abs(value) / max) * 100}%` }}
+                          />
+                        </div>
+                        <strong>
+                          {value.toLocaleString()} {block.unit}
+                        </strong>
+                      </>
+                    ) : (
+                      <span>Evidence unavailable</span>
+                    )}
+                    {evidence([point.value])}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {block.kind === 'result' && (
+            <div>
+              {block.text && <p>{block.text}</p>}
+              <Button onClick={() => onResult?.(block.result.kind, block.result.id)}>
+                View result
+              </Button>
+            </div>
+          )}
+        </article>
+      ))}
+      {surface.unavailableReferences > 0 && (
+        <p className="muted">
+          Some evidence is outside this loaded history window. The recorded activity retains the
+          original results.
+        </p>
       )}
-    </figure>
+      {sources}
+    </section>
   );
 }

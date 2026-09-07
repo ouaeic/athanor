@@ -3,12 +3,14 @@
  */
 
 import { MediaModelSelection } from '@athanor/contracts';
+import { registerProjectModelRoutes } from './project-models.js';
 import { AthanorError, decryptJson, encryptJson, inferenceCredentialAad } from '@athanor/core';
 import type { InferenceSecret } from '../context.js';
 import { requireUser } from '../http/auth-hook.js';
 import type { RouteContext } from '../http/server-context.js';
 
 export const registerMediaRoutes = (context: RouteContext): void => {
+  registerProjectModelRoutes(context);
   const { app, store, masterKey, mediaSettings, mediaRoutesFor, idempotent } = context;
   app.get('/v1/media/models', async (request) => mediaSettings(requireUser(request.user).id));
 

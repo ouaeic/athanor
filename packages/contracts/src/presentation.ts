@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { TaskOutputIntents } from './output-intent.js';
+import { WorkSurfaceView } from './work-surface.js';
 
 export const TaskResult = z.object({
   id: z.string(),
@@ -8,10 +9,13 @@ export const TaskResult = z.object({
   status: z.enum(['ready', 'unavailable', 'unknown']),
   url: z.string().nullable(),
   downloadUrl: z.string().nullable(),
-  /** POST here on an explicit Open action to obtain a fresh private preview URL. */
+  /** POST here when the owner views this result to obtain a private preview URL. */
   accessPath: z.string().nullable(),
   previewId: z.string().optional(),
   artifactId: z.string().optional(),
+  workspaceId: z.string().optional(),
+  sha256: z.string().optional(),
+  createdAt: z.string().optional(),
   path: z.string().optional(),
   mimeType: z.string().optional(),
   sizeBytes: z.number().int().nonnegative().optional(),
@@ -38,6 +42,7 @@ export const TaskPresentation = z.object({
   taskId: z.string(),
   eventCursor: z.number().int().nonnegative(),
   results: z.array(TaskResult),
+  surface: WorkSurfaceView.optional(),
   outputs: TaskOutputIntents.optional(),
   delivery: z
     .object({

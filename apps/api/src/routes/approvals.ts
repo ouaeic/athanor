@@ -4,7 +4,8 @@
  * Pending is the default listing because that is the list with something to answer.
  */
 
-import { AthanorError, decryptJson, unwrapDataKey } from '@athanor/core';
+import { APPROVAL_NOTE_MAX_CHARS, approvalDenialMessage } from '@athanor/contracts';
+import { AthanorError, decryptJson, encryptJson, unwrapDataKey } from '@athanor/core';
 import { z } from 'zod';
 import { textValue } from '../context.js';
 import { requireUser } from '../http/auth-hook.js';
@@ -69,16 +70,38 @@ export const registerApprovalRoutes = (context: RouteContext): void => {
       const user = requireUser(request.user);
       return idempotent(request, reply, user, async () => {
         const decision = z.enum(['approve', 'deny']).parse(request.params.decision);
+        const input = (
+          decision === 'deny'
+            ? z.object({ note: z.string().max(APPROVAL_NOTE_MAX_CHARS).optional() }).strict()
+            : z.object({}).strict()
+        ).parse(request.body ?? {});
         const approval = await store.getApproval(request.params.approvalId);
         if (!approval || approval.userId !== user.id)
           throw new AthanorError(
             'approval_unavailable',
             'Approval is missing, resolved, or expired'
           );
+        const note = approvalDenialMessage({
+          tool: textValue(approval.action),
+          ...('note' in input ? { note: input.note } : {})
+        });
+        let correction;
+        if (note) {
+          const task = await store.getTask(user.id, String(approval.taskId));
+          const workspace = task ? await store.getWorkspace(user.id, task.workspaceId) : null;
+          if (!task || !workspace?.wrappedKey)
+            throw new AthanorError('approval_unavailable', 'Approval workspace is unavailable');
+          const key = unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id);
+          correction = {
+            promptCiphertext: encryptJson({ prompt: note }, key, `task-message:${task.id}`),
+            queuedEventCiphertext: encryptJson({ markdown: note }, key, `task-event:${task.id}`)
+          };
+        }
         const changed = await store.resolveApproval(
           user.id,
           request.params.approvalId,
-          decision === 'approve' ? 'approved' : 'denied'
+          decision === 'approve' ? 'approved' : 'denied',
+          ...(correction ? ([correction] as const) : [])
         );
         if (!changed)
           throw new AthanorError(

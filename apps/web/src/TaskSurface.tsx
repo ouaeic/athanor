@@ -13,7 +13,6 @@ import {
   Play,
   Plus,
   Share2,
-  Shield,
   Terminal,
   X
 } from 'lucide-react';
@@ -51,12 +50,17 @@ import { DecisionCard } from './DecisionQueue';
 import { createQuestionAnswerSender } from './task-actions';
 import { TaskOutputs, TaskProgress } from './TaskCanvas';
 import WorkTrace from './WorkTrace';
-import { modeFloors } from './asking-rules';
+import { WorkDirections } from './WorkDirections';
+import { currentWork } from './current-work';
+import { presentationArtifacts } from './task-artifacts';
+import { TaskAutonomy } from './TaskAutonomy';
+import './presentation.css';
 import { effortLabel } from './reasoning-options';
 const Markdown = lazy(() => import('./MarkdownBody'));
 const Composer = lazy(() => import('./Composer'));
 const VoiceSession = lazy(() => import('./voice/VoiceSession'));
 const MediaJobs = lazy(() => import('./MediaJobs'));
+const ProjectModels = lazy(() => import('./ProjectModels'));
 const CodingMissions = lazy(() => import('./CodingMissions'));
 const Share = lazy(() => import('./Sharing'));
 const ResultPreview = lazy(() =>
@@ -93,13 +97,13 @@ export default function TaskSurface({
   const [events, setEvents] = useState<TaskEvent[]>([]);
   const [plan, setPlan] = useState<TaskPlan | null>(null);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
-  const [presentation, setPresentation] = useState<TaskPresentation | null>(null);
+  const [storedPresentation, setPresentation] = useState<TaskPresentation | null>(null);
   const [preview, setPreview] = useState<Artifact | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<unknown>(null);
   const [connection, setConnection] = useState<StreamConnection>('connecting');
   const [panel, setPanel] = useState<
-    'direction' | 'history' | 'plan' | 'settings' | 'share' | 'brief' | null
+    'direction' | 'history' | 'plan' | 'settings' | 'share' | 'brief' | 'models' | null
   >(null);
   const [busy, setBusy] = useState(false);
   const [voiceOpen, setVoiceOpen] = useState(false);
@@ -112,6 +116,7 @@ export default function TaskSurface({
   const [originalBrief, setOriginalBrief] = useState<TaskEvent | null>(null);
   const [briefLoading, setBriefLoading] = useState(false);
   const [branchEvent, setBranchEvent] = useState<TaskEvent | null>(null);
+  const presentation = currentWork(storedPresentation, events);
   const onTaskRef = useRef(onTask);
   onTaskRef.current = onTask;
   const onRefreshRef = useRef(onRefresh);
@@ -132,8 +137,16 @@ export default function TaskSurface({
       if (nextPlan.status === 'fulfilled') setPlan(nextPlan.value);
       else setError(nextPlan.reason);
       if (nextArtifacts.status === 'fulfilled')
-        setArtifacts(nextArtifacts.value.filter((item) => item.taskId === task.id));
-      else setError(nextArtifacts.reason);
+        setArtifacts(
+          nextPresentation.status === 'fulfilled'
+            ? presentationArtifacts(nextPresentation.value, nextArtifacts.value)
+            : nextArtifacts.value.filter((item) => item.taskId === task.id)
+        );
+      else {
+        setError(nextArtifacts.reason);
+        if (nextPresentation.status === 'fulfilled')
+          setArtifacts(presentationArtifacts(nextPresentation.value, []));
+      }
       if (nextPresentation.status === 'fulfilled') setPresentation(nextPresentation.value);
       else setError(nextPresentation.reason);
     },
@@ -211,10 +224,23 @@ export default function TaskSurface({
       clearTimeout(refreshTimer);
     };
   }, [task.id, reload, isFinished(task)]);
+  function showArtifact(id: string) {
+    const artifact = artifacts.find((item) => item.id === id);
+    if (artifact) setPreview(artifact);
+    else
+      setError(
+        new Error(
+          'This result metadata is not available. Refresh its recorded results and try again.'
+        )
+      );
+  }
   async function inspectEvidence(id: string) {
     const existing = events.find((event) => event.id === id);
     if (existing) return setEvidence(existing);
-    const sequence = presentation?.progress.milestones.find((item) => item.id === id)?.sequence;
+    const sequence =
+      presentation?.progress.milestones.find((item) => item.id === id)?.sequence ??
+      presentation?.surface?.references.find((item) => item.eventId === id)?.sequence ??
+      presentation?.surface?.sources.find((item) => item.eventId === id)?.sequence;
     if (sequence === undefined) return;
     try {
       const page = await loadEventPage(task.id, { after: Math.max(0, sequence - 1), limit: 1 });
@@ -225,8 +251,13 @@ export default function TaskSurface({
       setError(cause);
     }
   }
-  const answer = surfaceAnswer(events);
-  const completionEvent = lastEvent(events, 'completed');
+  const directionSequence = presentation?.surface?.direction?.sequence ?? 0;
+  const currentEvents = events.filter((event) => event.sequence >= directionSequence);
+  const answer = surfaceAnswer(currentEvents);
+  const previousAnswer = directionSequence
+    ? surfaceAnswer(events.filter((event) => event.sequence < directionSequence))
+    : null;
+  const completionEvent = lastEvent(currentEvents, 'completed');
   const completion = data(completionEvent?.payload);
   const verification = data(completion.verification);
   const pendingDelivery = (presentation?.delivery?.status ?? task.deliveryStatus) === 'pending';
@@ -377,6 +408,29 @@ export default function TaskSurface({
             </Button>
           </div>
         </div>
+        <div className="work-tools garden-top-tools">
+          <Button onClick={() => onComputer('terminal')}>
+            <Terminal size={16} />
+            Terminal
+          </Button>
+          <Button onClick={() => onComputer('browser')}>Browser</Button>
+          <Button onClick={() => onComputer('desktop')}>Desktop</Button>
+          <Button onClick={() => onComputer('files')}>Files</Button>
+          <Button onClick={() => onComputer('previews')}>Previews</Button>
+          <Button onClick={() => setPanel('models')}>Models</Button>
+          <Button
+            onClick={() => {
+              setHistoryPage(events.slice(-250));
+              setHistoryMore((events.at(-250)?.sequence ?? events[0]?.sequence ?? 1) > 1);
+              setPanel('history');
+            }}
+          >
+            <History size={16} />
+            Activity
+          </Button>
+          <Button onClick={() => setPanel('plan')}>Plan</Button>
+        </div>
+        <TaskAutonomy key={task.id} task={task} onTask={onTask} onRefresh={onRefresh} />
         <div className="run-summary">
           <div className={`status-line ${isWorking(task) || pendingDelivery ? 'active' : ''}`}>
             <i />
@@ -408,6 +462,23 @@ export default function TaskSurface({
             )}
           </div>
         </div>
+        {presentation?.surface && (
+          <WorkDirections
+            surface={presentation.surface}
+            onRevisit={(id, sequence) => {
+              const existing = events.find((event) => event.id === id);
+              if (existing) setBranchEvent(existing);
+              else
+                void loadEventPage(task.id, { after: Math.max(0, sequence - 1), limit: 1 })
+                  .then((page) => {
+                    const found = page.events.find((event) => event.id === id);
+                    if (found) setBranchEvent(found);
+                    else setError(new Error('This original direction is not available.'));
+                  })
+                  .catch(setError);
+            }}
+          />
+        )}
         <ErrorNotice
           error={error}
           onRetry={() => {
@@ -423,19 +494,69 @@ export default function TaskSurface({
               <Suspense fallback={null}>
                 <MediaJobs taskId={task.id} onDelivered={reload} />
               </Suspense>
-              {presentation && !presentation.results.length && (
+              {presentation && (
                 <WorkTrace
                   progress={presentation.progress}
+                  {...(presentation.surface ? { surface: presentation.surface } : {})}
                   onEvidence={(id) => void inspectEvidence(id)}
+                  onResult={(kind, id) => {
+                    if (kind === 'artifact') showArtifact(id);
+                    else
+                      document
+                        .getElementById(`preview-${id}`)
+                        ?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+                  }}
                 />
               )}
               {presentation && (
                 <TaskOutputs
                   events={events}
                   artifacts={artifacts}
-                  presentation={presentation}
-                  onArtifact={(id) => setPreview(artifacts.find((item) => item.id === id) ?? null)}
+                  presentation={
+                    presentation.surface
+                      ? {
+                          ...presentation,
+                          results: presentation.results.filter((result) =>
+                            presentation.surface!.currentResultIds.includes(result.id)
+                          ),
+                          ...(!presentation.surface.report &&
+                          directionSequence > 0 &&
+                          !presentation.progress.phases.length
+                            ? { outputs: [] }
+                            : {})
+                        }
+                      : presentation
+                  }
+                  onArtifact={(id) => showArtifact(id)}
                 />
+              )}
+              {presentation?.surface &&
+                presentation.results.some(
+                  (result) => !presentation.surface!.currentResultIds.includes(result.id)
+                ) && (
+                  <details className="garden-previous-results">
+                    <summary>Results from earlier directions</summary>
+                    <TaskOutputs
+                      autoPreview={false}
+                      events={events}
+                      artifacts={artifacts}
+                      presentation={{
+                        ...presentation,
+                        results: presentation.results.filter(
+                          (result) => !presentation.surface!.currentResultIds.includes(result.id)
+                        )
+                      }}
+                      onArtifact={(id) => showArtifact(id)}
+                    />
+                  </details>
+                )}
+              {previousAnswer?.markdown && (
+                <details className="garden-previous-answer">
+                  <summary>Answer from an earlier direction</summary>
+                  <Suspense fallback={null}>
+                    <Markdown>{previousAnswer.markdown}</Markdown>
+                  </Suspense>
+                </details>
               )}
               {answer.markdown ? (
                 <article className="garden-answer">
@@ -696,29 +817,14 @@ export default function TaskSurface({
             ))}
           </details>
         )}
-        <div className="work-tools">
-          <span className="eyebrow">With this work</span>
-          <Button onClick={() => onComputer('terminal')}>
-            <Terminal size={16} />
-            Terminal
-          </Button>
-          <Button onClick={() => onComputer('browser')}>Browser</Button>
-          <Button onClick={() => onComputer('desktop')}>Desktop</Button>
-          <Button onClick={() => onComputer('files')}>Files</Button>
-          <Button onClick={() => onComputer('previews')}>Previews</Button>
-          <Button
-            onClick={() => {
-              setHistoryPage(events.slice(-250));
-              setHistoryMore((events.at(-250)?.sequence ?? events[0]?.sequence ?? 1) > 1);
-              setPanel('history');
-            }}
-          >
-            <History size={16} />
-            Activity
-          </Button>
-          <Button onClick={() => setPanel('plan')}>Plan</Button>
-        </div>
       </div>
+      {panel === 'models' && (
+        <Dialog title="Project models" onClose={() => setPanel(null)}>
+          <Suspense fallback={<Spinner />}>
+            <ProjectModels taskId={task.id} onChange={onRefresh} />
+          </Suspense>
+        </Dialog>
+      )}
       <div className="garden-task-composer">
         {task.parentMissionId ? (
           <div className="selected-context garden-mission-context">
@@ -1106,27 +1212,12 @@ function TaskOptions({
         }}
       >
         <Field label="Work title">
-          <input value={title} maxLength={160} onChange={(event) => setTitle(event.target.value)} />
+          <input value={title} onChange={(event) => setTitle(event.target.value)} />
         </Field>
         <Button type="submit" busy={busy}>
           Rename
         </Button>
       </form>
-      <Field label="How much should it ask?">
-        <select
-          value={task.securityMode}
-          disabled={busy}
-          onChange={(event) => change({ securityMode: event.target.value }, '/security-mode')}
-        >
-          <option value="review">Review</option>
-          <option value="balanced">Balanced</option>
-          <option value="autonomous">Autonomous</option>
-        </select>
-      </Field>
-      <p className="mode-floor">
-        <Shield size={16} />
-        {modeFloors[task.securityMode]}
-      </p>
       <dl className="facts">
         <div>
           <dt>Model</dt>

@@ -1137,6 +1137,12 @@ const keysAtTopLevel = (body) =>
 
 const copiedConstants = [
   {
+    what: 'the approval correction note bound',
+    owner: 'packages/contracts/src/index.ts',
+    copy: 'apps/web/src/approval-copy.ts',
+    find: /APPROVAL_NOTE_MAX_CHARS = ([\d_]+)/
+  },
+  {
     what: 'the provider audio receipt reference bound',
     owner: 'packages/contracts/src/dictation.ts',
     copy: 'apps/web/src/AudioReceipts.tsx',

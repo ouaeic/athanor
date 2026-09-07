@@ -20,11 +20,17 @@ import {
   unwrapDataKey,
   type MemoryDeadEndCheck
 } from '@athanor/core';
-import { agentNotificationAad, TASK_MAX_ATTEMPTS } from '@athanor/data';
+import {
+  agentNotificationAad,
+  TASK_MAX_ATTEMPTS,
+  readProjectModelPreferences,
+  mergeProjectModelChoices
+} from '@athanor/data';
 import type { DataStore, TaskRecord } from '@athanor/data';
 import {
   isProviderWall,
   ModelGateway,
+  MediaRouteResolver,
   OpenAICompatibleAdapter,
   type ModelResponse,
   type ModelToolCall
@@ -289,7 +295,8 @@ export class AgentWorker {
      * failure there belongs in the API's journal at the API's threshold rather than in a second
      * stream nobody configured.
      */
-    private readonly logger: Logger = workerLogger
+    private readonly logger: Logger = workerLogger,
+    private readonly mediaRouting: Pick<MediaRouteResolver, 'resolve'> = new MediaRouteResolver()
   ) {
     if (masterKey.byteLength !== 32) throw new Error('Agent worker master key must be 32 bytes');
     this.#masterKey = Buffer.from(masterKey);
@@ -299,6 +306,7 @@ export class AgentWorker {
       config,
       masterKey: this.#masterKey,
       gateway: (task, model) => this.#gateway(task, model),
+      inferenceCredential: (task) => this.#inferenceCredential(task),
       startedBySchedule: (task, key) => this.#startedBySchedule(task, key),
       toolchainSummary: (task) => this.#toolchainSummary(task),
       machineSummary: (task) => this.#machineSummary(task),
@@ -367,7 +375,7 @@ export class AgentWorker {
       store,
       masterKey: this.#masterKey,
       runner: this.#runner,
-      inferenceCredential: (task) => this.#inferenceCredential(task),
+      inferenceCredential: (task, resolveMedia) => this.#inferenceCredential(task, resolveMedia),
       destinationContext: (state) => this.#destinationContext(state)
     };
     this.#acceptanceRunner = {
@@ -460,7 +468,7 @@ export class AgentWorker {
    * so the lookup lives here rather than being written twice with two chances to disagree about
    * which credential wins.
    */
-  async #inferenceCredential(task: TaskRecord): Promise<InferenceCredential> {
+  async #inferenceCredential(task: TaskRecord, resolveMedia = false): Promise<InferenceCredential> {
     const credential =
       (await this.store.getManagedProviderCredential(task.userId, 'inference')) ??
       (await this.store.getManagedProviderCredential(task.userId, 'openrouter'));
@@ -504,7 +512,14 @@ export class AgentWorker {
         'Add a model provider in Settings before starting agent work',
         503
       );
-    return secret;
+    if (!resolveMedia) return secret;
+    const project = await readProjectModelPreferences(this.store, this.#masterKey, task);
+    const mediaModels = mergeProjectModelChoices(secret.mediaModels ?? {}, project.choices);
+    return {
+      ...secret,
+      mediaModels,
+      mediaRoutes: (await this.mediaRouting.resolve(secret, mediaModels)).routes
+    };
   }
 
   async #gateway(
@@ -1531,7 +1546,8 @@ export class AgentWorker {
         consequentialApproved,
         webPlan,
         state,
-        inferenceCredential: (forTask) => this.#inferenceCredential(forTask),
+        inferenceCredential: (forTask, resolveMedia) =>
+          this.#inferenceCredential(forTask, resolveMedia),
         providerWebSearch: (forTask, forCall, plan, forState) =>
           this.#providerWebSearch(forTask, forCall, plan, forState),
         missingBinaries: (forTask, binaries) => this.#missingBinaries(forTask, binaries),
@@ -1734,7 +1750,11 @@ export class AgentWorker {
           additionalComputeCredits: queued.maxComputeCredits,
           ...(queued.maxSpendUsd === null ? {} : { additionalSpendUsd: queued.maxSpendUsd }),
           agentStateCiphertext: encryptJson(nextState, key, `task-state:${task.id}`),
-          userMessageCiphertext: encryptJson({ markdown: prompt }, key, `task-event:${task.id}`),
+          userMessageCiphertext: encryptJson(
+            { markdown: prompt, messageId: queued.id },
+            key,
+            `task-event:${task.id}`
+          ),
           statusEventCiphertext: encryptJson(
             { messageId: queued.id, turn: nextTurn },
             key,

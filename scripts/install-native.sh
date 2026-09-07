@@ -36,7 +36,7 @@ install_asset() {
   asset_mode="$1"
   asset_source="$2"
   asset_target="$3"
-  if [ -e "$asset_target" ] && [ "$asset_source" -ef "$asset_target" ]; then
+  if [ -e "$asset_target" ] && env test "$asset_source" -ef "$asset_target"; then
     chmod "$asset_mode" "$asset_target"
   else
     install -m "$asset_mode" "$asset_source" "$asset_target"

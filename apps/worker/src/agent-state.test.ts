@@ -106,8 +106,10 @@ const FIELDS: ReadonlyArray<keyof AgentState> = [
   'pendingNativeInputs',
   'nativeInputApprovals',
   'transcriptionApprovals',
+  'mediaApprovals',
   'codingMissionWaiting',
-  'codingMissionReviews'
+  'codingMissionReviews',
+  'mainModelPreference'
 ];
 
 /**
@@ -120,6 +122,8 @@ const FIELDS: ReadonlyArray<keyof AgentState> = [
  * as a present field.
  */
 const FULL: Required<AgentState> = {
+  mainModelPreference: '[true,"best",""]',
+  mediaApprovals: { image: { binding: 'a'.repeat(64), modelId: 'test/image' } },
   transcriptionApprovals: {
     'transcription-1': { binding: 'd'.repeat(64), sourceSha256: 'e'.repeat(64), sourceBytes: 4096 }
   },
@@ -363,6 +367,7 @@ describe('what a new turn inherits', () => {
       'pendingNativeInputs',
       'nativeInputApprovals',
       'transcriptionApprovals',
+      'mediaApprovals',
       'codingMissionWaiting',
       'codingMissionReviews'
     ]);
@@ -429,7 +434,8 @@ describe('what a new turn inherits', () => {
       'taint',
       'webToolMode',
       'knownOrigins',
-      'knownAddresses'
+      'knownAddresses',
+      'mainModelPreference'
     ]);
     expect(dropped.length + reset.length + carried.length).toBe(FIELDS.length);
   });

@@ -1,4 +1,6 @@
 import type { Database } from './database.js';
+import { ProjectExecutionStore } from './project-executions.js';
+export type { ProjectExecutionRecord } from './project-executions.js';
 import { IdentityStore } from './store/identity.js';
 import { BillingStore } from './store/billing.js';
 import { DictationStore } from './store/dictation.js';
@@ -16,6 +18,7 @@ import { MediaAssetStore } from './store/media-assets.js';
 import { CodingMissionStore } from './store/coding-missions.js';
 export type { CodingMissionRecord } from './store/coding-missions.js';
 import { MediaBatchStore } from './store/media-batches.js';
+import { ProjectModelPreferenceStore } from './project-model-preferences.js';
 export type { MediaBatchRecord, MediaBatchStatus } from './store/media-batches.js';
 export type { MediaAssetRecord } from './store/media-assets.js';
 export type { MediaJobRecord } from './store/media-jobs.js';
@@ -91,6 +94,7 @@ export class DataStore {
    * initialiser runs before the constructor body, so a field would have captured `undefined` and
    * every forwarded call would have queried nothing.
    */
+  readonly #projectExecutions: ProjectExecutionStore;
   readonly #identity: IdentityStore;
   readonly #billing: BillingStore;
   readonly #dictation: DictationStore;
@@ -108,8 +112,10 @@ export class DataStore {
   readonly #mediaAssets: MediaAssetStore;
   readonly #codingMissions: CodingMissionStore;
   readonly #mediaBatches: MediaBatchStore;
+  readonly #projectModelPreferences: ProjectModelPreferenceStore;
 
   constructor(database: Database) {
+    this.#projectModelPreferences = new ProjectModelPreferenceStore(database);
     this.#identity = new IdentityStore(database);
     this.#billing = new BillingStore(database);
     this.#dictation = new DictationStore(database);
@@ -122,6 +128,7 @@ export class DataStore {
     // One emitter and one LISTEN connection per process, shared by the two domains that write rows
     // worth waking somebody for. Two of these would mean two connections and two deliveries.
     this.#taskSignals = new TaskSignals(database);
+    this.#projectExecutions = new ProjectExecutionStore(database, this.#taskSignals);
     this.#mediaDelivery = new MediaDeliveryStore(database, this.#notifications, this.#taskSignals);
     this.#connectors = new ConnectorStore(database, this.#taskSignals);
     this.#tasks = new TaskStore(database, this.#taskSignals);
@@ -138,8 +145,40 @@ export class DataStore {
     );
   }
 
+  listProjectWorkspaces(...args: Parameters<ProjectExecutionStore['listProjectWorkspaces']>) {
+    return this.#projectExecutions.listProjectWorkspaces(...args);
+  }
+  getProjectExecution(...args: Parameters<ProjectExecutionStore['getProjectExecution']>) {
+    return this.#projectExecutions.getProjectExecution(...args);
+  }
+  beginProjectExecution(...args: Parameters<ProjectExecutionStore['beginProjectExecution']>) {
+    return this.#projectExecutions.beginProjectExecution(...args);
+  }
+  finishProjectExecution(...args: Parameters<ProjectExecutionStore['finishProjectExecution']>) {
+    return this.#projectExecutions.finishProjectExecution(...args);
+  }
+  failProjectExecution(...args: Parameters<ProjectExecutionStore['failProjectExecution']>) {
+    return this.#projectExecutions.failProjectExecution(...args);
+  }
+  pendingProjectExecutions(...args: Parameters<ProjectExecutionStore['pendingProjectExecutions']>) {
+    return this.#projectExecutions.pendingProjectExecutions(...args);
+  }
+
   createCodingMission(...args: Parameters<CodingMissionStore['createCodingMission']>) {
     return this.#codingMissions.createCodingMission(...args);
+  }
+  getProjectModelPreferences(
+    ...args: Parameters<ProjectModelPreferenceStore['getProjectModelPreferences']>
+  ) {
+    return this.#projectModelPreferences.getProjectModelPreferences(...args);
+  }
+  applyProjectMainModel(...args: Parameters<ProjectModelPreferenceStore['applyProjectMainModel']>) {
+    return this.#projectModelPreferences.applyProjectMainModel(...args);
+  }
+  putProjectModelPreferences(
+    ...args: Parameters<ProjectModelPreferenceStore['putProjectModelPreferences']>
+  ) {
+    return this.#projectModelPreferences.putProjectModelPreferences(...args);
   }
   getCodingMission(...args: Parameters<CodingMissionStore['getCodingMission']>) {
     return this.#codingMissions.getCodingMission(...args);
@@ -473,6 +512,10 @@ export class DataStore {
 
   createWorkspace(...args: Parameters<WorkspaceStore['createWorkspace']>) {
     return this.#workspaces.createWorkspace(...args);
+  }
+
+  listWorkspaceMetadata(...args: Parameters<WorkspaceStore['listWorkspaceMetadata']>) {
+    return this.#workspaces.listWorkspaceMetadata(...args);
   }
 
   listWorkspaces(...args: Parameters<WorkspaceStore['listWorkspaces']>) {
@@ -988,6 +1031,10 @@ export class DataStore {
     return this.#tasks.listTaskEvents(...args);
   }
 
+  listTaskEvidenceByIds(...args: Parameters<TaskStore['listTaskEvidenceByIds']>) {
+    return this.#tasks.listTaskEvidenceByIds(...args);
+  }
+
   listTaskEventPage(...args: Parameters<TaskStore['listTaskEventPage']>) {
     return this.#tasks.listTaskEventPage(...args);
   }
@@ -1112,6 +1159,10 @@ export class DataStore {
 
   saveMessageDraft(...args: Parameters<BillingStore['saveMessageDraft']>) {
     return this.#billing.saveMessageDraft(...args);
+  }
+
+  listOwnerMessageDrafts(...args: Parameters<BillingStore['listOwnerMessageDrafts']>) {
+    return this.#billing.listOwnerMessageDrafts(...args);
   }
 
   listMessageDrafts(...args: Parameters<BillingStore['listMessageDrafts']>) {

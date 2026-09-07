@@ -104,6 +104,10 @@ export class DesktopControl {
     return this.#queue.length;
   }
 
+  get busy(): boolean {
+    return this.#active !== null || this.#queue.length > 0 || this.#releasing !== null;
+  }
+
   get state(): DesktopControlState {
     return { holder: this.#holder, holderSince: this.#holderSince, generation: this.#generation };
   }

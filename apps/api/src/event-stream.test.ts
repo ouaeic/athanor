@@ -143,7 +143,7 @@ const start = async (
 
   vi.stubGlobal(
     'fetch',
-    vi.fn(async (input: string | URL | Request) => {
+    vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = input instanceof Request ? input.url : input.toString();
       const json = (body: unknown, status = 200) =>
         new Response(JSON.stringify(body), {
@@ -153,6 +153,29 @@ const start = async (
       if (url.includes('workspace-manager.test')) {
         const path = new URL(url).pathname;
         runnerCalls.push(path);
+        if (path.endsWith('/project-execution')) {
+          if (init?.method !== 'POST' || typeof init.body !== 'string')
+            throw Error('Expected a JSON project preparation request');
+          const body = JSON.parse(init.body) as {
+            taskId: string;
+            workspaceId: string;
+            paths: string[];
+            kind: string;
+          };
+          expect(body).toEqual({
+            taskId: expect.any(String) as unknown,
+            workspaceId: expect.any(String) as unknown,
+            kind: 'new',
+            paths: ['workspace/AGENTS.md', 'workspace/ATHANOR.md', 'workspace/OPEN_CLOUD.md']
+          });
+          return json({
+            status: 'ready',
+            sourceWorkspaceId: path.split('/')[3],
+            workspaceId: body.workspaceId,
+            taskId: body.taskId,
+            bytes: 0
+          });
+        }
         if (path.endsWith('/usage')) {
           // The real runner walks the whole tree here. This is that walk, on a modest project -
           // or, while a test holds it, a walk that has not finished at all yet.
@@ -423,7 +446,11 @@ const start = async (
         }
       });
       if (response.statusCode !== 200) throw new Error(`send failed: ${response.body}`);
-      return response.json<{ id: string }>().id;
+      const task = response.json<{ id: string; workspaceId: string; status: string }>();
+      expect(task.workspaceId).toMatch(/^[0-9a-f-]{36}$/);
+      expect(task.workspaceId).not.toBe(workspaceId);
+      expect(task.status).not.toBe('awaiting_resource');
+      return task.id;
     }
   };
 };

@@ -67,7 +67,10 @@ export interface ToolContext {
    * closes over per-worker state (the master key, the gateway, the binary cache) that has no
    * business being copied per call, so they arrive as bound functions rather than as data.
    */
-  readonly inferenceCredential: (task: TaskRecord) => Promise<InferenceCredential>;
+  readonly inferenceCredential: (
+    task: TaskRecord,
+    resolveMedia?: boolean
+  ) => Promise<InferenceCredential>;
   /*
    * `state` is required here for the same reason it is required on the context above, and it was
    * the last place in this file still saying otherwise.

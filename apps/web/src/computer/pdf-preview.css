@@ -1,0 +1,37 @@
+.pdf-viewer {
+  grid-template-columns: minmax(0, 1fr);
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  width: 100%;
+}
+.pdf-toolbar {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.pdf-toolbar .field {
+  min-width: 0;
+}
+.pdf-toolbar input {
+  width: 5rem;
+}
+.pdf-page-scroll {
+  min-width: 0;
+  overflow: auto;
+  width: 100%;
+  max-height: 75dvh;
+  background: #d5d4ce;
+  border-radius: 8px;
+}
+.pdf-page-scroll canvas {
+  display: block;
+  max-width: none;
+  margin: auto;
+}
+.pdf-page-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.65;
+}

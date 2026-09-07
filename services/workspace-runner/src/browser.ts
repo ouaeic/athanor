@@ -19,7 +19,7 @@ import type {
   ResearchReadSource
 } from '@athanor/contracts';
 import type { BrowserTabCleanup, BrowserTabState } from '@athanor/contracts';
-import { BrowserTabs, AGENT_TAB_LIMIT, TAB_SWEEP_MS } from './browser-tabs.js';
+import { BrowserTabs, AGENT_TAB_LIMIT, TAB_IDLE_MS, TAB_SWEEP_MS } from './browser-tabs.js';
 import { assertPublicHttpUrl, isPublicHttpUrl, isPublicInternetAddress } from '@athanor/core';
 import {
   assertUserDataPath,
@@ -1694,6 +1694,7 @@ export class BrowserManager {
   readonly #searchWalls = new Map<string, { wall: BotWall; at: number }>();
   /** Sessions already registered with their screen's control; see `#controlOf`. */
   readonly #attached = new WeakSet<Session>();
+  readonly #lastUsed = new WeakMap<Session, number>();
 
   constructor(
     private readonly options: {
@@ -1845,14 +1846,54 @@ export class BrowserManager {
     const pending = this.#starting.get(workspaceId);
     if (pending) return pending;
     const existing = this.#sessions.get(workspaceId);
-    if (existing) return existing;
+    if (existing) {
+      this.#lastUsed.set(existing, this.#now());
+      return existing;
+    }
     const starting = this.#start(workspaceId, root);
     this.#starting.set(workspaceId, starting);
     try {
-      return await starting;
+      const session = await starting;
+      this.#lastUsed.set(session, this.#now());
+      return session;
     } finally {
       if (this.#starting.get(workspaceId) === starting) this.#starting.delete(workspaceId);
     }
+  }
+
+  hasSession(workspaceId: string): boolean {
+    return this.#sessions.has(workspaceId) || this.#starting.has(workspaceId);
+  }
+
+  async retireIdle(isViewed: (workspaceId: string) => boolean = () => false): Promise<string[]> {
+    const retired: string[] = [];
+    for (const [workspaceId, session] of this.#sessions) {
+      if (
+        this.#closing.has(workspaceId) ||
+        isViewed(workspaceId) ||
+        this.#now() - (this.#lastUsed.get(session) ?? this.#now()) < TAB_IDLE_MS ||
+        session.control.holder !== 'agent' ||
+        session.control.busy ||
+        session.stream?.subscribers.size ||
+        session.pendingDownloads.size ||
+        session.pendingDialog
+      )
+        continue;
+      const tabs = this.#tabStates(session);
+      if (
+        tabs.some(
+          (tab) =>
+            tab.owner !== 'agent' ||
+            tab.pinned ||
+            ![null, 'active'].includes(tab.protectedReason) ||
+            this.#now() - Date.parse(tab.lastUsedAt) < TAB_IDLE_MS
+        )
+      )
+        continue;
+      await this.close(workspaceId);
+      retired.push(workspaceId);
+    }
+    return retired;
   }
 
   async #start(workspaceId: string, root: string): Promise<Session> {
@@ -3152,8 +3193,17 @@ export class BrowserManager {
   }> {
     const targetId =
       'tabId' in action && action.tabId ? action.tabId : tabIdFor(session, session.page);
-    if (targetId)
+    if (targetId) {
+      if (
+        resolveTab(session, 'tabId' in action ? action.tabId : undefined).url() === 'about:blank' &&
+        action.type === 'navigate'
+      )
+        this.#tabLifecycle(session).adopt(
+          targetId,
+          session.caller ?? { owner: 'agent', taskId: null }
+        );
       this.#tabLifecycle(session).touch(targetId, session.caller?.owner ?? 'agent', this.#now());
+    }
     const page = resolveTab(session, 'tabId' in action ? action.tabId : undefined);
     let acted = page;
     switch (action.type) {

@@ -154,6 +154,7 @@ export interface MemoryProcedureReviewRecord extends MemoryItemRecord {
 }
 
 export interface MemorySourceRecord {
+  sharedForWorkspaceId?: string;
   id: string;
   userId: string;
   workspaceId: string;
@@ -213,6 +214,8 @@ export interface MemoryCitedCallRecord {
 export type MemoryUseOutcome = 'ok' | 'fail' | 'unknown';
 
 export interface MemoryCandidateRecord {
+  sharedForWorkspaceId?: string;
+  originWorkspaceId?: string;
   id: string;
   /** `item` rows come from the curated overlay, `source` rows from the verbatim layer. */
   layer: 'item' | 'source';
@@ -532,6 +535,16 @@ export class MemoryStore {
 
   /** Detected once per process: extension availability cannot change under a running server. */
   #memoryCapabilities: Promise<MemoryCapabilities> | null = null;
+
+  async #sharedWorkspace(workspaceId: string): Promise<string | null> {
+    const row = (
+      await this.database.query(
+        `SELECT p.id FROM workspaces w JOIN workspaces p ON p.id=w.parent_workspace_id AND p.user_id=w.user_id WHERE w.id=$1 AND p.parent_workspace_id IS NULL`,
+        [workspaceId]
+      )
+    ).rows[0];
+    return row ? String(row.id) : null;
+  }
 
   async memoryCapabilities(): Promise<MemoryCapabilities> {
     this.#memoryCapabilities ??= this.database
@@ -1040,7 +1053,7 @@ export class MemoryStore {
 
   async getMemoryItem(workspaceId: string, id: string): Promise<MemoryItemRecord | null> {
     const result = await this.database.query(
-      'SELECT * FROM mem.item WHERE id=$2 AND workspace_id=$1',
+      `SELECT * FROM mem.item WHERE id=$2 AND workspace_id IN ($1,(SELECT p.id FROM workspaces w JOIN workspaces p ON p.id=w.parent_workspace_id AND p.user_id=w.user_id WHERE w.id=$1))`,
       [workspaceId, id]
     );
     return result.rows[0] ? mapMemoryItem(result.rows[0]) : null;
@@ -1052,7 +1065,7 @@ export class MemoryStore {
   ): Promise<MemoryItemRecord[]> {
     const result = await this.database.query(
       `SELECT * FROM mem.item
-       WHERE workspace_id=$1
+       WHERE workspace_id IN ($1,(SELECT p.id FROM workspaces w JOIN workspaces p ON p.id=w.parent_workspace_id AND p.user_id=w.user_id WHERE w.id=$1))
          AND ($2::text IS NULL OR kind::text=$2)
          AND ($3::text IS NULL OR status::text=$3)
        ORDER BY observed_at DESC, id
@@ -2203,7 +2216,23 @@ export class MemoryStore {
       // not a UUID is dropped here rather than reaching PostgreSQL as a cast error.
       [...new Set((input.excludeIds ?? []).filter((id) => UUID_PATTERN.test(id)))]
     ]);
-    return result.rows.map(mapMemoryCandidate);
+    const own = result.rows.map(mapMemoryCandidate);
+    const shared = await this.#sharedWorkspace(input.workspaceId);
+    if (!shared) return own;
+    const inherited = (await this.recallMemoryCandidates({ ...input, workspaceId: shared })).map(
+      (candidate) => ({
+        ...candidate,
+        sharedForWorkspaceId: input.workspaceId,
+        originWorkspaceId: shared
+      })
+    );
+    let tokens = 0;
+    return [...own, ...inherited]
+      .filter((candidate) => {
+        tokens += candidate.tokensEst;
+        return tokens <= (input.budgetTokens ?? MEMORY_PACK_BUDGET_TOKENS);
+      })
+      .slice(0, input.maxItems ?? 60);
   }
 
   /**
@@ -2232,7 +2261,13 @@ export class MemoryStore {
         )
       ]
     );
-    return result.rows.map((row) => ({ ...mapMemorySource(row), score: Number(row.score) }));
+    const own = result.rows.map((row) => ({ ...mapMemorySource(row), score: Number(row.score) }));
+    const shared = await this.#sharedWorkspace(input.workspaceId);
+    if (!shared) return own;
+    const inherited = (await this.searchMemorySources({ ...input, workspaceId: shared })).map(
+      (source) => ({ ...source, sharedForWorkspaceId: input.workspaceId })
+    );
+    return [...own, ...inherited].sort((a, b) => b.score - a.score).slice(0, limit);
   }
 
   /**
@@ -2271,7 +2306,7 @@ export class MemoryStore {
               count(*) FILTER (WHERE NOT indexed AND body_tokens <> '') AS archived_turns,
               min(occurred_at) FILTER (WHERE NOT indexed AND body_tokens <> '')
                 AS archived_earliest
-       FROM mem.source WHERE workspace_id = $1`,
+       FROM mem.source WHERE workspace_id IN ($1,(SELECT p.id FROM workspaces w JOIN workspaces p ON p.id=w.parent_workspace_id AND p.user_id=w.user_id WHERE w.id=$1))`,
       [workspaceId]
     );
     const row = result.rows[0];
@@ -2301,7 +2336,14 @@ export class MemoryStore {
       Math.max(0, Math.trunc(window.before ?? 2)),
       Math.max(0, Math.trunc(window.after ?? 2))
     ]);
-    return result.rows.map(mapMemorySource);
+    if (result.rows.length) return result.rows.map(mapMemorySource);
+    const shared = await this.#sharedWorkspace(workspaceId);
+    return shared
+      ? (await this.listMemorySourceWindow(shared, sourceId, window)).map((source) => ({
+          ...source,
+          sharedForWorkspaceId: workspaceId
+        }))
+      : [];
   }
 
   /**
@@ -2313,7 +2355,7 @@ export class MemoryStore {
     const wanted = [...new Set(ids.filter((id) => UUID_PATTERN.test(id)))];
     if (wanted.length === 0) return [];
     const result = await this.database.query(
-      `SELECT * FROM mem.item WHERE workspace_id=$1 AND id = ANY($2::uuid[]) ORDER BY kind, id`,
+      `SELECT * FROM mem.item WHERE workspace_id IN ($1,(SELECT p.id FROM workspaces w JOIN workspaces p ON p.id=w.parent_workspace_id AND p.user_id=w.user_id WHERE w.id=$1)) AND id = ANY($2::uuid[]) ORDER BY kind, id`,
       [workspaceId, wanted]
     );
     return result.rows.map(mapMemoryItem);

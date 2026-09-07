@@ -135,8 +135,11 @@ const openMemoryCandidate = (
   workspaceId: string,
   dataKey: Uint8Array
 ): MemoryRecordDocument | null => {
-  const expected =
-    candidate.layer === 'source' ? memorySourceAad(workspaceId) : memoryItemAad(workspaceId);
+  const origin =
+    candidate.sharedForWorkspaceId === workspaceId && candidate.originWorkspaceId
+      ? candidate.originWorkspaceId
+      : workspaceId;
+  const expected = candidate.layer === 'source' ? memorySourceAad(origin) : memoryItemAad(origin);
   if (candidate.documentCiphertext.aad !== expected) return null;
   try {
     const document = decryptJson<MemoryRecordDocument>(candidate.documentCiphertext, dataKey);
@@ -624,11 +627,15 @@ export interface MemorySessionSearchInput {
 }
 
 const openSourceBody = (
-  record: { bodyCiphertext: { aad?: string } },
+  record: { bodyCiphertext: { aad?: string }; workspaceId?: string; sharedForWorkspaceId?: string },
   workspaceId: string,
   dataKey: Uint8Array
 ): string | null => {
-  if (record.bodyCiphertext.aad !== memorySourceAad(workspaceId)) return null;
+  const origin =
+    record.sharedForWorkspaceId === workspaceId && record.workspaceId
+      ? record.workspaceId
+      : workspaceId;
+  if (record.bodyCiphertext.aad !== memorySourceAad(origin)) return null;
   try {
     const { body } = decryptJson<{ body: string }>(
       record.bodyCiphertext as Parameters<typeof decryptJson>[0],
@@ -1105,7 +1112,7 @@ export const reachMemoryEvidence = async (
       itemId,
       2 * MEMORY_MAX_SOURCE_CHUNKS
     )) {
-      if (evidence.bodyCiphertext.aad !== memorySourceAad(input.workspaceId)) continue;
+      if (evidence.bodyCiphertext.aad !== memorySourceAad(item.workspaceId)) continue;
       let body: string;
       try {
         body = decryptJson<{ body: string }>(evidence.bodyCiphertext, input.dataKey).body;

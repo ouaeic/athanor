@@ -950,10 +950,27 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
     const outputCap = ((): Record<string, number> => {
       const value = maxTokensFor(input);
       if (value === undefined) return {};
+      if (input.textPriceCeiling && nativeOpenAI) return { max_completion_tokens: value };
       if (sends('max_tokens')) return { max_tokens: value };
       if (declared?.has('max_completion_tokens')) return { max_completion_tokens: value };
+      if (input.textPriceCeiling)
+        throw new AthanorError(
+          'provider_output_limit_unsupported',
+          'This route cannot enforce the title output limit',
+          409
+        );
       return {};
     })();
+    if (
+      input.textPriceCeiling &&
+      input.reasoningEffort &&
+      !sends(this.provider === 'openrouter' ? 'reasoning' : 'reasoning_effort')
+    )
+      throw new AthanorError(
+        'provider_reasoning_control_unsupported',
+        'This route cannot disable reasoning for a title',
+        409
+      );
     const payload = (withReasoningDetails: boolean, shedImages: ReadonlySet<number>): string =>
       JSON.stringify({
         model: input.model,
@@ -1023,13 +1040,16 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
         ...outputCap,
         ...(input.onTextDelta ? { stream: true, stream_options: { include_usage: true } } : {}),
         ...((this.#enforceZeroDataRetention && !nativeOpenAI) ||
-        (nativeParts.length && this.provider === 'openrouter')
+        ((nativeParts.length || input.textPriceCeiling) && this.provider === 'openrouter')
           ? {
               provider: {
                 ...(this.#enforceZeroDataRetention
                   ? { zdr: true, data_collection: 'deny', require_parameters: true }
                   : {}),
-                allow_fallbacks: nativeParts.length ? false : true,
+                allow_fallbacks: nativeParts.length || input.textPriceCeiling ? false : true,
+                ...(input.textPriceCeiling
+                  ? { require_parameters: true, max_price: input.textPriceCeiling }
+                  : {}),
                 ...(nativeParts.length && input.nativeInputMaxPrice
                   ? { max_price: input.nativeInputMaxPrice }
                   : {})

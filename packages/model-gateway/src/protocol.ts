@@ -92,6 +92,14 @@ export const ModelRequest = z.object({
   nativeInputMaxPrice: z
     .object({ prompt: z.number().nonnegative(), completion: z.number().nonnegative() })
     .optional(),
+  /** Exact text routing ceilings; providers must honor every requested generation parameter. */
+  textPriceCeiling: z
+    .object({
+      prompt: z.number().finite().nonnegative(),
+      completion: z.number().finite().nonnegative(),
+      request: z.literal(0)
+    })
+    .optional(),
   nativeInputCreditLimit: z.number().nonnegative().optional(),
   nativeInputApprovedCostUsd: z.number().finite().nonnegative().optional(),
   messages: z.array(ModelMessage).min(1),

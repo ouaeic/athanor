@@ -389,9 +389,9 @@ export const MEMORY_SOURCE_SEARCH_PER_TASK = 3;
  * scoring and only ever moves a row down, so a conversation that genuinely holds the best rows
  * still leads - it just stops holding all of them.
  */
-const sourceSearchSql = (tier: 'indexed' | 'archived'): string => `
+const sourceSearchSql = (tier: 'indexed' | 'archived', ownerScoped = false): string => `
 WITH q AS (
-  SELECT $1::uuid AS ws, $3::uuid AS task, $4::timestamptz AS since, $5::timestamptz AS until,
+  SELECT ${ownerScoped ? 'scope.id' : '$1::uuid'} AS ws, $3::uuid AS task, $4::timestamptz AS since, $5::timestamptz AS until,
          $7::int AS per_task
 ),
 stats AS (
@@ -405,6 +405,14 @@ hits AS (
   FROM mem.source sc CROSS JOIN q CROSS JOIN qq CROSS JOIN stats st
   WHERE sc.workspace_id = q.ws AND ${tier === 'indexed' ? 'sc.indexed' : 'NOT sc.indexed'}
     AND sc.tsv @@ qq.q_ts
+    ${
+      ownerScoped
+        ? `AND sc.user_id = $8 AND EXISTS (
+      SELECT 1 FROM tasks t JOIN workspaces tw ON tw.id = t.workspace_id
+      WHERE t.id = sc.task_id AND tw.user_id = $8 AND t.workspace_id = ANY($9::uuid[])
+    )`
+        : ''
+    }
     AND (q.task IS NULL OR sc.task_id = q.task)
     AND (q.since IS NULL OR sc.occurred_at >= q.since)
     AND (q.until IS NULL OR sc.occurred_at <= q.until)
@@ -429,6 +437,28 @@ FROM (
 ORDER BY r.s DESC, sc.id`;
 
 export const MEMORY_SOURCE_SEARCH_SQL = sourceSearchSql('indexed');
+
+/**
+ * One bounded probe per source root, grouped into a single round trip per index key. Current task
+ * membership is checked before candidate limits, so inherited history cannot admit sibling tasks.
+ * The final page carries only the title/prompt metadata needed to open its current task namespace.
+ */
+export const OWNER_MEMORY_SOURCE_SEARCH_SQL = `
+WITH owner_scope AS (
+  SELECT id FROM workspaces WHERE user_id = $8 AND id = ANY($1::uuid[])
+), scoped AS (
+  SELECT hit.* FROM owner_scope scope
+  CROSS JOIN LATERAL (${sourceSearchSql('indexed', true)}) hit
+), ranked AS (
+  SELECT scoped.*, row_number() OVER (PARTITION BY task_id ORDER BY score DESC, id) AS task_rank
+  FROM scoped
+)
+SELECT r.*, t.workspace_id AS task_workspace_id, t.title AS task_title,
+       t.prompt_ciphertext AS task_prompt_ciphertext, t.updated_at AS task_updated_at
+FROM ranked r JOIN tasks t ON t.id = r.task_id
+JOIN workspaces tw ON tw.id = t.workspace_id
+WHERE r.task_rank <= $7 AND tw.user_id = $8 AND t.workspace_id = ANY($9::uuid[])
+ORDER BY r.score DESC, r.id LIMIT $6`;
 
 /**
  * The same search, one step further away: over the rows the nightly pass took out of the index.

@@ -115,6 +115,10 @@ export const mapUser = (row: Record<string, unknown>): UserRecord => ({
 });
 
 export const mapWorkspace = (row: Record<string, unknown>): WorkspaceRecord => ({
+  ...(typeof row.parent_workspace_id === 'string'
+    ? { parentWorkspaceId: row.parent_workspace_id }
+    : {}),
+  ...(typeof row.project_task_id === 'string' ? { projectTaskId: row.project_task_id } : {}),
   id: String(row.id),
   userId: String(row.user_id),
   name: String(row.name),
@@ -204,6 +208,7 @@ export const mapWorkspaceCheckpoint = (
 
 export const mapTaskMessage = (row: Record<string, unknown>): TaskMessageQueueRecord => ({
   id: String(row.id),
+  ...(typeof row.approval_id === 'string' ? { approvalId: row.approval_id } : {}),
   taskId: String(row.task_id),
   userId: String(row.user_id),
   promptCiphertext: json<EncryptedEnvelope>(row.prompt_ciphertext),

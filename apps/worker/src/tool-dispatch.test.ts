@@ -9,9 +9,10 @@ import {
   verifyCapabilityToken,
   wrapDataKey
 } from '@athanor/core';
-import type { DataStore, TaskRecord, WorkspaceRecord } from '@athanor/data';
+import type { DataStore, TaskEventRecord, TaskRecord, WorkspaceRecord } from '@athanor/data';
 import type { ModelRelease } from '@athanor/contracts';
 import { AgentWorker, approvalPreviewHash } from './agent.js';
+import { fixtureMediaRouting } from './media-fixture.js';
 import type { WorkerConfig } from './config.js';
 import type { InferenceCredential } from './agent-state.js';
 import { forgetReads, recordRead } from './edit/index.js';
@@ -162,6 +163,22 @@ const spy =
 const probeStore = (task: () => TaskRecord): StoreProbe => {
   const calls: StoreCall[] = [];
   const events: StoreProbe['events'] = [];
+  const initial = task();
+  const storedEvents: TaskEventRecord[] = [
+    {
+      id: '44444444-4444-4444-8444-000000000001',
+      taskId: initial.id,
+      sequence: 1,
+      kind: 'user_message',
+      summary: 'Owner direction',
+      createdAt: initial.createdAt,
+      payloadCiphertext: encryptJson(
+        { markdown: decryptJson<{ prompt: string }>(initial.promptCiphertext, dataKey).prompt },
+        dataKey,
+        `task-event:${initial.id}`
+      )
+    }
+  ];
   const store: Record<string, unknown> = {
     // The turn's own scaffolding: everything the loop needs before and after the one call under
     // test. Kept minimal on purpose - a probe that answers more than the loop asks for hides the
@@ -174,6 +191,19 @@ const probeStore = (task: () => TaskRecord): StoreProbe => {
     curateWorkspaceSkills: spy(calls, 'curateWorkspaceSkills', () => undefined),
     listWorkspaceSkills: spy(calls, 'listWorkspaceSkills', () => []),
     getLatestTaskPlan: async () => null,
+    listTaskEvents: async (
+      id: string,
+      after = 0,
+      selection?: { kind: TaskEventRecord['kind']; limit: number }
+    ) => {
+      const rows = storedEvents.filter(
+        (row) =>
+          row.taskId === id && row.sequence > after && (!selection || row.kind === selection.kind)
+      );
+      return selection
+        ? rows.slice(-Math.max(1, Math.min(1_000, Math.trunc(selection.limit))))
+        : rows;
+    },
     createTaskPlan: async () => {
       throw new Error('plan_version_conflict');
     },
@@ -193,7 +223,7 @@ const probeStore = (task: () => TaskRecord): StoreProbe => {
     recordWorkspaceCheckpoint: async (input: Record<string, unknown>) => input,
     deleteWorkspaceCheckpoints: async (_workspaceId: string, ids: string[]) => ids.length,
     appendTaskEvent: async (input: {
-      kind: string;
+      kind: TaskEventRecord['kind'];
       payloadCiphertext: Parameters<typeof decryptJson>[0];
     }) => {
       const body = decryptJson<{ summary: string; payload: unknown }>(
@@ -201,7 +231,18 @@ const probeStore = (task: () => TaskRecord): StoreProbe => {
         dataKey
       );
       events.push({ kind: input.kind, summary: body.summary, payload: body.payload });
-      return { id: 'event', sequence: events.length };
+      const sequence = storedEvents.length + 1;
+      const row: TaskEventRecord = {
+        id: `44444444-4444-4444-8444-${String(sequence).padStart(12, '0')}`,
+        taskId: initial.id,
+        sequence,
+        kind: input.kind,
+        summary: body.summary,
+        payloadCiphertext: input.payloadCiphertext,
+        createdAt: initial.createdAt
+      };
+      storedEvents.push(row);
+      return row;
     },
     createAgentNotification: async () => ({ id: 'notification' }),
     recordUsage: spy(calls, 'recordUsage', () => undefined),
@@ -217,6 +258,14 @@ const probeStore = (task: () => TaskRecord): StoreProbe => {
     setWorkspaceStorage: spy(calls, 'setWorkspaceStorage', () => undefined),
     // Read by the media approval floor before `generate_media` and `audio_read` are dispatched at
     // all. Absent, both arms fail inside the floor rather than reaching the wire.
+    getProjectModelPreferences: async () => ({
+      projectTaskId: taskId,
+      workspaceId,
+      wrappedKey: wrapDataKey(dataKey, masterKey, workspaceId),
+      revision: 0,
+      choicesCiphertext: null
+    }),
+    getUserById: async () => ({ preferences: {} }),
     mediaSpendForTask: async () => 0,
     transitionUsage: async () => undefined,
     getNextQueuedTaskMessage: async () => null,
@@ -575,7 +624,14 @@ const dispatch = async (
     });
   }) as typeof fetch);
 
-  await new AgentWorker(probe.store, config(options.config ?? {}), masterKey, runnerSecret)
+  await new AgentWorker(
+    probe.store,
+    config(options.config ?? {}),
+    masterKey,
+    runnerSecret,
+    undefined,
+    fixtureMediaRouting
+  )
     .run(task)
     .catch(() => undefined);
 
@@ -727,6 +783,7 @@ describe('the plan arm', () => {
     ).toEqual(['Read the brief', 'Write the notes']);
     expect(executed.result).toMatchObject({ version: 4 });
     expect(executed.events.find((entry) => entry.kind === 'plan')?.payload).toMatchObject({
+      directionEventId: '44444444-4444-4444-8444-000000000001',
       version: 4,
       branchName: 'Notes'
     });

@@ -285,27 +285,32 @@ export const registerWorkspaceRoutes = (context: RouteContext): void => {
             'confirmation_failed',
             'Type the exact workspace name to delete it'
           );
-        const tasks = await store.listTasks(user.id, workspace.id);
+        const executionIds = await store.listProjectWorkspaces(user.id, workspace.id);
+        const workspaceIds = [...executionIds, workspace.id];
+        const tasks = (
+          await Promise.all(workspaceIds.map((id) => store.listTasks(user.id, id)))
+        ).flat();
         if (tasks.some((task) => task.parentMissionId))
           throw new AthanorError(
             'coding_mission_scoped',
             'Remove an isolated specialist workspace through its parent task',
             409
           );
-        await store.updateWorkspaceStatus(workspace.id, 'deleting');
+        for (const id of workspaceIds) await store.updateWorkspaceStatus(id, 'deleting');
         for (const task of tasks) await store.cancelTaskAndReleaseReservations(user.id, task.id);
         // Parent row cancellation serializes with any mission that was still being allocated.
-        for (const task of await store.listTasks(user.id, workspace.id))
+        for (const task of tasks)
           if (task.hasCodingFamily) await removeCodingMissionFamily(context, task);
         await meterWorkspace(workspace);
-        await runner.request({
-          workspaceId: workspace.id,
-          userId: user.id,
-          role: 'control',
-          scopes: ['workspace.manage'],
-          path: `/v1/workspaces/${workspace.id}`,
-          method: 'DELETE'
-        });
+        for (const id of workspaceIds)
+          await runner.request({
+            workspaceId: id,
+            userId: user.id,
+            role: 'control',
+            scopes: ['workspace.manage'],
+            path: `/v1/workspaces/${id}`,
+            method: 'DELETE'
+          });
         await store.deleteWorkspace(user.id, workspace.id);
         await recordSecurityEvent(store, {
           userId: user.id,

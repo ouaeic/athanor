@@ -1,4 +1,4 @@
-import { lazy, Suspense, useState } from 'react';
+import { lazy, Suspense, useEffect, useRef, useState } from 'react';
 import { ArrowUpRight, Check, Download, FileText, Globe, Maximize2, X } from 'lucide-react';
 import type { Artifact, TaskPresentation, TaskResult, TaskEvent } from '@athanor/contracts';
 import { isNativeClient, post } from './client';
@@ -6,6 +6,7 @@ import { resultSnapshot } from './result-snapshot';
 import { previewIsolated, previewUrl } from './preview-url';
 import { useExpandedView } from './use-expanded-view';
 import { Button, ErrorNotice, Spinner } from './ui';
+import './presentation.css';
 const ResultPreview = lazy(() =>
   import('./computer/ResultPreview').then((module) => ({ default: module.ResultPreview }))
 );
@@ -14,14 +15,19 @@ export function TaskOutputs({
   presentation,
   events = [],
   artifacts = [],
-  onArtifact
+  onArtifact,
+  autoPreview = true
 }: {
   presentation: TaskPresentation;
   events?: TaskEvent[];
   artifacts?: Artifact[];
   onArtifact: (id: string) => void;
+  autoPreview?: boolean;
 }) {
   const [opened, setOpened] = useState<{ id: string; url: string } | null>(null);
+  const [dismissed, setDismissed] = useState<string | null>(null);
+  const [frameState, setFrameState] = useState<'loading' | 'loaded' | 'slow' | 'failed'>('loading');
+  const grants = useRef(new Map<string, Promise<string>>());
   const {
     ref: stage,
     expanded,
@@ -45,6 +51,62 @@ export function TaskOutputs({
         files.some((file) => file.artifactId === item.id && file.status === 'ready')
       )
     : undefined;
+  useEffect(() => {
+    grants.current.clear();
+    setOpened(null);
+    setDismissed(null);
+  }, [presentation.taskId]);
+  const previewKey = preview ? `${presentation.taskId}:${preview.id}` : null;
+  const previewAccess = preview?.accessPath;
+  const previewAddress = preview?.url;
+  const previewStatus = preview?.status;
+  const previewId = preview?.id;
+  useEffect(() => {
+    if (
+      !autoPreview ||
+      !previewKey ||
+      !previewId ||
+      previewStatus !== 'ready' ||
+      dismissed === previewKey
+    )
+      return;
+    let active = true;
+    setOpened(null);
+    setFrameState('loading');
+    setError(null);
+    const grantKey = `${previewKey}:${previewAccess ?? previewAddress}`;
+    let grant = grants.current.get(grantKey);
+    if (!grant) {
+      grant = (
+        previewAccess
+          ? post<{ url: string }>(previewAccess, {}).then((result) => result.url)
+          : Promise.resolve(previewAddress)
+      ).then((url) => {
+        if (!url) throw new Error('This result does not have an available preview.');
+        return previewUrl(url);
+      });
+      grants.current.set(grantKey, grant);
+    }
+    void grant
+      .then((url) => {
+        if (active) setOpened({ id: previewId, url });
+      })
+      .catch((cause: unknown) => {
+        grants.current.delete(grantKey);
+        if (active) {
+          setError(cause);
+          setFrameState('failed');
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [previewKey, previewId, previewAccess, previewAddress, previewStatus, dismissed, autoPreview]);
+  useEffect(() => {
+    if (!opened || frameState !== 'loading') return;
+    const timer = setTimeout(() => setFrameState('slow'), 15_000);
+    return () => clearTimeout(timer);
+  }, [opened, frameState]);
   async function resultUrl(result: TaskResult) {
     const url = result.accessPath
       ? (await post<{ url: string }>(result.accessPath, {})).url
@@ -85,7 +147,10 @@ export function TaskOutputs({
         const { openPreviewBrowser } = await import('./native');
         await openPreviewBrowser(url);
       } else if (windowRef) windowRef.location.replace(previewUrl(url, false));
-      else setOpened({ id: result.id, url: previewUrl(url) });
+      else {
+        setFrameState('loading');
+        setOpened({ id: result.id, url: previewUrl(url) });
+      }
     } catch (cause) {
       windowRef?.close();
       setError(cause);
@@ -101,6 +166,8 @@ export function TaskOutputs({
       referrerPolicy="no-referrer"
       allow="fullscreen"
       className="garden-preview-frame"
+      onLoad={() => setFrameState('loaded')}
+      onError={() => setFrameState('failed')}
     />
   );
   return (
@@ -123,7 +190,7 @@ export function TaskOutputs({
               ))}
           </div>
         )}
-      {presentation.sourceBundle && (
+      {presentation.sourceBundle && presentation.results.length > 0 && (
         <div className="garden-source-bundle">
           <a className="button" href={presentation.sourceBundle.downloadUrl} download>
             <Download size={15} /> Download source bundle
@@ -169,7 +236,11 @@ export function TaskOutputs({
         </nav>
       )}
       {preview && (
-        <article className={`garden-output-primary ${expanded ? 'expanded' : ''}`} ref={stage}>
+        <article
+          className={`garden-output-primary ${expanded ? 'expanded' : ''}`}
+          ref={stage}
+          id={`preview-${preview.previewId ?? preview.id}`}
+        >
           <header className="garden-output-header">
             <div>
               <span className="eyebrow">
@@ -187,7 +258,7 @@ export function TaskOutputs({
                   busy={busy === preview.id}
                   onClick={() => void open(preview, true)}
                 >
-                  Open in browser
+                  Open app
                   <ArrowUpRight size={16} />
                 </Button>
                 <Button busy={busy === preview.id} onClick={() => void copyLink(preview)}>
@@ -207,6 +278,7 @@ export function TaskOutputs({
                       aria-label="Close embedded preview"
                       onClick={() => {
                         void closeExpanded().catch(setError);
+                        setDismissed(previewKey);
                         setOpened(null);
                       }}
                     >
@@ -241,8 +313,22 @@ export function TaskOutputs({
                 />
               </label>
             ))}
-          {opened?.id === preview.id ? (
-            frame
+          {opened?.id === preview.id && preview.status === 'ready' ? (
+            <div className="garden-preview-live">
+              {frame}
+              {frameState !== 'loaded' && (
+                <div className="garden-preview-state" role="status">
+                  {frameState === 'failed'
+                    ? 'The embedded app could not load. Try Open app, or retry here.'
+                    : frameState === 'slow'
+                      ? 'The app is taking longer to load. You can open it separately or retry.'
+                      : 'Loading the live app…'}
+                  {(frameState === 'failed' || frameState === 'slow') && (
+                    <Button onClick={() => void open(preview)}>Retry preview</Button>
+                  )}
+                </div>
+              )}
+            </div>
           ) : captured ? (
             <figure className="garden-captured-result">
               <img src={captured.src} alt={`Recorded view of ${preview.title}`} />
@@ -256,28 +342,14 @@ export function TaskOutputs({
               </figcaption>
             </figure>
           ) : (
-            <div className="garden-result-map">
-              <span className="garden-map-grid" aria-hidden="true" />
-              <div className="garden-map-source">
-                <FileText size={24} />
-                <span>{files[0]?.title ?? 'Your work'}</span>
-                {files.length > 1 && <small>+ {files.length - 1} more outputs</small>}
-              </div>
-              <div className="garden-map-link" aria-hidden="true">
-                <span />
-                <ArrowUpRight size={18} />
-              </div>
-              <div className="garden-map-target">
-                <Globe size={30} />
-                <span>Browser preview</span>
-                <small>
-                  {preview.status === 'ready'
-                    ? 'Available on this computer'
-                    : preview.status === 'unknown'
-                      ? 'Availability not confirmed'
-                      : 'Currently unavailable'}
-                </small>
-              </div>
+            <div className="garden-preview-state" role="status">
+              {preview.status !== 'ready'
+                ? (preview.detail ?? 'The live app is not available right now.')
+                : dismissed === previewKey
+                  ? 'Embedded preview closed. Open the app or view it here when you are ready.'
+                  : frameState === 'failed'
+                    ? 'The app could not be opened. Use View here to retry.'
+                    : 'Opening the live app…'}
             </div>
           )}
         </article>
@@ -372,16 +444,6 @@ export function TaskProgress({
             </li>
           ))}
         </ol>
-      )}
-      {progress.metrics.length > 0 && (
-        <dl className="garden-metrics">
-          {progress.metrics.map((metric) => (
-            <div key={metric.key}>
-              <dt>{metric.label}</dt>
-              <dd>{metric.value}</dd>
-            </div>
-          ))}
-        </dl>
       )}
       <details className="garden-milestone-disclosure" open>
         <summary>

@@ -815,6 +815,7 @@ export class DesktopManager {
   readonly #failedStarts = new Map<string, () => Promise<void>>();
   readonly #closed = new WeakSet<DesktopSession>();
   readonly #lifetimes = new WeakMap<DesktopSession, AbortController>();
+  readonly #lastUsed = new WeakMap<DesktopSession, number>();
 
   constructor(
     private readonly bridgeExecutable?: string,
@@ -825,6 +826,10 @@ export class DesktopManager {
 
   get configured(): boolean {
     return Boolean(this.bridgeExecutable && this.sessionExecutable);
+  }
+
+  hasSubscribers(workspaceId: string): boolean {
+    return Boolean(this.#sessions.get(workspaceId)?.subscribers.size);
   }
 
   /**
@@ -875,15 +880,53 @@ export class DesktopManager {
       await this.close(workspaceId);
       return this.ensure(workspaceId, root);
     }
-    if (existing && existing.process.exitCode === null && existing.process.signalCode === null)
+    if (existing && existing.process.exitCode === null && existing.process.signalCode === null) {
+      this.#lastUsed.set(existing, Date.now());
       return existing;
+    }
     const starting = this.#start(workspaceId, root);
     this.#starting.set(workspaceId, starting);
     try {
-      return await starting;
+      const session = await starting;
+      this.#lastUsed.set(session, Date.now());
+      return session;
     } finally {
       if (this.#starting.get(workspaceId) === starting) this.#starting.delete(workspaceId);
     }
+  }
+
+  async retireIdle(
+    hasBrowser: (workspaceId: string) => boolean,
+    idleMs: number
+  ): Promise<string[]> {
+    const retired: string[] = [];
+    for (const [workspaceId, session] of this.#sessions) {
+      const eligible = () =>
+        !this.#closing.has(workspaceId) &&
+        !hasBrowser(workspaceId) &&
+        Date.now() - (this.#lastUsed.get(session) ?? Date.now()) >= idleMs &&
+        session.control.holder === 'agent' &&
+        !session.control.busy &&
+        session.subscribers.size === 0 &&
+        session.applicationGroups.size === 0;
+      if (!eligible()) continue;
+      // A program may have been opened from the terminal rather than through launch().
+      const windowList = await this.#run(session, '/usr/bin/xprop', ['-root', '_NET_CLIENT_LIST'], {
+        env: session.env,
+        timeoutMs: 5_000
+      })
+        .then((result) => result.stdout.toString('utf8'))
+        .catch(() => null);
+      if (
+        !windowList ||
+        !/^_NET_CLIENT_LIST\(WINDOW\): window id #\s*$/.test(windowList) ||
+        !eligible()
+      )
+        continue;
+      await this.close(workspaceId);
+      retired.push(workspaceId);
+    }
+    return retired;
   }
 
   async #start(workspaceId: string, root: string): Promise<DesktopSession> {

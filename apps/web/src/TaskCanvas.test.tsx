@@ -88,14 +88,15 @@ describe('usable task delivery and recorded progress', () => {
       )
     ).toBe('');
   });
-  it('puts browser and source actions on the result, without silently loading private content', () => {
+  it('puts browser and source actions on the result, while the private iframe awaits its owner grant', () => {
     const html = renderToStaticMarkup(
       <TaskOutputs presentation={presentation} onArtifact={() => undefined} />
     );
-    expect(html).toContain('Open in browser');
+    expect(html).toContain('Open app');
     expect(html).toContain('download="index.html"');
     expect(html).toContain('workspace%2Fmaze%2Findex.html');
-    expect(html).not.toContain('<iframe');
+    expect(html).not.toContain('garden-result-map');
+    expect(html).toContain('Opening the live app');
   });
   it('does not offer opening an unavailable preview or downloading an unavailable file', () => {
     const html = renderToStaticMarkup(
@@ -107,7 +108,7 @@ describe('usable task delivery and recorded progress', () => {
         onArtifact={() => undefined}
       />
     );
-    expect(html).not.toContain('Open in browser');
+    expect(html).not.toContain('Open app');
     expect(html).not.toContain('download=');
   });
   it('keeps a source download accessible when its availability probe is pending', () => {
@@ -121,7 +122,7 @@ describe('usable task delivery and recorded progress', () => {
       />
     );
     expect(html).toContain('download="index.html"');
-    expect(html).not.toContain('Open in browser');
+    expect(html).not.toContain('Open app');
   });
   it('exposes all previews rather than silently dropping later outputs', () => {
     const second = { ...presentation.results[0]!, id: 'preview-2', title: 'Second deliverable' };
@@ -144,7 +145,7 @@ describe('usable task delivery and recorded progress', () => {
     );
     expect(html).toContain('Plan: 1 of 2 steps completed');
     expect(html).toContain('Checking keyboard input');
-    expect(html).toContain('Files changed');
+    expect(html).not.toContain('garden-metrics');
     expect(html).not.toContain('50% complete');
   });
 });

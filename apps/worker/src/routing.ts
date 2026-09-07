@@ -93,53 +93,6 @@ export const usableCapabilities = (
 };
 
 /**
- * The models a delegated mission may be run on, strongest first.
- *
- * Extracted so it can be asked a question. Inline it was four filters and a sort with two defects,
- * and both were invisible because the failure mode is a silent fallback to the lead rather than an
- * error.
- *
- * **The route test was an equality.** `entry.privacyRoute === task.privacyRoute` is the wrong
- * shape: the policy is directional, and a zero-retention route also satisfies an ordinary task -
- * which is what `usableCapabilities`' own comment says and what every other picker in this file
- * uses. On a default box (`AI_REQUIRE_ZDR` unset) a task's route is `external` while the catalogue
- * stamps `provider_zdr` on live entries, so the equality never matched, the pool was empty on every
- * such box, and `eligible[0] ?? lead` quietly ran every delegated mission ever run on one against
- * the lead. The equality also skipped the two liveness checks `usableCapabilities` makes - a
- * withdrawn row and a route that has lost its zero-retention endpoint were both still eligible.
- *
- * **It never asked whose provider the candidate was on.** `#gateway` throws `provider_model_mismatch`
- * for a model whose provider is not the configured credential's, and the sort is deterministic - so
- * on a box migrated from one provider to another, rows left behind by the old one could be chosen
- * for every mission, for the life of the box. The vision picker beside this has always had the
- * check; this is the same check, made against the lead because the lead is the model the task was
- * admitted on and therefore the one known to match the credential.
- *
- * Note that this reads the catalogue it is handed rather than refreshing it the way the vision
- * picker does through `#currentCatalog`, so `providerAvailable` here is as fresh as the caller's
- * read. Left alone deliberately: changing when the catalogue is refreshed is a different question
- * from which rows are eligible, and no measurement covers it.
- */
-export const delegateSpecialists = (
-  catalog: readonly ModelRelease[],
-  privacyRoute: string,
-  lead?: ModelRelease
-): ModelRelease[] =>
-  catalog
-    .filter((entry) => {
-      if (lead && entry.provider !== lead.provider) return false;
-      const usable = usableCapabilities(entry, privacyRoute);
-      return usable.has('tools') && usable.has('reasoning');
-    })
-    .sort(
-      (left, right) =>
-        (right.measuredQuality ?? 0.5) - (left.measuredQuality ?? 0.5) ||
-        (left.benchmarkRank ?? Number.MAX_SAFE_INTEGER) -
-          (right.benchmarkRank ?? Number.MAX_SAFE_INTEGER) ||
-        right.contextTokens - left.contextTokens
-    );
-
-/**
  * Private transcription requires both a verified native connection and its selected route policy.
  * Generic catalogue ZDR metadata cannot establish the actual transcription endpoint's behavior.
  * External eligibility here is not consent: the recording executor separately requires an explicit

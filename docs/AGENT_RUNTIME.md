@@ -608,3 +608,10 @@ evidence that the half that survives the correction is the half that was doing t
 An approved action is bound to the arguments the owner saw: the approval row stores an HMAC over
 them, and the resume path recomputes it before executing, so an approval cannot be spent on a
 different call than the one it was granted for.
+
+The owner can include a reason when denying an action. Resolving the decision and queuing the
+encrypted reason share a transaction; the reason reaches the next model step as owner speech.
+Consuming a correction, recording it in the transcript, and saving its continuation also share a
+transaction, so a worker restart cannot lose or duplicate it. Denial adds no spending or compute
+allowance, preserves the current model and effort settings, and leaves paused work paused. An
+unrelated pending question still requires its own answer.

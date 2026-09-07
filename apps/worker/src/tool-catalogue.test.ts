@@ -35,7 +35,7 @@ import { surfaceActionRequest } from './surface-actions.js';
 import { MAX_NOTICES_PER_TURN } from './agent.js';
 import { BASE_SYSTEM_PROMPT, COMPACT_CONTEXT_TOOL } from './context.js';
 import { MEMORY_SESSION_SEARCH_MAX_RESULTS } from './memory-runtime.js';
-import { managedMediaCatalog, resolvedMediaModel } from './media.js';
+import { resolvedMediaModel } from './media.js';
 import { CODE_SEARCH_COLLAPSE_LINES, CODE_SEARCH_FILE_CEILING } from './tools/repository.js';
 import { EDIT_FORMAT_SPEC } from './edit/index.js';
 
@@ -1385,16 +1385,21 @@ describe('the catalogue as the model reads it', () => {
     const image = { kind: 'image', prompt: 'A logo', modelId: 'x', width: 1024, height: 1024 };
     // One image is a cent and a half: below the ceiling, and no card - which is why the ceiling is
     // cumulative rather than per call.
-    expect(approvalRequirement('generate_media', image)).toBeNull();
+    const mediaModel = resolvedMediaModel('image', {
+      image: mediaOption({ id: 'fixture/image', usdPerImage: 0.015, priceSource: 'provider' })
+    });
+    expect(approvalRequirement('generate_media', image, 'balanced', { mediaModel })).toBeNull();
     const card = approvalRequirement('generate_media', image, 'balanced', {
-      mediaCommittedUsd: 0.3
+      mediaCommittedUsd: 0.3,
+      mediaModel
     });
     expect(card?.sideEffect).toBe('external_reversible');
     expect(card?.preview).toContain('already spent about $0.30');
     // And the model saying it is free changes nothing, because it is not asked.
     expect(
       approvalRequirement('generate_media', { ...image, estimatedCostUsd: 0 }, 'balanced', {
-        mediaCommittedUsd: 0.3
+        mediaCommittedUsd: 0.3,
+        mediaModel
       })?.sideEffect
     ).toBe('external_reversible');
   });
@@ -1440,7 +1445,16 @@ describe('the catalogue as the model reads it', () => {
     // The voice was a constant belonging to one specific speech model. The moment the model became
     // the owner's choice, sending it to any other route would have asked for a voice from a
     // different model's list.
-    expect(resolvedMediaModel('audio').voice).toBe('af_heart');
+    expect(resolvedMediaModel('audio').voice).toBeUndefined();
+    expect(
+      resolvedMediaModel('audio', {
+        audio: mediaOption({
+          id: 'fixture/audio',
+          modality: 'audio',
+          defaultVoice: 'fixture-voice'
+        })
+      }).voice
+    ).toBe('fixture-voice');
     expect(
       resolvedMediaModel('audio', {
         audio: mediaOption({
@@ -1458,7 +1472,8 @@ describe('the catalogue as the model reads it', () => {
     const crossed = resolvedMediaModel('image', {
       image: mediaOption({ id: 'openrouter/studio/speaker-1', modality: 'audio' })
     });
-    expect(crossed.modelId).toBe(managedMediaCatalog.image.modelId);
+    expect(crossed.modelId).toBe('');
+    expect(crossed.priceKnown).toBe(false);
   });
 
   it('never describes the computer as somebody else’s', () => {

@@ -951,17 +951,10 @@ canvas {
 .decision-card,
 .question-card {
   padding: 28px;
-  background: var(--paper);
-  color: var(--ink);
-  border-radius: 3px 26px 3px 3px;
-  --line: #2c422a30;
-  --line-strong: #2c422a55;
-  --muted: #617356;
-  --raised: #d6dfc9;
-  --bg: #dce4d2;
-  --text: #293726;
-  --paper: #2a3c2b;
-  --ink: #eef1e2;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
 }
 .decision-card > h3,
 .question-card h2 {
@@ -979,14 +972,6 @@ canvas {
 .question-card > .eyebrow {
   color: var(--muted);
 }
-.decision-card {
-  color: var(--text);
-  background: #e6ecd9;
-}
-.question-card {
-  color: var(--text);
-  background: #e6ecd9;
-}
 .decision-card details {
   font-size: 12px;
 }
@@ -1001,7 +986,13 @@ canvas {
   font-size: 11px;
   margin: 18px 0;
   max-height: 220px;
-  background: #d5dfc8;
+  background: var(--bg);
+}
+.decision-note {
+  margin-top: 16px;
+}
+.decision-note .field {
+  margin: 12px 0 6px;
 }
 .decision-actions {
   margin: 20px 0 13px;
@@ -1061,10 +1052,11 @@ canvas {
   background: none;
   border: 0;
   border-radius: 5px;
-  min-height: 80px;
+  min-height: 54px;
+  max-height: min(260px, 30dvh);
   font-size: 17px;
   line-height: 1.6;
-  resize: vertical;
+  resize: none;
 }
 .intent-editor > textarea::placeholder {
   color: var(--muted);
@@ -1087,14 +1079,12 @@ canvas {
 }
 .intent-options {
   display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
-  gap: 14px;
-  padding-top: 22px;
-  margin-top: 12px;
-  border-top: 1px solid var(--line);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 24px;
 }
 .intent-options .field {
-  font-size: 11px;
+  font-size: 13px;
+  min-width: 0;
 }
 .intent-options input,
 .intent-options select {
@@ -1596,7 +1586,7 @@ canvas {
   }
   .intent-editor > textarea {
     font-size: 16px;
-    min-height: 105px;
+    min-height: 54px;
   }
   .intent-toolbar {
     gap: 8px;
@@ -1615,7 +1605,7 @@ canvas {
   }
   .intent-options {
     grid-template-columns: 1fr;
-    gap: 14px;
+    gap: 24px;
   }
   .intent-options input,
   .intent-options select {

@@ -7,7 +7,6 @@
  */
 
 import { decryptJson, unwrapDataKey } from '@athanor/core';
-import type { WorkspaceRecord } from '@athanor/data';
 import { workspaceResponse } from '../context.js';
 import type { HostStorage } from '../context.js';
 import { requireUser } from '../http/auth-hook.js';
@@ -35,75 +34,44 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
   app.get('/v1/bootstrap', async (request, reply) => {
     const user = requireUser(request.user);
     const { start: periodStart, end: periodEnd } = currentPeriod();
-    /**
-     * What the owner was part-way through typing, on whichever device they typed it. Opened here
-     * rather than by the client, because the client has no key and never sees one; a draft whose
-     * workspace key cannot be unwrapped is simply left out rather than failing the whole load.
-     *
-     * Takes the workspaces as a promise so it can be started in the same wave as everything else
-     * and still be the one thing that waits for them.
-     */
-    const openDrafts = async (pending: Promise<WorkspaceRecord[]>) =>
-      (
-        await Promise.all(
-          (await pending).map(async (workspace) => {
-            if (!workspace.wrappedKey) return [];
-            try {
-              const key = unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id);
-              const rows = await store.listMessageDrafts(user.id, workspace.id);
-              return rows.map((row) => {
-                // `attachments` is absent from a draft written before they travelled with one, so
-                // it reads as none rather than as a decryption failure that would drop the
-                // sentence too.
-                const opened = decryptJson<{
-                  body: string;
-                  controls?: {
-                    modelId: string;
-                    reasoningEffort: string;
-                    privacyRoute: string;
-                    spendCap: string;
-                  };
-                  attachments?: Array<{
-                    path: string;
-                    name: string;
-                    sizeBytes: number;
-                    mimeType: string;
-                  }>;
-                }>(row.bodyCiphertext, key);
-                return {
-                  workspaceId: workspace.id,
-                  taskId: row.taskId,
-                  body: opened.body,
-                  ...(opened.controls ? { controls: opened.controls } : {}),
-                  attachments: opened.attachments ?? [],
-                  updatedAt: row.updatedAt
-                };
-              });
-            } catch {
-              return [];
+    // Keys and drafts are read together so private execution roots need no per-project queries.
+    const openDrafts = async () =>
+      (await store.listOwnerMessageDrafts(user.id)).flatMap((row) => {
+        try {
+          const key = unwrapDataKey(row.wrappedKey, masterKey, row.workspaceId);
+          const opened = decryptJson<{
+            body: string;
+            controls?: {
+              modelId: string;
+              reasoningEffort: string;
+              privacyRoute: string;
+              spendCap: string;
+            };
+            attachments?: Array<{
+              path: string;
+              name: string;
+              sizeBytes: number;
+              mimeType: string;
+            }>;
+          }>(row.bodyCiphertext, key);
+          return [
+            {
+              workspaceId: row.workspaceId,
+              taskId: row.taskId,
+              body: opened.body,
+              ...(opened.controls ? { controls: opened.controls } : {}),
+              attachments: opened.attachments ?? [],
+              updatedAt: row.updatedAt
             }
-          })
-        )
-      ).flat();
-    /*
-     * Everything in one wave, because none of it was ever waiting on anything else.
-     *
-     * This request gates first paint, and it used to be twelve database round trips deep for
-     * eighteen queries - the workspaces, then the page, then the catalogue, then the totals, then
-     * the drafts, then, one at a time in the order they happened to be written in the returned
-     * object, the retention flag, the search route and the provider spend. An object literal
-     * awaits its properties in source order, so three of those hops were paid because of where the
-     * lines sat on the page. Only the drafts genuinely depend on anything: they need the owner's
-     * workspace keys, so they wait on `ensurePrimaryWorkspace` and nothing else does.
-     *
-     * The second `listWorkspaces` is gone with them. `ensurePrimaryWorkspace` already ends in that
-     * exact query and hands the rows back, so reading them again was a round trip spent to learn
-     * what the previous line had already returned - and a window in which the two copies could
-     * disagree about a computer that had just been provisioned.
-     */
+          ];
+        } catch {
+          return [];
+        }
+      });
     const workspacesRead = ensurePrimaryWorkspace(user);
     const [
       workspaces,
+      workspaceMetadata,
       tasks,
       schedules,
       models,
@@ -115,16 +83,18 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
       spend
     ] = await Promise.all([
       workspacesRead,
+      store.listWorkspaceMetadata(user.id),
       store.listTaskPage(user.id),
       store.listTaskSchedules(user.id),
       modelsForUser(user),
       store.getManagedProviderCredential(user.id, 'inference'),
       store.usageTotals(user.id, periodStart, periodEnd),
-      openDrafts(workspacesRead),
+      openDrafts(),
       requiresZeroDataRetention(user.id),
       webSearchRouteFor(user.id),
       providerSpend(user.id)
     ]);
+    const metadata = new Map(workspaceMetadata.map((workspace) => [workspace.id, workspace]));
     const hostStorage = new Map(
       workspaces
         .map((workspace) => [workspace.id, cachedHostStorage(workspace)] as const)
@@ -146,10 +116,7 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
       ),
       tasks: await Promise.all(
         (await withTaskDeliveryStatus(database, user.id, tasks.tasks)).map((task) =>
-          privateTaskResponse(
-            task,
-            workspaces.find((workspace) => workspace.id === task.workspaceId)
-          )
+          privateTaskResponse(task, metadata.get(task.workspaceId))
         )
       ),
       /** Where GET /v1/tasks resumes from, so the sidebar can reach past this first page. */
@@ -158,10 +125,7 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
       scheduleRunCounts: tasks.scheduleRunCounts,
       schedules: await Promise.all(
         schedules.map((schedule) =>
-          privateScheduleResponse(
-            schedule,
-            workspaces.find((workspace) => workspace.id === schedule.workspaceId)
-          )
+          privateScheduleResponse(schedule, metadata.get(schedule.workspaceId))
         )
       ),
       /*

@@ -10,7 +10,7 @@
  * lease-guarded writes matched no rows, its timeline events are not lease-guarded and did, and the
  * conversation gained a second copy of the batch.
  */
-import { decryptJson, encryptJson } from '@athanor/core';
+import { AthanorError, decryptJson, encryptJson } from '@athanor/core';
 import type { DataStore, TaskRecord } from '@athanor/data';
 import type { ModelMessage, ModelTool } from '@athanor/model-gateway';
 import type { AgentState, AgentWorkerConfig } from './agent-state.js';
@@ -42,39 +42,45 @@ export interface TurnControlDeps {
  * one as the other from timing alone would be wrong half the time.
  */
 export const drainCorrection = async (
-  deps: TurnControlDeps,
+  deps: Pick<TurnControlDeps, 'store' | 'config'>,
   task: TaskRecord,
   key: Uint8Array,
   state: AgentState
 ): Promise<boolean> => {
-  const queued = await deps.store
-    .getNextQueuedTaskMessage(task.id, { interruptOnly: true })
-    .catch(() => null);
+  const queued = await deps.store.getNextQueuedTaskMessage(task.id, { interruptOnly: true });
   if (!queued?.interrupt) return false;
   const correction = decryptJson<{ prompt: string }>(queued.promptCiphertext, key).prompt;
   if (!correction.trim()) return false;
+  const nextState = structuredClone(state);
+  if (!queued.approvalId)
+    nextState.ownerReasoningEffort = queued.reasoningEffort ?? task.reasoningEffort ?? 'auto';
+  sealUnansweredToolCalls(nextState.messages, 'the user redirected the task before this call ran');
+  nextState.messages.push({ role: 'user', content: correction });
   const consumed = await deps.store.consumeQueuedTaskMessageInTurn({
     taskId: task.id,
     messageId: queued.id,
     workerId: deps.config.WORKER_ID,
-    // Without this the loop trips its own ceiling on the next iteration: the message reserved
-    // credits of its own, and the turn it is joining was budgeted before they existed.
     additionalComputeCredits: queued.maxComputeCredits,
     ...(queued.maxSpendUsd === null ? {} : { additionalSpendUsd: queued.maxSpendUsd }),
-    userMessageCiphertext: encryptJson({ markdown: correction }, key, `task-event:${task.id}`)
+    userMessageCiphertext: encryptJson(
+      { markdown: correction, messageId: queued.id },
+      key,
+      `task-event:${task.id}`
+    ),
+    // The queue row and the words in the saved trajectory commit together, including on restart.
+    agentStateCiphertext: encryptJson(nextState, key, `task-state:${task.id}`),
+    actualComputeCredits: nextState.credits
   });
-  if (!consumed) return false;
-  state.ownerReasoningEffort = queued.reasoningEffort ?? task.reasoningEffort ?? 'auto';
-  task.reasoningEffort = state.ownerReasoningEffort;
-  // The same primitive pause, cancel and a worker restart use: a tool call with no result is a
-  // malformed window, and the correction arrives between a call and its answer.
-  sealUnansweredToolCalls(state.messages, 'the user redirected the task before this call ran');
-  // A genuine user message, so it is owner speech everywhere that matters - the taint model,
-  // the compaction rule that never paraphrases what the user said, and the transcript.
-  state.messages.push({ role: 'user', content: correction });
-  // Written immediately: a crash between the store transaction and the next state write would
-  // otherwise lose the correction, or replay it.
-  await deps.checkpoint(task, key, state);
+  if (!consumed) {
+    if (queued.approvalId)
+      throw new AthanorError(
+        'approval_correction_conflict',
+        'The task changed before its denial correction could be saved'
+      );
+    return false;
+  }
+  Object.assign(state, nextState);
+  if (!queued.approvalId) task.reasoningEffort = nextState.ownerReasoningEffort ?? 'auto';
   await event(deps.store, task, key, 'status', 'Applying your correction to the running task');
   return true;
 };

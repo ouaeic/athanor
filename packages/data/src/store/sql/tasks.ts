@@ -162,14 +162,14 @@ export const TASK_LIVE_COUNTS = `
  * conversation, and pulling fifty of those back to read fifty titles would rebuild here the cost
  * the index was added to remove.
  */
-const taskNameSearchSql = (prefixed: boolean): string => `
+const taskNameSearchSql = (prefixed: boolean, grouped = false): string => `
 SELECT t.id, t.workspace_id, t.title, t.prompt_ciphertext, t.updated_at,
        (t.name_tsv @@ (array_to_string($2::text[], ':A & ') || ':A')::tsquery) AS whole_name,
        (t.name_tsv @@ (array_to_string($2::text[], ':A | ') || ':A')::tsquery) AS in_name,
        ${prefixed ? `(t.name_tsv @@ (array_to_string($5::text[], ':B | ') || ':B')::tsquery)` : 'false'} AS name_prefix
 FROM tasks t JOIN workspaces w ON w.id = t.workspace_id
 WHERE w.user_id = $1
-  AND ($3::uuid IS NULL OR t.workspace_id = $3)
+  AND ${grouped ? 't.workspace_id = ANY($3::uuid[])' : '($3::uuid IS NULL OR t.workspace_id = $3)'}
   AND t.name_tsv @@ (array_to_string($2::text[], ' | ')${
     prefixed ? ` || ' | ' || array_to_string($5::text[], ':B | ') || ':B'` : ''
   })::tsquery
@@ -181,6 +181,12 @@ LIMIT $4`;
 export const TASK_NAME_SEARCH_SQL = {
   plain: taskNameSearchSql(false),
   prefixed: taskNameSearchSql(true)
+};
+
+/** Workspaces sharing an index key can share one owner-scoped name lookup. */
+export const OWNER_TASK_NAME_SEARCH_SQL = {
+  plain: taskNameSearchSql(false, true),
+  prefixed: taskNameSearchSql(true, true)
 };
 
 /**

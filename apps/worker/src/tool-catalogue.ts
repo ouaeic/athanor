@@ -482,12 +482,14 @@ export const agentTools: ModelTool[] = [
   {
     name: 'set_plan',
     description:
-      'Set the visible plan before material work and revise it when the approach changes. Mark steps in_progress when started and completed when verified. Reusing a title preserves identity and status unless changed.',
+      'Set the visible plan before material work and revise it when the approach changes. Mark steps in_progress then completed when verified. Use presentation for a task-specific surface and acknowledgment; action=describe gives its schema.',
     parameters: {
       type: 'object',
       additionalProperties: false,
-      required: ['steps'],
+      required: [],
       properties: {
+        action: { type: 'string', enum: ['describe'] },
+        presentation: { type: 'object', additionalProperties: true },
         branchName: { type: 'string', description: 'Short name for this plan branch.' },
         outputs: {
           type: 'array',

@@ -1,0 +1,162 @@
+import { describe, expect, it } from 'vitest';
+import type { TaskEvent, TaskPlan, TaskResult } from '@athanor/contracts';
+import { projectWorkSurface } from './work-surface-projection.js';
+
+const event = (sequence: number, kind: TaskEvent['kind'], payload: unknown): TaskEvent => ({
+  id: `event-${sequence}`,
+  taskId: 'task',
+  sequence,
+  kind,
+  payload,
+  summary: kind,
+  createdAt: new Date(sequence * 1000).toISOString()
+});
+describe('current work presentation', () => {
+  it('switches immediately to new owner steering while retaining previous directions and results', () => {
+    const events = [
+      event(1, 'user_message', { markdown: 'Build an app' }),
+      event(3, 'preview', { previewId: 'preview' }),
+      event(4, 'plan', {
+        presentation: {
+          directionEventId: 'event-1',
+          content: { title: 'App', acknowledgment: 'I will build it.', blocks: [] }
+        }
+      }),
+      event(5, 'queued_message', { markdown: 'Compare the options instead' })
+    ];
+    const plan = {
+      presentation: {
+        directionEventId: 'event-1',
+        content: { title: 'App', acknowledgment: 'I will build it.', blocks: [] }
+      },
+      id: 'plan',
+      taskId: 'task',
+      version: 1,
+      parentVersion: null,
+      branchName: 'Main',
+      steps: [{ id: 'step', title: 'Work', status: 'pending' }],
+      createdBy: 'agent',
+      createdAt: new Date(0).toISOString()
+    } satisfies TaskPlan;
+    const results = [{ id: 'preview', evidenceEventIds: ['event-3'] }] as TaskResult[];
+    const projected = projectWorkSurface(events, plan, results);
+    expect(projected.direction).toMatchObject({ eventId: 'event-5', queued: true });
+    expect(projected.report).toBeNull();
+    expect(projected.currentResultIds).toEqual([]);
+    expect(projected.directions).toHaveLength(2);
+    expect(projected.directions[0]?.acknowledgment).toBe('I will build it.');
+    expect(results).toHaveLength(1);
+  });
+  it('collapses only consumed queue identities and acknowledges a direction from its actual plan', () => {
+    const events = [
+      event(1, 'user_message', { markdown: 'Check it again' }),
+      event(2, 'queued_message', { markdown: 'Check it again', messageId: 'first-repeat' }),
+      event(3, 'user_message', { markdown: 'Check it again', messageId: 'first-repeat' }),
+      event(4, 'plan', {
+        directionEventId: 'event-3',
+        steps: [{ title: 'Recheck the reported totals' }]
+      }),
+      event(5, 'queued_message', { markdown: 'Check it again', messageId: 'second-repeat' }),
+      event(6, 'queued_message', { markdown: 'Keep this legacy correction' }),
+      event(7, 'user_message', { markdown: 'Keep this legacy correction', messageId: 'event-6' }),
+      event(8, 'plan', { directionEventId: 'event-3', steps: [{ title: 'Obsolete direction' }] }),
+      event(9, 'queued_message', { markdown: 'Unlinked repeated words' }),
+      event(10, 'user_message', { markdown: 'Unlinked repeated words' })
+    ];
+    const projected = projectWorkSurface(events, null, []);
+    expect(projected.directions.map((direction) => direction.eventId)).toEqual([
+      'event-1',
+      'event-3',
+      'event-5',
+      'event-7',
+      'event-9',
+      'event-10'
+    ]);
+    expect(
+      projected.directions.filter((direction) => direction.text === 'Check it again')
+    ).toHaveLength(3);
+    expect(projected.directions.find((direction) => direction.eventId === 'event-3')).toMatchObject(
+      {
+        queued: false,
+        messageId: 'first-repeat',
+        acknowledgment: 'Recheck the reported totals'
+      }
+    );
+    expect(
+      projected.directions.find((direction) => direction.eventId === 'event-7')?.acknowledgment
+    ).toBeUndefined();
+    expect(projected.direction?.eventId).toBe('event-10');
+  });
+  it('deduplicates discovered/read sources and never calls a search snippet a read page', () => {
+    const events = [
+      event(1, 'user_message', { markdown: 'Research' }),
+      event(2, 'tool_started', { toolCallId: 'search', tool: 'web_search' }),
+      event(3, 'tool_result', {
+        toolCallId: 'search',
+        result: { results: [{ url: 'https://example.test/a' }, { url: 'https://example.test/b' }] }
+      }),
+      event(4, 'tool_started', { toolCallId: 'read', tool: 'parallel_web_read' }),
+      event(5, 'tool_result', {
+        toolCallId: 'read',
+        result: {
+          sources: [
+            { url: 'https://example.test/a', text: 'Full page' },
+            { url: 'https://example.test/b', error: 'Denied' }
+          ]
+        }
+      })
+    ];
+    expect(
+      projectWorkSurface(events, null, []).sources.map(({ url, state }) => ({ url, state }))
+    ).toEqual([
+      { url: 'https://example.test/a', state: 'read' },
+      { url: 'https://example.test/b', state: 'discovered' }
+    ]);
+  });
+  it('only resolves chart values and safe source links from actual tool receipts', () => {
+    const events = [
+      event(1, 'user_message', { markdown: 'Analyze' }),
+      event(2, 'tool_result', { toolCallId: 'measure', result: { count: 17 } })
+    ];
+    const plan = {
+      presentation: {
+        directionEventId: 'event-1',
+        content: {
+          title: 'Counts',
+          acknowledgment: 'I will compare the counts.',
+          blocks: [
+            {
+              kind: 'chart',
+              title: 'Sample',
+              unit: 'reads',
+              points: [
+                { label: 'A', value: { toolCallId: 'measure', pointer: '/count' } },
+                { label: 'B', value: { toolCallId: 'absent', pointer: '/count' } }
+              ]
+            }
+          ]
+        }
+      },
+      id: 'plan',
+      taskId: 'task',
+      version: 1,
+      parentVersion: null,
+      branchName: 'Main',
+      steps: [{ id: 'step', title: 'Work', status: 'pending' }],
+      createdBy: 'agent',
+      createdAt: new Date(0).toISOString()
+    } satisfies TaskPlan;
+    const projected = projectWorkSurface(events, plan, []);
+    expect(projected.references).toEqual([
+      {
+        toolCallId: 'measure',
+        pointer: '/count',
+        value: 17,
+        eventId: 'event-2',
+        sequence: 2,
+        label: 'tool_result'
+      }
+    ]);
+    expect(projected.unavailableReferences).toBe(1);
+  });
+});

@@ -1,5 +1,7 @@
 import { z } from 'zod';
 import { TaskOutputIntents } from './output-intent.js';
+import { WorkSurfaceReport } from './work-surface.js';
+export * from './work-surface.js';
 export * from './output-intent.js';
 export * from './delivery-state.js';
 import { ReasoningOptions, TaskReasoningEffort } from './reasoning.js';
@@ -115,6 +117,8 @@ const TaskSpendUsd = z.number().positive().max(MAX_TASK_SPEND_USD);
 const PriceCeilingUsd = z.number().nonnegative().max(MAX_PRICE_CEILING_USD_PER_MILLION);
 
 export const Workspace = z.object({
+  parentWorkspaceId: Id.optional(),
+  projectTaskId: Id.optional(),
   id: Id,
   name: z.string().min(1).max(80),
   status: WorkspaceStatus,
@@ -545,9 +549,12 @@ export const publishesPublicly = (reach: unknown): boolean => reach === PublishR
  * on its own slug under the box's own hostname, and that is the whole of the addressing story.
  */
 
+export const TASK_TITLE_MAX_LENGTH = 1024;
+
 export const Task = z.object({
   id: Id,
   workspaceId: Id,
+  parentWorkspaceId: Id.optional(),
   parentTaskId: Id.nullable().optional(),
   parentMissionId: Id.nullable().optional(),
   branchedFromEventId: Id.nullable().optional(),
@@ -561,7 +568,7 @@ export const Task = z.object({
    * reference, and it stays true after the schedule itself is deleted.
    */
   scheduleId: Id.nullable().default(null),
-  title: z.string().min(1).max(160),
+  title: z.string().min(1).max(TASK_TITLE_MAX_LENGTH),
   status: TaskStatus,
   modelId: z.string(),
   reasoningEffort: TaskReasoningEffort.optional(),
@@ -631,7 +638,7 @@ export type TaskPageQuery = z.input<typeof TaskPageQuery>;
  */
 export const UpdateTaskRequest = z
   .object({
-    title: z.string().trim().min(1).max(160).optional(),
+    title: z.string().trim().min(1).max(TASK_TITLE_MAX_LENGTH).optional(),
     pinned: z.boolean().optional(),
     archived: z.boolean().optional()
   })
@@ -801,6 +808,8 @@ export const TaskPlan = z.object({
   branchName: z.string().min(1).max(80),
   steps: z.array(TaskPlanStep).min(1).max(30),
   outputs: TaskOutputIntents.optional(),
+  presentation: WorkSurfaceReport.optional(),
+  directionEventId: z.string().optional(),
   createdBy: z.enum(['agent', 'user']),
   createdAt: IsoDate
 });
@@ -1125,6 +1134,57 @@ export const MediaSettings = z.object({
   approvalThresholdUsd: z.number().nonnegative()
 });
 export type MediaSettings = z.infer<typeof MediaSettings>;
+
+export const ModelPurpose = z.enum([
+  'main',
+  'specialist',
+  'coding',
+  'image',
+  'audio',
+  'transcription',
+  'video'
+]);
+export type ModelPurpose = z.infer<typeof ModelPurpose>;
+export const PurposeModelChoice = MediaModelChoice.refine(
+  (choice) => choice.automatic || choice.modelId.trim().length > 0,
+  'Choose a model or automatic selection'
+);
+export type PurposeModelChoice = z.infer<typeof PurposeModelChoice>;
+export const ProjectModelChoices = z
+  .object({
+    main: PurposeModelChoice.optional(),
+    specialist: PurposeModelChoice.optional(),
+    coding: PurposeModelChoice.optional(),
+    image: PurposeModelChoice.optional(),
+    audio: PurposeModelChoice.optional(),
+    transcription: PurposeModelChoice.optional(),
+    video: PurposeModelChoice.optional()
+  })
+  .strict();
+export type ProjectModelChoices = z.infer<typeof ProjectModelChoices>;
+export const UpdateProjectModelPreferences = z
+  .object({
+    expectedRevision: z.number().int().nonnegative(),
+    choices: ProjectModelChoices
+  })
+  .strict();
+export const ProjectModelPreferences = z.object({
+  projectTaskId: Id,
+  revision: z.number().int().nonnegative(),
+  choices: ProjectModelChoices,
+  purposes: z.array(
+    z.object({
+      purpose: ModelPurpose,
+      source: z.enum(['project', 'global', 'automatic']),
+      choice: PurposeModelChoice,
+      available: z.boolean(),
+      reason: z.string().nullable(),
+      effective: z.union([MediaModelOption, ModelRelease]).nullable(),
+      options: z.array(z.union([MediaModelOption, ModelRelease]))
+    })
+  )
+});
+export type ProjectModelPreferences = z.infer<typeof ProjectModelPreferences>;
 
 export const Approval = z.object({
   id: Id,
@@ -1457,10 +1517,11 @@ export type MessageAttachments = z.infer<typeof MessageAttachments>;
 export const CreateTaskRequest = z.object({
   workspaceId: Id,
   prompt: z.string().min(1).max(200_000),
-  title: z.string().min(1).max(160).optional(),
+  title: z.string().min(1).max(TASK_TITLE_MAX_LENGTH).optional(),
   modelId: z.string().optional(),
   reasoningEffort: TaskReasoningEffort.optional(),
   privacyRoute: PrivacyRoute.default('provider_zdr'),
+  securityMode: SecurityMode.optional(),
   maxComputeCredits: z.number().min(0.01).max(10_000).default(1),
   /** Omitted means "use the account default", not "unlimited". */
   maxSpendUsd: TaskSpendUsd.optional(),
@@ -1911,6 +1972,9 @@ export const ApiError = z.object({
  * validated, so a device cannot write a shape another device will choke on.
  */
 export const OwnerPreferences = z.object({
+  modelPurposes: z
+    .object({ specialist: PurposeModelChoice.optional(), coding: PurposeModelChoice.optional() })
+    .optional(),
   model: z
     .object({
       automatic: z.boolean(),

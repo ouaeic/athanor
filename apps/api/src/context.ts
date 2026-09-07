@@ -216,6 +216,8 @@ export const workspaceResponse = (
   workspace: WorkspaceRecord,
   hostStorage?: HostStorage | null
 ): Workspace => ({
+  ...(workspace.parentWorkspaceId ? { parentWorkspaceId: workspace.parentWorkspaceId } : {}),
+  ...(workspace.projectTaskId ? { projectTaskId: workspace.projectTaskId } : {}),
   id: workspace.id,
   name: workspace.name,
   status: workspace.status as Workspace['status'],
@@ -743,6 +745,8 @@ export const createApiContext = async (config: ApiConfig, overrides: ApiOverride
           timeoutMs: 5_000
         });
         await store.setWorkspaceStorage(workspace.userId, workspace.id, usage.storageBytes);
+        const aggregated = await store.getWorkspace(workspace.userId, workspace.id);
+        if (aggregated) usage.storageBytes = aggregated.storageBytes;
         hostStorageCache.set(workspace.id, { usage, at: Date.now() });
         return usage;
       } catch (error) {
@@ -790,7 +794,13 @@ export const createApiContext = async (config: ApiConfig, overrides: ApiOverride
   const privateTaskResponse = async (
     task: NonNullable<Awaited<ReturnType<DataStore['getTask']>>>,
     knownWorkspace?: WorkspaceRecord
-  ) => taskResponse(task, await taskTitle(task, knownWorkspace));
+  ) => {
+    const workspace = knownWorkspace ?? (await store.getWorkspaceById(task.workspaceId));
+    return {
+      ...taskResponse(task, await taskTitle(task, workspace ?? undefined)),
+      ...(workspace?.parentWorkspaceId ? { parentWorkspaceId: workspace.parentWorkspaceId } : {})
+    };
+  };
 
   const scheduleTitle = async (
     schedule: TaskScheduleRecord,
@@ -874,6 +884,8 @@ export const createApiContext = async (config: ApiConfig, overrides: ApiOverride
       steps: TaskPlanStep[];
       branchName?: string;
       outputs?: TaskPlan['outputs'];
+      presentation?: TaskPlan['presentation'];
+      directionEventId?: string;
     }>(plan.stepsCiphertext, key);
     return {
       id: plan.id,
@@ -883,6 +895,8 @@ export const createApiContext = async (config: ApiConfig, overrides: ApiOverride
       branchName: content.branchName ?? plan.branchName,
       steps: content.steps,
       ...(content.outputs === undefined ? {} : { outputs: content.outputs }),
+      ...(content.presentation ? { presentation: content.presentation } : {}),
+      ...(content.directionEventId ? { directionEventId: content.directionEventId } : {}),
       createdBy: plan.createdBy,
       createdAt: plan.createdAt
     };

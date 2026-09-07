@@ -1,3 +1,4 @@
+import { TASK_TITLE_MAX_LENGTH } from '@athanor/contracts';
 import {
   AthanorError,
   buildConversationNameIndex,
@@ -8,38 +9,11 @@ import {
 } from '@athanor/core';
 import type { DataStore, TaskRecord } from '@athanor/data';
 import { errorFields, type Logger } from './log.js';
+import { TITLE_MAX_COST_USD } from './title-route.js';
 
-/**
- * Naming a conversation after it has said something.
- *
- * A new conversation is filed under the first ten words of the request, because that is all there
- * is at the moment it is created. It is a placeholder and it reads like one: three conversations
- * that begin "Have a look at the build and tell me" are three identical lines in the sidebar. Once
- * the first answer has landed there is enough to name it properly, and this is what does that.
- *
- * Three rules hold it in place, and all three are about not taking something from the owner:
- *
- * - The name is written only while it is still the placeholder. `setGeneratedTaskTitle` is
- *   conditional on that in SQL, so an owner who renames the conversation while the model is
- *   thinking keeps their name and the late answer is dropped.
- * - The conversation is named by the model it already ran on. A cheaper model would be a second
- *   disclosure of the same request to a route the owner did not choose for it; this one has
- *   already seen every word of it.
- * - It is spending, so it goes through the same ceilings everything else does and is recorded in
- *   the same ledger. A box that has reached its cap keeps its placeholders.
- */
-
-/** What a sidebar line can show before it is cut off anyway. */
-export const MAX_GENERATED_TITLE_LENGTH = 60;
-
-/**
- * What one title is assumed to cost when it is weighed against the spending caps.
- *
- * A guess, and deliberately a generous one: the real cost arrives with the answer and is what gets
- * recorded. It only has to be large enough that a box sitting exactly on its ceiling stops naming
- * conversations instead of stepping over it.
- */
-const TITLE_ESTIMATE_USD = 0.005;
+/** Owner names win; the main task can supply its headline without an auxiliary model call. */
+/** Input safety bound; the interface handles visual truncation without changing the name. */
+export const MAX_GENERATED_TITLE_LENGTH = TASK_TITLE_MAX_LENGTH;
 
 /** How many conversations one sweep names, so a backlog is worked through rather than swallowed. */
 const TITLES_PER_SWEEP = 5;
@@ -105,7 +79,7 @@ const SHUTDOWN_GRACE_MS = 2_000;
 const PROMPT_EXCERPT_CHARACTERS = 2_000;
 
 export const TITLE_SYSTEM_PROMPT =
-  'You name conversations. Reply with nothing but a title of at most six words saying what the request is about, in the language the request is written in. No quotation marks, no final full stop, no preamble.';
+  'You name conversations. Reply with nothing but a clear, specific title naming the request and its intended outcome. Keep it concise, but preserve the details needed to distinguish this work, in the language the request is written in. No quotation marks, no final full stop, no preamble.';
 
 /**
  * Turns whatever the model said into a name, or nothing.
@@ -114,6 +88,14 @@ export const TITLE_SYSTEM_PROMPT =
  * string, or a sentence the rest of the time. What cannot be reduced to a plausible line is
  * refused: the placeholder is a poor name, and a paragraph in the sidebar is a worse one.
  */
+export const openingTaskTitle = (prompt: string): string =>
+  prompt
+    .trim()
+    .split(/\n\s*\n/, 1)[0]!
+    .replace(/\s+/g, ' ')
+    .slice(0, TASK_TITLE_MAX_LENGTH)
+    .trim();
+
 export const cleanGeneratedTitle = (raw: string): string | null => {
   const firstLine = raw
     .split('\n')
@@ -127,18 +109,13 @@ export const cleanGeneratedTitle = (raw: string): string | null => {
     .replace(/\s+/g, ' ')
     .trim();
   if (!stripped) return null;
-  if (stripped.length <= MAX_GENERATED_TITLE_LENGTH) return stripped;
-  // Cut at a word boundary when there is one to cut at, so a long name ends on a word rather than
-  // mid-syllable. Scripts that do not space their words fall back to the hard limit.
-  const cut = stripped.slice(0, MAX_GENERATED_TITLE_LENGTH);
-  const lastSpace = cut.lastIndexOf(' ');
-  return (lastSpace > MAX_GENERATED_TITLE_LENGTH / 2 ? cut.slice(0, lastSpace) : cut).trim();
+  return stripped.length <= MAX_GENERATED_TITLE_LENGTH ? stripped : null;
 };
 
 /** What the provider call has to give back for a title to be written and paid for. */
 export interface TitleCompletion {
   readonly text: string;
-  readonly costUsd: number;
+  readonly costUsd: number | null;
   readonly inputTokens: number;
   readonly outputTokens: number;
   readonly providerRef: string;
@@ -149,19 +126,20 @@ export interface TaskTitlerDeps {
   readonly store: DataStore;
   readonly masterKey: Buffer;
   readonly log: Logger;
-  /**
-   * One naming call on the conversation's own model. Null means this box cannot make it right now
-   * - no provider configured, or the model the conversation ran on is no longer in the catalogue -
-   * which is a reason to leave the placeholder alone rather than an error to report.
-   */
+  /** No bounded route is a skip; a provider outage starts a shared cooldown. */
   readonly complete: (input: {
     userId: string;
     modelId: string;
     privacyRoute: string;
     prompt: string;
+    beforeSubmit?: (admission: {
+      costUsd: number;
+      providerRef: string;
+      modelId: string;
+    }) => Promise<void>;
     /** Aborted when the process is shutting down, so a restart never waits out a provider call. */
     signal?: AbortSignal;
-  }) => Promise<TitleCompletion | null>;
+  }) => Promise<TitleCompletion | { skipped: true } | null>;
 }
 
 const recordAttempt = (attempts: Map<string, number>, taskId: string): void => {
@@ -180,7 +158,7 @@ const titleOneTask = async (
   deps: TaskTitlerDeps,
   task: TaskRecord,
   signal?: AbortSignal
-): Promise<'named' | 'not_now' | 'unusable' | 'provider_failed'> => {
+): Promise<'named' | 'not_now' | 'unusable' | 'provider_failed' | 'skipped'> => {
   const workspace = await deps.store.getWorkspaceById(task.workspaceId);
   if (!workspace?.wrappedKey) return 'not_now';
   const key = unwrapDataKey(workspace.wrappedKey, deps.masterKey, workspace.id);
@@ -191,36 +169,69 @@ const titleOneTask = async (
   const decision = await deps.store.spendGuard({
     userId: task.userId,
     taskId: task.id,
-    estimateUsd: TITLE_ESTIMATE_USD
+    estimateUsd: TITLE_MAX_COST_USD
   });
   if (decision.outcome === 'deny') return 'not_now';
 
+  let reserved = false;
   const completion = await deps.complete({
     userId: task.userId,
     modelId: task.modelId,
     privacyRoute: task.privacyRoute,
     prompt: prompt.slice(0, PROMPT_EXCERPT_CHARACTERS),
+    beforeSubmit: async (admission) => {
+      signal?.throwIfAborted();
+      if (
+        !Number.isFinite(admission.costUsd) ||
+        admission.costUsd < 0 ||
+        admission.costUsd > TITLE_MAX_COST_USD
+      )
+        throw new AthanorError(
+          'title_cost_invalid',
+          'Title generation exceeds its spending limit',
+          409
+        );
+      await deps.store.recordUsage({
+        userId: task.userId,
+        workspaceId: workspace.id,
+        taskId: task.id,
+        kind: 'model_inference',
+        resourceClass: 'model:task-title',
+        quantity: 0,
+        unit: 'tokens',
+        credits: 0,
+        state: 'reserved',
+        reserveAgainstCaps: true,
+        idempotencyKey: `task:${task.id}:title`,
+        providerRef: admission.providerRef,
+        modelId: admission.modelId,
+        costUsd: admission.costUsd
+      });
+      reserved = true;
+      signal?.throwIfAborted();
+    },
     ...(signal ? { signal } : {})
   });
   if (!completion) return 'provider_failed';
+  if ('skipped' in completion) return 'skipped';
 
-  // Recorded before the title is written, and keyed on the task, so a crash in between leaves a
-  // charge the owner can see rather than a name they were billed for invisibly. The key also makes
-  // a second attempt at the same conversation free of a second ledger row.
-  await deps.store.recordUsage({
-    userId: task.userId,
-    workspaceId: workspace.id,
-    taskId: task.id,
-    kind: 'model_inference',
-    resourceClass: completion.resourceClass,
-    quantity: completion.inputTokens + completion.outputTokens,
-    unit: 'tokens',
-    credits: 0,
-    state: 'settled',
-    idempotencyKey: `task:${task.id}:title`,
-    providerRef: completion.providerRef,
-    costUsd: completion.costUsd
-  });
+  // Missing usage retains the bounded reservation instead of inventing a zero charge.
+  if (completion.costUsd !== null)
+    await deps.store.recordUsage({
+      userId: task.userId,
+      workspaceId: workspace.id,
+      taskId: task.id,
+      kind: 'model_inference',
+      resourceClass: reserved ? 'model:task-title' : completion.resourceClass,
+      quantity: completion.inputTokens + completion.outputTokens,
+      unit: 'tokens',
+      credits: 0,
+      state: 'settled',
+      ...(reserved ? { settleReservation: true } : {}),
+      idempotencyKey: `task:${task.id}:title`,
+      providerRef: completion.providerRef,
+      costUsd: completion.costUsd
+    });
 
   const title = cleanGeneratedTitle(completion.text);
   if (!title) return 'unusable';
@@ -260,6 +271,9 @@ export const titleTasksOnce = async (
       if (outcome === 'named') {
         named += 1;
         deps.log.debug('task.titled', { taskId: task.id, modelId: task.modelId });
+      } else if (outcome === 'skipped') {
+        if (state.attempts.size >= MAX_TRACKED_ATTEMPTS) state.attempts.clear();
+        state.attempts.set(task.id, MAX_ATTEMPTS_PER_TASK);
       } else if (outcome === 'unusable') {
         recordAttempt(state.attempts, task.id);
       } else if (outcome === 'provider_failed') {
@@ -272,6 +286,11 @@ export const titleTasksOnce = async (
       // A wall reached us as a throw rather than as `null`. It is still a wall: stand down for the
       // cooldown and say so once, rather than charging this conversation an attempt it did not get
       // and asking the same refusing provider again for the next one.
+      if (
+        error instanceof AthanorError &&
+        ['media_submission_exists', 'spend_cap_reached'].includes(error.code)
+      )
+        continue;
       if (error instanceof AthanorError && PROVIDER_WALL_CODES.has(error.code)) {
         state.providerReadyAt = now + PROVIDER_COOLDOWN_MS;
         deps.log.warn('task.title_provider_unavailable', { code: error.code });

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { verifyCapabilityToken } from '@athanor/core';
+import { verifyCapabilityToken, wrapDataKey } from '@athanor/core';
 import type { ModelRelease } from '@athanor/contracts';
 import type { DataStore, TaskRecord } from '@athanor/data';
 import type { ModelResponse, ModelToolCall } from '@athanor/model-gateway';
@@ -185,6 +185,14 @@ const runMission = async (
   const runner = options.client ?? stub;
   const context = {
     store: {
+      getUserById: async () => ({ preferences: {} }),
+      getProjectModelPreferences: async () => ({
+        projectTaskId: taskId,
+        workspaceId,
+        wrappedKey: wrapDataKey(new Uint8Array(32), Buffer.alloc(32, 5), workspaceId),
+        revision: 0,
+        choicesCiphertext: null
+      }),
       listModels: async () => [model],
       effectiveSpendLimits: async () => ({ timeZone: 'UTC' }),
       recordUsage: async () => undefined,
@@ -210,7 +218,7 @@ const runMission = async (
     consequentialApproved: false,
     webPlan: options.webPlan ?? { mode: 'in_house' },
     state,
-    inferenceCredential: async () => ({}),
+    inferenceCredential: async () => ({ provider: 'openai-compatible' }),
     providerWebSearch: async () => ({}),
     missingBinaries: async () => [],
     // The real dispatcher, which is what this harness's own header says it drives. It arrives on

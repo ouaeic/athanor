@@ -262,6 +262,94 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
         )}
       </Section>
       <Section
+        title="Specialist defaults"
+        description="Used by projects that inherit these choices. These agents use the same connected provider and task approval rules."
+      >
+        {preferences.value && (
+          <form
+            className="stack"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const form = new FormData(event.currentTarget);
+              const modelPurposes = Object.fromEntries(
+                ['specialist', 'coding'].map((purpose) => [
+                  purpose,
+                  {
+                    automatic: fieldValue(form, `${purpose}-model`) === '',
+                    modelId: fieldValue(form, `${purpose}-model`),
+                    preference: fieldValue(form, `${purpose}-preference`)
+                  }
+                ])
+              );
+              void action.run(
+                () => put('/v1/account/preferences', { modelPurposes }),
+                'Specialist defaults saved'
+              );
+            }}
+          >
+            {(['specialist', 'coding'] as const).map((purpose) => (
+              <div className="management-grid" key={purpose}>
+                <Field label={purpose === 'specialist' ? 'Research specialists' : 'Coding agents'}>
+                  <select
+                    name={`${purpose}-model`}
+                    defaultValue={
+                      preferences.value?.preferences.modelPurposes?.[purpose]?.automatic === false
+                        ? preferences.value.preferences.modelPurposes[purpose]?.modelId
+                        : ''
+                    }
+                  >
+                    <option value="">Automatic</option>
+                    {preferences.value?.preferences.modelPurposes?.[purpose]?.automatic === false &&
+                      !models.value?.some(
+                        (model) =>
+                          model.id ===
+                          preferences.value?.preferences.modelPurposes?.[purpose]?.modelId
+                      ) && (
+                        <option
+                          value={preferences.value.preferences.modelPurposes[purpose]?.modelId}
+                        >
+                          {preferences.value.preferences.modelPurposes[purpose]?.modelId} ·
+                          unavailable
+                        </option>
+                      )}
+                    {models.value?.map((model) => (
+                      <option
+                        value={model.id}
+                        key={model.id}
+                        disabled={
+                          model.availability !== 'available' &&
+                          model.id !==
+                            preferences.value?.preferences.modelPurposes?.[purpose]?.modelId
+                        }
+                      >
+                        {model.displayName}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <Field label="Preference">
+                  <select
+                    name={`${purpose}-preference`}
+                    defaultValue={
+                      preferences.value?.preferences.modelPurposes?.[purpose]?.preference ??
+                      'balanced'
+                    }
+                  >
+                    <option value="balanced">Balanced</option>
+                    <option value="fast">Faster</option>
+                    <option value="best">Higher quality</option>
+                  </select>
+                </Field>
+              </div>
+            ))}
+            <Button type="submit" busy={action.busy}>
+              Save specialist defaults
+            </Button>
+            <ActionFeedback action={action} />
+          </form>
+        )}
+      </Section>
+      <Section
         title="Images, video, voice and transcription"
         description="Choose from the generation routes your provider makes available."
       >
@@ -274,31 +362,31 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
               const form = new FormData(event.currentTarget);
               void action.run(async () => {
                 const choices = Object.fromEntries(
-                  media
-                    .value!.modalities.filter((item) => item.available)
-                    .flatMap((item) => {
-                      const modelId =
-                        mediaSelections[item.modality] ??
-                        (item.choice.automatic ? '' : item.choice.modelId);
-                      const option = item.options.find((candidate) => candidate.id === modelId);
-                      if (mediaRouteIsRetired(option) || option?.unavailableReason) {
-                        if (!item.choice.automatic && modelId === item.choice.modelId) return [];
-                        throw new Error(
-                          option?.unavailableReason ??
-                            'This generation route has retired. Choose an available model.'
-                        );
-                      }
-                      return [
-                        [
-                          item.modality,
-                          {
-                            automatic: modelId === '',
-                            preference: fieldValue(form, `${item.modality}-preference`),
-                            modelId
-                          }
-                        ]
-                      ];
-                    })
+                  media.value!.modalities.flatMap((item) => {
+                    if (!item.available) return [[item.modality, item.choice]];
+                    const modelId =
+                      mediaSelections[item.modality] ??
+                      (item.choice.automatic ? '' : item.choice.modelId);
+                    const option = item.options.find((candidate) => candidate.id === modelId);
+                    if (mediaRouteIsRetired(option) || option?.unavailableReason) {
+                      if (!item.choice.automatic && modelId === item.choice.modelId)
+                        return [[item.modality, item.choice]];
+                      throw new Error(
+                        option?.unavailableReason ??
+                          'This generation route has retired. Choose an available model.'
+                      );
+                    }
+                    return [
+                      [
+                        item.modality,
+                        {
+                          automatic: modelId === '',
+                          preference: fieldValue(form, `${item.modality}-preference`),
+                          modelId
+                        }
+                      ]
+                    ];
+                  })
                 );
                 await put('/v1/media/models', choices);
                 setMediaSelections({});
@@ -343,9 +431,7 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
                               }))
                             }
                           >
-                            <option value="">
-                              {item.modality === 'video' ? 'No video model selected' : 'Automatic'}
-                            </option>
+                            <option value="">Automatic</option>
                             {item.options.map((option) => (
                               <option
                                 value={option.id}

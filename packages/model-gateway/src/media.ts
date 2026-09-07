@@ -338,7 +338,9 @@ export class MediaClient {
 
   async generate(input: MediaRequest): Promise<GeneratedMediaResult> {
     this.#validate(input);
+    input.signal?.throwIfAborted();
     await input.onBeforeSubmit?.();
+    input.signal?.throwIfAborted();
     return input.kind === 'image' ? this.#image(input) : this.#speech(input);
   }
 

@@ -179,7 +179,7 @@ describe('selected media route through the authenticated settings API', () => {
       independent.mediaRoutesFor(secret, {
         image: { automatic: false, preference: 'best', modelId: 'openrouter/vendor/draw' }
       })
-    ).rejects.toThrow('Image metadata unavailable');
+    ).rejects.toThrow('selected media route is unavailable');
   });
   it('never transfers cached routes to another credential when discovery fails', async () => {
     fail = true;

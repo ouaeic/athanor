@@ -1,0 +1,287 @@
+.garden-top-tools.work-tools {
+  margin: 0 0 0.75rem;
+  padding: 0.65rem 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  align-items: center;
+}
+.garden-autonomy {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  column-gap: 1.5rem;
+  row-gap: 0.35rem;
+  margin-bottom: 0.75rem;
+  min-width: 0;
+}
+.garden-autonomy-control {
+  display: flex;
+  align-items: center;
+  flex: 0 1 390px;
+  min-width: 0;
+  gap: 1rem;
+}
+.garden-autonomy-control > label {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.garden-autonomy-track {
+  flex: 1;
+  min-width: 0;
+}
+.garden-autonomy-track input {
+  width: 100%;
+  height: 24px;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  accent-color: var(--accent, #9caf88);
+}
+.garden-autonomy-track > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.garden-autonomy-track button {
+  padding: 0.3rem 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 11px;
+  min-height: 28px;
+  opacity: 0.68;
+  cursor: pointer;
+}
+.garden-autonomy-track button[aria-pressed='true'] {
+  opacity: 1;
+  font-weight: 650;
+}
+.garden-autonomy details {
+  border: 0;
+  margin: 0;
+  font-size: 11px;
+}
+.garden-autonomy details summary {
+  cursor: pointer;
+  min-height: 32px;
+  padding: 0.45rem 0;
+  color: var(--muted);
+}
+.garden-autonomy details[open] {
+  flex-basis: 100%;
+}
+.garden-autonomy details p {
+  max-width: 70ch;
+  line-height: 1.6;
+}
+.garden-preview-state {
+  padding: 1.25rem;
+  line-height: 1.6;
+}
+.garden-preview-live {
+  position: relative;
+  min-width: 0;
+}
+.garden-preview-live > .garden-preview-state {
+  border-top: 1px solid currentColor;
+}
+@media (max-width: 520px) {
+  .garden-autonomy-control {
+    width: 100%;
+    flex-basis: 100%;
+    gap: 12px;
+  }
+}
+.garden-work-surface {
+  display: grid;
+  gap: 1rem;
+  min-width: 0;
+}
+.garden-work-surface > h2 {
+  margin: 0;
+  font-size: 1.5rem;
+}
+.garden-work-block {
+  min-width: 0;
+  border: 1px solid var(--line, #727c6940);
+  border-radius: 1rem;
+  padding: 1.15rem;
+  background: var(--panel);
+}
+.garden-work-block h3 {
+  margin: 0 0 0.9rem;
+  font-size: 1.05rem;
+}
+.garden-work-block h4 {
+  margin: 0.35rem 0;
+}
+.garden-work-block p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.6;
+}
+.garden-block-sections {
+  display: grid;
+  gap: 1rem;
+}
+.garden-block-sections.cards {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr));
+}
+.garden-block-sections.timeline {
+  border-left: 2px solid var(--accent, #9caf88);
+  padding-left: 1.1rem;
+}
+.garden-block-sections small {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.garden-block-table {
+  max-width: 100%;
+  overflow: auto;
+}
+.garden-block-table table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+}
+.garden-block-table th,
+.garden-block-table td {
+  padding: 0.7rem;
+  vertical-align: top;
+  border-bottom: 1px solid var(--line, #727c6940);
+  min-width: 6rem;
+  overflow-wrap: anywhere;
+}
+.garden-block-evidence {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin-top: 0.35rem;
+}
+.garden-block-evidence .button {
+  font-size: 0.72rem;
+  padding: 0.3rem 0.5rem;
+}
+.garden-block-checklist {
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 1rem;
+}
+.garden-block-checklist li {
+  display: flex;
+  gap: 0.75rem;
+}
+.garden-check-state {
+  flex: 0 0 4rem;
+  font-size: 0.72rem;
+  padding-top: 0.2rem;
+  text-transform: uppercase;
+}
+.garden-check-state.done {
+  color: var(--accent, #9caf88);
+}
+.garden-chart-row {
+  display: grid;
+  grid-template-columns: minmax(6rem, 1fr) minmax(4rem, 2fr) auto;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+.garden-chart-row > .garden-block-evidence {
+  grid-column: 1 / -1;
+}
+.garden-chart-bar-track {
+  height: 1rem;
+  background: var(--line, #727c6920);
+}
+.garden-chart-bar-track i {
+  display: block;
+  height: 100%;
+  background: var(--accent, #9caf88);
+}
+.garden-chart-bar-track i.negative {
+  background: var(--danger, #c48875);
+}
+.garden-recorded-actions > div {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.5rem 0;
+}
+.garden-surface-sources ul {
+  padding: 0;
+  list-style: none;
+}
+.garden-surface-sources li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.5rem 0;
+}
+.garden-surface-sources li > a {
+  flex: 1 1 15rem;
+  overflow-wrap: anywhere;
+}
+.garden-directions {
+  display: grid;
+  gap: 0.7rem;
+  margin: 0.5rem 0 1.25rem;
+}
+.garden-direction {
+  border: 1px solid var(--line, #727c6940);
+  border-radius: 0.85rem;
+  padding: 0.85rem 1rem;
+}
+.garden-direction > header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+}
+.garden-direction p {
+  margin: 0.6rem 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.6;
+}
+.garden-direction .garden-acknowledgment {
+  border-top: 1px solid var(--line, #727c6940);
+  padding-top: 0.7rem;
+}
+.garden-prior-direction {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  padding: 0.35rem 0;
+}
+.garden-prior-direction > span {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.garden-prior-direction > div {
+  flex: 1;
+  min-width: 0;
+}
+.garden-prior-direction > div > span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.garden-prior-direction p {
+  font-size: 0.8rem;
+  margin: 0.3rem 0;
+  overflow-wrap: anywhere;
+}

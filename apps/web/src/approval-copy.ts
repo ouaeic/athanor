@@ -1,3 +1,5 @@
+export const APPROVAL_NOTE_MAX_CHARS = 600;
+
 export const approvalToolPhrases: Record<string, string> = {
   audio_read: 'Read audio',
   browser_action: 'Use the browser',

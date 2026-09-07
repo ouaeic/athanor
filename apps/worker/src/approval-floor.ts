@@ -26,6 +26,7 @@ import {
 import type { AgentRunnerClient } from './runner-client.js';
 import { approvalRequirement, surfaceActionRequest, type ApprovalContext } from './tools.js';
 import { textValue } from './values.js';
+import { pinMediaGenerationApproval } from './media-approval.js';
 import { computationApproval } from './computation-approval.js';
 import { jobRecoveryApproval } from './job-recovery-approval.js';
 import {
@@ -38,7 +39,7 @@ export interface ApprovalFloorDeps {
   readonly store: DataStore;
   readonly masterKey: Buffer;
   readonly runner: AgentRunnerClient;
-  inferenceCredential(task: TaskRecord): Promise<InferenceCredential>;
+  inferenceCredential(task: TaskRecord, resolveMedia?: boolean): Promise<InferenceCredential>;
   destinationContext(state?: AgentState): DestinationContext;
 }
 
@@ -236,6 +237,23 @@ export const approvalForCall = async (
     )
       ? await transcriptionModelForCall(deps, task)
       : undefined;
+  const generation =
+    call.name === 'generate_media' &&
+    !['describe', 'status', 'library', 'batch'].includes(textValue(call.arguments.action))
+      ? await mediaModelForCall(deps, task, textValue(call.arguments.kind))
+      : undefined;
+  if (generation?.credential && state) {
+    const workspace = await deps.store.getWorkspaceById(task.workspaceId);
+    if (!workspace?.wrappedKey)
+      throw new AthanorError('media_route_unavailable', 'Media workspace is unavailable', 409);
+    pinMediaGenerationApproval(
+      unwrapDataKey(workspace.wrappedKey, deps.masterKey, workspace.id),
+      task,
+      state,
+      call,
+      generation.credential
+    );
+  }
   const declared = approvalRequirement(call.name, call.arguments, task.securityMode, {
     ...(call.name === 'generate_media'
       ? {
@@ -244,7 +262,7 @@ export const approvalForCall = async (
           // quoted the reviewed default's figure at an owner who had chosen something ten times
           // the price, and it applied a cumulative threshold to a route whose price nobody
           // published - which is the one case that has to ask every time instead.
-          ...(await mediaModelForCall(deps, task, textValue(call.arguments.kind)))
+          ...(generation?.mediaModel ? { mediaModel: generation.mediaModel } : {})
         }
       : {}),
     // Reading a recording lands on the same bill as making one, so it meets the same cumulative
@@ -372,10 +390,13 @@ export const mediaModelForCall = async (
   deps: ApprovalFloorDeps,
   task: TaskRecord,
   kind: string
-): Promise<{ mediaModel?: ResolvedMediaModel }> => {
+): Promise<{ mediaModel?: ResolvedMediaModel; credential?: InferenceCredential }> => {
   if (kind !== 'image' && kind !== 'audio' && kind !== 'video') return {};
-  const secret = await deps.inferenceCredential(task).catch(() => undefined);
-  return { mediaModel: resolvedMediaModel(kind, secret?.mediaRoutes) };
+  const secret = await deps.inferenceCredential(task, true).catch(() => undefined);
+  return {
+    mediaModel: resolvedMediaModel(kind, secret?.mediaRoutes),
+    ...(secret ? { credential: secret } : {})
+  };
 };
 
 /** Price evidence is resolved from the selected credential, never from a previous invoice. */
@@ -383,7 +404,7 @@ export const transcriptionModelForCall = async (
   deps: ApprovalFloorDeps,
   task: TaskRecord
 ): Promise<{ mediaModel?: ResolvedMediaModel; credential?: InferenceCredential }> => {
-  const stored = await deps.inferenceCredential(task).catch(() => undefined);
+  const stored = await deps.inferenceCredential(task, true).catch(() => undefined);
   const secret = stored ? await currentTranscriptionCredential(stored) : undefined;
   const route = resolvedTranscriptionRoute(
     secret?.mediaRoutes,

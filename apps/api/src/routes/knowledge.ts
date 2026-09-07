@@ -272,7 +272,7 @@ export const registerKnowledgeRoutes = (context: RouteContext): void => {
         : decryptJson<MemoryDocument>(
             record.contentCiphertext,
             workspaceKey,
-            `workspace-memory:${workspaceId}`
+            `workspace-memory:${record.workspaceId ?? workspaceId}`
           );
     return { workspaceKey, ownerKey, open };
   };
@@ -1016,7 +1016,7 @@ export const registerKnowledgeRoutes = (context: RouteContext): void => {
           ...decryptJson<{ name: string; description: string; content: string }>(
             record.documentCiphertext,
             key,
-            `workspace-skill:${request.params.workspaceId}`
+            `workspace-skill:${record.workspaceId ?? request.params.workspaceId}`
           ),
           createdAt: record.createdAt,
           updatedAt: record.updatedAt

@@ -70,6 +70,23 @@ const fixture = async (status = 'running') => {
     store,
     database,
     masterKey,
+    runner: {
+      request: vi.fn(
+        async (input: { workspaceId: string; body?: BodyInit; role: string; scopes: string[] }) => {
+          expect(input.role).toBe('control');
+          expect(input.scopes).toEqual(['workspace.manage']);
+          if (typeof input.body !== 'string') throw Error('Expected preparation request JSON');
+          const body = JSON.parse(input.body) as { taskId: string; workspaceId: string };
+          return {
+            status: 'ready',
+            sourceWorkspaceId: input.workspaceId,
+            workspaceId: body.workspaceId,
+            taskId: body.taskId,
+            bytes: 0
+          };
+        }
+      )
+    },
     config: { TASK_MAX_STEPS: 20 },
     modelsForUser: async () => [model],
     privateTaskResponse: async (value: TaskRecord) => value,
@@ -96,6 +113,17 @@ describe('confirmed continuation within existing task authority', () => {
       reasoningEffort: 'high',
       privacyRoute: f.task.privacyRoute,
       interrupt: false
+    });
+    const queueEvents = await store.listTaskEvents(f.task.id, 0, {
+      kind: 'queued_message',
+      limit: 1
+    });
+    expect(queueEvents).toHaveLength(1);
+    expect(
+      decryptJson(queueEvents[0]!.payloadCiphertext!, key, `task-event:${f.task.id}`)
+    ).toMatchObject({
+      markdown: 'Check the result',
+      messageId: queued!.id
     });
     expect(f.resolveSpendCeiling).not.toHaveBeenCalled();
     await database.query("UPDATE tasks SET lease_owner='worker' WHERE id=$1", [f.task.id]);
@@ -264,6 +292,7 @@ describe('confirmed continuation within existing task authority', () => {
       maxComputeCredits: 2,
       maxSpendUsd: 2
     });
+    expect((await store.getTask(f.user.id, f.task.id))?.workspaceId).not.toBe(f.task.workspaceId);
     expect(await store.getNextQueuedTaskMessage(f.task.id)).toMatchObject({
       maxComputeCredits: 50,
       maxSpendUsd: 2

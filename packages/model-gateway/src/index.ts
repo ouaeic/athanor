@@ -21,3 +21,5 @@ export { readBoundedMediaBody } from './media-output.js';
 export * from './realtime.js';
 export * from './realtime-catalog.js';
 export { nativeTranscriptionBound, type TranscriptionBound } from './transcription-cost.js';
+
+export * from './media-routing.js';

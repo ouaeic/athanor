@@ -174,7 +174,7 @@ export const registerUsageRoutes = (context: RouteContext): void => {
   app.get('/v1/usage', async (request) => {
     const user = requireUser(request.user);
     const period = currentPeriod();
-    const workspaces = await store.listWorkspaces(user.id);
+    const workspaces = await store.listWorkspaceMetadata(user.id);
     await Promise.all(workspaces.map(meterWorkspace));
     const totals = await store.usageTotals(user.id, period.start, period.end);
     // Re-read after metering: the records above were fetched before the walk, so summing them
@@ -238,7 +238,7 @@ export const registerUsageRoutes = (context: RouteContext): void => {
     // Unwrapped once per workspace rather than once per conversation: a box with three hundred
     // conversations in one workspace would otherwise unwrap the same key three hundred times.
     const keys = new Map<string, Uint8Array>();
-    for (const workspace of await store.listWorkspaces(user.id))
+    for (const workspace of await store.listWorkspaceMetadata(user.id))
       if (workspace.wrappedKey)
         keys.set(workspace.id, unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id));
 

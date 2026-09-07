@@ -107,6 +107,29 @@ const start = async (
         if (scripted !== undefined) return json(scripted);
         // Each route has to answer in the shape the worker parses. A generic {ok:true} reads as a
         // failed tool, which then fails verification - a real-looking failure with a fake cause.
+        if (path.endsWith('/project-execution')) {
+          if (init?.method !== 'POST' || typeof init.body !== 'string')
+            throw Error('Expected a JSON project preparation request');
+          const body = JSON.parse(init.body) as {
+            taskId: string;
+            workspaceId: string;
+            kind: string;
+            paths: string[];
+          };
+          expect(body).toEqual({
+            taskId: expect.any(String) as unknown,
+            workspaceId: expect.any(String) as unknown,
+            kind: 'new',
+            paths: ['workspace/AGENTS.md', 'workspace/ATHANOR.md', 'workspace/OPEN_CLOUD.md']
+          });
+          return json({
+            status: 'ready',
+            sourceWorkspaceId: path.split('/')[3],
+            workspaceId: body.workspaceId,
+            taskId: body.taskId,
+            bytes: 0
+          });
+        }
         if (path.endsWith('/exec'))
           return json({
             exitCode: 0,
@@ -316,7 +339,12 @@ const start = async (
           ...(options.taskSpendCapUsd === undefined ? {} : { maxSpendUsd: options.taskSpendCapUsd })
         }
       });
-      return response.json<{ id: string }>().id;
+      expect(response.statusCode, response.body).toBe(200);
+      const task = response.json<{ id: string; workspaceId: string; status: string }>();
+      expect(task.workspaceId).toMatch(/^[0-9a-f-]{36}$/);
+      expect(task.workspaceId).not.toBe(workspaceId);
+      expect(task.status).not.toBe('awaiting_resource');
+      return task.id;
     },
     settle: async (taskId, until = ['completed', 'failed', 'cancelled', 'awaiting_user']) => {
       const deadline = Date.now() + 20_000;
@@ -376,8 +404,8 @@ describe('a task from prompt to completion', () => {
     // retries invisibly shows up here as a bill, which is the only place the owner would otherwise
     // notice it - so naming the conversation is counted separately rather than folded in.
     expect(harness.completions()).toBe(3);
-    // And naming it costs exactly one cheap call, not one per turn.
-    expect(harness.titleCompletions()).toBe(1);
+    // This catalogue has no published prices, so auxiliary naming cannot buy an unbounded call.
+    expect(harness.titleCompletions()).toBe(0);
     expect(harness.runnerCalls().some((path) => path.includes('/exec'))).toBe(true);
   }, 30_000);
 

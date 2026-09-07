@@ -81,17 +81,28 @@ export class WorkspaceStore {
 
   async listWorkspaces(userId: string): Promise<WorkspaceRecord[]> {
     const result = await this.database.query(
-      `SELECT w.*, k.wrapped_key, k.wrapping_mode FROM workspaces w
+      `SELECT w.*, k.wrapped_key, k.wrapping_mode, w.storage_bytes+COALESCE((SELECT SUM(child.storage_bytes) FROM workspaces child WHERE child.parent_workspace_id=w.id),0) AS storage_bytes FROM workspaces w
        JOIN workspace_keys k ON k.workspace_id = w.id
-       WHERE w.user_id = $1 AND w.internal_parent_task_id IS NULL ORDER BY w.created_at DESC`,
+       WHERE w.user_id = $1 AND w.internal_parent_task_id IS NULL AND w.parent_workspace_id IS NULL ORDER BY w.created_at DESC`,
       [userId]
+    );
+    return result.rows.map(mapWorkspace);
+  }
+
+  /** Owner-scoped metadata for response serialization, including hidden project execution roots. */
+  async listWorkspaceMetadata(userId: string, ids?: string[]): Promise<WorkspaceRecord[]> {
+    if (ids?.length === 0) return [];
+    const result = await this.database.query(
+      `SELECT w.*, k.wrapped_key, k.wrapping_mode FROM workspaces w
+       JOIN workspace_keys k ON k.workspace_id=w.id WHERE w.user_id=$1 AND ($2::uuid[] IS NULL OR w.id=ANY($2::uuid[]))`,
+      [userId, ids ? [...new Set(ids)] : null]
     );
     return result.rows.map(mapWorkspace);
   }
 
   async getWorkspace(userId: string, id: string): Promise<WorkspaceRecord | null> {
     const result = await this.database.query(
-      `SELECT w.*,k.wrapped_key,k.wrapping_mode FROM workspaces w
+      `SELECT w.*,k.wrapped_key,k.wrapping_mode, w.storage_bytes+COALESCE((SELECT SUM(child.storage_bytes) FROM workspaces child WHERE child.parent_workspace_id=w.id),0) AS storage_bytes FROM workspaces w
        JOIN workspace_keys k ON k.workspace_id = w.id
        WHERE w.id=$1 AND w.user_id=$2`,
       [id, userId]
@@ -101,7 +112,7 @@ export class WorkspaceStore {
 
   async getWorkspaceById(id: string): Promise<WorkspaceRecord | null> {
     const result = await this.database.query(
-      `SELECT w.*, k.wrapped_key, k.wrapping_mode FROM workspaces w
+      `SELECT w.*, k.wrapped_key, k.wrapping_mode, w.storage_bytes+COALESCE((SELECT SUM(child.storage_bytes) FROM workspaces child WHERE child.parent_workspace_id=w.id),0) AS storage_bytes FROM workspaces w
        JOIN workspace_keys k ON k.workspace_id = w.id WHERE w.id = $1`,
       [id]
     );
@@ -139,7 +150,7 @@ export class WorkspaceStore {
 
   async listRunningWorkspaces(): Promise<WorkspaceRecord[]> {
     const result = await this.database.query(
-      `SELECT w.*,k.wrapped_key,k.wrapping_mode FROM workspaces w
+      `SELECT w.*,k.wrapped_key,k.wrapping_mode, w.storage_bytes+COALESCE((SELECT SUM(child.storage_bytes) FROM workspaces child WHERE child.parent_workspace_id=w.id),0) AS storage_bytes FROM workspaces w
        JOIN workspace_keys k ON k.workspace_id=w.id
        WHERE w.status='running'
        ORDER BY w.compute_metered_at ASC NULLS FIRST, w.id LIMIT 500`
@@ -220,7 +231,7 @@ export class WorkspaceStore {
     const result = await this.database.query(
       `SELECT s.id,s.workspace_id,s.name,s.status,s.size_bytes,s.created_at,s.updated_at
        FROM workspace_snapshots s JOIN workspaces w ON w.id=s.workspace_id
-       WHERE s.workspace_id=$2 AND w.user_id=$1
+       WHERE s.workspace_id IN (SELECT id FROM workspaces WHERE id=$2 OR id=(SELECT parent_workspace_id FROM workspaces WHERE id=$2 AND user_id=$1)) AND w.user_id=$1
        ORDER BY s.created_at DESC`,
       [userId, workspaceId]
     );
@@ -422,7 +433,7 @@ export class WorkspaceStore {
        WHERE m.user_id=$1
          AND (
            m.key_scope='user'
-           OR (m.workspace_id=$2 AND EXISTS (
+           OR (m.workspace_id IN (SELECT id FROM workspaces WHERE id=$2 OR id=(SELECT parent_workspace_id FROM workspaces WHERE id=$2 AND user_id=$1)) AND EXISTS (
              SELECT 1 FROM workspaces w WHERE w.id=$2 AND w.user_id=$1
            ))
          )
@@ -614,7 +625,7 @@ export class WorkspaceStore {
     const result = await this.database.query(
       `SELECT s.* FROM workspace_skills s
        JOIN workspaces w ON w.id=s.workspace_id
-       WHERE s.workspace_id=$2 AND w.user_id=$1
+       WHERE s.workspace_id IN (SELECT id FROM workspaces WHERE id=$2 OR id=(SELECT parent_workspace_id FROM workspaces WHERE id=$2 AND user_id=$1)) AND w.user_id=$1
        ORDER BY s.updated_at DESC,s.id`,
       [userId, workspaceId]
     );
@@ -629,7 +640,7 @@ export class WorkspaceStore {
     const result = await this.database.query(
       `SELECT s.* FROM workspace_skills s
        JOIN workspaces w ON w.id=s.workspace_id
-       WHERE s.id=$3 AND s.workspace_id=$2 AND w.user_id=$1`,
+       WHERE s.id=$3 AND s.workspace_id IN (SELECT id FROM workspaces WHERE id=$2 OR id=(SELECT parent_workspace_id FROM workspaces WHERE id=$2 AND user_id=$1)) AND w.user_id=$1`,
       [userId, workspaceId, id]
     );
     return result.rows[0] ? mapWorkspaceSkill(result.rows[0]) : null;
@@ -819,7 +830,7 @@ export class WorkspaceStore {
   ): Promise<Array<Record<string, unknown>>> {
     const result = await this.database.query(
       `SELECT a.* FROM artifacts a JOIN workspaces w ON w.id=a.workspace_id
-       WHERE a.workspace_id=$2 AND w.user_id=$1 AND ($3::uuid IS NULL OR a.task_id=$3)
+       WHERE (a.workspace_id=$2 OR ($3::uuid IS NULL AND w.parent_workspace_id=$2)) AND w.user_id=$1 AND ($3::uuid IS NULL OR a.task_id=$3)
        ORDER BY a.created_at DESC LIMIT $4`,
       [userId, workspaceId, taskId ?? null, limit ?? null]
     );

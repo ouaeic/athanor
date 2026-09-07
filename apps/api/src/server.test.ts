@@ -42,6 +42,35 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
+/** The native preparation handshake, including its exact task/source/target binding. */
+const projectPreparationFixture = (url: string, init?: RequestInit): Response | null => {
+  const match = new URL(url).pathname.match(
+    /^\/v1\/workspaces\/([0-9a-f-]{36})\/project-execution$/
+  );
+  if (!match) return null;
+  if (init?.method !== 'POST' || typeof init.body !== 'string')
+    throw Error('Expected a JSON project preparation request');
+  const body = JSON.parse(init.body) as {
+    taskId: string;
+    workspaceId: string;
+    paths: string[];
+    kind: string;
+  };
+  expect(body.taskId).toMatch(/^[0-9a-f-]{36}$/);
+  expect(body.workspaceId).toMatch(/^[0-9a-f-]{36}$/);
+  expect(body.workspaceId).not.toBe(match[1]);
+  expect(['new', 'legacy']).toContain(body.kind);
+  expect(Array.isArray(body.paths)).toBe(true);
+  expect(body.paths.length).toBeLessThanOrEqual(128);
+  return Response.json({
+    status: 'ready',
+    sourceWorkspaceId: match[1],
+    workspaceId: body.workspaceId,
+    taskId: body.taskId,
+    bytes: 0
+  });
+};
+
 describe('API production boundaries', () => {
   test('replays primary-computer creation and exposes only hosted model routes', async () => {
     let provisioningCalls = 0;
@@ -52,6 +81,8 @@ describe('API production boundaries', () => {
       'fetch',
       vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
         const requestUrl = input instanceof Request ? input.url : input.toString();
+        const prepared = projectPreparationFixture(requestUrl, init);
+        if (prepared) return prepared;
         if (requestUrl.includes('/models?output_modalities=transcription')) {
           return new Response(
             JSON.stringify({
@@ -1038,6 +1069,8 @@ describe('API production boundaries', () => {
     });
     expect(task.statusCode).toBe(200);
     const taskId = task.json<{ id: string }>().id;
+    const taskExecutionWorkspaceId = task.json<{ workspaceId: string }>().workspaceId;
+    expect(taskExecutionWorkspaceId).not.toBe(workspaceId);
     expect(task.json()).toMatchObject({ securityMode: 'balanced', forkKind: null });
     const conversationSearch = await app.inject({
       method: 'GET',
@@ -1174,7 +1207,7 @@ describe('API production boundaries', () => {
     expect(events.statusCode).toBe(200);
     const busySnapshot = await app.inject({
       method: 'POST',
-      url: `/v1/workspaces/${workspaceId}/snapshots`,
+      url: `/v1/workspaces/${taskExecutionWorkspaceId}/snapshots`,
       headers: { cookie: cookie!, 'idempotency-key': 'snapshot-create-busy-0001' },
       payload: { name: 'Unsafe while task runs' }
     });
@@ -1187,8 +1220,12 @@ describe('API production boundaries', () => {
       payload: {}
     });
     expect(paused.json<{ status: string }>().status).toBe('paused');
-    const taskWorkspace = await store.getWorkspaceById(workspaceId);
-    const taskKey = unwrapDataKey(taskWorkspace!.wrappedKey!, Buffer.alloc(32, 7), workspaceId);
+    const taskWorkspace = await store.getWorkspaceById(taskExecutionWorkspaceId);
+    const taskKey = unwrapDataKey(
+      taskWorkspace!.wrappedKey!,
+      Buffer.alloc(32, 7),
+      taskExecutionWorkspaceId
+    );
     const checkpoint = encryptJson(
       {
         messages: [
@@ -2000,8 +2037,10 @@ describe('conversation management', () => {
   test('renames a conversation and deletes it owner-only', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn(async (input: string | URL | Request) => {
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
         const requestUrl = input instanceof Request ? input.url : input.toString();
+        const prepared = projectPreparationFixture(requestUrl, init);
+        if (prepared) return prepared;
         const json = (body: unknown) =>
           new Response(JSON.stringify(body), {
             status: 200,
@@ -2369,8 +2408,10 @@ describe('conversation management', () => {
 const stubProviderFetch = (onRunnerRequest?: (url: string) => void) =>
   vi.stubGlobal(
     'fetch',
-    vi.fn(async (input: string | URL | Request) => {
+    vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const requestUrl = input instanceof Request ? input.url : input.toString();
+      const prepared = projectPreparationFixture(requestUrl, init);
+      if (prepared) return prepared;
       const json = (body: unknown) =>
         new Response(JSON.stringify(body), {
           status: 200,
@@ -3801,16 +3842,38 @@ describe('operator-facing logs', () => {
  * which is what every test that does not care about money gets.
  */
 const stubProviderAndRunner = (
-  pricing: Record<string, { prompt: string; completion: string }> = {}
+  pricing: Record<string, { prompt: string; completion: string }> = {},
+  imageModel = false
 ): void => {
   vi.stubGlobal(
     'fetch',
-    vi.fn(async (input: string | URL | Request) => {
+    vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const requestUrl = input instanceof Request ? input.url : input.toString();
+      const prepared = projectPreparationFixture(requestUrl, init);
+      if (prepared) return prepared;
       const json = (body: unknown) =>
         new Response(JSON.stringify(body), {
           status: 200,
           headers: { 'content-type': 'application/json' }
+        });
+      if (imageModel && requestUrl.endsWith('/images/models'))
+        return json({
+          data: [
+            {
+              id: 'test/image-model',
+              name: 'Fixture image',
+              architecture: { output_modalities: ['image'] }
+            }
+          ]
+        });
+      if (imageModel && requestUrl.endsWith('/images/models/test/image-model/endpoints'))
+        return json({
+          endpoints: [
+            {
+              provider_tag: 'fixture-private',
+              pricing: [{ billable: 'output_image', unit: 'megapixel', cost_usd: 0.01 }]
+            }
+          ]
         });
       if (requestUrl.endsWith('/models'))
         return json({
@@ -3824,7 +3887,12 @@ const stubProviderAndRunner = (
         });
       if (requestUrl.endsWith('/endpoints/zdr'))
         return json({
-          data: seedModels().map((model) => ({ model_id: model.providerModelId, status: 0 }))
+          data: [
+            ...seedModels().map((model) => ({ model_id: model.providerModelId, status: 0 })),
+            ...(imageModel
+              ? [{ model_id: 'test/image-model', tag: 'fixture-private', status: 0 }]
+              : [])
+          ]
         });
       if (requestUrl.includes('/benchmarks?')) return json({ data: [] });
       return json({
@@ -8072,7 +8140,7 @@ describe('the routes nothing had ever asked', () => {
   test('reports readiness, changes a security mode, rotates a private link and remembers a media choice', async () => {
     // The runner stub that answers the preview port check, which is what stands between a request
     // for a private link and a 400 saying nothing is listening.
-    stubProviderAndRunner();
+    stubProviderAndRunner({}, true);
     const directory = await mkdtemp(join(tmpdir(), 'athanor-api-untested-routes-'));
     disposers.push(() => rm(directory, { recursive: true, force: true }));
     const { app, store, database } = await buildServer(isolatedConfig(directory), { masterKey });
@@ -8168,7 +8236,9 @@ describe('the routes nothing had ever asked', () => {
       method: 'PUT',
       url: '/v1/media/models',
       headers: { cookie, 'idempotency-key': 'untested-media' },
-      payload: { image: { automatic: false, preference: 'best', modelId: 'test/image-model' } }
+      payload: {
+        image: { automatic: false, preference: 'best', modelId: 'openrouter/test/image-model' }
+      }
     });
     expect(chosen.statusCode, chosen.body).toBe(200);
     const credential = (await store.getManagedProviderCredential(
@@ -8181,7 +8251,11 @@ describe('the routes nothing had ever asked', () => {
         masterKey,
         inferenceCredentialAad((await store.getWorkspaceById(workspaceId))!.userId)
       ).mediaModels?.image
-    ).toMatchObject({ automatic: false, preference: 'best', modelId: 'test/image-model' });
+    ).toMatchObject({
+      automatic: false,
+      preference: 'best',
+      modelId: 'openrouter/test/image-model'
+    });
 
     /*
      * Readiness, which is the gate an update should be checking and the one route that reports a
@@ -9307,18 +9381,32 @@ describe('round trips before the first token', () => {
   test('starts the independent reads on the send path together', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn(
-        async () =>
-          new Response(
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(input instanceof Request ? input.url : input.toString());
+        if (url.pathname.endsWith('/project-execution')) {
+          if (typeof init?.body !== 'string') throw Error('Expected preparation request JSON');
+          const body = JSON.parse(init.body) as { workspaceId: string; taskId: string };
+          return new Response(
             JSON.stringify({
-              ok: true,
-              storageBytes: 1_000,
-              hostStorageTotalBytes: 1_000_000_000,
-              hostStorageAvailableBytes: 900_000_000
+              status: 'ready',
+              sourceWorkspaceId: url.pathname.split('/')[3],
+              workspaceId: body.workspaceId,
+              taskId: body.taskId,
+              bytes: 0
             }),
             { status: 200, headers: { 'content-type': 'application/json' } }
-          )
-      )
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            storageBytes: 1_000,
+            hostStorageTotalBytes: 1_000_000_000,
+            hostStorageAvailableBytes: 900_000_000
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } }
+        );
+      })
     );
     const directory = await mkdtemp(join(tmpdir(), 'athanor-api-roundtrips-'));
     disposers.push(() => rm(directory, { recursive: true, force: true }));
@@ -9395,14 +9483,9 @@ describe('round trips before the first token', () => {
     const workspaceId = (JSON.parse(firstPaint.body) as { workspaces: Array<{ id: string }> })
       .workspaces[0]!.id;
 
-    /*
-     * The send. Fourteen links, and the four that are not this route's: two for the credential
-     * above, one to claim the idempotency key and one to settle it, and five for the spend guard -
-     * the ceiling, then `spendGuard`'s own four queries in `packages/data`. That guard is a bound
-     * and is deliberately not raced against the write it protects. The catalogue and the ranking
-     * over it now run inside the guard's chain rather than after it, and the reservation is
-     * written beside the timeline rather than in front of it.
-     */
+    // New projects also commit an execution journal, await its native receipt and atomically
+    // rebind their encrypted prompt/title. This measured depth includes that preparation;
+    // ordinary continuation keeps its separate bound below.
     const send = await serialDepth(() =>
       app.inject({
         method: 'POST',
@@ -9416,7 +9499,8 @@ describe('round trips before the first token', () => {
         }
       })
     );
-    expect(send.depth).toBeLessThanOrEqual(14);
+    expect(send.depth).toBeLessThanOrEqual(20);
+    expect(JSON.parse(send.body) as { workspaceId: string }).not.toMatchObject({ workspaceId });
     const taskId = (JSON.parse(send.body) as { id: string }).id;
 
     // A follow-up into a live conversation. The computer is the one link that genuinely waits:

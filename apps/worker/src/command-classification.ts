@@ -611,11 +611,9 @@ const withoutRunners = (tokens: readonly string[]): string[] => {
   }
 };
 
+export const shellInterpreters = new Set(['sh', 'bash', 'dash', 'zsh']);
 export const commandInterpreters = new Set([
-  'sh',
-  'bash',
-  'dash',
-  'zsh',
+  ...shellInterpreters,
   'python',
   'python3',
   'node',
@@ -691,8 +689,56 @@ export const commandScript = (args: Record<string, unknown>): string => {
  */
 const HARMLESS_REDIRECT_TARGET = /^(?:\/dev\/(?:null|stdout|stderr|zero|tty)|\/(?:var\/)?tmp\/)/;
 const escapingRedirect = (body: string): boolean => {
-  for (const match of body.matchAll(/(?<![->\d])>>?\s*['"]?((?:\/|~\/|\.\.\/)[^\s'";|&)]*)/g)) {
-    if (!HARMLESS_REDIRECT_TARGET.test(match[1] ?? '')) return true;
+  // Quoted program text has no shell redirects. Command substitutions still execute inside
+  // double quotes, so their own quote scope must be inspected independently.
+  let quote = '';
+  const substitutions: Array<{ quote: string; depth: number; backtick: boolean }> = [];
+  for (let i = 0; i < body.length; i++) {
+    const character = body[i];
+    if (character === '\\' && quote !== "'") {
+      i++;
+      continue;
+    }
+    if (quote === "'") {
+      if (character === "'") quote = '';
+      continue;
+    }
+    if (character === '$' && body[i + 1] === '(') {
+      substitutions.push({ quote, depth: 1, backtick: false });
+      quote = '';
+      i++;
+      continue;
+    }
+    if (character === '`') {
+      const current = substitutions.at(-1);
+      if (current?.backtick) {
+        quote = current.quote;
+        substitutions.pop();
+      } else {
+        substitutions.push({ quote, depth: 0, backtick: true });
+        quote = '';
+      }
+      continue;
+    }
+    if (quote === '"') {
+      if (character === '"') quote = '';
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      continue;
+    }
+    const current = substitutions.at(-1);
+    if (current && !current.backtick) {
+      if (character === '(') current.depth++;
+      if (character === ')' && --current.depth === 0) {
+        quote = current.quote;
+        substitutions.pop();
+      }
+    }
+    if (character !== '>' || /[->\d]/.test(body[i - 1] ?? '')) continue;
+    const match = /^>>?\s*['"]?((?:\/|~\/|\.\.\/)[^\s'";|&)]*)/.exec(body.slice(i));
+    if (match && !HARMLESS_REDIRECT_TARGET.test(match[1] ?? '')) return true;
   }
   return false;
 };
@@ -722,7 +768,7 @@ const escapingRedirect = (body: string): boolean => {
 const DESTRUCTIVE_RUNTIME_CALL =
   /\.(?:rm|rmSync|rmdir|rmdirSync|unlink|unlinkSync|rmtree|removedirs)\s*\(/;
 
-export const isDestructiveScript = (body: string): boolean =>
+export const isDestructiveScript = (body: string, interpreter = 'sh'): boolean =>
   new RegExp(
     `(?<![\\w.])(?:${[...consequentialExecutables].join('|')}|mkfs[\\w.-]*|shutil\\.rmtree|os\\.(?:remove|removedirs|rmdir|unlink))(?![\\w])`
   ).test(body) ||
@@ -738,7 +784,7 @@ export const isDestructiveScript = (body: string): boolean =>
     ([head = '', ...rest]) =>
       (unquoted(head).split('/').pop() ?? '').toLowerCase() === 'git' && gitRemovesAWorktree(rest)
   ) ||
-  escapingRedirect(body);
+  (shellInterpreters.has(interpreter) && escapingRedirect(body));
 export const safeNetworkExecutables = new Set([
   'apt',
   'apt-get',

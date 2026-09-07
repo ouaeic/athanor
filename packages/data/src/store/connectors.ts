@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { AthanorError } from '@athanor/core';
 import type { EncryptedEnvelope } from '@athanor/core';
 import type { Database } from '../database.js';
-import { TaskSignals, TASK_QUEUE_CHANNEL } from './tasks.js';
+import { TaskSignals, TASK_QUEUE_CHANNEL, TASK_EVENT_CHANNEL } from './tasks.js';
 import { COMMITTED_TASK_STATUSES } from './sql/tasks.js';
 import type {
   ConnectorAuditRecord,
@@ -193,8 +193,11 @@ export class ConnectorStore {
   async resolveApproval(
     userId: string,
     id: string,
-    decision: 'approved' | 'denied'
+    decision: 'approved' | 'denied',
+    correction?: { promptCiphertext: EncryptedEnvelope; queuedEventCiphertext: EncryptedEnvelope }
   ): Promise<boolean> {
+    if (correction && decision !== 'denied')
+      throw new AthanorError('approval_correction_invalid', 'Only a denial may carry a correction');
     const resolved = await this.database.transaction(async (tx) => {
       // Cancellation locks the task before its decisions. Keep that order and hold the task
       // through settlement so a later pause or cancellation cannot be overwritten by queuing.
@@ -206,12 +209,54 @@ export class ConnectorStore {
       );
       const task = owned.rows[0];
       if (!task || ['completed', 'failed', 'cancelled'].includes(task.status)) return null;
+      if (
+        decision === 'approved' &&
+        (
+          await tx.query(
+            "SELECT 1 FROM project_executions WHERE task_id=$1 AND status='preparing'",
+            [task.task_id]
+          )
+        ).rows.length
+      )
+        return null;
+      if (
+        correction &&
+        (correction.promptCiphertext.aad !== `task-message:${task.task_id}` ||
+          correction.queuedEventCiphertext.aad !== `task-event:${task.task_id}`)
+      )
+        throw new AthanorError(
+          'approval_correction_invalid',
+          'Correction encryption context does not match the task'
+        );
       const changed = await tx.query(
         `UPDATE approvals SET status=$3,resolved_at=NOW()
          WHERE id=$1 AND user_id=$2 AND status='pending' AND expires_at > NOW()`,
         [id, userId, decision]
       );
       if (changed.rowCount !== 1) return null;
+      if (correction) {
+        const messageId = randomUUID();
+        await tx.query(
+          `INSERT INTO task_message_queue(
+             id,task_id,user_id,prompt_ciphertext,model_id,privacy_route,max_compute_credits,
+             resource_class,reservation_key,max_spend_usd,interrupt,reasoning_effort,approval_id
+           ) SELECT $1,id,user_id,$2::jsonb,model_id,privacy_route,0,
+             'task_compute',$3,NULL,TRUE,reasoning_effort,$4 FROM tasks WHERE id=$5`,
+          [
+            messageId,
+            JSON.stringify(correction.promptCiphertext),
+            `approval:${id}:denial`,
+            id,
+            task.task_id
+          ]
+        );
+        await tx.query(
+          `INSERT INTO task_events(id,task_id,sequence,kind,summary,payload_ciphertext)
+           SELECT $1,$2,COALESCE(MAX(sequence),0)+1,'queued_message','Approval correction queued',$3::jsonb
+           FROM task_events WHERE task_id=$2`,
+          [messageId, task.task_id, JSON.stringify(correction.queuedEventCiphertext)]
+        );
+      }
       const queued = await tx.query(
         `UPDATE tasks SET status='queued',lease_owner=NULL,lease_expires_at=NULL,
            spend_paused_at=NULL,attempt=0,updated_at=NOW()
@@ -221,6 +266,7 @@ export class ConnectorStore {
       return { taskId: task.task_id, queued: queued.rowCount === 1 };
     });
     if (resolved?.queued) this.taskSignals.signal(TASK_QUEUE_CHANNEL, resolved.taskId);
+    if (resolved && correction) this.taskSignals.signal(TASK_EVENT_CHANNEL, resolved.taskId);
     return resolved !== null;
   }
 

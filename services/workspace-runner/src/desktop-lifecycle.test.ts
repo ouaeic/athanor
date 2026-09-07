@@ -46,6 +46,7 @@ const starts: Array<{ root: string; display: string; child: Child }> = [];
 const spawned: Array<{ executable: string; args: readonly string[]; child: Child }> = [];
 const bridgeRequests: string[] = [];
 let blockedOperation = '';
+let windowList = '_NET_CLIENT_LIST(WINDOW): window id #\n';
 const environment = (display: string) =>
   `DISPLAY=:${display}\nDBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/bus\nXDG_RUNTIME_DIR=/nonexistent/runtime\n`;
 let readEnvironment = (root: string): Promise<string> =>
@@ -57,6 +58,7 @@ vi.mock('node:child_process', async (importOriginal) => {
     ...actual,
     spawn: (executable: string, args: readonly string[]) => {
       const child = new Child();
+      if (executable === '/usr/bin/xprop') queueMicrotask(() => child.stdout.write(windowList));
       spawned.push({ executable, args, child });
       if (executable === sessionExecutable)
         starts.push({ root: args[0]!, display: args[1]!, child });
@@ -112,6 +114,7 @@ afterEach(async () => {
   for (const entry of spawned.splice(0)) entry.child.finish();
   bridgeRequests.splice(0);
   blockedOperation = '';
+  windowList = '_NET_CLIENT_LIST(WINDOW): window id #\n';
   readEnvironment = (root) =>
     Promise.resolve(
       environment([...starts].reverse().find((entry) => entry.root === root)!.display)
@@ -120,6 +123,21 @@ afterEach(async () => {
 });
 
 describe('desktop session ownership', () => {
+  it('retires an unused empty display while preserving browsers, programs, and windows', async () => {
+    const { manager, root } = await setup();
+    const session = await manager.ensure(workspace, root);
+    expect(await manager.retireIdle(() => true, 0)).toEqual([]);
+    session.applicationGroups.add(99999);
+    expect(await manager.retireIdle(() => false, 0)).toEqual([]);
+    session.applicationGroups.clear();
+    windowList = '_NET_CLIENT_LIST(WINDOW): window id # 0x2001\n';
+    expect(await manager.retireIdle(() => false, 0)).toEqual([]);
+    windowList = 'unknown display';
+    expect(await manager.retireIdle(() => false, 0)).toEqual([]);
+    windowList = '_NET_CLIENT_LIST(WINDOW): window id #\n';
+    expect(await manager.retireIdle(() => false, 0)).toEqual([workspace]);
+    expect(session.process.exitCode).toBe(0);
+  });
   for (const ending of ['close', 'exit'] as const)
     for (const operation of ['ping', 'observe', 'act'] as const) {
       it(`rejects an active ${operation} and queued observation on ${ending} without fallback`, async () => {

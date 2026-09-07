@@ -106,16 +106,14 @@ describe('media model catalogue', () => {
     expect(rankMediaModels(models, 'fast')[0]?.id).toBe('cheaper');
   });
 
-  it('falls back to the automatic answer when a pinned model has left the catalogue', () => {
+  it('refuses to substitute another model when the pinned model has left the catalogue', () => {
     const models = [option({ id: 'still-here', usdPerImage: 0.02 })];
     const resolved = resolveMediaModel(
       models,
       { automatic: false, preference: 'balanced', modelId: 'withdrawn-last-month' },
       'image'
     );
-    // The alternative is a conversation that cannot generate anything because a provider retired a
-    // route months ago on an unattended box and nobody was watching.
-    expect(resolved?.id).toBe('still-here');
+    expect(resolved).toBeNull();
   });
 
   it('will not resolve to a model that cannot be chosen', () => {

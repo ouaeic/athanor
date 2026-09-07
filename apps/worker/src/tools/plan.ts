@@ -1,9 +1,16 @@
-import { TaskOutputIntents, type TaskOutputIntent, type TaskPlanStep } from '@athanor/contracts';
+import {
+  TaskOutputIntents,
+  type TaskOutputIntent,
+  type TaskPlanStep,
+  type WorkSurfaceReport
+} from '@athanor/contracts';
 import { decryptJson, encryptJson, AthanorError } from '@athanor/core';
 import { type ModelToolCall } from '@athanor/model-gateway';
 import { event } from '../tool-recording.js';
 import { planStepsFromArguments, textValue } from '../values.js';
 import { type ToolContext } from '../tool-dispatch.js';
+import { describeWorkSurface, validateWorkSurface } from '../work-surface.js';
+import { applyPresentationTitle } from '../presentation-title.js';
 
 /**
  * The plan tool: the one arm that writes the document the owner reads back.
@@ -17,18 +24,46 @@ export async function executePlanTool(context: ToolContext, call: ModelToolCall)
   const { task, key, state } = context;
   switch (call.name) {
     case 'set_plan': {
+      if (call.arguments.action === 'describe') return describeWorkSurface();
       const current = await context.store.getLatestTaskPlan(task.id);
       const previousPlan =
         current?.stepsCiphertext.aad === `task-plan:${task.id}`
-          ? decryptJson<{ steps: TaskPlanStep[]; outputs?: TaskOutputIntent[] }>(
-              current.stepsCiphertext,
-              key
-            )
+          ? decryptJson<{
+              steps: TaskPlanStep[];
+              outputs?: TaskOutputIntent[];
+              presentation?: WorkSurfaceReport;
+              directionEventId?: string;
+            }>(current.stepsCiphertext, key)
           : { steps: [] };
-      const steps = planStepsFromArguments(call.arguments.steps, previousPlan.steps);
+      const latestDirection = (
+        await context.store.listTaskEvents(task.id, 0, { kind: 'user_message', limit: 1 })
+      ).at(-1);
+      const directionEventId = latestDirection?.id;
+      if (call.arguments.presentation !== undefined && !directionEventId)
+        throw new AthanorError(
+          'presentation_direction_missing',
+          'The current owner direction is unavailable; reload the task before reporting.'
+        );
+      const sameDirection = previousPlan.directionEventId
+        ? previousPlan.directionEventId === directionEventId
+        : !latestDirection ||
+          !current ||
+          Date.parse(current.createdAt) >= Date.parse(latestDirection.createdAt);
+      const presentation =
+        call.arguments.presentation === undefined
+          ? sameDirection
+            ? previousPlan.presentation
+            : undefined
+          : await validateWorkSurface(context, call.arguments.presentation, directionEventId ?? '');
+      const steps =
+        call.arguments.steps === undefined && presentation && sameDirection
+          ? previousPlan.steps
+          : planStepsFromArguments(call.arguments.steps, sameDirection ? previousPlan.steps : []);
       const outputs =
         call.arguments.outputs === undefined
-          ? previousPlan.outputs
+          ? sameDirection
+            ? previousPlan.outputs
+            : undefined
           : TaskOutputIntents.parse(call.arguments.outputs);
       if (!steps.length)
         /*
@@ -50,20 +85,34 @@ export async function executePlanTool(context: ToolContext, call: ModelToolCall)
           expectedVersion: current?.version ?? 0,
           branchName,
           stepsCiphertext: encryptJson(
-            { steps, branchName, ...(outputs === undefined ? {} : { outputs }) },
+            {
+              steps,
+              branchName,
+              ...(outputs === undefined ? {} : { outputs }),
+              ...(directionEventId ? { directionEventId } : {}),
+              ...(presentation ? { presentation } : {})
+            },
             key,
             `task-plan:${task.id}`
           ),
           createdBy: 'agent'
         });
+        if (call.arguments.presentation !== undefined && presentation)
+          await applyPresentationTitle(context, presentation.content.title);
         await event(context.store, task, key, 'plan', `Plan version ${created.version}`, {
           planId: created.id,
           version: created.version,
           branchName,
           steps,
+          ...(directionEventId ? { directionEventId } : {}),
+          ...(presentation ? { presentation } : {}),
           ...(outputs === undefined ? {} : { outputs })
         });
-        return { version: created.version, steps };
+        return {
+          version: created.version,
+          steps,
+          ...(presentation ? { presentationUpdated: true } : {})
+        };
       } catch (cause) {
         if (cause instanceof Error && cause.message === 'plan_version_conflict')
           return {

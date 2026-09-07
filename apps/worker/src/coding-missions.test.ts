@@ -38,7 +38,32 @@ const digest = 'a'.repeat(64);
 describe('native coding tool and durable parent wait', () => {
   const database = createDatabase({ driver: 'pglite', pglitePath: ':memory:' }),
     store = new DataStore(database);
-  beforeAll(async () => migrateDatabase(database));
+  beforeAll(async () => {
+    await migrateDatabase(database);
+    await store.upsertModels([
+      {
+        id: 'model',
+        providerModelId: 'model',
+        displayName: 'Model',
+        provider: 'custom',
+        revision: 'test',
+        availability: 'available',
+        openness: 'remote_proprietary',
+        license: 'Provider-defined',
+        commercialUse: true,
+        privacyRoute: 'provider_zdr',
+        contextTokens: 128000,
+        modalities: ['text'],
+        capabilities: ['chat', 'tools', 'reasoning'],
+        usageClass: 'light',
+        recommendationTags: [],
+        measuredQuality: 0.8,
+        measuredLatencyMs: 100,
+        inputUsdPerMillionTokens: 0.1,
+        outputUsdPerMillionTokens: 0.2
+      }
+    ]);
+  });
   afterAll(async () => database.close());
   const fixture = async () => {
     const user = await store.createUser({ username: randomUUID(), displayName: 'Owner' }),
@@ -93,7 +118,8 @@ describe('native coding tool and durable parent wait', () => {
       masterKey: master,
       runner,
       state,
-      config: { WORKER_ID: 'worker' }
+      config: { WORKER_ID: 'worker' },
+      inferenceCredential: async () => ({ provider: 'openai-compatible' })
     } as unknown as ToolContext;
     return { context, runner, state, task, user, workspace };
   };

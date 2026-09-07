@@ -730,6 +730,7 @@ describe('effective price', () => {
  * that reads none of what it collected.
  */
 const everyRoutingField: Required<RoutingMetadata> = {
+  reasoning: { supportedEfforts: ['low', 'high', 'max'], defaultEffort: 'high', mandatory: true },
   metadataSource: 'measured',
   agenticIndex: 55.3,
   codingIndex: 78,

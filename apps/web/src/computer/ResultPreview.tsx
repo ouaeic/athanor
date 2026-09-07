@@ -5,6 +5,7 @@ import { shareArtifactDocument } from '../share-html.js';
 import { message, mimeTypeForFile } from './format.js';
 import '../computer.css';
 const Markdown = lazy(() => import('../MarkdownBody'));
+const PdfPreview = lazy(() => import('./PdfPreview'));
 
 export function ResultPreview({ artifact }: { artifact: Artifact }) {
   const url = `/v1/artifacts/${artifact.id}/content`;
@@ -15,6 +16,8 @@ export function ResultPreview({ artifact }: { artifact: Artifact }) {
   const [content, setContent] = useState<string | null>(null);
   const [error, setError] = useState('');
   useEffect(() => {
+    setContent(null);
+    setError('');
     if ((!plain && mime !== 'text/html') || artifact.sizeBytes > 262144) return;
     const controller = new AbortController();
     void fetch(url, { credentials: 'include', signal: controller.signal })
@@ -72,13 +75,9 @@ export function ResultPreview({ artifact }: { artifact: Artifact }) {
     );
   if (mime === 'application/pdf')
     return (
-      <iframe
-        className="computer-preview"
-        src={url}
-        title={artifact.name}
-        sandbox=""
-        referrerPolicy="no-referrer"
-      />
+      <Suspense fallback={<p className="muted">Opening document…</p>}>
+        <PdfPreview key={artifact.id} url={url} name={artifact.name} />
+      </Suspense>
     );
   if (plain && /\.md(?:own)?$/i.test(artifact.name) && artifact.sizeBytes <= 262144)
     return content === null ? (

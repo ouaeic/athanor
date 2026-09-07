@@ -1,4 +1,5 @@
 import type { ModelRelease, PrivacyRoute } from '@athanor/contracts';
+import { ReasoningOptions } from '@athanor/contracts';
 
 export type ModelCapability = ModelRelease['capabilities'][number];
 export type ModelModality = ModelRelease['modalities'][number];
@@ -72,6 +73,7 @@ export type RoutingMetadata = {
    * which is exactly what the zero-retention posture demands.
    */
   readonly supportsReasoningEffort?: boolean;
+  readonly reasoning?: NonNullable<ModelRelease['reasoning']> | undefined;
   readonly priceTiers?: readonly ModelPriceTier[];
   /** Worst one-day uptime across the endpoints that serve this model, as a percentage. */
   readonly uptimeLast1dPercent?: number | null;
@@ -140,6 +142,10 @@ const routingMetadataReaders: {
     value: unknown
   ) => Required<RoutingMetadata>[K] | undefined;
 } = {
+  reasoning: (value) => {
+    const parsed = ReasoningOptions.safeParse(value);
+    return parsed.success ? parsed.data : undefined;
+  },
   metadataSource: oneOf(['measured', 'declared', 'unknown']),
   agenticIndex: finiteNumberOrNull,
   codingIndex: finiteNumberOrNull,

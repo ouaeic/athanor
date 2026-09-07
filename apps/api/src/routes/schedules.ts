@@ -159,7 +159,7 @@ export const registerScheduleRoutes = (context: RouteContext): void => {
     // - so it returns a handful of rows however many schedules the owner has.
     const [schedules, workspaces, triggers] = await Promise.all([
       store.listTaskSchedules(user.id),
-      store.listWorkspaces(user.id),
+      store.listWorkspaceMetadata(user.id),
       store.listTaskScheduleTriggers(user.id)
     ]);
     return Promise.all(

@@ -23,6 +23,7 @@ import type { AgentState } from '../agent-state.js';
 import { approvalArgumentsMatch, approvalOutcome } from '../approval-state.js';
 import { event, type ToolRecordingDeps } from '../tool-recording.js';
 import { sealUnansweredToolCalls, unansweredToolCallIds } from '../turn-lifecycle.js';
+import { drainCorrection } from '../turn-control.js';
 import { textValue } from '../values.js';
 import { PLAN_MODE_PERMITTED } from './dispatch.js';
 
@@ -297,12 +298,25 @@ export const resumeParkedTurn = async (
    */
   if (state.question) {
     const asked = state.question;
-    const waiting = await deps.store.getNextQueuedTaskMessage(task.id).catch(() => null);
+    let waiting = await deps.store.getNextQueuedTaskMessage(task.id);
+    // A refusal explains a decision; it does not consume the answer to a separate question.
+    while (waiting?.approvalId) {
+      await drainCorrection(deps, task, key, state);
+      if (await honorUserControl()) return true;
+      waiting = await deps.store.getNextQueuedTaskMessage(task.id);
+    }
     const answer = waiting
       ? decryptJson<{ prompt: string }>(waiting.promptCiphertext, key).prompt.trim()
       : '';
+    const answeredState = waiting && answer ? structuredClone(state) : null;
+    if (answeredState) {
+      answeredState.ownerReasoningEffort =
+        waiting?.reasoningEffort ?? task.reasoningEffort ?? 'auto';
+      delete answeredState.question;
+      answeredState.messages.push({ role: 'user', content: answer });
+    }
     const consumed =
-      waiting && answer
+      waiting && answeredState
         ? await deps.store.consumeQueuedTaskMessageInTurn({
             taskId: task.id,
             messageId: waiting.id,
@@ -311,7 +325,13 @@ export const resumeParkedTurn = async (
             // before they existed - without this the loop trips its own ceiling immediately.
             additionalComputeCredits: waiting.maxComputeCredits,
             ...(waiting.maxSpendUsd === null ? {} : { additionalSpendUsd: waiting.maxSpendUsd }),
-            userMessageCiphertext: encryptJson({ markdown: answer }, key, `task-event:${task.id}`)
+            userMessageCiphertext: encryptJson(
+              { markdown: answer, messageId: waiting.id },
+              key,
+              `task-event:${task.id}`
+            ),
+            agentStateCiphertext: encryptJson(answeredState, key, `task-state:${task.id}`),
+            actualComputeCredits: answeredState.credits
           })
         : false;
     if (!consumed) {
@@ -323,16 +343,9 @@ export const resumeParkedTurn = async (
       });
       return true;
     }
-    state.ownerReasoningEffort = waiting?.reasoningEffort ?? task.reasoningEffort ?? 'auto';
-    task.reasoningEffort = state.ownerReasoningEffort;
+    Object.assign(state, answeredState);
     delete state.question;
-    // Their words, unaltered and in their own role: the answer is owner speech everywhere it
-    // matters - the taint model, the compaction rule that never paraphrases what the user said,
-    // and the transcript. The question it answers is one message above it in the window.
-    state.messages.push({ role: 'user', content: answer });
-    // Written before anything else can fail, so a crash here loses neither the answer nor the
-    // fact that it has already been taken out of the queue.
-    await deps.checkpoint(task, key, state);
+    task.reasoningEffort = state.ownerReasoningEffort ?? 'auto';
     await event(deps.store, task, key, 'status', 'Answered - carrying on', {
       question: asked.question
     });

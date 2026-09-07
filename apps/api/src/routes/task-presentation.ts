@@ -35,11 +35,27 @@ export const registerTaskPresentationRoutes = (context: RouteContext): void => {
       if (!workspace?.wrappedKey)
         throw new AthanorError('workspace_not_found', 'Workspace not found');
       const key = unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id);
+      const execution = await store.getProjectExecution(user.id, task.id);
+      const sourceWorkspace =
+        execution?.status === 'ready' && execution.sourceWorkspaceId !== workspace.id
+          ? await store.getWorkspace(user.id, execution.sourceWorkspaceId)
+          : null;
+      const sourceKey = sourceWorkspace?.wrappedKey
+        ? unwrapDataKey(sourceWorkspace.wrappedKey, masterKey, sourceWorkspace.id)
+        : null;
       const [evidence, planRecord, storedArtifacts, storedPreviews, jobRows] = await Promise.all([
         evidenceReader.read(task.id, key),
         store.getLatestTaskPlan(task.id),
-        store.listArtifacts(user.id, workspace.id, task.id, 129),
-        store.listWorkspacePreviews(user.id, workspace.id),
+        Promise.all([
+          store.listArtifacts(user.id, workspace.id, task.id, 129),
+          sourceWorkspace ? store.listArtifacts(user.id, sourceWorkspace.id, task.id, 129) : []
+        ]).then((rows) =>
+          rows.flat().sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
+        ),
+        Promise.all([
+          store.listWorkspacePreviews(user.id, workspace.id),
+          sourceWorkspace ? store.listWorkspacePreviews(user.id, sourceWorkspace.id) : []
+        ]).then((rows) => rows.flat()),
         database.query<{ status: string; output_path: string | null }>(
           `SELECT status,output_path FROM (SELECT DISTINCT ON(output_path) status,output_path,created_at FROM provider_media_jobs WHERE user_id=$1 AND task_id=$2 ORDER BY output_path,created_at DESC) latest ORDER BY created_at DESC LIMIT 100`,
           [user.id, task.id]
@@ -66,8 +82,8 @@ export const registerTaskPresentationRoutes = (context: RouteContext): void => {
         taskId: task.id,
         name: decryptJson<{ name: string }>(
           artifact.nameCiphertext as Parameters<typeof decryptJson>[0],
-          key,
-          `artifact-name:${workspace.id}`
+          artifact.workspaceId === sourceWorkspace?.id && sourceKey ? sourceKey : key,
+          `artifact-name:${String(artifact.workspaceId)}`
         ).name,
         mimeType: String(artifact.mimeType),
         sizeBytes: Number(artifact.sizeBytes),
@@ -86,7 +102,9 @@ export const registerTaskPresentationRoutes = (context: RouteContext): void => {
       >();
       const checks: Array<() => Promise<void>> = [];
       for (const preview of previews) {
-        if (!['running', 'hibernated'].includes(workspace.status)) {
+        const previewWorkspace =
+          preview.workspaceId === sourceWorkspace?.id ? sourceWorkspace : workspace;
+        if (!['running', 'hibernated'].includes(previewWorkspace.status)) {
           previewAvailability.set(preview.id, 'unavailable');
           continue;
         }
@@ -106,11 +124,11 @@ export const registerTaskPresentationRoutes = (context: RouteContext): void => {
           const observed = await availabilityCache.check(cacheKey, async () => {
             try {
               const result = await runner.request<{ available: boolean }>({
-                workspaceId: workspace.id,
+                workspaceId: preview.workspaceId,
                 userId: user.id,
                 role: 'user',
                 scopes: [`preview:${preview.port}`],
-                path: `/v1/workspaces/${workspace.id}/preview-check/${preview.port}`,
+                path: `/v1/workspaces/${preview.workspaceId}/preview-check/${preview.port}`,
                 timeoutMs: 2_000
               });
               return { status: result.available ? 'ready' : 'unavailable' };
@@ -180,6 +198,7 @@ export const registerTaskPresentationRoutes = (context: RouteContext): void => {
       const presentation = buildTaskPresentation({
         taskId: task.id,
         workspaceId: workspace.id,
+        ...(sourceWorkspace ? { sourceWorkspaceId: sourceWorkspace.id } : {}),
         taskStatus: task.status,
         events,
         plan,

@@ -6,6 +6,7 @@
  * metering pass or the two sweeps that release held credits.
  */
 
+import { recoverProjectExecutions } from '../project-execution.js';
 import type { SupportedContext } from '../http/server-context.js';
 import { errorFields } from '../log.js';
 
@@ -41,6 +42,7 @@ export const createMaintenanceSweep = (context: SupportedContext, sweeps: Mainte
         log.error(event, errorFields(error));
       }
     };
+    await step('maintenance.project_preparation_failed', () => recoverProjectExecutions(context));
     await step('maintenance.cleanup_failed', () =>
       store.cleanupExpired(config.SECURITY_EVENT_RETENTION_DAYS)
     );

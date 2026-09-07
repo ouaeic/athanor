@@ -1,7 +1,8 @@
 import { reconcileCodingMission } from './coding-mission-loop.js';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { CodingMissionStart, CodingMissionChange } from '@athanor/contracts';
+import { CodingMissionStart, CodingMissionChange, type ModelRelease } from '@athanor/contracts';
+import { resolveTaskPurposeModel } from './purpose-model.js';
 import {
   AthanorError,
   buildConversationNameIndex,
@@ -89,6 +90,12 @@ export async function executeCodingMission(
   }
   if (action === 'run') {
     const input = CodingMissionStart.parse(options);
+    const model = await resolveTaskPurposeModel(
+      context,
+      task,
+      'coding',
+      (await store.listModels()) as ModelRelease[]
+    );
     const capabilities = await runner.call<{ available: boolean; reason: string | null }>(
       task.workspaceId,
       task.id,
@@ -135,8 +142,8 @@ export async function executeCodingMission(
           `task-title:${childWorkspaceId}`
         ),
         nameIndex: buildConversationNameIndex(input.name, prompt, memoryIndexKey(childKey)),
-        modelId: task.modelId,
-        reasoningEffort: task.reasoningEffort ?? 'auto',
+        modelId: model.id,
+        reasoningEffort: model.id === task.modelId ? (task.reasoningEffort ?? 'auto') : 'auto',
         privacyRoute: task.privacyRoute,
         securityMode: task.securityMode,
         maxComputeCredits: input.maxComputeCredits,

@@ -1,4 +1,9 @@
 import { continueTaskOperation } from '../task-continuation.js';
+import {
+  beginProjectExecution,
+  completeProjectExecution,
+  ensureProjectExecution
+} from '../project-execution.js';
 import { stopCodingMissionFamily, removeCodingMissionFamily } from '../coding-mission-cleanup.js';
 /**
  * Conversations: starting one, sending to it, reading it back, and the plan it is working to.
@@ -26,11 +31,12 @@ import {
   unwrapDataKey
 } from '@athanor/core';
 import type { RoutableModel } from '@athanor/core';
-import { ownerPriceCeiling, resumableTaskStatuses, taskResponse } from '../context.js';
+import { ownerPriceCeiling, resumableTaskStatuses } from '../context.js';
 import { withTaskDeliveryStatus } from '../task-delivery-status.js';
 import { requireUser } from '../http/auth-hook.js';
 import type { RouteContext } from '../http/server-context.js';
 import { errorFields } from '../log.js';
+import { openingTaskTitle } from '../task-titles.js';
 import { validateTaskReasoning } from '../task-reasoning.js';
 import { recordSecurityEvent } from '../security-events.js';
 
@@ -62,17 +68,6 @@ export const registerTaskRoutes = (context: RouteContext): void => {
   }>('/v1/tasks', async (request): Promise<TaskPage> => {
     const user = requireUser(request.user);
     const query = TaskPageQuery.parse(request.query);
-    /**
-     * The page, and the owner's workspaces read once for the whole of it.
-     *
-     * Called without the second, `privateTaskResponse` runs `getWorkspaceById` and `unwrapDataKey`
-     * per row - and a page defaults to 200 rows and is allowed 500, so drawing the sidebar issued
-     * 201 queries instead of 2. `/v1/bootstrap` has always done it this way against the same
-     * helper; this route and `/v1/schedules` were the two that did not.
-     *
-     * Together, because which conversations are on this page has never had any bearing on which
-     * computers the owner has.
-     */
     const [page, workspaces] = await Promise.all([
       store.listTaskPage(user.id, {
         ...(query.workspaceId ? { workspaceId: query.workspaceId } : {}),
@@ -80,15 +75,13 @@ export const registerTaskRoutes = (context: RouteContext): void => {
         ...(query.cursor ? { cursor: query.cursor } : {}),
         include: query.include
       }),
-      store.listWorkspaces(user.id)
+      store.listWorkspaceMetadata(user.id)
     ]);
+    const metadata = new Map(workspaces.map((workspace) => [workspace.id, workspace]));
     return {
       tasks: await Promise.all(
         (await withTaskDeliveryStatus(database, user.id, page.tasks)).map((task) =>
-          privateTaskResponse(
-            task,
-            workspaces.find((workspace) => workspace.id === task.workspaceId)
-          )
+          privateTaskResponse(task, metadata.get(task.workspaceId))
         )
       ),
       nextCursor: page.nextCursor,
@@ -244,28 +237,43 @@ export const registerTaskRoutes = (context: RouteContext): void => {
       }
       const reasoningEffort = validateTaskReasoning(input.reasoningEffort ?? 'auto', selected);
       const dataKey = unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id);
-      const title =
-        input.title ?? input.prompt.trim().split(/\s+/).slice(0, 10).join(' ').slice(0, 160);
-      const task = await store.createTask({
-        userId: user.id,
-        workspaceId: workspace.id,
-        titleCiphertext: encryptJson({ title }, dataKey, `task-title:${workspace.id}`),
-        nameIndex: nameIndexFor(title, input.prompt, dataKey),
-        modelId: selected.id,
-        reasoningEffort,
-        privacyRoute: input.privacyRoute,
-        maxComputeCredits: Math.max(
-          input.maxComputeCredits,
-          computeAllowanceFor(selected, config.TASK_MAX_STEPS)
-        ),
-        maxSpendUsd: spendCeilingUsd,
-        securityMode: workspace.securityMode,
-        promptCiphertext: encryptJson(
-          { prompt: input.prompt },
-          dataKey,
-          `task-prompt:${workspace.id}`
-        )
+      const title = input.title ?? openingTaskTitle(input.prompt);
+      const prepared = await database.transaction(async () => {
+        const created = await store.createTask({
+          userId: user.id,
+          workspaceId: workspace.id,
+          titleCiphertext: encryptJson({ title }, dataKey, `task-title:${workspace.id}`),
+          nameIndex: nameIndexFor(title, input.prompt, dataKey),
+          modelId: selected.id,
+          reasoningEffort,
+          privacyRoute: input.privacyRoute,
+          maxComputeCredits: Math.max(
+            input.maxComputeCredits,
+            computeAllowanceFor(selected, config.TASK_MAX_STEPS)
+          ),
+          maxSpendUsd: spendCeilingUsd,
+          securityMode: input.securityMode ?? workspace.securityMode,
+          promptCiphertext: encryptJson(
+            { prompt: input.prompt },
+            dataKey,
+            `task-prompt:${workspace.id}`
+          )
+        });
+        const titled = input.title
+          ? await store.renameTask(
+              user.id,
+              created.id,
+              encryptJson({ title }, dataKey, `task-title:${workspace.id}`),
+              nameIndexFor(title, input.prompt, dataKey)
+            )
+          : created;
+        if (!titled) throw new AthanorError('task_unavailable', 'The task could not be named', 409);
+        return {
+          task: titled,
+          execution: await beginProjectExecution(context, titled, input.attachments ?? [])
+        };
       });
+      let task = prepared.task;
       /*
        * The reservation beside the timeline, not behind it.
        *
@@ -363,7 +371,28 @@ export const registerTaskRoutes = (context: RouteContext): void => {
             `task-event:${task.id}`
           )
         });
-      return taskResponse(task, title);
+      try {
+        task = await completeProjectExecution(context, task, prepared.execution);
+      } catch (error) {
+        task = (await store.getTask(user.id, task.id)) ?? task;
+        await store.appendTaskEvent({
+          taskId: task.id,
+          kind: 'notice',
+          summary: 'Project preparation needs attention',
+          payloadCiphertext: encryptJson(
+            {
+              headline: 'Project preparation needs attention',
+              detail:
+                error instanceof Error
+                  ? error.message
+                  : 'The project could not be prepared. Send the message again to retry preparation.'
+            },
+            dataKey,
+            `task-event:${task.id}`
+          )
+        });
+      }
+      return privateTaskResponse(task);
     });
   });
 
@@ -410,7 +439,7 @@ export const registerTaskRoutes = (context: RouteContext): void => {
         nameIndexFor(input.title, openPrompt(task, key), key)
       );
       if (!renamed) throw new AthanorError('task_not_found', 'Task not found');
-      return taskResponse(renamed, input.title);
+      return privateTaskResponse(renamed, workspace);
     });
   });
 
@@ -474,9 +503,10 @@ export const registerTaskRoutes = (context: RouteContext): void => {
     const input = UpdateTaskPlanRequest.parse(request.body);
     const previousPlan =
       input.outputs === undefined ? await store.getLatestTaskPlan(task.id) : null;
-    const previousOutputs = previousPlan
-      ? (await privateTaskPlanResponse(previousPlan, workspace)).outputs
-      : undefined;
+    const previousContent = previousPlan
+      ? await privateTaskPlanResponse(previousPlan, workspace)
+      : null;
+    const previousOutputs = previousContent?.outputs;
     const outputs = input.outputs ?? previousOutputs;
     const steps: TaskPlanStep[] = input.steps.map((step) => ({
       id: step.id ?? randomUUID(),
@@ -492,7 +522,17 @@ export const registerTaskRoutes = (context: RouteContext): void => {
         ...(input.parentVersion ? { parentVersion: input.parentVersion } : {}),
         branchName: input.branchName,
         stepsCiphertext: encryptJson(
-          { steps, branchName: input.branchName, ...(outputs === undefined ? {} : { outputs }) },
+          {
+            steps,
+            branchName: input.branchName,
+            ...(outputs === undefined ? {} : { outputs }),
+            ...(previousContent?.presentation
+              ? { presentation: previousContent.presentation }
+              : {}),
+            ...(previousContent?.directionEventId
+              ? { directionEventId: previousContent.directionEventId }
+              : {})
+          },
           key,
           `task-plan:${task.id}`
         ),
@@ -555,7 +595,10 @@ export const registerTaskRoutes = (context: RouteContext): void => {
         if (action === 'cancel') {
           await store.cancelTaskAndReleaseReservations(user.id, task.id);
           await stopCodingMissionFamily(context, task);
-        } else await store.setTaskStatusForUser(user.id, task.id, status);
+        } else {
+          if (action === 'resume') await ensureProjectExecution(context, task);
+          await store.setTaskStatusForUser(user.id, task.id, status);
+        }
         log.info('task.action', { taskId: task.id, userId: user.id, kind: action, status });
         return privateTaskResponse((await store.getTask(user.id, task.id))!);
       });

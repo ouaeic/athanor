@@ -17,6 +17,7 @@ import { createDatabase, DataStore, migrateDatabase, type Database } from '@atha
 import { createLogger } from './log.js';
 import {
   cleanGeneratedTitle,
+  openingTaskTitle,
   MAX_GENERATED_TITLE_LENGTH,
   startTaskTitler,
   titleTasksOnce,
@@ -100,28 +101,35 @@ const boxWithAnsweredTask = async () => {
 const freshState = () => ({ attempts: new Map<string, number>(), providerReadyAt: 0 });
 
 describe('turning a model answer into a name', () => {
-  it('keeps the first line, drops the decoration, and cuts on a word', () => {
+  it('preserves the complete opening rather than cutting it to a word count', () => {
+    const opening =
+      'Investigate every cause of the release pipeline failure and repair the stale dependency lockfile across all workspaces';
+    expect(openingTaskTitle(opening + '\n\nSupporting details')).toBe(opening);
+  });
+
+  it('keeps a complete descriptive title and drops only decoration', () => {
     expect(cleanGeneratedTitle('Release job failure')).toBe('Release job failure');
     expect(cleanGeneratedTitle('  "Release job failure."  ')).toBe('Release job failure');
     expect(cleanGeneratedTitle('Title: Release job failure\nHere is why:')).toBe(
       'Release job failure'
     );
     expect(cleanGeneratedTitle('\n\nRelease job failure\n')).toBe('Release job failure');
-    // A model that answers with a paragraph still yields a line a sidebar can show, ending on a
-    // word rather than mid-word.
     const long = cleanGeneratedTitle(
       'Investigating the release pipeline failure caused by a stale dependency lockfile'
     );
     expect(long!.length).toBeLessThanOrEqual(MAX_GENERATED_TITLE_LENGTH);
     expect(long!.endsWith(' ')).toBe(false);
-    expect(long).toBe('Investigating the release pipeline failure caused by a');
+    expect(long).toBe(
+      'Investigating the release pipeline failure caused by a stale dependency lockfile'
+    );
+    expect(cleanGeneratedTitle('x'.repeat(MAX_GENERATED_TITLE_LENGTH + 1))).toBeNull();
     expect(cleanGeneratedTitle('   ')).toBeNull();
     expect(cleanGeneratedTitle('')).toBeNull();
   });
 });
 
 describe('the titler', () => {
-  it('names a conversation on its own model and records what it cost', async () => {
+  it('names a conversation under its existing privacy route and records the billed model', async () => {
     const { database, store, user, task, titleOf } = await boxWithAnsweredTask();
     try {
       const complete = vi.fn<TaskTitlerDeps['complete']>(async () =>
@@ -131,8 +139,6 @@ describe('the titler', () => {
 
       expect(named).toBe(1);
       expect(await titleOf()).toBe('Release job failure');
-      // The conversation's own model, not a cheaper one: the request has already been sent there,
-      // and sending it anywhere else is a disclosure the owner did not choose.
       expect(complete.mock.lastCall?.[0]).toMatchObject({
         modelId: 'openrouter/z-ai/glm-5.2',
         privacyRoute: 'provider_zdr',
@@ -290,6 +296,62 @@ describe('the titler', () => {
       const deps: TaskTitlerDeps = { store, masterKey, log, complete };
       for (let sweep = 0; sweep < 6; sweep += 1) await titleTasksOnce(deps, state);
       expect(complete).toHaveBeenCalledTimes(3);
+    } finally {
+      await database.close();
+    }
+  }, 60_000);
+
+  it('reserves once before submission, settles the receipt, and cannot buy a retry after restart', async () => {
+    const { database, store, user, task } = await boxWithAnsweredTask();
+    try {
+      let providerCalls = 0;
+      const complete: TaskTitlerDeps['complete'] = async (input) => {
+        await input.beforeSubmit!({
+          costUsd: 0.001,
+          providerRef: 'openrouter:title',
+          modelId: 'title'
+        });
+        providerCalls++;
+        const rows = await database.query(
+          'SELECT state,cost_usd FROM usage_entries WHERE idempotency_key=$1',
+          [`task:${task.id}:title`]
+        );
+        expect(rows.rows).toHaveLength(1);
+        expect(rows.rows[0]).toMatchObject({ state: 'reserved' });
+        return completion('');
+      };
+      await titleTasksOnce({ store, masterKey, log, complete }, freshState());
+      await titleTasksOnce({ store, masterKey, log, complete }, freshState());
+      expect(providerCalls).toBe(1);
+      expect(await store.taskSpend(task.id)).toBeCloseTo(0.0004);
+      await expect(
+        store.recordUsage({
+          userId: user.id,
+          taskId: task.id,
+          kind: 'model_inference',
+          resourceClass: 'unapproved:kind',
+          quantity: 0,
+          unit: 'tokens',
+          credits: 0,
+          state: 'reserved',
+          reserveAgainstCaps: true,
+          idempotencyKey: 'invalid-title-class',
+          costUsd: 0.001
+        })
+      ).rejects.toMatchObject({ code: 'media_reservation_invalid' });
+    } finally {
+      await database.close();
+    }
+  }, 60_000);
+
+  it('does not loop on an unavailable bounded naming route', async () => {
+    const { database, store } = await boxWithAnsweredTask();
+    try {
+      const complete = vi.fn<TaskTitlerDeps['complete']>(async () => ({ skipped: true }));
+      const state = freshState();
+      for (let n = 0; n < 4; n++) await titleTasksOnce({ store, masterKey, log, complete }, state);
+      expect(complete).toHaveBeenCalledOnce();
+      expect(state.providerReadyAt).toBe(0);
     } finally {
       await database.close();
     }

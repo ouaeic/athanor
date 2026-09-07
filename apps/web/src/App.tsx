@@ -36,6 +36,7 @@ import {
 } from './model';
 import { Button, Dialog, Empty, ErrorNotice, Field, Spinner } from './ui';
 import DecisionQueue from './DecisionQueue';
+import { ProjectLink } from './ProjectLink';
 import './styles.css';
 import './garden.css';
 const Composer = lazy(() => import('./Composer'));
@@ -350,8 +351,12 @@ function WorkspaceApp() {
         setBootstrap((current) =>
           current ? { ...current, tasks: [task, ...current.tasks] } : current
         );
-        if (bootstrap.workspaces.some((workspace) => workspace.id === task.workspaceId))
-          setWorkspaceId(task.workspaceId);
+        if (
+          bootstrap.workspaces.some(
+            (workspace) => workspace.id === (task.parentWorkspaceId ?? task.workspaceId)
+          )
+        )
+          setWorkspaceId(task.parentWorkspaceId ?? task.workspaceId);
       })
       .catch((err: unknown) => {
         if (!controller.signal.aborted) setError(err);
@@ -408,8 +413,13 @@ function WorkspaceApp() {
   function openTask(id: string) {
     if (window.innerWidth <= 760) setSidebarOpen(false);
     const target = bootstrapRef.current?.tasks.find((item) => item.id === id);
-    if (target && bootstrapRef.current?.workspaces.some((item) => item.id === target.workspaceId))
-      setWorkspaceId(target.workspaceId);
+    if (
+      target &&
+      bootstrapRef.current?.workspaces.some(
+        (item) => item.id === (target.parentWorkspaceId ?? target.workspaceId)
+      )
+    )
+      setWorkspaceId(target.parentWorkspaceId ?? target.workspaceId);
     navigate('work', id);
   }
   function updateTask(next: Task) {
@@ -518,7 +528,6 @@ function WorkspaceApp() {
         />
       </main>
     );
-  const running = bootstrap.tasks.filter(hasOngoingWork);
   const attentionTasks = bootstrap.tasks.filter(needsAttention);
   const attentionCount = new Set([
     ...decisions.map((decision) => decision.taskId),
@@ -527,7 +536,7 @@ function WorkspaceApp() {
   const visibleTasks = bootstrap.tasks
     .filter(
       (item) =>
-        item.workspaceId === workspace?.id &&
+        (item.parentWorkspaceId ?? item.workspaceId) === workspace?.id &&
         (filter === 'archived' ? Boolean(item.archivedAt) : !item.archivedAt)
     )
     .filter((item) =>
@@ -602,12 +611,6 @@ function WorkspaceApp() {
           >
             <Bell size={18} />
             {attentionCount > 0 && <span className="notification-count">{attentionCount}</span>}
-          </Button>
-          <Button
-            aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
-            onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
-          >
-            {theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}
           </Button>
           <Button
             aria-label="Settings"
@@ -688,33 +691,21 @@ function WorkspaceApp() {
         </label>
         <nav className="garden-project-list" aria-label="Project work">
           {personalTasks.map((item) => (
-            <button
+            <ProjectLink
               key={item.id}
-              aria-current={task?.id === item.id ? 'page' : undefined}
-              onClick={() => openTask(item.id)}
-            >
-              <span className={`garden-project-dot status-${item.status}`} />
-              <span>
-                <strong>{item.title}</strong>
-                <small>
-                  {taskStatusLabel(item)}
-                  {item.pinned ? ' · Pinned' : ''}
-                </small>
-              </span>
-            </button>
+              task={item}
+              current={task?.id === item.id}
+              onOpen={openTask}
+            />
           ))}
           {!personalTasks.length && (
             <p className="muted">Your ideas and ongoing work will live here.</p>
           )}
         </nav>
         <div className="garden-sidebar-bottom">
-          <span className="status-line">
-            <i />
-            {workspace?.name ?? 'Your computer'}
-          </span>
-          <small>{running.length ? `${running.length} running` : 'Ready when you are'}</small>
           <Button
             className="garden-sidebar-theme"
+            aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
             onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
           >
             {theme === 'dark' ? <Sun size={14} /> : <Moon size={14} />}{' '}
@@ -736,7 +727,7 @@ function WorkspaceApp() {
         <Suspense fallback={<Spinner label="Opening this surface…" />}>
           {navigation.view === 'work' &&
             (navigation.taskId && (!task || !taskWorkspace) ? (
-              <Spinner label="Opening the work’s computer…" />
+              <Spinner label="Opening project…" />
             ) : task && taskWorkspace ? (
               <TaskSurface
                 key={task.id}
@@ -793,9 +784,7 @@ function WorkspaceApp() {
                     <Sparkles size={24} />
                     <div>
                       <h3>Connect your model provider.</h3>
-                      <p>
-                        Your computer is ready. Add your own provider credentials to start working.
-                      </p>
+                      <p>Add your provider credentials to start working.</p>
                     </div>
                     <Button className="primary" onClick={() => navigate('settings')}>
                       Connect provider
@@ -1005,19 +994,6 @@ function WorkspaceApp() {
           )}
         </Suspense>
       </main>
-      <footer className="garden-status-footer">
-        <span className={`status-line ${running.length ? 'active' : ''}`}>
-          <i />
-          {running.length ? `${running.length} running` : 'Your workspace'}
-          {workspace && ` · ${workspace.name}`}
-        </span>
-        <span className="footer-center">
-          {workspace?.status === 'running' ? 'Computer connected' : (workspace?.status ?? '')}
-        </span>
-        <button className="text-button" onClick={() => navigate('settings')}>
-          Your models. Your computer.
-        </button>
-      </footer>
       {newWork && workspace && (
         <Dialog title="Begin something new" onClose={() => setNewWork(false)}>
           <Suspense fallback={<Spinner />}>

@@ -273,6 +273,45 @@ printf 'database-before-update\n' >"$database_file"
 # lifted out of the installer and run rather than restated here, because a second copy of the
 # expression is a second thing free to drift away from the one that actually executes.
 installer_source="$repository_root/scripts/install-native.sh"
+asset_fixture="$test_root/installer-assets"
+mkdir -p "$asset_fixture"
+awk '
+  /^install_asset\(\) \{$/ { emitting = 1 }
+  emitting { print }
+  emitting && /^\}$/ { exit }
+' "$installer_source" >"$asset_fixture/install-asset.sh"
+[ -s "$asset_fixture/install-asset.sh" ] || {
+  printf 'the installer asset operation could not be read\n' >&2; exit 1;
+}
+cat >>"$asset_fixture/install-asset.sh" <<'ASSET_CASES'
+set -eu
+cd "$1"
+printf 'source bytes\n' >source
+chmod 0644 source
+ln source hardlink
+ln -s source symlink
+for target in source hardlink symlink; do
+  install_asset 0755 source "$target"
+  [ -x "$target" ] || { printf 'same-file asset did not receive its mode\n' >&2; exit 1; }
+  [ "$(cat "$target")" = 'source bytes' ] || exit 1
+  chmod 0644 source
+done
+[ -L symlink ] || { printf 'same-file symlink was replaced\n' >&2; exit 1; }
+env test source -ef hardlink || { printf 'same-file hardlink was replaced\n' >&2; exit 1; }
+printf 'old bytes\n' >existing
+for target in existing new; do
+  install_asset 0755 source "$target"
+  [ -x "$target" ] || exit 1
+  [ "$(cat "$target")" = 'source bytes' ] || {
+    printf 'a distinct asset destination was not installed\n' >&2; exit 1;
+  }
+done
+ASSET_CASES
+if ! sh "$asset_fixture/install-asset.sh" "$asset_fixture"; then
+  printf 'assertion failed: installer asset identity, mode or replacement behavior\n' >&2
+  exit 1
+fi
+printf 'ok  installer assets preserve file identity and install distinct destinations\n'
 {
   awk '
     /^existing_control_value\(\) \{$/ { emitting = 1 }

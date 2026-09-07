@@ -302,10 +302,8 @@ export const rankMediaModels = (
 /**
  * Which model a modality will actually use, from the owner's choice and what their provider offers.
  *
- * A pinned model that has left the catalogue falls back to the automatic answer rather than
- * failing: the alternative is a conversation that cannot generate an image because a provider
- * withdrew a route months ago and nobody was watching. Null means the provider offers nothing for
- * this modality at all, which is a real state and is reported as one.
+ * An explicit selection never grants permission to choose another model. Unavailable pinned
+ * options retain their explanation; a missing id returns null until the owner chooses again.
  */
 export const resolveMediaModel = (
   options: readonly MediaModelOption[],
@@ -317,7 +315,7 @@ export const resolveMediaModel = (
     const pinned = forModality.find(
       (option) => option.id === choice.modelId || option.providerModelId === choice.modelId
     );
-    if (pinned && !pinned.unavailableReason) return pinned;
+    return pinned ?? null;
   }
   return rankMediaModels(forModality, choice?.preference ?? 'balanced')[0] ?? null;
 };

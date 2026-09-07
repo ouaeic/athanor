@@ -5,7 +5,8 @@ import { effortChoices, effortLabel } from './reasoning-options';
 import type { Bootstrap, Draft, DraftAttachment } from './model';
 import { defaultPrivacy, isWorking, text, data } from './model';
 import { isNativeClient, post, put, request } from './client';
-import { Button, ErrorNotice, Field } from './ui';
+import { Button, Dialog, ErrorNotice, Field } from './ui';
+import { useAutosizeTextarea } from './use-autosize-textarea';
 import { MAX_TASK_SPEND_USD } from './usage-model.js';
 import {
   dictationSession,
@@ -49,7 +50,7 @@ export default function Composer({
     initialDraft?.controls?.privacyRoute ?? task?.privacyRoute ?? defaultPrivacy(bootstrap)
   );
   const [cap, setCap] = useState(initialDraft?.controls?.spendCap ?? '');
-  const [interrupt, setInterrupt] = useState(false);
+  const [interrupt, setInterrupt] = useState(true);
   const [advanced, setAdvanced] = useState(false);
   const [busy, setBusy] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -59,7 +60,7 @@ export default function Composer({
   const [dictationSetup, setDictationSetup] = useState(false);
   const [pendingTask, setPendingTask] = useState<Task | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
-  const input = useRef<HTMLTextAreaElement>(null);
+  const input = useAutosizeTextarea(body);
   const voice = useRef<ReturnType<typeof dictationSession> | null>(null);
   const voiceState = useRef<DictationState>('idle');
   const dictationConsent = useRef<DictationConsent | null>(null);
@@ -224,6 +225,7 @@ export default function Composer({
   }
   async function send() {
     if (
+      advanced ||
       dictationSetup ||
       !body.trim() ||
       sending.current ||
@@ -330,7 +332,7 @@ export default function Composer({
         value={body}
         disabled={editingDisabled || voiceBusy}
         maxLength={200000}
-        rows={task ? 3 : 2}
+        rows={1}
         onChange={(event) => {
           changed.current = true;
           setBody(event.target.value);
@@ -341,9 +343,7 @@ export default function Composer({
             void send();
           }
         }}
-        placeholder={
-          task ? 'Add a thought or shape the next step…' : 'Describe what you want to do…'
-        }
+        placeholder={task ? 'Add a direction…' : 'Describe what you want to do…'}
       />
       {attachments.length > 0 && (
         <div className="attachments">
@@ -404,17 +404,12 @@ export default function Composer({
             </Button>
           )}
           <Button
-            aria-label="Model and spending options"
+            aria-label="Direction options"
             aria-expanded={advanced}
             disabled={editingDisabled || uploading || voiceBusy}
             onClick={() => setAdvanced(!advanced)}
           >
             <SlidersHorizontal size={17} />
-            <span>
-              {modelId
-                ? (models.find((model) => model.id === modelId)?.displayName ?? 'Chosen model')
-                : 'Automatic'}
-            </span>
           </Button>
         </div>
         <Button
@@ -429,7 +424,7 @@ export default function Composer({
           }
           busy={busy}
         >
-          {task ? (interrupt ? 'Steer now' : 'Send') : 'Begin'}
+          {task ? (isWorking(task) ? (interrupt ? 'Update run' : 'Queue next') : 'Send') : 'Begin'}
           <ArrowUpRight size={18} />
         </Button>
       </div>
@@ -518,58 +513,63 @@ export default function Composer({
         </label>
       </div>
       {advanced && (
-        <div className="intent-options">
-          <Field label="Privacy route">
-            <select
-              value={privacyRoute}
-              disabled={
-                editingDisabled ||
-                uploading ||
-                voiceBusy ||
-                bootstrap.instance.enforceZeroDataRetention
-              }
-              onChange={(event) => {
-                changed.current = true;
-                setPrivacyRoute(event.target.value === 'external' ? 'external' : 'provider_zdr');
-                setModelId('');
-                setReasoningEffort('auto');
-              }}
+        <Dialog title="Direction options" onClose={() => setAdvanced(false)}>
+          <div className="intent-options">
+            <Field label="Privacy route">
+              <select
+                value={privacyRoute}
+                disabled={
+                  editingDisabled ||
+                  uploading ||
+                  voiceBusy ||
+                  bootstrap.instance.enforceZeroDataRetention
+                }
+                onChange={(event) => {
+                  changed.current = true;
+                  setPrivacyRoute(event.target.value === 'external' ? 'external' : 'provider_zdr');
+                  setModelId('');
+                  setReasoningEffort('auto');
+                }}
+              >
+                <option value="provider_zdr">Zero data retention</option>
+                <option value="external">External provider</option>
+              </select>
+            </Field>
+            <Field
+              label={task ? 'Additional spend limit (USD)' : 'Task spend limit (USD)'}
+              hint="Leave blank to use your account limits."
             >
-              <option value="provider_zdr">Zero data retention</option>
-              <option value="external">External provider</option>
-            </select>
-          </Field>
-          <Field
-            label={task ? 'Additional spend limit (USD)' : 'Task spend limit (USD)'}
-            hint="Leave blank to use your account limits."
-          >
-            <input
-              type="number"
-              min="0.01"
-              max={MAX_TASK_SPEND_USD}
-              disabled={editingDisabled || uploading || voiceBusy}
-              step="0.01"
-              value={cap}
-              onChange={(event) => {
-                changed.current = true;
-                setCap(event.target.value);
-              }}
-              placeholder="Account default"
-            />
-          </Field>
-        </div>
-      )}
-      {task && isWorking(task) && (
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={interrupt}
-            disabled={editingDisabled || uploading || voiceBusy}
-            onChange={(event) => setInterrupt(event.target.checked)}
-          />
-          Steer the current run now
-          {!interrupt && <span className="muted"> · otherwise queued after current work</span>}
-        </label>
+              <input
+                type="number"
+                min="0.01"
+                max={MAX_TASK_SPEND_USD}
+                disabled={editingDisabled || uploading || voiceBusy}
+                step="0.01"
+                value={cap}
+                onChange={(event) => {
+                  changed.current = true;
+                  setCap(event.target.value);
+                }}
+                placeholder="Account default"
+              />
+            </Field>
+            {task && isWorking(task) && (
+              <Field
+                label="Apply this direction"
+                hint="Updates are picked up at the next step. An operation already in progress can finish safely."
+              >
+                <select
+                  value={interrupt ? 'now' : 'next'}
+                  disabled={editingDisabled || uploading || voiceBusy}
+                  onChange={(event) => setInterrupt(event.target.value === 'now')}
+                >
+                  <option value="now">Update this run</option>
+                  <option value="next">After this run finishes</option>
+                </select>
+              </Field>
+            )}
+          </div>
+        </Dialog>
       )}
       <ErrorNotice error={error} />
       {saved && (

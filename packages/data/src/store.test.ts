@@ -47,6 +47,7 @@ import { migrations } from './migrations.js';
 import { BillingStore, DEFAULT_MONTHLY_CAP_USD } from './store/billing.js';
 import { ConnectorStore } from './store/connectors.js';
 import { MemoryStore } from './store/memory.js';
+import { MEMORY_RECALL_SQL } from './store/sql/memory.js';
 import { TaskSignals, TaskStore } from './store/tasks.js';
 import { WorkspaceStore } from './store/workspaces.js';
 import {
@@ -6106,8 +6107,7 @@ describe('the indexes the recall statement can reach', () => {
   let database: Database;
   let store: DataStore;
   let workspaceId: string;
-  let lastSql = '';
-  let lastParams: unknown[] = [];
+  const recallCalls: Array<{ sql: string; params: unknown[] }> = [];
 
   const key = memoryIndexKey(Buffer.alloc(32, 9));
   const now = new Date('2026-07-31T08:00:00.000Z');
@@ -6121,8 +6121,7 @@ describe('the indexes the recall statement can reach', () => {
     // and concluded only the two widening options were paying for a table scan.
     const recorded: Database = {
       query: (sql, params) => {
-        lastSql = sql;
-        lastParams = params ?? [];
+        if (sql === MEMORY_RECALL_SQL) recallCalls.push({ sql, params: params ?? [] });
         return database.query(sql, params);
       },
       exec: (sql) => database.exec(sql),
@@ -6193,6 +6192,7 @@ describe('the indexes the recall statement can reach', () => {
 
   /** The plan the real statement takes with a sequential scan ruled out. */
   const planFor = async (options: Partial<RecallMemoryInput> = {}): Promise<string> => {
+    recallCalls.length = 0;
     await store.recallMemoryCandidates({
       workspaceId,
       plan: planMemoryQuery('chinstrap service-3', key),
@@ -6200,11 +6200,13 @@ describe('the indexes the recall statement can reach', () => {
       order: 'relevance',
       ...options
     });
+    expect(recallCalls).toHaveLength(1);
+    const actual = recallCalls[0]!;
     await database.exec('SET enable_seqscan = off');
     try {
       const explained = await database.query<Record<string, unknown>>(
-        `EXPLAIN (COSTS OFF) ${lastSql}`,
-        lastParams
+        `EXPLAIN (COSTS OFF) ${actual.sql}`,
+        actual.params
       );
       return explained.rows.map((row) => String(Object.values(row)[0])).join('\n');
     } finally {
@@ -7134,7 +7136,8 @@ describe('the upgrade path onto rows an older athanor wrote', () => {
     62: 1,
     76: 1,
     78: 1,
-    84: 1
+    84: 1,
+    95: 1
   };
 
   /**
@@ -7260,6 +7263,59 @@ describe('the upgrade path onto rows an older athanor wrote', () => {
         mixed
       ])
     ).rejects.toThrow();
+  });
+
+  it('binds existing coding missions to their original workspace before a project moves', async () => {
+    await migrateBelow(95);
+    await seedOwner();
+    const secondSource = randomUUID(),
+      movedSource = randomUUID();
+    await addWorkspace(secondSource, 'Another computer');
+    await addWorkspace(movedSource, 'Independent execution');
+    const expected = new Map<string, string>();
+    const parents: string[] = [];
+    for (const source of [SPACE_ID, secondSource]) {
+      const parent = randomUUID(),
+        child = randomUUID(),
+        childWorkspace = randomUUID(),
+        mission = randomUUID();
+      await addWorkspace(childWorkspace, 'Isolated specialist');
+      await addTask(parent, 'provider_zdr');
+      await addTask(child, 'provider_zdr');
+      await database.query('UPDATE tasks SET workspace_id=$2 WHERE id=$1', [parent, source]);
+      await database.query('UPDATE tasks SET workspace_id=$2 WHERE id=$1', [child, childWorkspace]);
+      await database.query(
+        `INSERT INTO coding_missions(id,user_id,parent_task_id,child_task_id,child_workspace_id,
+          request_key,request_hash,manifest_ciphertext,phase,allocated_credits)
+         VALUES($1,$2,$3,$4,$5,$6,'exact-request',$7::jsonb,'active',2)`,
+        [mission, OWNER_ID, parent, child, childWorkspace, `mission:${mission}`, sealed]
+      );
+      parents.push(parent);
+      expected.set(mission, source);
+    }
+    expect(await hasColumn('coding_missions', 'parent_workspace_id')).toBe(false);
+    const unchanged = () =>
+      database.query(
+        'SELECT id,parent_task_id,child_task_id,child_workspace_id,manifest_ciphertext,phase,allocated_credits FROM coding_missions ORDER BY id'
+      );
+    const before = (await unchanged()).rows;
+    expect(before).toHaveLength(2);
+    await apply(95);
+    const origins = async () =>
+      new Map(
+        (await database.query('SELECT id,parent_workspace_id FROM coding_missions')).rows.map(
+          (row) => [String(row.id), String(row.parent_workspace_id)]
+        )
+      );
+    expect(await origins()).toEqual(expected);
+    expect((await unchanged()).rows).toEqual(before);
+    await database.query('UPDATE tasks SET workspace_id=$2 WHERE id=ANY($1::uuid[])', [
+      parents,
+      movedSource
+    ]);
+    await database.exec(migrations.find((entry) => entry.version === 95)!.sql);
+    expect(await origins()).toEqual(expected);
+    expect((await unchanged()).rows).toEqual(before);
   });
 
   it('has an upgrade test for every migration that rewrites rows rather than reshaping them', () => {

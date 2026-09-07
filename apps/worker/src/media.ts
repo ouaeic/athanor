@@ -30,14 +30,7 @@ export const managedMediaCatalog = {
   }
 } as const;
 
-/**
- * The routes the owner chose, as the API sealed them into the credential this worker decrypts.
- *
- * A resolved option rather than a preference, because this process has no media catalogue and no
- * business fetching one: it talks to a provider to run the request in front of it and for nothing
- * else, and a catalogue fetch per tool call would put two round trips in front of every generated
- * image. The screen that has the catalogue does the resolving, at the moment the owner chooses.
- */
+/** Current verified routes, resolved with the same policy used by the model settings API. */
 export interface StoredMediaRoutes {
   image?: MediaModelOption;
   audio?: MediaModelOption;
@@ -45,15 +38,7 @@ export interface StoredMediaRoutes {
   video?: MediaModelOption;
 }
 
-/**
- * The model a generation will actually use, and what this side believes it costs.
- *
- * Until now the two ids in the manifest above were the whole of the answer, in both the pricer and
- * the dispatch arm, which is what the owner meant by having no control over the media models:
- * there was nothing to control, because the choice was a constant. An owner who has never opened
- * the media section still falls back to those reviewed routes, so a box that has never resolved a
- * catalogue generates exactly as it did before.
- */
+/** The exact route and typed price used by approval and generation. */
 export interface ResolvedMediaModel {
   route?: MediaModelOption;
   transcriptionBound?: TranscriptionBound;
@@ -87,34 +72,16 @@ export const resolvedMediaModel = (
       voice: undefined,
       priceKnown: Boolean(option?.pricing?.length)
     };
-  // A stored route for the wrong modality is not usable as this one's answer, and silently pricing
-  // an image against a speech route is the kind of mix-up an owner would only see on the invoice.
-  //
-  // Nor is one that names no model. Nothing this worker can see validates the sealed blob - it is
-  // decrypted and cast, because the screen that wrote it is the thing that parsed it - so a route
-  // left empty by a catalogue that answered with a blank id would go out as a request with no model
-  // on it, and what the provider does with that is its own business and the owner's bill. The
-  // reviewed default is the honest answer to a choice that resolved to nothing.
   if (!option || option.modality !== kind || !option.providerModelId)
-    return kind === 'image'
-      ? {
-          modelId: managedMediaModels.image.modelId,
-          displayName: managedMediaModels.image.displayName,
-          usdPerImage: managedMediaModels.image.baseUsdPerImage,
-          usdPerMillionCharacters: null,
-          usdPerMinute: null,
-          voice: undefined,
-          priceKnown: true
-        }
-      : {
-          modelId: managedMediaModels.audio.modelId,
-          displayName: managedMediaModels.audio.displayName,
-          usdPerImage: null,
-          usdPerMillionCharacters: managedMediaModels.audio.usdPerMillionCharacters,
-          usdPerMinute: null,
-          voice: managedMediaModels.audio.defaultVoice,
-          priceKnown: true
-        };
+    return {
+      modelId: '',
+      displayName: kind === 'image' ? 'Image' : 'Speech',
+      usdPerImage: null,
+      usdPerMillionCharacters: null,
+      usdPerMinute: null,
+      voice: undefined,
+      priceKnown: false
+    };
   return {
     route: option,
     modelId: option.providerModelId,
@@ -275,11 +242,12 @@ export const mediaQuoteUsd = (input: MediaEstimateInput): number | null => {
         ? {}
         : { inputImageCount: input.inputReferenceCount })
     });
-  if (input.model && !input.model.priceKnown) return null;
+  if (!input.model?.priceKnown) return null;
   if (input.kind === 'image') {
     const width = mediaDimension(input.width);
     const height = mediaDimension(input.height);
-    const base = input.model?.usdPerImage ?? managedMediaCatalog.image.baseUsdPerImage;
+    const base = input.model.usdPerImage;
+    if (base === null) return null;
     return (
       (input.model?.route ? base : (base * (width * height)) / 1_000_000) *
       Math.max(1, Math.min(10, Number(input.count) || 1))
@@ -287,8 +255,8 @@ export const mediaQuoteUsd = (input: MediaEstimateInput): number | null => {
   }
   if (input.kind === 'audio') {
     const characters = mediaCharacterCount(input.characterCount);
-    const perMillion =
-      input.model?.usdPerMillionCharacters ?? managedMediaCatalog.audio.usdPerMillionCharacters;
+    const perMillion = input.model.usdPerMillionCharacters;
+    if (perMillion === null) return null;
     return (characters * perMillion) / 1_000_000;
   }
   return null;

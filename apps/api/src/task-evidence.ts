@@ -64,6 +64,10 @@ export class TaskEvidenceReader {
       WITH candidates AS (
         (SELECT id,sequence FROM task_events WHERE task_id=$1 AND sequence <= $2 AND kind NOT IN ('assistant_delta','assistant_reasoning') ORDER BY sequence DESC LIMIT $3)
         UNION
+        (SELECT id,sequence FROM task_events WHERE task_id=$1 AND sequence <= $2 AND kind IN ('user_message','queued_message') ORDER BY sequence DESC LIMIT 32)
+        UNION
+        (SELECT id,sequence FROM task_events WHERE task_id=$1 AND sequence <= $2 AND kind='plan' ORDER BY sequence DESC LIMIT 64)
+        UNION
         (SELECT id,sequence FROM task_events WHERE task_id=$1 AND sequence <= $2 AND kind='preview' ORDER BY sequence DESC LIMIT $4)
         UNION
         (SELECT id,sequence FROM task_events WHERE task_id=$1 AND sequence <= $2 AND kind='completed' ORDER BY sequence DESC LIMIT $4)

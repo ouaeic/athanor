@@ -88,7 +88,7 @@ const completionFrames = (): string =>
 const stubUpstreams = (holdModel?: { reached: () => void; release: Promise<void> }): void => {
   vi.stubGlobal(
     'fetch',
-    vi.fn(async (input: string | URL | Request) => {
+    vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = input instanceof Request ? input.url : input.toString();
       const json = (body: unknown, status = 200): Response =>
         new Response(JSON.stringify(body), {
@@ -97,6 +97,29 @@ const stubUpstreams = (holdModel?: { reached: () => void; release: Promise<void>
         });
       if (url.includes('workspace-manager.test')) {
         const path = new URL(url).pathname;
+        if (path.endsWith('/project-execution')) {
+          if (init?.method !== 'POST' || typeof init.body !== 'string')
+            throw Error('Expected a JSON project preparation request');
+          const body = JSON.parse(init.body) as {
+            taskId: string;
+            workspaceId: string;
+            kind: string;
+            paths: string[];
+          };
+          expect(body).toEqual({
+            taskId: expect.any(String) as unknown,
+            workspaceId: expect.any(String) as unknown,
+            kind: 'new',
+            paths: ['workspace/AGENTS.md', 'workspace/ATHANOR.md', 'workspace/OPEN_CLOUD.md']
+          });
+          return json({
+            status: 'ready',
+            sourceWorkspaceId: path.split('/')[3],
+            workspaceId: body.workspaceId,
+            taskId: body.taskId,
+            bytes: 0
+          });
+        }
         if (path.endsWith('/usage')) return json({ storageBytes: 2_048 });
         return json({ ok: true });
       }
@@ -382,7 +405,7 @@ describe('the embedded worker and the process it lives in', () => {
       headers: { cookie }
     });
     const workspaceId = bootstrap.json<{ workspaces: Array<{ id: string }> }>().workspaces[0]!.id;
-    await app.inject({
+    const created = await app.inject({
       method: 'POST',
       url: '/v1/tasks',
       headers: { cookie, 'idempotency-key': 'shutdown-task-1' },
@@ -394,6 +417,11 @@ describe('the embedded worker and the process it lives in', () => {
         maxComputeCredits: 5
       }
     });
+    expect(created.statusCode, created.body).toBe(200);
+    const task = created.json<{ workspaceId: string; status: string }>();
+    expect(task.workspaceId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(task.workspaceId).not.toBe(workspaceId);
+    expect(task.status).not.toBe('awaiting_resource');
     // The worker has leased the task and is inside the model call.
     await reachedModel;
 

@@ -31,7 +31,7 @@ export const transcribeRecording = async (
   call: ModelToolCall
 ): Promise<unknown> => {
   const { task, state } = context,
-    secret = await currentTranscriptionCredential(await context.inferenceCredential(task));
+    secret = await currentTranscriptionCredential(await context.inferenceCredential(task, true));
   const controls = TranscriptionControls.parse(call.arguments.options ?? {});
   const path = textValue(call.arguments.path).trim();
   if (!path || path.split('/').includes('..'))
@@ -178,7 +178,7 @@ export const transcribeRecording = async (
       onBeforeSubmit: async () => {
         await assertActive();
         const latest = await currentTranscriptionCredential(
-          await context.inferenceCredential(task)
+          await context.inferenceCredential(task, true)
         );
         if (
           transcriptionBinding(context.key, task, state, call, latest) !==

@@ -18,7 +18,7 @@ import type {
 import { AthanorError, decryptJson, encryptJson, unwrapDataKey } from '@athanor/core';
 import type { UserRecord, WorkspaceCheckpointRecord } from '@athanor/data';
 import type { z } from 'zod';
-import { checkpointResponse, taskResponse } from '../context.js';
+import { checkpointResponse } from '../context.js';
 import { requireUser } from '../http/auth-hook.js';
 import type { RouteContext } from '../http/server-context.js';
 import { errorFields } from '../log.js';
@@ -434,7 +434,7 @@ export const registerTrajectoryRoutes = (context: RouteContext): void => {
           `task-event:${parent.id}`
         )
       });
-    return taskResponse(fork, title);
+    return context.privateTaskResponse(fork);
   };
 
   app.post<{ Params: { taskId: string } }>(

@@ -4,6 +4,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkNativeBinaries } from './check-native-binary.mjs';
 import { withReleaseRustFlags } from './release-build-env.mjs';
+import { withReleaseSwiftTools } from './release-swift-env.mjs';
 import { verifyAndroidApk, verifyAndroidBundle } from './verify-android-artifact.mjs';
 import { verifyIosIpa } from './verify-ios-artifact.mjs';
 
@@ -21,18 +22,24 @@ const platformArguments = process.argv.slice(3);
 const tauriCli = resolve(desktopDirectory, 'node_modules', '@tauri-apps', 'cli', 'tauri.js');
 const argumentsForTauri = [tauriCli, platform, 'build', ...platformArguments];
 
-const exitCode = await new Promise((resolveExit, reject) => {
-  const child = spawn(process.execPath, argumentsForTauri, {
-    cwd: desktopDirectory,
-    env: environment,
-    stdio: 'inherit'
+const swiftTools = platform === 'ios' ? await withReleaseSwiftTools(environment) : null;
+let exitCode;
+try {
+  exitCode = await new Promise((resolveExit, reject) => {
+    const child = spawn(process.execPath, argumentsForTauri, {
+      cwd: desktopDirectory,
+      env: swiftTools?.environment ?? environment,
+      stdio: 'inherit'
+    });
+    child.once('error', reject);
+    child.once('exit', (code, signal) => {
+      if (signal) reject(new Error(`Tauri ${platform} build terminated by ${signal}`));
+      else resolveExit(code ?? 1);
+    });
   });
-  child.once('error', reject);
-  child.once('exit', (code, signal) => {
-    if (signal) reject(new Error(`Tauri ${platform} build terminated by ${signal}`));
-    else resolveExit(code ?? 1);
-  });
-});
+} finally {
+  await swiftTools?.dispose();
+}
 
 if (exitCode !== 0) process.exit(exitCode);
 

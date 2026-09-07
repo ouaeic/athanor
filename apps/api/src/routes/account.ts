@@ -15,6 +15,7 @@ import { requireUser } from '../http/auth-hook.js';
 import type { RouteContext } from '../http/server-context.js';
 import { recordSecurityEvent } from '../security-events.js';
 import { sessionCookieName } from '../session.js';
+import { removeCodingMissionFamily } from '../coding-mission-cleanup.js';
 
 export const registerAccountRoutes = (context: RouteContext): void => {
   const {
@@ -204,8 +205,24 @@ export const registerAccountRoutes = (context: RouteContext): void => {
           'confirmation_failed',
           'Type the exact username to delete the account'
         );
-      for (const workspace of await store.listWorkspaces(user.id)) {
-        await meterWorkspace(workspace);
+      const workspaces = await store.listWorkspaceMetadata(user.id);
+      for (const workspace of workspaces)
+        await store.updateWorkspaceStatus(workspace.id, 'deleting');
+      const tasks = (
+        await Promise.all(workspaces.map((workspace) => store.listTasks(user.id, workspace.id)))
+      ).flat();
+      for (const task of tasks) await store.cancelTaskAndReleaseReservations(user.id, task.id);
+      for (const task of tasks)
+        if (task.hasCodingFamily && !task.parentMissionId)
+          await removeCodingMissionFamily(context, task);
+      for (const workspace of workspaces) await meterWorkspace(workspace);
+      // Cancellation waits for an allocating mission's parent lock before native roots are read.
+      const deletionRoots = await store.listWorkspaceMetadata(user.id);
+      deletionRoots.sort(
+        (left, right) =>
+          Number(Boolean(right.parentWorkspaceId)) - Number(Boolean(left.parentWorkspaceId))
+      );
+      for (const workspace of deletionRoots) {
         await runner.request({
           workspaceId: workspace.id,
           userId: user.id,

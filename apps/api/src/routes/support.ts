@@ -21,7 +21,6 @@ import {
 } from '@athanor/contracts';
 import type {
   MediaModalityState,
-  MediaModelOption,
   MediaSettings,
   PrivacyRoute,
   Workspace,
@@ -37,7 +36,6 @@ import {
   priceCeilingFields,
   readRoutingMetadata,
   selectModel,
-  sha256,
   spendWindowBounds,
   wrapDataKey
 } from '@athanor/core';
@@ -45,16 +43,11 @@ import type { ModelTaskKind, RoutableModel } from '@athanor/core';
 import type { UserRecord, WorkspaceRecord } from '@athanor/data';
 import {
   OpenAICompatibleAdapter,
+  MediaRouteResolver,
   applyOpenRouterPrivacyPolicy,
   refreshOpenRouterCatalog,
-  refreshOpenRouterMediaCatalog,
-  refreshOpenAIMediaCatalog,
-  isNativeOpenAIEndpoint,
-  describeOpenRouterImageModel,
-  quoteMediaPrice,
-  resolveMediaModel,
-  seedMediaModels,
-  seedModels
+  seedModels,
+  isNativeOpenAIEndpoint
 } from '@athanor/model-gateway';
 import type { z } from 'zod';
 import { ownerPriceCeiling, workspaceResponse } from '../context.js';
@@ -64,7 +57,8 @@ import { errorFields } from '../log.js';
 import { providerWalls } from '../maintenance/provider-walls.js';
 import { serverLimits } from '../plans.js';
 import { TITLE_SYSTEM_PROMPT } from '../task-titles.js';
-import type { TitleCompletion } from '../task-titles.js';
+import type { TaskTitlerDeps } from '../task-titles.js';
+import { selectTitleRoute } from '../title-route.js';
 
 /**
  * The model dial as the owner left it, read from the row rather than from whichever browser wrote
@@ -629,109 +623,19 @@ export const createServerSupport = (context: ServerBase) => {
     };
   };
 
-  /**
-   * What the owner's provider will make an image and a voice with, and what each will cost.
-   *
-   * Cached in this process for a few minutes because the settings screen asks for it on open and
-   * the answer is two provider requests. A media catalogue changes when a provider ships a model,
-   * which is not on the timescale of a settings dialog being opened twice, and the alternative -
-   * two live requests every time the page mounts - is what the owner meant when they said this
-   * software takes a while.
-   */
-  const MEDIA_CATALOG_TTL_MS = 5 * 60_000;
-  let mediaCatalogCache:
-    | { key: string; expiresAt: number; options: MediaModelOption[] }
-    | undefined;
+  const mediaRouting = new MediaRouteResolver({
+    ...(overrides.modelCatalogFetch ? { fetch: overrides.modelCatalogFetch } : {})
+  });
 
-  const mediaCatalogFor = async (secret: InferenceSecret): Promise<MediaModelOption[]> => {
-    const native = secret.provider !== 'openrouter' && isNativeOpenAIEndpoint(secret.baseUrl);
-    if ((!native && secret.provider !== 'openrouter') || !secret.apiKey) return [];
-    const key = `${secret.baseUrl}|${sha256(secret.apiKey)}|${secret.enforceZeroDataRetention}`;
-    const now = Date.now();
-    if (mediaCatalogCache?.key === key && mediaCatalogCache.expiresAt > now)
-      return mediaCatalogCache.options;
-    try {
-      const options = await (native ? refreshOpenAIMediaCatalog : refreshOpenRouterMediaCatalog)({
-        baseUrl: secret.baseUrl,
-        apiKey: secret.apiKey,
-        requireZeroDataRetention: secret.enforceZeroDataRetention,
-        ...(overrides.modelCatalogFetch ? { fetch: overrides.modelCatalogFetch } : {})
-      });
-      const usable = options.map((model) =>
-        model.modality === 'video' && model.requiresRetentionApproval
-          ? { ...model, unavailableReason: null }
-          : model
-      );
-      mediaCatalogCache = { key, expiresAt: now + MEDIA_CATALOG_TTL_MS, options: usable };
-      return usable;
-    } catch {
-      // A provider that cannot be reached must not empty the picker: the reviewed routes are still
-      // what this box would generate with, and saying so is better than an empty select and no
-      // reason. The failure is not cached, so the next open tries again.
-      return mediaCatalogCache?.key === key
-        ? mediaCatalogCache.options
-        : (native ? [] : seedMediaModels()).map((model) => ({
-            ...model,
-            usdPerImage: null,
-            usdPerMillionCharacters: null,
-            priceSource: 'unknown' as const,
-            unavailableReason:
-              'The provider catalogue could not be verified. Try again when the connection is available.'
-          }));
-    }
-  };
+  const mediaCatalogFor = (secret: InferenceSecret) => mediaRouting.catalog(secret);
 
-  const imageRouteCache = new Map<string, { expiresAt: number; route: MediaModelOption }>();
-  const hydrateImageRoute = async (
-    secret: InferenceSecret,
-    model: MediaModelOption
-  ): Promise<MediaModelOption> => {
-    if (secret.provider !== 'openrouter' || !secret.apiKey) return model;
-    const key = `${secret.baseUrl}|${sha256(secret.apiKey)}|${model.id}|${secret.enforceZeroDataRetention}`;
-    const cached = imageRouteCache.get(key);
-    if (cached && cached.expiresAt > Date.now()) return cached.route;
-    const routes = await describeOpenRouterImageModel(model, {
-      baseUrl: secret.baseUrl,
-      apiKey: secret.apiKey,
-      requireZeroDataRetention: true,
-      ...(overrides.modelCatalogFetch ? { fetch: overrides.modelCatalogFetch } : {})
-    });
-    // The pin and its quote must refer to the same endpoint. Unknown prices follow known quotes.
-    const cost = (route: MediaModelOption) =>
-      quoteMediaPrice(route.pricing, { width: 1024, height: 1024, count: 1 }) ?? Infinity;
-    routes.sort(
-      (left, right) =>
-        cost(left) - cost(right) ||
-        (left.providerEndpointTag ?? '').localeCompare(right.providerEndpointTag ?? '')
-    );
-    const route = routes[0];
-    if (!route)
-      throw new AthanorError(
-        'media_route_unavailable',
-        'The selected image model has no verified private endpoint',
-        409
-      );
-    if (imageRouteCache.size >= 32) imageRouteCache.clear();
-    imageRouteCache.set(key, { expiresAt: Date.now() + MEDIA_CATALOG_TTL_MS, route });
-    return route;
-  };
-
-  /**
-   * The media section of Settings, resolved here so the price beside the control and the price on
-   * the approval card are produced by one resolver rather than two.
-   */
-  const mediaSettings = async (userId: string): Promise<MediaSettings> => {
+  const mediaSettings = async (
+    userId: string,
+    overrideSelection?: MediaModelSelection
+  ): Promise<MediaSettings> => {
     const { secret } = await inferenceCredential(userId);
-    const options = await mediaCatalogFor(secret);
-    const selection = secret.mediaModels ?? {};
-    const image = resolveMediaModel(options, selection.image, 'image');
-    const effectiveImage = image
-      ? await hydrateImageRoute(secret, image).catch(() => ({
-          ...image,
-          unavailableReason:
-            'The selected image endpoint could not be verified. Choose a model or try again.'
-        }))
-      : null;
+    const selection = overrideSelection ?? secret.mediaModels ?? {};
+    const { options, routes } = await mediaRouting.resolve(secret, selection);
     const modality = (kind: 'image' | 'audio' | 'transcription' | 'video'): MediaModalityState => {
       const forKind = options.filter((option) => option.modality === kind);
       const choice = selection[kind] ?? { automatic: true, preference: 'balanced', modelId: '' };
@@ -740,14 +644,10 @@ export const createServerSupport = (context: ServerBase) => {
         available: forKind.some((option) => !option.unavailableReason),
         reason: forKind.some((option) => !option.unavailableReason)
           ? null
-          : secret.enforceZeroDataRetention
-            ? 'No route your provider offers for this has a verified private endpoint. Allowing providers that may retain data would offer more.'
-            : 'This provider account lists nothing that does this.',
-        options: forKind.map((option) =>
-          kind === 'image' && effectiveImage?.id === option.id ? effectiveImage : option
-        ),
+          : 'No currently verified route is available from this provider account.',
+        options: forKind,
         choice,
-        effective: kind === 'image' ? effectiveImage : resolveMediaModel(options, choice, kind)
+        effective: routes[kind] ?? null
       };
     };
     return {
@@ -761,63 +661,52 @@ export const createServerSupport = (context: ServerBase) => {
     };
   };
 
-  /**
-   * The owner's choice turned into the concrete routes the worker will run, ready to be sealed
-   * into the credential beside it. Resolution failure is not fatal here: a provider that could not
-   * be reached leaves the previously stored routes alone rather than replacing them with the seeds.
-   */
   const mediaRoutesFor = async (
     secret: InferenceSecret,
     selection: MediaModelSelection | undefined
   ): Promise<InferenceSecret['mediaRoutes']> => {
-    const options = await mediaCatalogFor(secret);
-    const selectedImage = resolveMediaModel(options, selection?.image, 'image');
-    const image = selectedImage
-      ? await hydrateImageRoute(secret, selectedImage).catch((error: unknown) => {
-          if (selection?.image && !selection.image.automatic) throw error;
-          return {
-            ...selectedImage,
-            unavailableReason:
-              'The automatic image endpoint could not be verified. Choose an image model or try again.'
-          };
-        })
-      : null;
-    const audio = resolveMediaModel(options, selection?.audio, 'audio');
-    const transcription = resolveMediaModel(options, selection?.transcription, 'transcription');
-    const video = selection?.video ? resolveMediaModel(options, selection.video, 'video') : null;
-    return {
-      ...(image ? { image } : {}),
-      ...(audio ? { audio } : {}),
-      ...(transcription ? { transcription } : {}),
-      ...(video ? { video } : {})
-    };
+    const { routes } = await mediaRouting.resolve(secret, selection);
+    for (const kind of ['image', 'audio', 'transcription', 'video'] as const) {
+      const choice = selection?.[kind];
+      if (
+        choice &&
+        !choice.automatic &&
+        choice.modelId &&
+        (!routes[kind] || routes[kind]?.unavailableReason)
+      )
+        throw new AthanorError(
+          'media_route_unavailable',
+          'The selected media route is unavailable. Choose an available model.',
+          409
+        );
+    }
+    return routes;
   };
 
-  /**
-   * One naming call, on the model the conversation itself ran on.
-   *
-   * Every reason to answer null is a reason not to name this conversation yet rather than a
-   * failure: no provider connected, a model that has left the catalogue or lost its route, or a
-   * catalogue entry that belongs to a provider this box is not connected to. The route is checked
-   * against the one the conversation was started under, so a model that has since been reclassified
-   * cannot quietly carry the request somewhere the owner did not agree to.
-   */
-  const titleCompletion = async (input: {
-    userId: string;
-    modelId: string;
-    privacyRoute: string;
-    prompt: string;
-    signal?: AbortSignal;
-  }): Promise<TitleCompletion | null> => {
+  const titleCompletion: TaskTitlerDeps['complete'] = async (input) => {
     const { secret, configured } = await inferenceCredential(input.userId);
     if (!configured) return null;
-    const model = (await store.listModels())
-      .map((record) => ModelRelease.parse(record))
-      .find((candidate) => candidate.id === input.modelId);
-    if (!model || model.availability !== 'available' || model.privacyRoute !== input.privacyRoute)
-      return null;
-    if (model.provider !== (secret.provider === 'openrouter' ? 'openrouter' : 'custom'))
-      return null;
+    const native = isNativeOpenAIEndpoint(secret.baseUrl);
+    if (secret.provider !== 'openrouter' && !native) return { skipped: true };
+    const privacy = input.privacyRoute;
+    if (privacy !== 'provider_zdr' && privacy !== 'external') return { skipped: true };
+    if (privacy === 'provider_zdr' && !secret.enforceZeroDataRetention) return { skipped: true };
+    const route = selectTitleRoute(
+      (await store.listModels()).map((record) => ({
+        ...ModelRelease.parse(record),
+        ...readRoutingMetadata(record)
+      })),
+      {
+        provider: secret.provider === 'openrouter' ? 'openrouter' : 'custom',
+        privacyRoute: privacy,
+        ceiling: priceCeilingFields(
+          ownerPriceCeiling(await store.effectiveSpendLimits(input.userId))
+        )
+      }
+    );
+    if (!route) return { skipped: true };
+    const model = route.model;
+    let submitted = false;
     const adapter = new OpenAICompatibleAdapter({
       baseUrl: secret.baseUrl,
       ...(secret.apiKey ? { apiKey: secret.apiKey } : {}),
@@ -825,22 +714,27 @@ export const createServerSupport = (context: ServerBase) => {
       privacyRoute: model.privacyRoute,
       appUrl: config.PUBLIC_APP_URL,
       appTitle: 'garden',
-      enforceZeroDataRetention: secret.provider === 'openrouter' && secret.enforceZeroDataRetention
+      enforceZeroDataRetention: secret.provider === 'openrouter' && secret.enforceZeroDataRetention,
+      fetch: async (url, init) => {
+        if (init?.method === 'POST') {
+          if (submitted)
+            throw new AthanorError(
+              'title_already_submitted',
+              'This title request has already been submitted',
+              409
+            );
+          init.signal?.throwIfAborted();
+          await input.beforeSubmit?.({
+            costUsd: route.maxCostUsd,
+            providerRef: `${model.provider}:${model.providerModelId}`,
+            modelId: model.id
+          });
+          init.signal?.throwIfAborted();
+          submitted = true;
+        }
+        return globalThis.fetch(url, init);
+      }
     });
-    /*
-     * A provider that will not serve us is answered with `null`, which is this function's word for
-     * "not the titler's fault" - the sweep reads it as `provider_failed`, stands down for five
-     * minutes and stops asking.
-     *
-     * Every check above already returns `null` that way, and the call itself did not: it threw, so
-     * the sweep caught the throw, charged the conversation an attempt, wrote a warning with a stack
-     * trace, and carried straight on to the next one. Observed on a box with no provider
-     * configured: fourteen conversations, fourteen stack traces, on every single boot, and the
-     * cooldown built for exactly this never once engaged.
-     *
-     * Only the three the box already knows are walls, and only those - anything else is a fault in
-     * this code and must still be reported rather than quietly becoming a cooldown.
-     */
     const response = await adapter
       .chat({
         model: model.providerModelId,
@@ -850,9 +744,11 @@ export const createServerSupport = (context: ServerBase) => {
         ],
         tools: [],
         temperature: 0.2,
-        // A title is a few words. This is the ceiling that makes a model which decides to explain
-        // itself cost the same as one that answers.
-        maxTokens: 32,
+        maxTokens: route.maxTokens,
+        ...(route.reasoningEffort
+          ? { reasoningEffort: route.reasoningEffort, reasoningOptions: model.reasoning }
+          : {}),
+        textPriceCeiling: route.maxPrice,
         signal: input.signal
           ? AbortSignal.any([input.signal, AbortSignal.timeout(20_000)])
           : AbortSignal.timeout(20_000)
@@ -862,13 +758,22 @@ export const createServerSupport = (context: ServerBase) => {
         throw error;
       });
     if (!response) return null;
+    const reported = response.usage.costUsd;
+    const costUsd =
+      typeof reported === 'number' && Number.isFinite(reported) && reported >= 0
+        ? reported
+        : native && response.usage.inputTokens > 0 && !response.usage.estimated
+          ? (response.usage.inputTokens * route.maxPrice.prompt +
+              response.usage.outputTokens * route.maxPrice.completion) /
+            1_000_000
+          : null;
     return {
-      text: response.text,
-      costUsd: response.usage.costUsd ?? 0,
+      text: response.finishReason === 'length' ? '' : response.text,
+      costUsd,
       inputTokens: response.usage.inputTokens,
       outputTokens: response.usage.outputTokens,
       providerRef: `${model.provider}:${model.providerModelId}`,
-      resourceClass: model.usageClass
+      resourceClass: 'model:task-title'
     };
   };
 

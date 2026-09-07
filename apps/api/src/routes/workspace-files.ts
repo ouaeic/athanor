@@ -378,7 +378,7 @@ export const registerWorkspaceFileRoutes = (context: RouteContext): void => {
         name: decryptJson<{ name: string }>(
           artifact.nameCiphertext as Parameters<typeof decryptJson>[0],
           key,
-          `artifact-name:${workspace.id}`
+          `artifact-name:${String(artifact.workspaceId)}`
         ).name,
         mimeType: artifact.mimeType,
         sizeBytes: artifact.sizeBytes,

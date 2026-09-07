@@ -6,7 +6,8 @@ import { type AgentState } from './agent-state.js';
 import { delegateBudget, estimatedInferenceCostUsd, usageCredit } from './billing.js';
 import { quotedSpanMatchesSource, type DelegateEvidenceCheck } from './completion.js';
 import { originsFromResult, providerWebProvenance, untrustedOriginOfResult } from './provenance.js';
-import { delegateSpecialists, routeTo } from './routing.js';
+import { routeTo } from './routing.js';
+import { resolveTaskPurposeModel } from './purpose-model.js';
 import { DELEGATE_MAX_STEPS } from './turn-bounds.js';
 import { startStopWatch, withRequestDeadline } from './turn-lifecycle.js';
 import { boundedKnowledge } from './values.js';
@@ -388,13 +389,7 @@ async function runDelegatedMission(
   untrustedSources?: string[];
 }> {
   const catalog = (await context.store.listModels()) as unknown as ModelRelease[];
-  const lead = catalog.find((entry) => entry.id === task.modelId);
-  const eligible = delegateSpecialists(catalog, task.privacyRoute, lead);
-  // Every mission gets the strongest eligible model, not one drawn by its position in the list.
-  // Rotating meant the third specialist reported from the third-best model while the lead weighed
-  // all three reports equally, and nothing said which was which.
-  const model = eligible[0] ?? lead;
-  if (!model) throw new AthanorError('model_unavailable', 'Lead model is unavailable');
+  const model = await resolveTaskPurposeModel(context, task, 'specialist', catalog);
   const { gateway, provider } = await context.gateway(task, model);
   // The read-only tier, named and reasoned about in tool-catalogue.ts where the wire is owned. It
   // used to be a nine-name Set built here and filtered out of the full forty, which meant the

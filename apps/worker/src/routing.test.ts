@@ -5,7 +5,6 @@ import { describe, expect, it } from 'vitest';
 import {
   compactionEventSummary,
   compactionModel,
-  delegateSpecialists,
   routeTo,
   transcriptionRouteAllowed,
   usableCapabilities
@@ -217,90 +216,6 @@ describe('summarising compaction routing', () => {
     expect(
       compactionEventSummary({ trigger: 'agent', condensedMessages: 1, source: 'deterministic' })
     ).toBe('Condensed a finished phase: 1 message recorded mechanically in the running brief');
-  });
-});
-
-/*
- * Who a delegated mission is actually run on.
- *
- * The filter this replaced was an equality on the privacy route, and on a default box - the
- * commonest configuration there is - it matched nothing at all: `AI_REQUIRE_ZDR` unset gives a task
- * `external` while the catalogue stamps `provider_zdr` on live entries. The pool was empty, the
- * `?? lead` fallback took every mission, and nothing anywhere said so.
- */
-describe('the models a delegated mission may run on', () => {
-  const model = (over: Partial<ModelRelease> & { id: string }): ModelRelease =>
-    ({
-      providerModelId: `vendor/${over.id}`,
-      displayName: over.id,
-      provider: 'custom',
-      revision: 'r1',
-      availability: 'available',
-      openness: 'permissive_open_weight',
-      license: 'apache-2.0',
-      commercialUse: true,
-      privacyRoute: 'provider_zdr',
-      contextTokens: 128_000,
-      modalities: ['text'],
-      capabilities: ['chat', 'tools', 'reasoning'],
-      usageClass: 'light',
-      recommendationTags: [],
-      updatedAt: '2026-07-01T00:00:00.000Z',
-      ...over
-    }) as ModelRelease;
-
-  // The directional rule, stated: a zero-retention route also satisfies an ordinary task. The
-  // reverse does not, and the case below holds that end.
-  it('runs an ordinary task on a zero-retention route, which the equality never did', () => {
-    const zdr = model({ id: 'zdr', privacyRoute: 'provider_zdr' });
-    expect(delegateSpecialists([zdr], 'external').map((entry) => entry.id)).toEqual(['zdr']);
-  });
-
-  it('refuses an ordinary route for a zero-retention task', () => {
-    const ordinary = model({ id: 'ordinary', privacyRoute: 'external' });
-    expect(delegateSpecialists([ordinary], 'provider_zdr')).toEqual([]);
-  });
-
-  // Two liveness checks the equality skipped entirely, both of which mean the row serves nothing.
-  it('drops a row the registry no longer serves', () => {
-    const withdrawn = model({ id: 'withdrawn', availability: 'unavailable' });
-    const down = model({ id: 'down', providerAvailable: false });
-    expect(delegateSpecialists([withdrawn, down], 'external')).toEqual([]);
-  });
-
-  it('drops a zero-retention row whose route has lost its endpoint', () => {
-    const lapsed = model({ id: 'lapsed', zeroDataRetentionAvailable: false });
-    expect(delegateSpecialists([lapsed], 'provider_zdr')).toEqual([]);
-  });
-
-  it('needs both tools and reasoning, not either', () => {
-    const half = model({ id: 'half', capabilities: ['chat', 'tools'] });
-    expect(delegateSpecialists([half], 'external')).toEqual([]);
-  });
-
-  /*
-   * `#gateway` throws `provider_model_mismatch` for a model that is not on the configured
-   * credential's provider. A box migrated from one provider to another keeps the old rows in
-   * `model_releases`, and the sort is deterministic - so without this the same doomed candidate is
-   * chosen for every mission, for the life of the box.
-   */
-  it('will not pick a model from a provider the box no longer holds a credential for', () => {
-    const lead = model({ id: 'lead', provider: 'openrouter', measuredQuality: 0.5 });
-    const stranded = model({ id: 'stranded', provider: 'custom', measuredQuality: 0.99 });
-    expect(
-      delegateSpecialists([stranded, lead], 'external', lead).map((entry) => entry.id)
-    ).toEqual(['lead']);
-  });
-
-  // Strongest first, so the mission is run on the best match rather than on whichever row the
-  // catalogue happened to return first.
-  it('offers the strongest match first', () => {
-    const weak = model({ id: 'weak', measuredQuality: 0.2 });
-    const strong = model({ id: 'strong', measuredQuality: 0.9 });
-    expect(delegateSpecialists([weak, strong], 'external').map((entry) => entry.id)).toEqual([
-      'strong',
-      'weak'
-    ]);
   });
 });
 

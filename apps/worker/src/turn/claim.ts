@@ -25,15 +25,17 @@ import {
 } from '@athanor/contracts';
 import type { DataStore, TaskRecord, WorkspaceRecord } from '@athanor/data';
 import type { ModelGateway, ModelTool } from '@athanor/model-gateway';
-import type { AgentState, AgentWorkerConfig } from '../agent-state.js';
+import type { AgentState, AgentWorkerConfig, InferenceCredential } from '../agent-state.js';
 import { BASE_SYSTEM_PROMPT, COMPACT_CONTEXT_TOOL } from '../context.js';
 import { agentToolsFor } from '../tools.js';
+import { applyProjectMainModel } from '../purpose-model.js';
 
 /** What claiming a turn needs from the worker that owns it. */
 export interface TurnClaimDeps {
   readonly store: DataStore;
   readonly config: AgentWorkerConfig;
   readonly masterKey: Buffer;
+  inferenceCredential(task: TaskRecord): Promise<Pick<InferenceCredential, 'provider'>>;
   gateway(
     task: TaskRecord,
     model: ModelRelease
@@ -120,6 +122,21 @@ export const claimTurn = async (
   const key = unwrapDataKey(workspace.wrappedKey, deps.masterKey, workspace.id);
   const prompt = decryptJson<{ prompt: string }>(task.promptCiphertext, key);
   const catalog = (await deps.store.listModels()) as unknown as ModelRelease[];
+  const savedState = task.agentStateCiphertext
+    ? decryptJson<AgentState>(task.agentStateCiphertext, key)
+    : null;
+  const state: AgentState = savedState ?? {
+    messages: [
+      { role: 'system', content: BASE_SYSTEM_PROMPT },
+      { role: 'user', content: prompt.prompt }
+    ],
+    step: 0,
+    credits: 0,
+    turnToolResults: {},
+    finishRejections: 0,
+    completionNags: 0
+  };
+  await applyProjectMainModel(deps, task, state, catalog, key, deps.config.WORKER_ID);
   const model = catalog.find((entry) => entry.id === task.modelId);
   if (!model) throw new Error(`Model ${task.modelId} is no longer in the registry`);
   const { gateway, provider, credential } = await deps.gateway(task, model);
@@ -130,9 +147,6 @@ export const claimTurn = async (
     .effectiveSpendLimits(task.userId)
     .then((limits) => limits.timeZone)
     .catch(() => 'UTC');
-  const savedState = task.agentStateCiphertext
-    ? decryptJson<AgentState>(task.agentStateCiphertext, key)
-    : null;
   // Whether anyone is watching changes what the run should say, so it has to be known before the
   // runtime block is written. Probed only when the saved state does not already carry the answer:
   // a task that ran before this field existed pays one indexed row read, once, and then persists.
@@ -260,17 +274,6 @@ export const claimTurn = async (
     deps.toolchainSummary(task),
     deps.machineSummary(task)
   ]);
-  const state: AgentState = savedState ?? {
-    messages: [
-      { role: 'system', content: BASE_SYSTEM_PROMPT },
-      { role: 'user', content: prompt.prompt }
-    ],
-    step: 0,
-    credits: 0,
-    turnToolResults: {},
-    finishRejections: 0,
-    completionNags: 0
-  };
   if (state.codingMissionWaiting) {
     const missions = await deps.store.listCodingMissions(task.userId, task.id);
     state.messages.push({

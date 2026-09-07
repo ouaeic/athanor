@@ -3561,5 +3561,53 @@ CREATE TABLE IF NOT EXISTS voice_proposals (
  message_id UUID,expires_at TIMESTAMPTZ NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(session_id,provider_call_id)
 );
 `
+  },
+  {
+    version: 94,
+    name: 'approval_denial_corrections',
+    sql: `
+ALTER TABLE task_message_queue ADD COLUMN IF NOT EXISTS approval_id UUID UNIQUE REFERENCES approvals(id) ON DELETE CASCADE;
+ALTER TABLE task_message_queue DROP CONSTRAINT IF EXISTS approval_correction_retains_allocation;
+ALTER TABLE task_message_queue ADD CONSTRAINT approval_correction_retains_allocation
+ CHECK(approval_id IS NULL OR (interrupt=TRUE AND max_compute_credits=0 AND max_spend_usd IS NULL));
+CREATE INDEX IF NOT EXISTS approval_correction_pending_idx ON task_message_queue(task_id,created_at,id)
+ WHERE approval_id IS NOT NULL AND status='queued';
+`
+  },
+  {
+    version: 95,
+    name: 'isolated_project_execution',
+    sql: `
+ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS parent_workspace_id UUID REFERENCES workspaces(id) ON DELETE CASCADE;
+ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS project_task_id UUID REFERENCES tasks(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS workspace_project_parent_idx ON workspaces(parent_workspace_id) WHERE parent_workspace_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS project_executions (
+ task_id UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+ parent_workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+ source_workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+ workspace_id UUID NOT NULL UNIQUE REFERENCES workspaces(id) ON DELETE CASCADE,
+ status TEXT NOT NULL DEFAULT 'preparing' CHECK(status IN ('preparing','ready','shared','failed')),
+ seed_kind TEXT NOT NULL CHECK(seed_kind IN ('new','legacy')),
+ source_task_status TEXT NOT NULL,
+ source_manifest_ciphertext JSONB NOT NULL,receipt_ciphertext JSONB,
+ lease_owner TEXT,lease_expires_at TIMESTAMPTZ,last_error_code TEXT,
+ created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS project_execution_preparing_idx ON project_executions(updated_at,task_id) WHERE status='preparing';
+ALTER TABLE coding_missions ADD COLUMN IF NOT EXISTS parent_workspace_id UUID REFERENCES workspaces(id) ON DELETE CASCADE;
+UPDATE coding_missions m SET parent_workspace_id=t.workspace_id FROM tasks t WHERE m.parent_task_id=t.id AND m.parent_workspace_id IS NULL;
+`
+  },
+  {
+    version: 96,
+    name: 'sealed_project_model_preferences',
+    sql: `
+CREATE TABLE IF NOT EXISTS project_model_preferences (
+ project_task_id UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+ user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ revision INTEGER NOT NULL CHECK(revision>0),choices_ciphertext JSONB NOT NULL,
+ created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+`
   }
 ] as const;

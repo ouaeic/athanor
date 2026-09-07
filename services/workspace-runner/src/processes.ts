@@ -226,6 +226,7 @@ export class ProcessManager {
   #jobCheckpoint: NodeJS.Timeout | undefined;
   readonly #registries = new Map<string, ServiceRegistry>();
   readonly #declarations = new Map<string, Promise<unknown>>();
+  #declarationTail: Promise<unknown> = Promise.resolve();
   readonly #flushGraceMs: number;
   readonly #policy: ServicePolicy;
   /**
@@ -307,7 +308,8 @@ export class ProcessManager {
   }
 
   #declareInOrder<T>(workspaceId: string, declare: () => Promise<T>): Promise<T> {
-    const previous = this.#declarations.get(workspaceId) ?? Promise.resolve();
+    // Admission is shared by every execution root on this computer; namespace creation cannot multiply the cap.
+    const previous = this.#declarationTail;
     const next = previous
       .catch(() => undefined)
       .then(() => {
@@ -316,6 +318,7 @@ export class ProcessManager {
         return declare();
       });
     this.#declarations.set(workspaceId, next);
+    this.#declarationTail = next;
     void next
       .finally(() => {
         if (this.#declarations.get(workspaceId) === next) this.#declarations.delete(workspaceId);
@@ -551,6 +554,19 @@ export class ProcessManager {
     return registry;
   }
 
+  #activePersistentCount(): number {
+    return [...this.#registries.values()].reduce(
+      (count, registry) =>
+        count +
+        registry
+          .list()
+          .filter(
+            (record) => record.kind !== 'job' || ['running', 'interrupted'].includes(record.state)
+          ).length,
+      0
+    );
+  }
+
   async #declareJob(
     root: string,
     workspaceId: string,
@@ -560,14 +576,9 @@ export class ProcessManager {
   ) {
     const registry = this.#registry(root, workspaceId);
     if (registry.list().length === 0) await registry.load();
-    const active = registry
-      .list()
-      .filter(
-        (record) => record.kind !== 'job' || ['running', 'interrupted'].includes(record.state)
-      );
-    if (active.length >= SERVICE_LIMIT_PER_WORKSPACE)
+    if (this.#activePersistentCount() >= SERVICE_LIMIT_PER_WORKSPACE)
       throw new Error(
-        'This workspace has reached its limit of active persistent processes. Stop one before starting another.'
+        'This computer has reached its limit of active persistent processes. Stop one before starting another.'
       );
     const record = newServiceRecord({
       workspaceId,
@@ -856,15 +867,9 @@ export class ProcessManager {
   ) {
     const registry = this.#registry(root, workspaceId);
     if (registry.list().length === 0) await registry.load();
-    if (
-      registry
-        .list()
-        .filter(
-          (record) => record.kind !== 'job' || ['running', 'interrupted'].includes(record.state)
-        ).length >= SERVICE_LIMIT_PER_WORKSPACE
-    )
+    if (this.#activePersistentCount() >= SERVICE_LIMIT_PER_WORKSPACE)
       throw new Error(
-        `This computer already keeps ${SERVICE_LIMIT_PER_WORKSPACE} services running. Stop one before starting another.`
+        `This computer already keeps ${SERVICE_LIMIT_PER_WORKSPACE} persistent processes. Stop one before starting another.`
       );
     const launch: ServiceLaunch = {
       executable: request.executable,
@@ -1266,6 +1271,27 @@ export class ProcessManager {
    * was in `.athanor/services.json` and in the owner's own panel the whole time. A thing the
    * product will restart across reboots, that no agent can name, cannot be turned off by asking.
    */
+  taskWriters(workspaceId: string, owner: string): Array<{ id: string; kind: string }> {
+    const writers = [...this.#sessions.values()]
+      .filter(
+        (session) =>
+          session.workspaceId === workspaceId &&
+          session.owner === owner &&
+          session.status === 'running' &&
+          !this.#supervised.has(session.id)
+      )
+      .map((session) => ({ id: session.id, kind: this.#jobs.has(session.id) ? 'job' : 'process' }));
+    for (const job of this.#jobs.values())
+      if (
+        job.record.workspaceId === workspaceId &&
+        job.record.owner === owner &&
+        job.record.state === 'running' &&
+        !writers.some((writer) => writer.id === job.record.id)
+      )
+        writers.push({ id: job.record.id, kind: 'job' });
+    return writers;
+  }
+
   list(workspaceId: string, owner: string) {
     return [
       ...[...this.#sessions.values()]

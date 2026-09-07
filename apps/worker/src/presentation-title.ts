@@ -1,0 +1,28 @@
+import { TASK_TITLE_MAX_LENGTH } from '@athanor/contracts';
+import {
+  buildConversationNameIndex,
+  decryptJson,
+  encryptJson,
+  memoryIndexKey
+} from '@athanor/core';
+import type { ToolContext } from './tool-dispatch.js';
+
+/** Reuses a headline already written by the agent, preserving an owner's explicit name in SQL. */
+export async function applyPresentationTitle(
+  context: ToolContext,
+  title: string
+): Promise<boolean> {
+  const name = title.trim();
+  if (!name || name.length > TASK_TITLE_MAX_LENGTH) return false;
+  const { task, key } = context;
+  const prompt = decryptJson<{ prompt: string }>(
+    task.promptCiphertext,
+    key,
+    `task-prompt:${task.workspaceId}`
+  ).prompt;
+  return context.store.setGeneratedTaskTitle(
+    task.id,
+    encryptJson({ title: name }, key, `task-title:${task.workspaceId}`),
+    buildConversationNameIndex(name, prompt, memoryIndexKey(key))
+  );
+}

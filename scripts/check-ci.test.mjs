@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import test from 'node:test';
 
@@ -216,12 +216,19 @@ test('pnpm native build commands deliver the exact bundle, simulator and APK fla
     hook,
     `
 import childProcess from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
+import { delimiter, join } from 'node:path';
 import { syncBuiltinESMExports } from 'node:module';
 import { EventEmitter } from 'node:events';
 if (/(?:^|[/\\\\])build-(?:native|mobile)\\.mjs$/.test(process.argv[1] ?? '')) {
-  childProcess.spawn = (command, args) => {
-    writeFileSync(process.env.NATIVE_RECEIPT, JSON.stringify({ command, args }));
+  const execFileSync = childProcess.execFileSync;
+  childProcess.execFileSync = (command, args, ...rest) => {
+    if (command === '/usr/bin/xcrun' && JSON.stringify(args) === '["--find","swift"]') return process.execPath + '\\n';
+    return execFileSync(command, args, ...rest);
+  };
+  childProcess.spawn = (command, args, options) => {
+    const swiftWrapper = args[1] === 'ios' ? join(options.env.PATH.split(delimiter)[0], 'swift') : null;
+    writeFileSync(process.env.NATIVE_RECEIPT, JSON.stringify({ command, args, swiftWrapper, swiftPrepared: swiftWrapper ? existsSync(swiftWrapper) : false }));
     const child = new EventEmitter();
     process.nextTick(() => child.emit('exit', 79, null));
     return child;
@@ -276,8 +283,22 @@ if (/(?:^|[/\\\\])build-(?:native|mobile)\\.mjs$/.test(process.argv[1] ?? '')) {
     assert.notEqual(result.status, 0, 'the recorder must stop before an actual native build');
     assert.ok(readFileSync(receipt, 'utf8'), output(result));
     const recorded = JSON.parse(readFileSync(receipt, 'utf8'));
+    if (recorded.swiftWrapper)
+      t.after(() => rmSync(dirname(recorded.swiftWrapper), { recursive: true, force: true }));
     assert.equal(resolve(recorded.command), resolve(process.execPath));
     assert.match(recorded.args[0], /@tauri-apps[/\\]cli[/\\]tauri\.js$/);
     assert.deepEqual(recorded.args.slice(1), expected, output(result));
+    if (script === 'ios:build') {
+      assert.equal(
+        recorded.swiftPrepared,
+        true,
+        'The iOS build must receive native compiler path maps'
+      );
+      assert.equal(
+        existsSync(recorded.swiftWrapper),
+        false,
+        'The temporary compiler must be removed after a failed build'
+      );
+    } else assert.equal(recorded.swiftWrapper, null);
   }
 });

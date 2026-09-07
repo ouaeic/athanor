@@ -6,7 +6,7 @@ import {
   generateDataKey,
   wrapDataKey
 } from '@athanor/core';
-import type { DataStore, TaskRecord, WorkspaceRecord } from '@athanor/data';
+import type { DataStore, TaskEventRecord, TaskRecord, WorkspaceRecord } from '@athanor/data';
 import type { ModelRelease } from '@athanor/contracts';
 import { MIN_TOKEN_BYTES } from './egress.js';
 import { AgentWorker } from './agent.js';
@@ -36,6 +36,7 @@ import {
 } from './turn-bounds.js';
 import { TURN_WALL_CLOCK_MS } from './handoff.js';
 import { managedMediaCatalog } from './media.js';
+import { fixtureMediaRouting } from './media-fixture.js';
 import { memoryItemAad, MEMORY_PACK_MARKER } from './memory-runtime.js';
 import { agentTools } from './tools.js';
 import type { WorkerConfig } from './config.js';
@@ -158,6 +159,21 @@ const probeStore = (task: () => TaskRecord): StoreProbe => {
   const checkpoints: Array<Record<string, unknown>> = [];
   const renewals: number[] = [];
   const events: StoreProbe['events'] = [];
+  const initial = task();
+  const storedEvents: TaskEventRecord[] = [];
+  const openingEvent = (): TaskEventRecord => ({
+    id: '44444444-4444-4444-8444-000000000001',
+    taskId: initial.id,
+    sequence: 1,
+    kind: 'user_message',
+    summary: 'Owner direction',
+    createdAt: initial.createdAt,
+    payloadCiphertext: encryptJson(
+      { markdown: decryptJson<{ prompt: string }>(initial.promptCiphertext, dataKey).prompt },
+      dataKey,
+      `task-event:${initial.id}`
+    )
+  });
   const notifications: Array<{ kind: string; message: string }> = [];
   const undoPoints: Array<Record<string, unknown>> = [];
   const forgottenUndoPoints: string[][] = [];
@@ -167,6 +183,14 @@ const probeStore = (task: () => TaskRecord): StoreProbe => {
   let memoryPack: Record<string, unknown> | null = null;
   let sources = 0;
   const store = {
+    getUserById: async () => ({ preferences: {} }),
+    getProjectModelPreferences: async () => ({
+      projectTaskId: task().id,
+      workspaceId: workspace.id,
+      wrappedKey: workspace.wrappedKey,
+      revision: 0,
+      choicesCiphertext: null
+    }),
     recordWorkspaceCheckpoint: async (input: Record<string, unknown>) => {
       undoPoints.push(input);
       return input;
@@ -186,6 +210,19 @@ const probeStore = (task: () => TaskRecord): StoreProbe => {
     listWorkspaceSkills: async () => [],
     listMediaJobs: async () => [],
     getLatestTaskPlan: async () => null,
+    listTaskEvents: async (
+      id: string,
+      after = 0,
+      selection?: { kind: TaskEventRecord['kind']; limit: number }
+    ) => {
+      const rows = [openingEvent(), ...storedEvents].filter(
+        (row) =>
+          row.taskId === id && row.sequence > after && (!selection || row.kind === selection.kind)
+      );
+      return selection
+        ? rows.slice(-Math.max(1, Math.min(1_000, Math.trunc(selection.limit))))
+        : rows;
+    },
     // The worker treats a version conflict as "a newer plan exists", which keeps this probe out of
     // the plan-encryption path without changing any branch the tests care about.
     createTaskPlan: async () => {
@@ -215,7 +252,7 @@ const probeStore = (task: () => TaskRecord): StoreProbe => {
       return true;
     },
     appendTaskEvent: async (input: {
-      kind: string;
+      kind: TaskEventRecord['kind'];
       payloadCiphertext: Parameters<typeof decryptJson>[0];
       replacesEarlierFrames?: boolean;
     }) => {
@@ -229,7 +266,18 @@ const probeStore = (task: () => TaskRecord): StoreProbe => {
         payload: body.payload,
         ...(input.replacesEarlierFrames ? { replacesEarlierFrames: true } : {})
       });
-      return { id: 'event', sequence: events.length };
+      const sequence = storedEvents.length + 2;
+      const row: TaskEventRecord = {
+        id: `44444444-4444-4444-8444-${String(sequence).padStart(12, '0')}`,
+        taskId: initial.id,
+        sequence,
+        kind: input.kind,
+        summary: body.summary,
+        payloadCiphertext: input.payloadCiphertext,
+        createdAt: initial.createdAt
+      };
+      storedEvents.push(row);
+      return row;
     },
     // The other end of a notice: the row the notifier reads to reach a phone. The conversation
     // event and this are written together, and a test that only saw the event could not tell the
@@ -3389,6 +3437,7 @@ describe('spending the owner’s money on generated media', () => {
     readonly billed: Array<Record<string, unknown>>;
     readonly generated: Array<Record<string, unknown>>;
     readonly written: string[];
+    readonly failure: unknown;
     readonly events: Array<{ kind: string; summary: string; payload: unknown }>;
     readonly messages: Array<{ role: string; content: string; toolCallId?: string }>;
   }
@@ -3402,6 +3451,7 @@ describe('spending the owner’s money on generated media', () => {
     imageRoute?: Record<string, unknown>;
     /** The same for speech, which is dispatched through its own arm and priced in its own unit. */
     audioRoute?: Record<string, unknown>;
+    videoRoute?: Record<string, unknown>;
     /** A provider that will not serve the sealed route, which is what a withdrawn model looks like. */
     providerRefusesTheRoute?: boolean;
   }): Promise<MediaProbe> => {
@@ -3410,7 +3460,7 @@ describe('spending the owner’s money on generated media', () => {
     const guarded: Array<Record<string, unknown>> = [];
     const billed: Array<Record<string, unknown>> = [];
     Object.assign(probe.store, {
-      ...(options.imageRoute || options.audioRoute
+      ...(options.imageRoute || options.audioRoute || options.videoRoute
         ? {
             getManagedProviderCredential: async (_userId: string, provider: string) =>
               provider === 'inference'
@@ -3424,7 +3474,8 @@ describe('spending the owner’s money on generated media', () => {
                         enforceZeroDataRetention: false,
                         mediaRoutes: {
                           ...(options.imageRoute ? { image: options.imageRoute } : {}),
-                          ...(options.audioRoute ? { audio: options.audioRoute } : {})
+                          ...(options.audioRoute ? { audio: options.audioRoute } : {}),
+                          ...(options.videoRoute ? { video: options.videoRoute } : {})
                         }
                       },
                       masterKey,
@@ -3516,11 +3567,22 @@ describe('spending the owner’s money on generated media', () => {
         }
       }
     );
-    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 1 }), masterKey, runnerSecret)
+    let failure: unknown;
+    await new AgentWorker(
+      probe.store,
+      config({ TASK_MAX_STEPS: 1 }),
+      masterKey,
+      runnerSecret,
+      silentLogger,
+      fixtureMediaRouting
+    )
       .run(task)
-      .catch(() => undefined);
+      .catch((error: unknown) => {
+        failure = error;
+      });
     return {
       guarded,
+      failure,
       billed,
       generated: log.mediaRequests ?? [],
       written,
@@ -3533,7 +3595,7 @@ describe('spending the owner’s money on generated media', () => {
     // This was the one money-spending path with no guard on it at all: every model call consults
     // the cap, and a generation - the only call that bills a second provider - did not.
     const probe = await generate({ arguments: { estimatedCostUsd: 0 } });
-    const expected = managedMediaCatalog.image.estimate({ width: 1024, height: 1024 });
+    const expected = 0.014; // The explicit fixture route declares a flat per-image quote.
     expect(probe.guarded).toHaveLength(1);
     expect(probe.guarded[0]).toMatchObject({ taskId, estimateUsd: expected });
     // The model said it was free. Nothing read that.
@@ -3614,9 +3676,7 @@ describe('spending the owner’s money on generated media', () => {
     });
     expect(probe.generated).toHaveLength(0);
     expect(probe.guarded).toHaveLength(0);
-    expect(probe.messages.find((message) => message.toolCallId === 'call-m')?.content).toContain(
-      'available route'
-    );
+    expect(probe.failure).toMatchObject({ code: 'media_route_unavailable' });
   });
 
   it('spends nothing and says so when the provider will not serve the chosen route', async () => {
@@ -3748,7 +3808,26 @@ describe('spending the owner’s money on generated media', () => {
   });
 
   it('requires per-job retention approval before submitting video', async () => {
-    const probe = await generate({ arguments: { kind: 'video' } });
+    const probe = await generate({
+      arguments: { kind: 'video', options: { duration: 4, size: '720x1280' } },
+      videoRoute: {
+        id: 'openai/video-fixture',
+        providerModelId: 'video-fixture',
+        displayName: 'Video fixture',
+        provider: 'openai',
+        apiProtocol: 'openai',
+        modality: 'video',
+        usdPerImage: null,
+        usdPerMillionCharacters: null,
+        usdPerMinute: null,
+        usdPerSecond: 0.1,
+        priceSource: 'provider',
+        requiresRetentionApproval: true,
+        zeroDataRetentionAvailable: false,
+        recommendationTags: [],
+        updatedAt: '2026-07-01T00:00:00.000Z'
+      }
+    });
     expect(probe.generated).toHaveLength(0);
     expect(probe.guarded).toHaveLength(0);
     expect(probe.events.some((event) => event.kind === 'approval_requested')).toBe(true);
@@ -5285,6 +5364,91 @@ describe('how full the window is believed to be', () => {
 });
 
 describe('a correction sent while the task is working', () => {
+  it('places a denied reason in the first model request without allocating another turn', async () => {
+    const call = { id: 'denied-copy', name: 'shell', arguments: { executable: 'cp', args: [] } };
+    const task = makeTask({
+      messages: [
+        { role: 'user', content: 'Copy the file' },
+        { role: 'assistant', content: '', toolCalls: [call] }
+      ],
+      step: 1,
+      credits: 0,
+      turn: 2,
+      pending: { approvalId: 'denied-approval', toolCall: call }
+    });
+    task.reasoningEffort = 'auto';
+    const probe = probeStore(() => task);
+    let pending = true;
+    const consumed: Array<Record<string, unknown>> = [];
+    Object.assign(probe.store, {
+      getApproval: async () => ({ status: 'denied', expiresAt: '2099-01-01T00:00:00.000Z' }),
+      getNextQueuedTaskMessage: async () =>
+        pending
+          ? {
+              id: 'denial-note',
+              approvalId: 'denied-approval',
+              taskId,
+              userId,
+              interrupt: true,
+              promptCiphertext: encryptJson(
+                {
+                  prompt:
+                    'I did not approve that shell request. Here is why:\n\nUse valid copy arguments.'
+                },
+                dataKey,
+                `task-message:${taskId}`
+              ),
+              maxComputeCredits: 0,
+              maxSpendUsd: null,
+              reasoningEffort: 'low',
+              modelId: 'stale',
+              privacyRoute: 'external'
+            }
+          : null,
+      consumeQueuedTaskMessageInTurn: async (input: Record<string, unknown>) => {
+        consumed.push(input);
+        pending = false;
+        return true;
+      }
+    });
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        toolFrame('finish-denial', 'finish', {
+          summary: 'The refused copy was not run.',
+          verification: { status: 'not_applicable', evidence: [] }
+        })
+      ],
+      log
+    );
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 2 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+    expect(consumed).toHaveLength(1);
+    expect(consumed[0]).toMatchObject({ additionalComputeCredits: 0 });
+    expect(consumed[0]).not.toHaveProperty('additionalSpendUsd');
+    const saved = decryptJson<{ messages: Array<{ role: string; content: string }>; turn: number }>(
+      consumed[0]!.agentStateCiphertext as Parameters<typeof decryptJson>[0],
+      dataKey,
+      `task-state:${taskId}`
+    );
+    expect(saved.turn).toBe(2);
+    expect(log.modelRequests.length).toBeGreaterThan(0);
+    const messages = log.modelRequests[0]!.messages as Array<{ role: string; content: string }>;
+    expect(messages.some((m) => m.role === 'tool' && m.content.includes('denied'))).toBe(true);
+    expect(
+      messages.find((m) => m.role === 'user' && m.content.includes('Use valid copy arguments.'))
+        ?.content
+    ).toContain('why:\n\nUse valid');
+    expect(
+      saved.messages.some(
+        (m) => m.role === 'user' && m.content.includes('Use valid copy arguments.')
+      )
+    ).toBe(true);
+    expect(task.reasoningEffort).toBe('auto');
+    expect(log.calls.some((url) => url.includes('/exec'))).toBe(false);
+  });
+
   it('joins the running turn instead of waiting for it to stop', async () => {
     // Until this existed, a message sent to a working task could only wait for it to finish. If
     // the agent had misread the request, the owner's choices were to watch it finish or cancel and
@@ -5341,6 +5505,16 @@ describe('a correction sent while the task is working', () => {
     // that the loop trips its own budget on the very next iteration.
     expect(consumed).toHaveLength(1);
     expect(consumed[0]).toMatchObject({ messageId: 'correction-1', additionalComputeCredits: 5 });
+    expect(
+      decryptJson(
+        consumed[0]!.userMessageCiphertext as Parameters<typeof decryptJson>[0],
+        dataKey,
+        `task-event:${taskId}`
+      )
+    ).toMatchObject({
+      messageId: 'correction-1',
+      markdown: 'Stop - use Postgres, not SQLite.'
+    });
 
     // And it reached the provider as the owner's own words, in the same turn.
     const sent = log.modelRequests.at(-1)?.messages as Array<{ role: string; content: string }>;
@@ -5447,6 +5621,16 @@ describe('queued message spending', () => {
       messageId: 'funded-followup',
       additionalComputeCredits: 5,
       additionalSpendUsd: 0.25
+    });
+    expect(
+      decryptJson(
+        promoted[0]!.userMessageCiphertext as Parameters<typeof decryptJson>[0],
+        dataKey,
+        `task-event:${taskId}`
+      )
+    ).toMatchObject({
+      messageId: 'funded-followup',
+      markdown: 'Check the saved result next.'
     });
     const next = decryptJson<{
       reservationKey: string;
@@ -5741,6 +5925,16 @@ describe('a question the agent stops to ask', () => {
 
     expect(consumed).toHaveLength(1);
     expect(consumed[0]).toMatchObject({ messageId: 'answer-1', additionalComputeCredits: 5 });
+    expect(
+      decryptJson(
+        consumed[0]!.userMessageCiphertext as Parameters<typeof decryptJson>[0],
+        dataKey,
+        `task-event:${taskId}`
+      )
+    ).toMatchObject({
+      messageId: 'answer-1',
+      markdown: 'billing@'
+    });
     const sent = log.modelRequests.at(-1)?.messages as Array<{ role: string; content: string }>;
     // Their words, in their own role, in the same window as the question - so the turn carries on
     // with everything it had already established rather than re-deriving it from a new turn.

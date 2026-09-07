@@ -1453,7 +1453,7 @@ const ordinaryRequirement = (
       packageRemovalExecutables.has(executable) &&
       lowerArgs.some((argument) => packageRemovalCommands.has(argument));
     const destructiveScript =
-      commandInterpreters.has(executable) && isDestructiveScript(commandScript(args));
+      commandInterpreters.has(executable) && isDestructiveScript(commandScript(args), executable);
     /*
      * A signal to PID 1 is the `shutdown` family arriving by another spelling, and it is here
      * because `kill`, `killall` and `pkill` have left `consequentialExecutables`. It is its own

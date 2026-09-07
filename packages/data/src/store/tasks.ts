@@ -683,9 +683,13 @@ export class TaskStore {
     options: { interruptOnly?: boolean } = {}
   ): Promise<TaskMessageQueueRecord | null> {
     const result = await this.database.query(
-      `SELECT * FROM task_message_queue
-       WHERE task_id=$1 AND status='queued' AND ($2::boolean = FALSE OR interrupt = TRUE)
-       ORDER BY created_at,id LIMIT 1`,
+      `SELECT q.*,
+         CASE WHEN q.approval_id IS NULL THEN q.model_id ELSE t.model_id END AS model_id,
+         CASE WHEN q.approval_id IS NULL THEN q.privacy_route ELSE t.privacy_route END AS privacy_route,
+         CASE WHEN q.approval_id IS NULL THEN q.reasoning_effort ELSE t.reasoning_effort END AS reasoning_effort
+       FROM task_message_queue q JOIN tasks t ON t.id=q.task_id
+       WHERE q.task_id=$1 AND q.status='queued' AND ($2::boolean = FALSE OR q.interrupt = TRUE)
+       ORDER BY (q.approval_id IS NOT NULL) DESC,q.created_at,q.id LIMIT 1`,
       [taskId, options.interruptOnly === true]
     );
     return result.rows[0] ? mapTaskMessage(result.rows[0]) : null;
@@ -812,19 +816,35 @@ export class TaskStore {
     additionalComputeCredits: number;
     additionalSpendUsd?: number | null;
     userMessageCiphertext: EncryptedEnvelope;
+    /** Required for a denial: consuming its queue row and saving its words are one commit. */
+    agentStateCiphertext?: EncryptedEnvelope;
+    actualComputeCredits?: number;
   }): Promise<boolean> {
     const consumed = await this.database.transaction(async (tx) => {
       const locked = await tx.query(
-        `SELECT id FROM tasks WHERE id=$1 AND lease_owner=$2 FOR UPDATE`,
+        `SELECT id,status,lease_expires_at > NOW() AS lease_live FROM tasks
+         WHERE id=$1 AND lease_owner=$2 FOR UPDATE`,
         [input.taskId, input.workerId]
       );
       if (!locked.rows[0]) return false;
       const queued = await tx.query(
-        `SELECT id,reasoning_effort FROM task_message_queue
+        `SELECT id,reasoning_effort,approval_id FROM task_message_queue
          WHERE id=$1 AND task_id=$2 AND status='queued' FOR UPDATE`,
         [input.messageId, input.taskId]
       );
       if (!queued.rows[0]) return false;
+      const denial = Boolean(queued.rows[0].approval_id);
+      if (
+        denial &&
+        (!['planning', 'running'].includes(String(locked.rows[0].status)) ||
+          locked.rows[0].lease_live !== true)
+      )
+        return false;
+      if (denial && input.agentStateCiphertext?.aad !== `task-state:${input.taskId}`)
+        throw new AthanorError(
+          'approval_correction_checkpoint',
+          'A denial correction requires its sealed continuation'
+        );
       await tx.query(
         `UPDATE task_message_queue SET status='promoted',promoted_at=NOW() WHERE id=$1`,
         [input.messageId]
@@ -832,7 +852,10 @@ export class TaskStore {
       await tx.query(
         `UPDATE tasks SET
            max_compute_credits=max_compute_credits+$3,
-           reasoning_effort=$5,
+           reasoning_effort=CASE WHEN $6 THEN reasoning_effort ELSE $5 END,
+           agent_state_ciphertext=COALESCE($7::jsonb,agent_state_ciphertext),
+           actual_compute_credits=CASE WHEN $8::double precision IS NULL THEN actual_compute_credits
+             WHEN has_coding_family THEN GREATEST(actual_compute_credits,$8) ELSE $8 END,
            max_spend_usd=CASE WHEN $4::double precision IS NULL THEN max_spend_usd ELSE
              COALESCE(max_spend_usd, (SELECT COALESCE(SUM(u.cost_usd),0) FROM usage_entries u
                WHERE u.task_id=tasks.id AND u.state='settled')) + $4::double precision END,
@@ -841,9 +864,12 @@ export class TaskStore {
         [
           input.taskId,
           input.workerId,
-          input.additionalComputeCredits,
-          input.additionalSpendUsd ?? null,
-          queued.rows[0].reasoning_effort ?? 'auto'
+          denial ? 0 : input.additionalComputeCredits,
+          denial ? null : (input.additionalSpendUsd ?? null),
+          queued.rows[0].reasoning_effort ?? 'auto',
+          denial,
+          input.agentStateCiphertext ? JSON.stringify(input.agentStateCiphertext) : null,
+          input.actualComputeCredits ?? null
         ]
       );
       await tx.query(
@@ -872,16 +898,24 @@ export class TaskStore {
   }): Promise<TaskRecord | null> {
     const promoted = await this.database.transaction(async (tx) => {
       const locked = await tx.query(
-        `SELECT id FROM tasks WHERE id=$1 AND lease_owner=$2 FOR UPDATE`,
+        `SELECT id,status,lease_expires_at > NOW() AS lease_live FROM tasks
+         WHERE id=$1 AND lease_owner=$2 FOR UPDATE`,
         [input.taskId, input.workerId]
       );
       if (!locked.rows[0]) return null;
       const queued = await tx.query(
-        `SELECT id,reasoning_effort FROM task_message_queue
+        `SELECT id,reasoning_effort,approval_id FROM task_message_queue
          WHERE id=$1 AND task_id=$2 AND status='queued' FOR UPDATE`,
         [input.messageId, input.taskId]
       );
       if (!queued.rows[0]) return null;
+      const denial = Boolean(queued.rows[0].approval_id);
+      if (
+        denial &&
+        (!['planning', 'running'].includes(String(locked.rows[0].status)) ||
+          locked.rows[0].lease_live !== true)
+      )
+        return null;
       // The next message still owns its reservation; only the finished turn's messages release.
       await releasePromotedMessageReservations(tx, input.taskId);
       await tx.query(
@@ -890,7 +924,9 @@ export class TaskStore {
       );
       const updated = await tx.query(
         `UPDATE tasks SET
-           status='queued',model_id=$3,privacy_route=$4,reasoning_effort=$8,
+           status='queued',model_id=CASE WHEN $9 THEN model_id ELSE $3 END,
+           privacy_route=CASE WHEN $9 THEN privacy_route ELSE $4 END,
+           reasoning_effort=CASE WHEN $9 THEN reasoning_effort ELSE $8 END,
            max_compute_credits=max_compute_credits+$5,
            max_spend_usd=CASE WHEN $7::double precision IS NULL THEN max_spend_usd ELSE
              COALESCE(max_spend_usd, (SELECT COALESCE(SUM(u.cost_usd),0) FROM usage_entries u
@@ -907,10 +943,11 @@ export class TaskStore {
           input.workerId,
           input.modelId,
           input.privacyRoute,
-          input.additionalComputeCredits,
+          denial ? 0 : input.additionalComputeCredits,
           JSON.stringify(input.agentStateCiphertext),
-          input.additionalSpendUsd ?? null,
-          queued.rows[0].reasoning_effort ?? 'auto'
+          denial ? null : (input.additionalSpendUsd ?? null),
+          queued.rows[0].reasoning_effort ?? 'auto',
+          denial
         ]
       );
       if (!updated.rows[0]) throw new Error('queued_message_promotion_conflict');
@@ -1582,6 +1619,7 @@ export class TaskStore {
          JOIN workspaces w ON w.id = t.workspace_id
          WHERE t.status IN ${COMMITTED_TASK_STATUSES}
            AND w.status<>'deleting'
+           AND NOT EXISTS (SELECT 1 FROM project_executions p WHERE p.task_id=t.id AND p.status IN ('preparing','failed'))
            AND (t.lease_expires_at IS NULL OR t.lease_expires_at < NOW())
            AND t.attempt < $3
            AND ${WORKSPACE_IS_FREE_FOR('t.id')}
@@ -1887,6 +1925,17 @@ export class TaskStore {
         : null,
       createdAt: iso(row.created_at)
     };
+  }
+
+  /** Named receipts keep presentation references task-scoped without loading the trajectory. */
+  async listTaskEvidenceByIds(taskId: string, ids: readonly string[]): Promise<TaskEventRecord[]> {
+    if (!ids.length) return [];
+    if (ids.length > 64) throw new Error('Too many presentation evidence references');
+    const result = await this.database.query(
+      `SELECT * FROM task_events WHERE task_id=$1 AND id=ANY($2::uuid[]) AND kind IN ('tool_result','preview','artifact') AND octet_length(COALESCE(payload_ciphertext::text,'')) <= 262144 ORDER BY sequence`,
+      [taskId, [...new Set(ids)]]
+    );
+    return result.rows.map(mapTaskEvent);
   }
 
   /**

@@ -1,8 +1,14 @@
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import Fastify from 'fastify';
-import { encryptJson, wrapDataKey } from '@athanor/core';
+import { decryptJson, encryptJson, wrapDataKey } from '@athanor/core';
 import type { RouteContext } from '../http/server-context.js';
 import { registerTaskRoutes } from './tasks.js';
+
+vi.mock('../project-execution.js', () => ({
+  beginProjectExecution: async () => null,
+  completeProjectExecution: async (_context: unknown, task: unknown) => task,
+  ensureProjectExecution: async (_context: unknown, task: unknown) => task
+}));
 
 describe('reasoning selection at the authenticated task boundary', () => {
   const app = Fastify();
@@ -29,6 +35,11 @@ describe('reasoning selection at the authenticated task boundary', () => {
   const enqueueTaskMessage = vi.fn(async () => ({ ...task, queuedMessageCount: 1 }));
   const continueTask = vi.fn(async (input: Record<string, unknown>) => ({ ...task, ...input }));
   const recordUsage = vi.fn(async () => undefined);
+  const renameTask = vi.fn(async (_owner: string, _id: string, titleCiphertext: unknown) => ({
+    ...task,
+    titleCiphertext,
+    titleSource: 'owner'
+  }));
   app.decorateRequest('user', null);
   app.addHook('onRequest', async (request) => {
     request.user = { id: ownerId } as typeof request.user;
@@ -36,6 +47,7 @@ describe('reasoning selection at the authenticated task boundary', () => {
   registerTaskRoutes({
     app,
     masterKey,
+    database: { transaction: async (run: () => Promise<unknown>) => run() },
     config: { TASK_MAX_STEPS: 3 },
     log: { warn() {} },
     store: {
@@ -47,6 +59,7 @@ describe('reasoning selection at the authenticated task boundary', () => {
         wrappedKey: wrapDataKey(key, masterKey, workspaceId)
       }),
       createTask,
+      renameTask,
       enqueueTaskMessage,
       continueTask,
       recordUsage,
@@ -139,5 +152,69 @@ describe('reasoning selection at the authenticated task boundary', () => {
     expect(continueTask).toHaveBeenLastCalledWith(
       expect.objectContaining({ reasoningEffort: 'auto' })
     );
+  });
+  it.each(['review', 'balanced', 'autonomous'] as const)(
+    'sets explicit %s mode in the initial runnable task write',
+    async (securityMode) => {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/tasks',
+        payload: {
+          workspaceId,
+          modelId: 'model',
+          prompt: 'Bounded work',
+          securityMode
+        }
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json<{ securityMode: string }>().securityMode).toBe(securityMode);
+      expect(createTask).toHaveBeenLastCalledWith(expect.objectContaining({ securityMode }));
+    }
+  );
+  it('inherits workspace mode only when omitted and refuses an invalid mode before writing', async () => {
+    const inherited = await app.inject({
+      method: 'POST',
+      url: '/v1/tasks',
+      payload: {
+        workspaceId,
+        modelId: 'model',
+        prompt: 'Bounded work'
+      }
+    });
+    expect(inherited.statusCode).toBe(200);
+    expect(inherited.json<{ securityMode: string }>().securityMode).toBe('balanced');
+    const count = createTask.mock.calls.length;
+    const invalid = await app.inject({
+      method: 'POST',
+      url: '/v1/tasks',
+      payload: {
+        workspaceId,
+        modelId: 'model',
+        prompt: 'Bounded work',
+        securityMode: 'skip-every-floor'
+      }
+    });
+    expect(invalid.statusCode).not.toBe(200);
+    expect(createTask).toHaveBeenCalledTimes(count);
+  });
+
+  it('marks an explicitly supplied initial title as owner-authored before execution', async () => {
+    const title =
+      'Repair the release pipeline while preserving the signed mobile build configuration';
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/tasks',
+      payload: {
+        workspaceId,
+        modelId: 'model',
+        prompt: 'Investigate the failure',
+        title
+      }
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    expect(renameTask).toHaveBeenCalledOnce();
+    const sealed = renameTask.mock.lastCall![2] as Parameters<typeof decryptJson>[0];
+    expect(decryptJson(sealed, key)).toEqual({ title });
+    expect(response.json()).toMatchObject({ titleSource: 'owner' });
   });
 });

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useId, useState } from 'react';
 import { ShieldCheck, ArrowUpRight } from 'lucide-react';
 import type { Task } from '@athanor/contracts';
 import type { Decision } from './model';
@@ -6,7 +6,7 @@ import { data, text, date } from './model';
 import { post, ApiError } from './client';
 import { stepUp } from './auth';
 import { Button, ErrorNotice } from './ui';
-import { approvalToolPhrases } from './approval-copy';
+import { APPROVAL_NOTE_MAX_CHARS, approvalToolPhrases } from './approval-copy';
 export function DecisionCard({
   decision,
   onResolved,
@@ -22,6 +22,8 @@ export function DecisionCard({
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
+  const [note, setNote] = useState('');
+  const noteHintId = useId();
   const preview = data(decision.preview);
   const args = data(preview.arguments ?? preview.args ?? preview.input);
   const tool = text(preview.tool, text(preview.toolName, text(preview.name)));
@@ -40,11 +42,12 @@ export function DecisionCard({
   const [inputFinished, setInputFinished] = useState(false);
   const expired = Date.parse(decision.expiresAt) <= Date.now();
   async function resolve(action: 'approve' | 'deny') {
+    const body = action === 'deny' && note.trim() ? { note: note.trim() } : {};
     setBusy(true);
     setError(null);
     try {
       try {
-        await post(`/v1/approvals/${decision.id}/${action}`, {});
+        await post(`/v1/approvals/${decision.id}/${action}`, body);
       } catch (err) {
         if (
           !(err instanceof ApiError) ||
@@ -52,7 +55,7 @@ export function DecisionCard({
         )
           throw err;
         await stepUp();
-        await post(`/v1/approvals/${decision.id}/${action}`, {});
+        await post(`/v1/approvals/${decision.id}/${action}`, body);
       }
       onResolved();
     } catch (err) {
@@ -135,6 +138,25 @@ export function DecisionCard({
           </label>
         </div>
       )}
+      <details className="decision-note">
+        <summary>Add a reason for denying</summary>
+        <label className="field">
+          <span>Reason for denying (optional)</span>
+          <textarea
+            value={note}
+            onChange={(event) => setNote(event.target.value)}
+            maxLength={APPROVAL_NOTE_MAX_CHARS}
+            rows={3}
+            disabled={busy || expired}
+            aria-describedby={noteHintId}
+            placeholder="Explain what should change before the agent continues."
+          />
+        </label>
+        <small id={noteHintId}>
+          Sent only if you deny. Uses this task’s existing allowance. {note.length}/
+          {APPROVAL_NOTE_MAX_CHARS}
+        </small>
+      </details>
       <ErrorNotice error={error} />
       <div className="row decision-actions">
         <Button

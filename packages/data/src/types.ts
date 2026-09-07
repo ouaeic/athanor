@@ -60,6 +60,8 @@ export interface ApiTokenRecord {
 }
 
 export interface WorkspaceRecord {
+  parentWorkspaceId?: string;
+  projectTaskId?: string;
   id: string;
   userId: string;
   name: string;
@@ -158,6 +160,8 @@ export interface WorkspaceCheckpointRecord {
 
 export interface TaskMessageQueueRecord {
   id: string;
+  /** A denial correction retains the active task's settings and allocation. */
+  approvalId?: string;
   taskId: string;
   userId: string;
   promptCiphertext: EncryptedEnvelope;
