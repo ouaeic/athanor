@@ -325,7 +325,6 @@ export default function Composer({
   );
   const selectedModel = models.find((model) => model.id === (modelId || task?.modelId));
   const efforts = effortChoices(selectedModel?.reasoning);
-  const effortIndex = efforts.indexOf(reasoningEffort);
   return (
     <form
       className={`intent-editor ${task ? 'follow-up' : ''}`}
@@ -498,7 +497,7 @@ export default function Composer({
               {models.map((model) => (
                 <option key={model.id} value={model.id}>
                   {model.displayName} ·{' '}
-                  {model.recommendationTags.includes('Ollama Cloud')
+                  {model.recommendationTags?.includes('Ollama Cloud')
                     ? 'Ollama Cloud'
                     : model.provider === 'openrouter'
                       ? 'OpenRouter'
@@ -522,89 +521,85 @@ export default function Composer({
             </select>
           </label>
           <label className="garden-effort-control">
-            <span>
-              Effort <strong>{effortLabel(reasoningEffort)}</strong>
-            </span>
-            <input
-              type="range"
+            <span>Effort</span>
+            <select
               aria-label="Model reasoning effort"
-              aria-valuetext={effortLabel(reasoningEffort)}
-              min={0}
-              max={Math.max(1, efforts.length - 1)}
-              step={1}
-              value={Math.max(0, effortIndex)}
+              title={
+                efforts.length < 2
+                  ? selectedModel
+                    ? 'This model does not expose adjustable effort'
+                    : 'Select a model to choose its effort'
+                  : 'Reasoning effort'
+              }
+              value={efforts.includes(reasoningEffort) ? reasoningEffort : 'auto'}
               disabled={editingDisabled || efforts.length < 2}
               onChange={(event) => {
                 changed.current = true;
-                setReasoningEffort(efforts[Number(event.target.value)] ?? 'auto');
+                setReasoningEffort(event.target.value as TaskReasoningEffort);
               }}
-            />
-            <small>
-              {efforts.length < 2
-                ? selectedModel
-                  ? 'No adjustable levels advertised'
-                  : 'Choose a model for exact levels'
-                : 'Provider-supported levels'}
-            </small>
+            >
+              {efforts.map((effort) => (
+                <option key={effort} value={effort}>
+                  {effortLabel(effort)}
+                </option>
+              ))}
+            </select>
           </label>
         </div>
-        <details className="garden-run-settings">
-          <summary>Run settings</summary>
-          <div className="garden-run-settings-fields">
+        <div className="garden-run-settings-fields">
+          <label className="garden-route-control">
+            <span>Privacy</span>
+            <select
+              value={privacyRoute}
+              disabled={
+                editingDisabled ||
+                uploading ||
+                voiceBusy ||
+                bootstrap.instance.enforceZeroDataRetention
+              }
+              onChange={(event) => {
+                changed.current = true;
+                setPrivacyRoute(event.target.value === 'external' ? 'external' : 'provider_zdr');
+                setModelId('');
+                setReasoningEffort('auto');
+              }}
+            >
+              <option value="provider_zdr">Private</option>
+              <option value="external">External</option>
+            </select>
+          </label>
+          <label className="garden-cap-control">
+            <span>{task ? 'Extra limit' : 'Limit'}</span>
+            <input
+              type="number"
+              min="0.01"
+              max={MAX_TASK_SPEND_USD}
+              disabled={editingDisabled || uploading || voiceBusy}
+              step="0.01"
+              value={cap}
+              onChange={(event) => {
+                changed.current = true;
+                setCap(event.target.value);
+              }}
+              placeholder="USD"
+              aria-label={task ? 'Additional spend limit in USD' : 'Task spend limit in USD'}
+            />
+          </label>
+          {task && isWorking(task) && (
             <label className="garden-route-control">
-              <span>Privacy</span>
+              <span>Apply</span>
               <select
-                value={privacyRoute}
-                disabled={
-                  editingDisabled ||
-                  uploading ||
-                  voiceBusy ||
-                  bootstrap.instance.enforceZeroDataRetention
-                }
-                onChange={(event) => {
-                  changed.current = true;
-                  setPrivacyRoute(event.target.value === 'external' ? 'external' : 'provider_zdr');
-                  setModelId('');
-                  setReasoningEffort('auto');
-                }}
+                value={interrupt ? 'now' : 'next'}
+                disabled={editingDisabled || uploading || voiceBusy}
+                onChange={(event) => setInterrupt(event.target.value === 'now')}
+                aria-label="Apply this direction"
               >
-                <option value="provider_zdr">Private</option>
-                <option value="external">External</option>
+                <option value="now">Now</option>
+                <option value="next">Next run</option>
               </select>
             </label>
-            <label className="garden-cap-control">
-              <span>{task ? 'Extra limit' : 'Limit'}</span>
-              <input
-                type="number"
-                min="0.01"
-                max={MAX_TASK_SPEND_USD}
-                disabled={editingDisabled || uploading || voiceBusy}
-                step="0.01"
-                value={cap}
-                onChange={(event) => {
-                  changed.current = true;
-                  setCap(event.target.value);
-                }}
-                placeholder="USD"
-                aria-label={task ? 'Additional spend limit in USD' : 'Task spend limit in USD'}
-              />
-            </label>
-            {task && isWorking(task) && (
-              <label className="garden-route-control">
-                <span>Apply</span>
-                <select
-                  value={interrupt ? 'now' : 'next'}
-                  disabled={editingDisabled || uploading || voiceBusy}
-                  onChange={(event) => setInterrupt(event.target.value === 'now')}
-                  aria-label="Apply this direction"
-                >
-                  <option value="now">Now</option>
-                  <option value="next">Next run</option>
-                </select>
-              </label>
-            )}
-          </div>
-        </details>
+          )}
+        </div>
       </div>
       <ErrorNotice error={error} />
       {saved && (

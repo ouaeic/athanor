@@ -767,9 +767,8 @@ try {
     'Editing an option must not submit or clear the direction'
   );
   await page.setViewportSize({ width: 1440, height: 1000 });
-  const effort = page.getByRole('slider', { name: 'Model reasoning effort' });
-  await effort.focus();
-  await page.keyboard.press('End');
+  const effort = page.getByRole('combobox', { name: 'Model reasoning effort' });
+  await effort.selectOption('max');
   const savedChoice = page.waitForResponse(
     (response) =>
       new URL(response.url()).pathname === '/v1/drafts' &&
@@ -1031,7 +1030,7 @@ try {
   );
   await page.goBack();
   assert.equal(
-    await page.getByRole('slider', { name: 'Model reasoning effort' }).count(),
+    await page.getByRole('combobox', { name: 'Model reasoning effort' }).count(),
     0,
     'An allocated specialist must not offer a new model allocation'
   );

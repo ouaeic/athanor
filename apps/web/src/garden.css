@@ -1022,8 +1022,8 @@
 .garden-model-controls {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 14px;
+  flex-wrap: wrap;
+  gap: 6px 16px;
   margin-top: 10px;
   padding-top: 10px;
   border-top: 1px solid var(--line);
@@ -1032,56 +1032,26 @@
 .garden-run-settings-fields {
   display: flex;
   align-items: center;
-  gap: 16px;
+  flex-wrap: wrap;
+  gap: 6px 16px;
   min-width: 0;
 }
-.garden-run-settings {
-  position: relative;
-  flex-shrink: 0;
-}
-.garden-run-settings > summary {
-  cursor: pointer;
-  list-style: none;
-  padding: 6px 8px;
-  color: var(--muted);
-  font-size: 11px;
-}
-.garden-run-settings > summary::-webkit-details-marker {
-  display: none;
-}
-.garden-run-settings > summary::after {
-  content: '⌄';
-  margin-left: 5px;
-  color: var(--cream);
-}
-.garden-run-settings[open] > summary::after {
-  content: '⌃';
-}
-.garden-run-settings-fields {
-  position: absolute;
-  z-index: 4;
-  right: 0;
-  top: calc(100% + 7px);
-  justify-content: flex-end;
-  flex-wrap: wrap;
-  width: min(560px, calc(100vw - 48px));
-  padding: 10px 12px;
-  border: 1px solid var(--line-strong);
-  border-radius: 10px;
-  background: var(--raised);
-  box-shadow: 0 18px 40px #080e0788;
+.garden-model-core {
+  flex: 1 1 480px;
 }
 .garden-model-select {
   display: flex;
   align-items: center;
   gap: 8px;
   min-width: 0;
-  max-width: 60%;
-  font-size: 10px;
+  flex: 1 1 180px;
+  font-size: 11px;
   color: var(--muted);
 }
 .garden-model-select select {
-  padding: 3px 5px;
+  width: 100%;
+  min-height: 30px;
+  padding: 3px 22px 3px 5px;
   font-size: 11px;
   border: 0;
   background: transparent;
@@ -1089,30 +1059,11 @@
   min-width: 0;
 }
 .garden-effort-control {
-  display: grid;
-  grid-template-columns: auto minmax(70px, 100px);
+  display: flex;
   align-items: center;
-  gap: 3px 10px;
-  font-size: 10px;
+  gap: 0.4rem;
+  font-size: 11px;
   color: var(--muted);
-  margin-left: auto;
-}
-.garden-effort-control strong {
-  color: var(--text);
-  font-weight: 400;
-  margin-left: 5px;
-}
-.garden-effort-control input {
-  padding: 0;
-  width: 100%;
-  height: 16px;
-  accent-color: var(--accent);
-  border: 0;
-}
-.garden-effort-control small {
-  grid-column: 1 / -1;
-  font-size: 9px;
-  color: var(--dim);
 }
 .garden-route-control,
 .garden-cap-control {
@@ -1123,15 +1074,23 @@
   color: var(--muted);
 }
 .garden-route-control select,
+.garden-effort-control select,
 .garden-cap-control input {
   width: auto;
   min-height: 30px;
-  max-width: 86px;
-  padding: 0.3rem 0.4rem;
+  max-width: 110px;
+  padding: 0.3rem 1.4rem 0.3rem 0.35rem;
   border: 0;
   background: transparent;
   color: var(--text);
   font-size: 11px;
+}
+.garden-cap-control input {
+  width: 76px;
+  padding-right: 0.35rem;
+}
+.garden-model-controls label > span {
+  white-space: nowrap;
 }
 @media (max-width: 760px) {
   .garden-model-controls {
@@ -1141,25 +1100,11 @@
     padding-top: 7px;
   }
   .garden-model-select {
-    max-width: 100%;
-    flex: 1;
+    flex-basis: 100%;
   }
   .garden-model-core {
     width: 100%;
-    justify-content: space-between;
     gap: 8px;
-  }
-  .garden-run-settings {
-    margin-left: auto;
-  }
-  .garden-model-select > span {
-    display: none;
-  }
-  .garden-effort-control {
-    grid-template-columns: auto 70px;
-  }
-  .garden-effort-control small {
-    display: none;
   }
 }
 .garden-sidebar-theme {

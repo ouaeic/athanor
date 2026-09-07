@@ -350,6 +350,7 @@ export const createServerSupport = (context: ServerBase) => {
     log.warn('models.catalog_repair_failed', errorFields(error));
   });
 
+  let ollamaReasoningRepair: Promise<void> | undefined;
   const modelsForUser = async (user: UserRecord) => {
     const requireZdr = await requiresZeroDataRetention(user.id);
     /*
@@ -374,6 +375,48 @@ export const createServerSupport = (context: ServerBase) => {
         };
       })
       .catch(() => null);
+    if (connected && 'tag' in connected && connected.tag === 'Ollama Cloud') {
+      // Persist discovery so both the picker and worker validate the same effort choices.
+      ollamaReasoningRepair ??= (async () => {
+        const catalog = await store.listModels();
+        const missing = catalog.filter((record) => {
+          const model = ModelRelease.parse(record);
+          return (
+            model.provider === 'custom' &&
+            model.recommendationTags.includes('Ollama Cloud') &&
+            model.reasoning?.supportedEfforts === undefined &&
+            record.supportsReasoningEffort !== false
+          );
+        });
+        if (!missing.length) return;
+        const { secret } = await inferenceCredential(user.id);
+        if (secret.provider !== 'ollama-cloud') return;
+        const adapter = new OpenAICompatibleAdapter({
+          provider: 'custom',
+          privacyRoute: 'external',
+          baseUrl: secret.baseUrl,
+          ...(secret.apiKey ? { apiKey: secret.apiKey } : {})
+        });
+        const described = await adapter.describe(AbortSignal.timeout(20_000));
+        const repaired = missing.flatMap((record) => {
+          const model = described.find((entry) => entry.id === record.providerModelId);
+          return model && model.supportsReasoningEffort !== null
+            ? [
+                {
+                  ...record,
+                  supportsReasoningEffort: model.supportsReasoningEffort,
+                  ...(model.reasoning ? { reasoning: model.reasoning } : {})
+                }
+              ]
+            : [];
+        });
+        if (repaired.length) await store.upsertModels(repaired);
+      })().catch((error: unknown) => {
+        ollamaReasoningRepair = undefined;
+        log.warn('models.ollama_capabilities_failed', errorFields(error));
+      });
+      await ollamaReasoningRepair;
+    }
     return (await store.listModels())
       .filter((record) => {
         if (!connected) return true;

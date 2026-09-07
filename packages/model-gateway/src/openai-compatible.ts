@@ -802,9 +802,52 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
       );
     const body = (await response.json()) as { data?: unknown };
     const entries = Array.isArray(body.data) ? body.data : [];
-    return entries
+    const described = entries
       .filter(isRecord)
       .map((entry) => describeNativeOpenAIInput(this.#baseUrl, describeConfiguredModel(entry)));
+    const endpoint = new URL(this.#baseUrl);
+    if (endpoint.origin !== 'https://ollama.com') return described;
+    // Ollama's OpenAI model list omits capabilities; its native metadata endpoint supplies them.
+    for (let offset = 0; offset < described.length; offset += 4) {
+      await Promise.all(
+        described.slice(offset, offset + 4).map(async (model) => {
+          if (model.reasoning?.supportedEfforts !== undefined) return;
+          try {
+            const timeout = AbortSignal.timeout(5_000);
+            const response = await this.#fetch(`${endpoint.origin}/api/show`, {
+              method: 'POST',
+              headers: this.#headers(),
+              redirect: 'error',
+              body: JSON.stringify({ model: model.id }),
+              signal: signal ? AbortSignal.any([signal, timeout]) : timeout
+            });
+            if (!response.ok) return;
+            const body: unknown = await response.json();
+            if (!isRecord(body) || !Array.isArray(body.capabilities)) return;
+            const thinking = body.capabilities.includes('thinking');
+            const gptOss = /^gpt-oss(?::|$)/.test(model.id);
+            Object.assign(model, {
+              supportsReasoningEffort: thinking,
+              ...(thinking
+                ? {
+                    reasoning: {
+                      mandatory: gptOss,
+                      // https://docs.ollama.com/capabilities/thinking
+                      supportedEfforts: gptOss
+                        ? ['low', 'medium', 'high']
+                        : ['none', 'low', 'medium', 'high', 'max']
+                    }
+                  }
+                : {})
+            });
+          } catch {
+            // Metadata failure must not remove an otherwise reachable model from the catalogue.
+            if (signal?.aborted) signal.throwIfAborted();
+          }
+        })
+      );
+    }
+    return described;
   }
 
   /**
