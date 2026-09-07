@@ -479,125 +479,132 @@ export default function Composer({
         </div>
       )}
       <div className="garden-model-controls">
-        <label className="garden-model-select">
-          <span>Model</span>
-          <select
-            aria-label="Model for this direction"
-            value={modelId}
-            disabled={editingDisabled || uploading || voiceBusy}
-            onChange={(event) => {
-              changed.current = true;
-              setModelId(event.target.value);
-              setReasoningEffort('auto');
-            }}
-          >
-            <option value="">
-              {task ? (selectedModel?.displayName ?? 'Current model') : 'Automatic selection'}
-            </option>
-            {models.map((model) => (
-              <option key={model.id} value={model.id}>
-                {model.displayName} ·{' '}
-                {model.recommendationTags.includes('Ollama Cloud')
-                  ? 'Ollama Cloud'
-                  : model.provider === 'openrouter'
-                    ? 'OpenRouter'
-                    : 'Connected endpoint'}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="garden-approval-select">
-          <span>Approvals</span>
-          <select
-            aria-label="Approvals for this prompt"
-            title={modeFloors[securityMode]}
-            value={securityMode}
-            disabled={editingDisabled}
-            onChange={(event) => changeSecurityMode(event.target.value as Task['securityMode'])}
-          >
-            <option value="review">Review</option>
-            <option value="balanced">Balanced</option>
-            <option value="autonomous">Autonomous</option>
-          </select>
-        </label>
-        <label className="garden-effort-control">
-          <span>
-            Effort <strong>{effortLabel(reasoningEffort)}</strong>
-          </span>
-          <input
-            type="range"
-            aria-label="Model reasoning effort"
-            aria-valuetext={effortLabel(reasoningEffort)}
-            min={0}
-            max={Math.max(1, efforts.length - 1)}
-            step={1}
-            value={Math.max(0, effortIndex)}
-            disabled={editingDisabled || efforts.length < 2}
-            onChange={(event) => {
-              changed.current = true;
-              setReasoningEffort(efforts[Number(event.target.value)] ?? 'auto');
-            }}
-          />
-          <small>
-            {efforts.length < 2
-              ? selectedModel
-                ? 'No adjustable levels advertised'
-                : 'Choose a model for exact levels'
-              : 'Provider-supported levels'}
-          </small>
-        </label>
-        <label className="garden-route-control">
-          <span>Privacy</span>
-          <select
-            value={privacyRoute}
-            disabled={
-              editingDisabled ||
-              uploading ||
-              voiceBusy ||
-              bootstrap.instance.enforceZeroDataRetention
-            }
-            onChange={(event) => {
-              changed.current = true;
-              setPrivacyRoute(event.target.value === 'external' ? 'external' : 'provider_zdr');
-              setModelId('');
-              setReasoningEffort('auto');
-            }}
-          >
-            <option value="provider_zdr">Private</option>
-            <option value="external">External</option>
-          </select>
-        </label>
-        <label className="garden-cap-control">
-          <span>{task ? 'Extra limit' : 'Limit'}</span>
-          <input
-            type="number"
-            min="0.01"
-            max={MAX_TASK_SPEND_USD}
-            disabled={editingDisabled || uploading || voiceBusy}
-            step="0.01"
-            value={cap}
-            onChange={(event) => {
-              changed.current = true;
-              setCap(event.target.value);
-            }}
-            placeholder="USD"
-            aria-label={task ? 'Additional spend limit in USD' : 'Task spend limit in USD'}
-          />
-        </label>
-        {task && isWorking(task) && (
-          <label className="garden-route-control">
-            <span>Apply</span>
+        <div className="garden-model-core">
+          <label className="garden-model-select">
+            <span>Model</span>
             <select
-              value={interrupt ? 'now' : 'next'}
+              aria-label="Model for this direction"
+              value={modelId}
               disabled={editingDisabled || uploading || voiceBusy}
-              onChange={(event) => setInterrupt(event.target.value === 'now')}
-              aria-label="Apply this direction"
+              onChange={(event) => {
+                changed.current = true;
+                setModelId(event.target.value);
+                setReasoningEffort('auto');
+              }}
             >
-              <option value="now">Now</option>
-              <option value="next">Next run</option>
+              <option value="">
+                {task ? (selectedModel?.displayName ?? 'Current model') : 'Automatic selection'}
+              </option>
+              {models.map((model) => (
+                <option key={model.id} value={model.id}>
+                  {model.displayName} ·{' '}
+                  {model.recommendationTags.includes('Ollama Cloud')
+                    ? 'Ollama Cloud'
+                    : model.provider === 'openrouter'
+                      ? 'OpenRouter'
+                      : 'Connected endpoint'}
+                </option>
+              ))}
             </select>
           </label>
-        )}
+          <label className="garden-approval-select">
+            <span>Approvals</span>
+            <select
+              aria-label="Approvals for this prompt"
+              title={modeFloors[securityMode]}
+              value={securityMode}
+              disabled={editingDisabled}
+              onChange={(event) => changeSecurityMode(event.target.value as Task['securityMode'])}
+            >
+              <option value="review">Review</option>
+              <option value="balanced">Balanced</option>
+              <option value="autonomous">Autonomous</option>
+            </select>
+          </label>
+          <label className="garden-effort-control">
+            <span>
+              Effort <strong>{effortLabel(reasoningEffort)}</strong>
+            </span>
+            <input
+              type="range"
+              aria-label="Model reasoning effort"
+              aria-valuetext={effortLabel(reasoningEffort)}
+              min={0}
+              max={Math.max(1, efforts.length - 1)}
+              step={1}
+              value={Math.max(0, effortIndex)}
+              disabled={editingDisabled || efforts.length < 2}
+              onChange={(event) => {
+                changed.current = true;
+                setReasoningEffort(efforts[Number(event.target.value)] ?? 'auto');
+              }}
+            />
+            <small>
+              {efforts.length < 2
+                ? selectedModel
+                  ? 'No adjustable levels advertised'
+                  : 'Choose a model for exact levels'
+                : 'Provider-supported levels'}
+            </small>
+          </label>
+        </div>
+        <details className="garden-run-settings">
+          <summary>Run settings</summary>
+          <div className="garden-run-settings-fields">
+            <label className="garden-route-control">
+              <span>Privacy</span>
+              <select
+                value={privacyRoute}
+                disabled={
+                  editingDisabled ||
+                  uploading ||
+                  voiceBusy ||
+                  bootstrap.instance.enforceZeroDataRetention
+                }
+                onChange={(event) => {
+                  changed.current = true;
+                  setPrivacyRoute(event.target.value === 'external' ? 'external' : 'provider_zdr');
+                  setModelId('');
+                  setReasoningEffort('auto');
+                }}
+              >
+                <option value="provider_zdr">Private</option>
+                <option value="external">External</option>
+              </select>
+            </label>
+            <label className="garden-cap-control">
+              <span>{task ? 'Extra limit' : 'Limit'}</span>
+              <input
+                type="number"
+                min="0.01"
+                max={MAX_TASK_SPEND_USD}
+                disabled={editingDisabled || uploading || voiceBusy}
+                step="0.01"
+                value={cap}
+                onChange={(event) => {
+                  changed.current = true;
+                  setCap(event.target.value);
+                }}
+                placeholder="USD"
+                aria-label={task ? 'Additional spend limit in USD' : 'Task spend limit in USD'}
+              />
+            </label>
+            {task && isWorking(task) && (
+              <label className="garden-route-control">
+                <span>Apply</span>
+                <select
+                  value={interrupt ? 'now' : 'next'}
+                  disabled={editingDisabled || uploading || voiceBusy}
+                  onChange={(event) => setInterrupt(event.target.value === 'now')}
+                  aria-label="Apply this direction"
+                >
+                  <option value="now">Now</option>
+                  <option value="next">Next run</option>
+                </select>
+              </label>
+            )}
+          </div>
+        </details>
       </div>
       <ErrorNotice error={error} />
       {saved && (
