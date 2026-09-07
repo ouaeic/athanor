@@ -35,6 +35,52 @@ else:
 PYTHON
 }
 
+# A completion receipt is reusable only while every executable path remains installer-owned.
+debugger_cache_safe() {
+  python3 -I - "$1" "$2" <<'PYTHON'
+import os, pathlib, stat, sys
+root = pathlib.Path(sys.argv[1])
+owner = os.geteuid()
+def safe(file):
+    info = file.lstat()
+    return (info.st_uid == owner and not info.st_mode & 0o6022 and
+            (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)))
+try:
+    if not safe(root) or not root.is_dir():
+        raise ValueError('unsafe debugger cache')
+    for directory, names, files in os.walk(root, followlinks=False):
+        if not all(safe(pathlib.Path(directory) / name) for name in names + files):
+            raise ValueError('unsafe debugger cache entry')
+    if (root / '.garden-complete').read_text().strip() != sys.argv[2]:
+        raise ValueError('incorrect debugger receipt')
+    if not (root / 'src/dapDebugServer.js').is_file():
+        raise ValueError('missing debugger entry point')
+except (OSError, ValueError):
+    sys.exit(1)
+PYTHON
+}
+
+# Replacement is committed only after the pinned staged archive has passed every check.
+replace_debugger_cache() {
+  python3 -I - "$1" "$2" <<'PYTHON'
+import ctypes, os, stat, sys
+staged, target = sys.argv[1:]
+if not os.path.lexists(target):
+    os.rename(staged, target)
+else:
+    if not stat.S_ISDIR(os.lstat(target).st_mode):
+        raise ValueError('the debugger cache must be a real directory')
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == 'darwin':
+        result = libc.renamex_np(os.fsencode(staged), os.fsencode(target), 2)
+    else:
+        result = libc.renameat2(-100, os.fsencode(staged), -100, os.fsencode(target), 2)
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+PYTHON
+}
+
 install_tools() (
   install -d -m 0755 "$native_root"
   requirements="$athanor_root/infra/native/athanor-python-requirements.txt"
@@ -66,24 +112,26 @@ install_tools() (
   js_version=1.117.0
   js_hash=ad8d04ede9d4b75cc290fd5438a65047a06f786d04f604b6112485b36f090772
   js_target="$native_root/js-debug-$js_version"
-  if [ ! -f "$js_target/.garden-complete" ]; then
-    [ ! -e "$js_target" ] || fail 'an unverified JavaScript debugger cache exists; preserve it for inspection'
+  if ! debugger_cache_safe "$js_target" "$js_hash"; then
+    [ ! -L "$js_target" ] || fail 'the JavaScript debugger cache must not be a symlink'
     js_stage=$(mktemp -d "$native_root/.debug-install.XXXXXX")
     trap 'rm -rf -- "$js_stage"' EXIT INT TERM
     curl -fsSL --retry 3 --max-time 120 \
       "https://github.com/microsoft/vscode-js-debug/releases/download/v$js_version/js-debug-dap-v$js_version.tar.gz" \
       -o "$js_stage/adapter.tar.gz"
     printf '%s  %s\n' "$js_hash" "$js_stage/adapter.tar.gz" | sha256sum --check --status
-    tar -xzf "$js_stage/adapter.tar.gz" -C "$js_stage"
+    tar --no-same-owner --no-same-permissions -xzf "$js_stage/adapter.tar.gz" -C "$js_stage"
     [ -f "$js_stage/js-debug/src/dapDebugServer.js" ] || fail 'the native debugger entry point is missing'
-    chmod -R a+rX "$js_stage/js-debug"
+    chmod -R a-s,go-w,a+rX "$js_stage/js-debug"
     printf '%s\n' "$js_hash" >"$js_stage/js-debug/.garden-complete"
-    mv "$js_stage/js-debug" "$js_target"
+    chmod 0644 "$js_stage/js-debug/.garden-complete"
+    debugger_cache_safe "$js_stage/js-debug" "$js_hash" || fail 'the staged debugger cache is not safely owned'
+    node --check "$js_stage/js-debug/src/dapDebugServer.js"
+    replace_debugger_cache "$js_stage/js-debug" "$js_target"
     rm -rf -- "$js_stage"
     trap - EXIT INT TERM
   fi
-  [ "$(cat "$js_target/.garden-complete")" = "$js_hash" ] || fail 'the debugger cache receipt does not match'
-  [ -f "$js_target/src/dapDebugServer.js" ] || fail 'the cached debugger entry point is missing'
+  debugger_cache_safe "$js_target" "$js_hash" || fail 'the debugger cache ownership or receipt is invalid'
   node --check "$js_target/src/dapDebugServer.js"
 
   # Completed environments remain available for offline recovery after activation.

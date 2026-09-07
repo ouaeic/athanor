@@ -1779,9 +1779,23 @@ set -eu
 printf 'download\n' >>"$NATIVE_CASE/downloads"
 if [ -f "$NATIVE_CASE/interrupt-download" ]; then kill -TERM "$PPID"; exit 143; fi
 for argument in "$@"; do destination="$argument"; done
-mkdir -p "$NATIVE_CASE/archive/js-debug/src"
-printf 'console.log("debugger fixture");\n' >"$NATIVE_CASE/archive/js-debug/src/dapDebugServer.js"
-tar -czf "$destination" -C "$NATIVE_CASE/archive" js-debug
+"$NATIVE_REAL_PYTHON" - "$destination" <<'PYTHON'
+import io, os, sys, tarfile
+body = b'function {\n' if os.path.exists(os.path.join(os.environ['NATIVE_CASE'], 'invalid-js')) else b'console.log("debugger fixture");\n'
+with tarfile.open(sys.argv[1], 'w:gz') as archive:
+    for name, content in [('js-debug', None), ('js-debug/src', None),
+                          ('js-debug/src/dapDebugServer.js', body)]:
+        entry = tarfile.TarInfo(name)
+        entry.uid = entry.gid = 1000
+        entry.uname = entry.gname = 'archive-builder'
+        entry.mode = 0o777 if content is None else 0o6777
+        if content is None:
+            entry.type = tarfile.DIRTYPE
+            archive.addfile(entry)
+        else:
+            entry.size = len(content)
+            archive.addfile(entry, io.BytesIO(content))
+PYTHON
 CURL
 cat >"$native_bin/sha256sum" <<'HASH'
 #!/bin/sh
@@ -1802,11 +1816,13 @@ grep -q '^Cmnd_Alias ATHANOR_MISSION_STATUS = ' "$policy"
 grep -q '^Defaults!ATHANOR_SANDBOX_RUN !use_pty$' "$policy"
 POLICY
 chmod 0755 "$native_bin/"*
-run_native() {
+# The installer must normalize archive modes even under a permissive caller umask.
+run_native() (
+  umask 000
   PATH="$native_bin:$fake_bin:$PATH" ATHANOR_ROOT="$native_source" \
     ATHANOR_RUNTIME_PREFIX="$native_runtime" ATHANOR_CONFIG="$native_case/config" \
     /bin/sh "$native_source/scripts/athanor-native-runtime" "$@"
-}
+)
 assert_original_native() {
   test ! -L "$native_lib/python"
   test "$(cat "$native_lib/python/owner-marker")" = 'original Python'
@@ -1826,12 +1842,26 @@ assert_original_native
 rm "$native_case/fail-hash"
 printf 'ok  failed and interrupted native acquisition preserves active tools and policy\n'
 
-run_native all >"$native_case/activated.log" 2>&1
+run_native all >"$native_case/activated.log" 2>&1 || {
+  cat "$native_case/activated.log" >&2
+  fail_case 'valid archive ownership and modes must normalize before activation'
+}
 for installed in python/bin/python3 js-debug/src/dapDebugServer.js mission-supervisor.py; do
   test -f "$native_lib/$installed" || fail_case "native activation omitted $installed"
 done
 test -L "$native_lib/python"
 test -L "$native_lib/js-debug"
+"$NATIVE_REAL_PYTHON" - "$native_lib/js-debug" <<'PYTHON'
+import os, pathlib, stat, sys
+root = pathlib.Path(sys.argv[1]).resolve()
+entries = [root, *root.rglob('*')]
+assert len(entries) > 1, 'archive extraction did not create files'
+for file in entries:
+    info = file.lstat()
+    assert info.st_uid == os.geteuid(), f'archive owner was preserved: {file}'
+    assert not info.st_mode & 0o6022, f'archive write/special modes were preserved: {file}'
+    assert stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode), file
+PYTHON
 test "$(cat "$native_lib/python-before-managed/owner-marker")" = 'original Python'
 grep -q -- '--require-hashes --no-deps --only-binary=:all:' "$native_case/pip-arguments" ||
   fail_case 'native Python wheels were not hash-verified'
@@ -1849,6 +1879,48 @@ grep -q '^PREVIEW_BASE_URL=https://native-box.example:8443/__athanor/preview$' "
 grep -q '^RESERVED_PREVIEW_PORTS=4100,4400,9999,443,8443$' "$native_case/config/runner.env"
 grep -q '^ISOLATE_AGENT_NETWORK=false$' "$native_case/config/runner.env"
 printf 'ok  native activation verifies pins, retains rollback tools and reuses its cache offline\n'
+# A previously writable completed cache cannot become trusted through chmod/chown alone. Failed
+# fresh acquisition preserves the exact active bytes; success replaces the tampered tree atomically.
+rm "$native_case/fail-pip" "$native_case/interrupt-download"
+js_cached=$(readlink "$native_lib/js-debug")
+printf 'console.log("tampered cache");\n' >"$js_cached/src/dapDebugServer.js"
+chmod 0777 "$js_cached/src/dapDebugServer.js"
+printf 'do not retain unsafe cache entry\n' >"$js_cached/untrusted-extra"
+: >"$native_case/fail-hash"
+if run_native tools >/dev/null 2>&1; then fail_case 'unsafe cached debugger bypassed verified acquisition'; fi
+grep -q 'tampered cache' "$js_cached/src/dapDebugServer.js"
+test -f "$js_cached/untrusted-extra"
+test "$(readlink "$native_lib/js-debug")" = "$js_cached"
+rm "$native_case/fail-hash"
+: >"$native_case/invalid-js"
+if run_native tools >/dev/null 2>&1; then fail_case 'invalid debugger syntax was accepted'; fi
+grep -q 'tampered cache' "$js_cached/src/dapDebugServer.js" || fail_case 'syntax validation replaced the active cache before it passed'
+test -f "$js_cached/untrusted-extra"
+test "$(readlink "$native_lib/js-debug")" = "$js_cached"
+rm "$native_case/invalid-js"
+native_downloads_before=$(wc -l <"$native_case/downloads")
+run_native tools >"$native_case/repaired-cache.log" 2>&1 || {
+  cat "$native_case/repaired-cache.log" >&2
+  fail_case 'unsafe cached debugger was not safely replaced'
+}
+native_downloads_after=$(wc -l <"$native_case/downloads")
+test "$native_downloads_after" -eq "$((native_downloads_before + 1))" || fail_case 'unsafe cache was not reacquired'
+grep -q 'debugger fixture' "$js_cached/src/dapDebugServer.js"
+test ! -e "$js_cached/untrusted-extra" || fail_case 'unsafe cache was repaired in place'
+test "$(readlink "$native_lib/js-debug")" = "$js_cached"
+"$NATIVE_REAL_PYTHON" - "$js_cached" <<'PYTHON'
+import os, pathlib, sys
+entries = [pathlib.Path(sys.argv[1]), *pathlib.Path(sys.argv[1]).rglob('*')]
+assert len(entries) > 1
+for file in entries:
+    info = file.lstat()
+    assert info.st_uid == os.geteuid() and not info.st_mode & 0o6022, file
+assert not list(pathlib.Path(sys.argv[1]).parent.glob('.debug-install.*')), 'staged replacement was not cleaned'
+PYTHON
+: >"$native_case/interrupt-download"
+run_native tools >/dev/null 2>&1
+rm "$native_case/interrupt-download"
+printf 'ok  real archive ownership/modes are normalized and unsafe completed adapters are reacquired before atomic replacement\n'
 # The generated frame policy follows an explicitly configured isolated origin, including a
 # custom gateway path. No reactivation rewrites the operator's route or networking preference.
 printf 'PUBLIC_APP_URL=https://native-box.example\nPREVIEW_BASE_URL=https://private-apps.example:9443/custom/preview\nRESERVED_PREVIEW_PORTS=5555\n' >"$native_case/config/control.env"
