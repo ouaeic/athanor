@@ -23,6 +23,7 @@ export interface Draft {
   controls?: {
     modelId: string;
     reasoningEffort: TaskReasoningEffort;
+    securityMode?: Task['securityMode'];
     privacyRoute: PrivacyRoute;
     spendCap: string;
   };

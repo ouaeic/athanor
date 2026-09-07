@@ -1,11 +1,12 @@
 import { lazy, Suspense, useEffect, useRef, useState } from 'react';
-import { ArrowUpRight, Paperclip, X, SlidersHorizontal, Mic, Square } from 'lucide-react';
+import { ArrowUpRight, Paperclip, X, Mic, Square } from 'lucide-react';
 import type { Task, Workspace, TaskReasoningEffort } from '@athanor/contracts';
+import { modeFloors } from './asking-rules';
 import { effortChoices, effortLabel } from './reasoning-options';
 import type { Bootstrap, Draft, DraftAttachment } from './model';
 import { defaultPrivacy, isWorking, text, data } from './model';
-import { isNativeClient, post, put, request } from './client';
-import { Button, Dialog, ErrorNotice, Field } from './ui';
+import { isNativeClient, patch, post, put, request } from './client';
+import { Button, ErrorNotice } from './ui';
 import { useAutosizeTextarea } from './use-autosize-textarea';
 import { MAX_TASK_SPEND_USD } from './usage-model.js';
 import {
@@ -49,9 +50,11 @@ export default function Composer({
   const [privacyRoute, setPrivacyRoute] = useState(
     initialDraft?.controls?.privacyRoute ?? task?.privacyRoute ?? defaultPrivacy(bootstrap)
   );
+  const [securityMode, setSecurityMode] = useState<Task['securityMode']>(
+    initialDraft?.controls?.securityMode ?? task?.securityMode ?? workspace.securityMode
+  );
   const [cap, setCap] = useState(initialDraft?.controls?.spendCap ?? '');
   const [interrupt, setInterrupt] = useState(true);
-  const [advanced, setAdvanced] = useState(false);
   const [busy, setBusy] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<unknown>(null);
@@ -83,7 +86,7 @@ export default function Composer({
       taskId: task?.id ?? null,
       body,
       attachments,
-      controls: { modelId, reasoningEffort, privacyRoute, spendCap: cap }
+      controls: { modelId, reasoningEffort, securityMode, privacyRoute, spendCap: cap }
     };
     onDraftRef.current(draft);
     const revision = ++draftRevision.current;
@@ -110,6 +113,7 @@ export default function Composer({
     attachments,
     modelId,
     reasoningEffort,
+    securityMode,
     privacyRoute,
     cap,
     workspace.id,
@@ -225,7 +229,6 @@ export default function Composer({
   }
   async function send() {
     if (
-      advanced ||
       dictationSetup ||
       !body.trim() ||
       sending.current ||
@@ -255,6 +258,7 @@ export default function Composer({
       attachments: attachments.map((file) => file.path),
       ...(modelId ? { modelId } : {}),
       reasoningEffort,
+      securityMode,
       privacyRoute,
       ...(limit !== undefined ? { maxSpendUsd: limit } : {}),
       ...(task ? { interrupt } : { workspaceId: workspace.id })
@@ -292,6 +296,26 @@ export default function Composer({
       return;
     setError(null);
     setDictationSetup(true);
+  }
+  function changeSecurityMode(next: Task['securityMode']) {
+    changed.current = true;
+    setSecurityMode(next);
+    setError(null);
+    if (!task || !isWorking(task)) return;
+    setBusy(true);
+    void patch<Task>(`/v1/tasks/${task.id}/security-mode`, { securityMode: next })
+      .then((updated) => {
+        if (mounted.current) onSent(updated);
+      })
+      .catch((cause: unknown) => {
+        if (mounted.current) {
+          setSecurityMode(task.securityMode);
+          setError(cause);
+        }
+      })
+      .finally(() => {
+        if (mounted.current) setBusy(false);
+      });
   }
   const recording = dictationState === 'recording';
   const voiceBusy = dictationState !== 'idle';
@@ -403,14 +427,6 @@ export default function Composer({
               {recording ? <Square size={16} /> : <Mic size={18} />}
             </Button>
           )}
-          <Button
-            aria-label="Direction options"
-            aria-expanded={advanced}
-            disabled={editingDisabled || uploading || voiceBusy}
-            onClick={() => setAdvanced(!advanced)}
-          >
-            <SlidersHorizontal size={17} />
-          </Button>
         </div>
         <Button
           type="submit"
@@ -485,6 +501,20 @@ export default function Composer({
             ))}
           </select>
         </label>
+        <label className="garden-approval-select">
+          <span>Approvals</span>
+          <select
+            aria-label="Approvals for this prompt"
+            title={modeFloors[securityMode]}
+            value={securityMode}
+            disabled={editingDisabled}
+            onChange={(event) => changeSecurityMode(event.target.value as Task['securityMode'])}
+          >
+            <option value="review">Review</option>
+            <option value="balanced">Balanced</option>
+            <option value="autonomous">Autonomous</option>
+          </select>
+        </label>
         <label className="garden-effort-control">
           <span>
             Effort <strong>{effortLabel(reasoningEffort)}</strong>
@@ -511,66 +541,59 @@ export default function Composer({
               : 'Provider-supported levels'}
           </small>
         </label>
-      </div>
-      {advanced && (
-        <Dialog title="Direction options" onClose={() => setAdvanced(false)}>
-          <div className="intent-options">
-            <Field label="Privacy route">
-              <select
-                value={privacyRoute}
-                disabled={
-                  editingDisabled ||
-                  uploading ||
-                  voiceBusy ||
-                  bootstrap.instance.enforceZeroDataRetention
-                }
-                onChange={(event) => {
-                  changed.current = true;
-                  setPrivacyRoute(event.target.value === 'external' ? 'external' : 'provider_zdr');
-                  setModelId('');
-                  setReasoningEffort('auto');
-                }}
-              >
-                <option value="provider_zdr">Zero data retention</option>
-                <option value="external">External provider</option>
-              </select>
-            </Field>
-            <Field
-              label={task ? 'Additional spend limit (USD)' : 'Task spend limit (USD)'}
-              hint="Leave blank to use your account limits."
+        <label className="garden-route-control">
+          <span>Privacy</span>
+          <select
+            value={privacyRoute}
+            disabled={
+              editingDisabled ||
+              uploading ||
+              voiceBusy ||
+              bootstrap.instance.enforceZeroDataRetention
+            }
+            onChange={(event) => {
+              changed.current = true;
+              setPrivacyRoute(event.target.value === 'external' ? 'external' : 'provider_zdr');
+              setModelId('');
+              setReasoningEffort('auto');
+            }}
+          >
+            <option value="provider_zdr">Private</option>
+            <option value="external">External</option>
+          </select>
+        </label>
+        <label className="garden-cap-control">
+          <span>{task ? 'Extra limit' : 'Limit'}</span>
+          <input
+            type="number"
+            min="0.01"
+            max={MAX_TASK_SPEND_USD}
+            disabled={editingDisabled || uploading || voiceBusy}
+            step="0.01"
+            value={cap}
+            onChange={(event) => {
+              changed.current = true;
+              setCap(event.target.value);
+            }}
+            placeholder="USD"
+            aria-label={task ? 'Additional spend limit in USD' : 'Task spend limit in USD'}
+          />
+        </label>
+        {task && isWorking(task) && (
+          <label className="garden-route-control">
+            <span>Apply</span>
+            <select
+              value={interrupt ? 'now' : 'next'}
+              disabled={editingDisabled || uploading || voiceBusy}
+              onChange={(event) => setInterrupt(event.target.value === 'now')}
+              aria-label="Apply this direction"
             >
-              <input
-                type="number"
-                min="0.01"
-                max={MAX_TASK_SPEND_USD}
-                disabled={editingDisabled || uploading || voiceBusy}
-                step="0.01"
-                value={cap}
-                onChange={(event) => {
-                  changed.current = true;
-                  setCap(event.target.value);
-                }}
-                placeholder="Account default"
-              />
-            </Field>
-            {task && isWorking(task) && (
-              <Field
-                label="Apply this direction"
-                hint="Updates are picked up at the next step. An operation already in progress can finish safely."
-              >
-                <select
-                  value={interrupt ? 'now' : 'next'}
-                  disabled={editingDisabled || uploading || voiceBusy}
-                  onChange={(event) => setInterrupt(event.target.value === 'now')}
-                >
-                  <option value="now">Update this run</option>
-                  <option value="next">After this run finishes</option>
-                </select>
-              </Field>
-            )}
-          </div>
-        </Dialog>
-      )}
+              <option value="now">Now</option>
+              <option value="next">Next run</option>
+            </select>
+          </label>
+        )}
+      </div>
       <ErrorNotice error={error} />
       {saved && (
         <small className="draft-status" role="status">

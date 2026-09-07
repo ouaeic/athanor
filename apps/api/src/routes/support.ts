@@ -361,29 +361,37 @@ export const createServerSupport = (context: ServerBase) => {
      * every one of them offered as available, and the first thing that noticed was the worker
      * refusing the turn with `provider_model_mismatch` - after the conversation had started.
      *
-     * They are withdrawn rather than hidden, for the same reason a model held back for a licence
-     * review is still listed: an owner whose model vanished concludes athanor lost it. A box with
-     * no provider connected withdraws nothing, because on that box no row is wrong yet.
+     * A connected catalogue is the picker: other providers' rows are excluded. A box with no
+     * provider connected keeps the seeded rows so the first connection can still be configured.
      */
     const connected = await inferenceCredential(user.id)
-      .then(({ secret, configured }) =>
-        configured ? (secret.provider === 'openrouter' ? 'openrouter' : 'custom') : null
-      )
+      .then(({ secret, configured }) => {
+        if (!configured) return null;
+        if (secret.provider === 'openrouter') return { provider: 'openrouter' as const };
+        return {
+          provider: 'custom' as const,
+          tag: secret.provider === 'ollama-cloud' ? 'Ollama Cloud' : 'Configured endpoint'
+        };
+      })
       .catch(() => null);
-    return (await store.listModels()).map((record) => {
-      // The contract's parse strips what it does not declare, and the fields the router reads -
-      // where the numbers came from, when the route retires, how it bills a cached prefix - are
-      // deliberately not part of the owner-facing model shape. Carried alongside rather than
-      // widened into it, so the API keeps answering with exactly what it promises.
-      const parsed = ModelRelease.parse(record);
-      const model = applyOpenRouterPrivacyPolicy(
-        connected && parsed.provider !== connected
-          ? { ...parsed, availability: 'unavailable' as const }
-          : parsed,
-        requireZdr
-      );
-      return { ...model, ...readRoutingMetadata(record) };
-    });
+    return (await store.listModels())
+      .filter((record) => {
+        if (!connected) return true;
+        const model = ModelRelease.parse(record);
+        return (
+          model.provider === connected.provider &&
+          (!('tag' in connected) || model.recommendationTags.includes(connected.tag))
+        );
+      })
+      .map((record) => {
+        // The contract's parse strips what it does not declare, and the fields the router reads -
+        // where the numbers came from, when the route retires, how it bills a cached prefix - are
+        // deliberately not part of the owner-facing model shape. Carried alongside rather than
+        // widened into it, so the API keeps answering with exactly what it promises.
+        const parsed = ModelRelease.parse(record);
+        const model = applyOpenRouterPrivacyPolicy(parsed, requireZdr);
+        return { ...model, ...readRoutingMetadata(record) };
+      });
   };
 
   const provisionWorkspace = async (

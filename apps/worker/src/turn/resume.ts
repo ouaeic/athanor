@@ -345,6 +345,7 @@ export const resumeParkedTurn = async (
     }
     Object.assign(state, answeredState);
     delete state.question;
+    if (!waiting?.approvalId && waiting?.securityMode) task.securityMode = waiting.securityMode;
     task.reasoningEffort = state.ownerReasoningEffort ?? 'auto';
     await event(deps.store, task, key, 'status', 'Answered - carrying on', {
       question: asked.question

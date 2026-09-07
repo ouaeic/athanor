@@ -1530,6 +1530,7 @@ export const CreateTaskRequest = z.object({
 export type CreateTaskRequest = z.input<typeof CreateTaskRequest>;
 
 export const ContinueTaskRequest = z.object({
+  securityMode: SecurityMode.optional(),
   prompt: z.string().trim().min(1).max(200_000),
   modelId: z.string().optional(),
   reasoningEffort: TaskReasoningEffort.optional(),
@@ -2025,6 +2026,7 @@ export const SaveDraftRequest = z.object({
     .object({
       modelId: z.string().max(300),
       reasoningEffort: TaskReasoningEffort,
+      securityMode: SecurityMode.optional(),
       privacyRoute: PrivacyRoute,
       spendCap: z.string().max(32)
     })

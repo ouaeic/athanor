@@ -159,6 +159,7 @@ export interface WorkspaceCheckpointRecord {
 }
 
 export interface TaskMessageQueueRecord {
+  securityMode?: TaskRecord['securityMode'];
   id: string;
   /** A denial correction retains the active task's settings and allocation. */
   approvalId?: string;

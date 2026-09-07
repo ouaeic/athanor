@@ -3609,5 +3609,12 @@ CREATE TABLE IF NOT EXISTS project_model_preferences (
  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 `
+  },
+  {
+    version: 97,
+    name: 'prompt_approval_mode',
+    sql: `
+ALTER TABLE task_message_queue ADD COLUMN IF NOT EXISTS security_mode TEXT CHECK(security_mode IN ('review','balanced','autonomous'));
+`
   }
 ] as const;

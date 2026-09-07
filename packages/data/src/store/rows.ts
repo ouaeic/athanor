@@ -207,6 +207,9 @@ export const mapWorkspaceCheckpoint = (
 });
 
 export const mapTaskMessage = (row: Record<string, unknown>): TaskMessageQueueRecord => ({
+  ...(typeof row.security_mode === 'string'
+    ? { securityMode: row.security_mode as TaskRecord['securityMode'] }
+    : {}),
   id: String(row.id),
   ...(typeof row.approval_id === 'string' ? { approvalId: row.approval_id } : {}),
   taskId: String(row.task_id),

@@ -608,17 +608,10 @@ try {
     ),
     'Project tools must precede the running work'
   );
-  const autonomy = page.getByRole('combobox', { name: 'Autonomy', exact: true });
-  await autonomy.selectOption('2');
-  await page.waitForFunction(
-    () => document.querySelector('.garden-autonomy')?.getAttribute('aria-busy') === 'false'
-  );
-  assert.equal(autonomyChanges.at(-1), 'autonomous');
-  await autonomy.selectOption('1');
-  await page.waitForFunction(
-    () => document.querySelector('.garden-autonomy')?.getAttribute('aria-busy') === 'false'
-  );
-  assert.equal(autonomyChanges.at(-1), 'balanced');
+  const autonomy = page.getByRole('combobox', { name: 'Approvals for this prompt', exact: true });
+  await autonomy.selectOption('autonomous');
+  assert.equal(autonomyChanges.length, 0, 'A completed task selection must not mutate the project');
+  assert.equal(await page.locator('.garden-top-tools select').count(), 0);
   for (const [width, height] of [
     [1440, 1000],
     [1024, 900],
@@ -762,47 +755,35 @@ try {
     'Removing text shrinks the direction editor'
   );
   await page.setViewportSize({ width: 320, height: 600 });
-  await page.getByRole('button', { name: 'Direction options', exact: true }).click();
-  const directionOptions = page.getByRole('dialog', { name: 'Direction options', exact: true });
-  const optionsGeometry = await directionOptions.evaluate((element) => {
-    const box = element.getBoundingClientRect(),
-      fields = [...element.querySelectorAll('.field')].map((field) =>
-        field.getBoundingClientRect()
-      );
-    return {
-      inside: box.left >= 0 && box.right <= innerWidth && box.top >= 0 && box.bottom <= innerHeight,
-      overflow: element.scrollWidth > element.clientWidth + 1,
-      gap: fields[1].top - fields[0].bottom
-    };
+  const limit = page.getByRole('spinbutton', {
+    name: 'Additional spend limit in USD',
+    exact: true
   });
-  assert(
-    optionsGeometry.inside && !optionsGeometry.overflow,
-    'Direction options must fit the phone in their own panel'
-  );
-  assert(optionsGeometry.gap >= 18, 'Option fields must have a clear separation');
-  await directionOptions.getByRole('spinbutton').fill('0.2');
-  await directionOptions.getByRole('spinbutton').press('Enter');
+  await limit.fill('0.2');
+  await limit.press('Enter');
   assert.equal(
     await directionInput.inputValue(),
     'Keep this direction while adjusting options.',
     'Editing an option must not submit or clear the direction'
   );
-  await directionOptions
-    .getByRole('button', { name: 'Close Direction options', exact: true })
-    .click();
   await page.setViewportSize({ width: 1440, height: 1000 });
   const effort = page.getByRole('slider', { name: 'Model reasoning effort' });
   await effort.focus();
   await page.keyboard.press('End');
-  await page.locator(`#intent-${task.id}`).fill('Keep this draft and its effort choice.');
-  await page.waitForFunction(() =>
-    document.querySelector('.draft-status')?.textContent.includes('Draft saved')
+  const savedChoice = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === '/v1/drafts' &&
+      response.request().postDataJSON()?.body === 'Keep this draft and its effort choice.' &&
+      response.request().postDataJSON()?.controls?.reasoningEffort === 'max'
   );
+  await page.locator(`#intent-${task.id}`).fill('Keep this draft and its effort choice.');
+  assert((await savedChoice).ok());
   assert.equal(
     draft.controls.reasoningEffort,
     'max',
     'The effort choice must travel with the saved draft'
   );
+  assert.equal(draft.controls.securityMode, 'autonomous');
   await page.evaluate(() =>
     Object.defineProperty(navigator, 'clipboard', {
       configurable: true,

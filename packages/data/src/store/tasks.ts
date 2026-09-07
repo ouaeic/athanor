@@ -519,6 +519,7 @@ export class TaskStore {
     userId: string;
     modelId: string;
     reasoningEffort?: TaskRecord['reasoningEffort'];
+    securityMode?: TaskRecord['securityMode'];
     privacyRoute: string;
     additionalComputeCredits: number;
     /** Extra real currency this follow-up may spend, on top of what the task already spent. */
@@ -535,7 +536,7 @@ export class TaskStore {
         // ceiling is anchored to what the task has already spent rather than to zero - otherwise
         // asking for "$2 more" on a task that spent $5 would read as an instantly-breached cap.
         `UPDATE tasks t SET
-           status='queued', model_id=$3, privacy_route=$4, reasoning_effort=COALESCE($8,reasoning_effort),
+           status='queued', model_id=$3, privacy_route=$4, reasoning_effort=COALESCE($8,reasoning_effort), security_mode=COALESCE($9,security_mode),
            max_compute_credits=max_compute_credits+$5,
            max_spend_usd=CASE WHEN $7::double precision IS NULL THEN max_spend_usd ELSE
              COALESCE(max_spend_usd, (SELECT COALESCE(SUM(u.cost_usd),0) FROM usage_entries u
@@ -558,7 +559,8 @@ export class TaskStore {
           input.additionalComputeCredits,
           JSON.stringify(input.agentStateCiphertext),
           input.additionalSpendUsd ?? null,
-          input.reasoningEffort ?? null
+          input.reasoningEffort ?? null,
+          input.securityMode ?? null
         ]
       );
       if (!updated.rows[0]) return null;
@@ -599,6 +601,7 @@ export class TaskStore {
     userId: string;
     modelId: string;
     reasoningEffort?: TaskRecord['reasoningEffort'];
+    securityMode?: TaskRecord['securityMode'];
     privacyRoute: string;
     maxComputeCredits: number;
     maxSpendUsd?: number | null;
@@ -626,8 +629,8 @@ export class TaskStore {
       await tx.query(
         `INSERT INTO task_message_queue(
            id,task_id,user_id,prompt_ciphertext,model_id,privacy_route,max_compute_credits,
-           resource_class,reservation_key,max_spend_usd,interrupt,reasoning_effort
-         ) VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9,$10,$11,$12)`,
+           resource_class,reservation_key,max_spend_usd,interrupt,reasoning_effort,security_mode
+         ) VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
         [
           input.id,
           input.taskId,
@@ -640,7 +643,8 @@ export class TaskStore {
           input.reservationKey,
           input.maxSpendUsd ?? null,
           input.interrupt ?? false,
-          input.reasoningEffort ?? optionalText(row.reasoning_effort) ?? 'auto'
+          input.reasoningEffort ?? optionalText(row.reasoning_effort) ?? 'auto',
+          input.securityMode ?? null
         ]
       );
       await tx.query(
@@ -828,7 +832,7 @@ export class TaskStore {
       );
       if (!locked.rows[0]) return false;
       const queued = await tx.query(
-        `SELECT id,reasoning_effort,approval_id FROM task_message_queue
+        `SELECT id,reasoning_effort,security_mode,approval_id FROM task_message_queue
          WHERE id=$1 AND task_id=$2 AND status='queued' FOR UPDATE`,
         [input.messageId, input.taskId]
       );
@@ -853,6 +857,7 @@ export class TaskStore {
         `UPDATE tasks SET
            max_compute_credits=max_compute_credits+$3,
            reasoning_effort=CASE WHEN $6 THEN reasoning_effort ELSE $5 END,
+           security_mode=CASE WHEN $6 THEN security_mode ELSE COALESCE($9,security_mode) END,
            agent_state_ciphertext=COALESCE($7::jsonb,agent_state_ciphertext),
            actual_compute_credits=CASE WHEN $8::double precision IS NULL THEN actual_compute_credits
              WHEN has_coding_family THEN GREATEST(actual_compute_credits,$8) ELSE $8 END,
@@ -869,7 +874,8 @@ export class TaskStore {
           queued.rows[0].reasoning_effort ?? 'auto',
           denial,
           input.agentStateCiphertext ? JSON.stringify(input.agentStateCiphertext) : null,
-          input.actualComputeCredits ?? null
+          input.actualComputeCredits ?? null,
+          queued.rows[0].security_mode ?? null
         ]
       );
       await tx.query(
@@ -904,7 +910,7 @@ export class TaskStore {
       );
       if (!locked.rows[0]) return null;
       const queued = await tx.query(
-        `SELECT id,reasoning_effort,approval_id FROM task_message_queue
+        `SELECT id,reasoning_effort,security_mode,approval_id FROM task_message_queue
          WHERE id=$1 AND task_id=$2 AND status='queued' FOR UPDATE`,
         [input.messageId, input.taskId]
       );
@@ -927,6 +933,7 @@ export class TaskStore {
            status='queued',model_id=CASE WHEN $9 THEN model_id ELSE $3 END,
            privacy_route=CASE WHEN $9 THEN privacy_route ELSE $4 END,
            reasoning_effort=CASE WHEN $9 THEN reasoning_effort ELSE $8 END,
+           security_mode=CASE WHEN $9 THEN security_mode ELSE COALESCE($10,security_mode) END,
            max_compute_credits=max_compute_credits+$5,
            max_spend_usd=CASE WHEN $7::double precision IS NULL THEN max_spend_usd ELSE
              COALESCE(max_spend_usd, (SELECT COALESCE(SUM(u.cost_usd),0) FROM usage_entries u
@@ -947,7 +954,8 @@ export class TaskStore {
           JSON.stringify(input.agentStateCiphertext),
           denial ? null : (input.additionalSpendUsd ?? null),
           queued.rows[0].reasoning_effort ?? 'auto',
-          denial
+          denial,
+          queued.rows[0].security_mode ?? null
         ]
       );
       if (!updated.rows[0]) throw new Error('queued_message_promotion_conflict');

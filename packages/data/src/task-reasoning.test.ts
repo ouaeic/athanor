@@ -38,7 +38,11 @@ describe('task reasoning preferences survive each durable message path', () => {
       maxComputeCredits: 10,
       ...(reasoningEffort ? { reasoningEffort } : {})
     });
-  const queue = async (taskId: string, effort: NonNullable<TaskRecord['reasoningEffort']>) => {
+  const queue = async (
+    taskId: string,
+    effort: NonNullable<TaskRecord['reasoningEffort']>,
+    securityMode?: TaskRecord['securityMode']
+  ) => {
     const id = randomUUID();
     await store.enqueueTaskMessage({
       id,
@@ -46,6 +50,7 @@ describe('task reasoning preferences survive each durable message path', () => {
       userId,
       modelId: 'model',
       reasoningEffort: effort,
+      ...(securityMode ? { securityMode } : {}),
       privacyRoute: 'provider_zdr',
       maxComputeCredits: 1,
       resourceClass: 'light',
@@ -65,8 +70,9 @@ describe('task reasoning preferences survive each durable message path', () => {
 
   it('keeps queued preferences separate until atomic promotion', async () => {
     const task = await create('high');
-    const messageId = await queue(task.id, 'minimal');
+    const messageId = await queue(task.id, 'minimal', 'autonomous');
     expect((await store.getTask(userId, task.id))?.reasoningEffort).toBe('high');
+    expect((await store.getTask(userId, task.id))?.securityMode).toBe('balanced');
     expect((await store.getNextQueuedTaskMessage(task.id))?.reasoningEffort).toBe('minimal');
     await database.query("UPDATE tasks SET lease_owner='worker',status='running' WHERE id=$1", [
       task.id
@@ -83,12 +89,13 @@ describe('task reasoning preferences survive each durable message path', () => {
       statusEventCiphertext: envelope
     });
     expect(promoted?.reasoningEffort).toBe('minimal');
+    expect(promoted?.securityMode).toBe('autonomous');
     expect(await store.getNextQueuedTaskMessage(task.id)).toBeNull();
   });
 
   it('applies an in-turn correction only under the active lease', async () => {
     const task = await create('low');
-    const messageId = await queue(task.id, 'xhigh');
+    const messageId = await queue(task.id, 'xhigh', 'review');
     await database.query("UPDATE tasks SET lease_owner='worker',status='running' WHERE id=$1", [
       task.id
     ]);
@@ -103,6 +110,7 @@ describe('task reasoning preferences survive each durable message path', () => {
     expect((await store.getTask(userId, task.id))?.reasoningEffort).toBe('low');
     expect(await store.consumeQueuedTaskMessageInTurn({ ...input, workerId: 'worker' })).toBe(true);
     expect((await store.getTask(userId, task.id))?.reasoningEffort).toBe('xhigh');
+    expect((await store.getTask(userId, task.id))?.securityMode).toBe('review');
   });
 
   it('preserves a choice on follow-up and lets the owner explicitly restore Auto', async () => {
@@ -126,10 +134,12 @@ describe('task reasoning preferences survive each durable message path', () => {
         await store.continueTask({
           ...input,
           reservationKey: `followup:${randomUUID()}`,
-          reasoningEffort: 'auto'
+          reasoningEffort: 'auto',
+          securityMode: 'autonomous'
         })
       )?.reasoningEffort
     ).toBe('auto');
+    expect((await store.getTask(userId, task.id))?.securityMode).toBe('autonomous');
   });
 
   it('inherits the parent preference when branching', async () => {

@@ -80,6 +80,7 @@ export const drainCorrection = async (
     return false;
   }
   Object.assign(state, nextState);
+  if (!queued.approvalId && queued.securityMode) task.securityMode = queued.securityMode;
   if (!queued.approvalId) task.reasoningEffort = nextState.ownerReasoningEffort ?? 'auto';
   await event(deps.store, task, key, 'status', 'Applying your correction to the running task');
   return true;

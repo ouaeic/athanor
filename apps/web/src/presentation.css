@@ -6,23 +6,6 @@
   gap: 0.45rem;
   align-items: center;
 }
-.garden-autonomy {
-  display: flex;
-  align-items: center;
-  gap: 0.25rem;
-  margin-left: auto;
-  min-width: 0;
-  color: var(--muted);
-}
-.garden-autonomy select {
-  width: auto;
-  min-height: 30px;
-  padding: 0.3rem 1.5rem 0.3rem 0.35rem;
-  border: 0;
-  background-color: transparent;
-  font-size: 11px;
-  color: var(--text);
-}
 .garden-preview-state {
   padding: 1.25rem;
   line-height: 1.6;

@@ -211,6 +211,7 @@ async function performContinuation(
       userId: user.id,
       modelId: selected.id,
       reasoningEffort,
+      ...(!retained && input.securityMode ? { securityMode: input.securityMode } : {}),
       privacyRoute,
       maxComputeCredits: retained
         ? 0
@@ -267,6 +268,7 @@ async function performContinuation(
     userId: user.id,
     modelId: selected.id,
     reasoningEffort,
+    ...(!retained && input.securityMode ? { securityMode: input.securityMode } : {}),
     privacyRoute,
     additionalComputeCredits: retained ? 0 : input.maxComputeCredits,
     additionalSpendUsd: spendCeilingUsd,

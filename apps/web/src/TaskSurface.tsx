@@ -50,10 +50,8 @@ import { DecisionCard } from './DecisionQueue';
 import { createQuestionAnswerSender } from './task-actions';
 import { TaskOutputs, TaskProgress } from './TaskCanvas';
 import WorkTrace from './WorkTrace';
-import { WorkDirections } from './WorkDirections';
 import { currentWork } from './current-work';
 import { presentationArtifacts } from './task-artifacts';
-import { TaskAutonomy } from './TaskAutonomy';
 import './presentation.css';
 import { effortLabel } from './reasoning-options';
 const Markdown = lazy(() => import('./MarkdownBody'));
@@ -343,6 +341,63 @@ export default function TaskSurface({
     setScope(selection.slice(0, 12000));
     document.getElementById(`intent-${task.id}`)?.focus();
   }
+  const attentionPanel =
+    taskDecisions.length > 0 || question ? (
+      <aside className="work-attention">
+        {taskDecisions.map((decision) => (
+          <DecisionCard
+            key={decision.id}
+            decision={decision}
+            onComputer={onComputer}
+            onResolved={() => {
+              onRefresh();
+              void reload();
+            }}
+          />
+        ))}
+        {question && (!task.parentMissionId || taskDecisions.length === 0) && (
+          <article className="question-card" id={`question-${task.id}`}>
+            <div className="eyebrow">
+              <MessageSquare size={14} />
+              Your judgement
+            </div>
+            <h2>{text(questionData.question, question.summary)}</h2>
+            {text(questionData.why) && <p>{text(questionData.why)}</p>}
+            <div className="stack">
+              {strings(questionData.options).map((option) => (
+                <Button key={option} disabled={busy} onClick={() => answerQuestion(option)}>
+                  {option}
+                  <ArrowUpRight size={15} />
+                </Button>
+              ))}
+            </div>
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                void answerQuestion(questionAnswer);
+              }}
+            >
+              <Field label="Your answer">
+                <textarea
+                  value={questionAnswer}
+                  onChange={(event) => setQuestionAnswer(event.target.value)}
+                  rows={3}
+                />
+              </Field>
+              <Button
+                type="submit"
+                className="primary"
+                disabled={!questionAnswer.trim()}
+                busy={busy}
+              >
+                Send answer
+                <ArrowUpRight size={16} />
+              </Button>
+            </form>
+          </article>
+        )}
+      </aside>
+    ) : null;
   return (
     <section className="garden-task">
       <div className="garden-task-scroll">
@@ -429,7 +484,6 @@ export default function TaskSurface({
             Activity
           </Button>
           <Button onClick={() => setPanel('plan')}>Plan</Button>
-          <TaskAutonomy key={task.id} task={task} onTask={onTask} onRefresh={onRefresh} />
         </div>
         <div className="run-summary">
           <div className={`status-line ${isWorking(task) || pendingDelivery ? 'active' : ''}`}>
@@ -462,23 +516,6 @@ export default function TaskSurface({
             )}
           </div>
         </div>
-        {presentation?.surface && (
-          <WorkDirections
-            surface={presentation.surface}
-            onRevisit={(id, sequence) => {
-              const existing = events.find((event) => event.id === id);
-              if (existing) setBranchEvent(existing);
-              else
-                void loadEventPage(task.id, { after: Math.max(0, sequence - 1), limit: 1 })
-                  .then((page) => {
-                    const found = page.events.find((event) => event.id === id);
-                    if (found) setBranchEvent(found);
-                    else setError(new Error('This original direction is not available.'));
-                  })
-                  .catch(setError);
-            }}
-          />
-        )}
         <ErrorNotice
           error={error}
           onRetry={() => {
@@ -733,66 +770,6 @@ export default function TaskSurface({
               <Suspense fallback={null}>
                 <CodingMissions taskId={task.id} onOpenTask={onOpenTask} onChange={reload} />
               </Suspense>
-              {(taskDecisions.length > 0 || question) && (
-                <aside className="work-attention">
-                  {taskDecisions.map((decision) => (
-                    <DecisionCard
-                      key={decision.id}
-                      decision={decision}
-                      onComputer={onComputer}
-                      onResolved={() => {
-                        onRefresh();
-                        void reload();
-                      }}
-                    />
-                  ))}
-                  {question && (!task.parentMissionId || taskDecisions.length === 0) && (
-                    <article className="question-card" id={`question-${task.id}`}>
-                      <div className="eyebrow">
-                        <MessageSquare size={14} />
-                        Your judgement
-                      </div>
-                      <h2>{text(questionData.question, question.summary)}</h2>
-                      {text(questionData.why) && <p>{text(questionData.why)}</p>}
-                      <div className="stack">
-                        {strings(questionData.options).map((option) => (
-                          <Button
-                            key={option}
-                            disabled={busy}
-                            onClick={() => answerQuestion(option)}
-                          >
-                            {option}
-                            <ArrowUpRight size={15} />
-                          </Button>
-                        ))}
-                      </div>
-                      <form
-                        onSubmit={(event) => {
-                          event.preventDefault();
-                          void answerQuestion(questionAnswer);
-                        }}
-                      >
-                        <Field label="Your answer">
-                          <textarea
-                            value={questionAnswer}
-                            onChange={(event) => setQuestionAnswer(event.target.value)}
-                            rows={3}
-                          />
-                        </Field>
-                        <Button
-                          type="submit"
-                          className="primary"
-                          disabled={!questionAnswer.trim()}
-                          busy={busy}
-                        >
-                          Send answer
-                          <ArrowUpRight size={16} />
-                        </Button>
-                      </form>
-                    </article>
-                  )}
-                </aside>
-              )}
               {presentation && (
                 <TaskProgress
                   presentation={presentation}
@@ -826,61 +803,62 @@ export default function TaskSurface({
         </Dialog>
       )}
       <div className="garden-task-composer">
-        {task.parentMissionId ? (
-          <div className="selected-context garden-mission-context">
-            <p>This specialist uses the model and budget assigned by its parent work.</p>
-            <small className="muted">
-              {bootstrap.models.find((model) => model.id === task.modelId)?.displayName ??
-                task.modelId}
-              {' · '}Effort {effortLabel(task.reasoningEffort ?? 'auto')}
-            </small>
-            <div className="row">
-              {question && taskDecisions.length === 0 && (
-                <Button
-                  onClick={() => {
-                    const card = document.getElementById(`question-${task.id}`);
-                    card?.scrollIntoView({ block: 'center', behavior: 'smooth' });
-                    card?.querySelector('textarea')?.focus({ preventScroll: true });
-                  }}
-                >
-                  Reply to the question
-                </Button>
-              )}
-              {task.parentTaskId && (
-                <Button onClick={() => onOpenTask(task.parentTaskId!)}>
-                  Continue in parent work
-                </Button>
-              )}
-            </div>
-          </div>
-        ) : (
-          <>
-            {scope && (
-              <div className="selected-context">
-                <span className="eyebrow">Selected context</span>
-                <p>{scope}</p>
-                <Button onClick={() => setScope('')} aria-label="Clear selected context">
-                  <X size={14} />
-                </Button>
+        {attentionPanel ??
+          (task.parentMissionId ? (
+            <div className="selected-context garden-mission-context">
+              <p>This specialist uses the model and budget assigned by its parent work.</p>
+              <small className="muted">
+                {bootstrap.models.find((model) => model.id === task.modelId)?.displayName ??
+                  task.modelId}
+                {' · '}Effort {effortLabel(task.reasoningEffort ?? 'auto')}
+              </small>
+              <div className="row">
+                {question && taskDecisions.length === 0 && (
+                  <Button
+                    onClick={() => {
+                      const card = document.getElementById(`question-${task.id}`);
+                      card?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+                      card?.querySelector('textarea')?.focus({ preventScroll: true });
+                    }}
+                  >
+                    Reply to the question
+                  </Button>
+                )}
+                {task.parentTaskId && (
+                  <Button onClick={() => onOpenTask(task.parentTaskId!)}>
+                    Continue in parent work
+                  </Button>
+                )}
               </div>
-            )}
-            <Suspense fallback={<Spinner />}>
-              <Composer
-                workspace={workspace}
-                task={task}
-                bootstrap={bootstrap}
-                {...(draft ? { initialDraft: draft } : {})}
-                {...(scope ? { scope } : {})}
-                onDraft={onDraft}
-                onSent={(result) => {
-                  onTask(result);
-                  setScope('');
-                  onRefresh();
-                }}
-              />
-            </Suspense>
-          </>
-        )}
+            </div>
+          ) : (
+            <>
+              {scope && (
+                <div className="selected-context">
+                  <span className="eyebrow">Selected context</span>
+                  <p>{scope}</p>
+                  <Button onClick={() => setScope('')} aria-label="Clear selected context">
+                    <X size={14} />
+                  </Button>
+                </div>
+              )}
+              <Suspense fallback={<Spinner />}>
+                <Composer
+                  workspace={workspace}
+                  task={task}
+                  bootstrap={bootstrap}
+                  {...(draft ? { initialDraft: draft } : {})}
+                  {...(scope ? { scope } : {})}
+                  onDraft={onDraft}
+                  onSent={(result) => {
+                    onTask(result);
+                    setScope('');
+                    onRefresh();
+                  }}
+                />
+              </Suspense>
+            </>
+          ))}
       </div>
       {voiceOpen && (
         <Suspense fallback={null}>
