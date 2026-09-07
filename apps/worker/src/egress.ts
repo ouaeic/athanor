@@ -88,15 +88,32 @@ export interface DestinationVerdict {
    */
   readonly reach: NetworkReach;
 }
-
 /**
- * How much material an address may carry that appears nowhere the owner put it.
+ * How much material an address may carry that appears nowhere the owner put it, in two parts.
  *
- * This is the number that turns "exfiltrate a mailbox" into "exfiltrate a bit at a time": a base64
- * payload is one long token and trips it immediately, while a real deep link - a docs path, a slug,
- * a tracking parameter - is comfortably under it.
+ * `MAX_NOVEL_TOKEN_CHARS` is the part that turns "exfiltrate a mailbox" into "exfiltrate a bit
+ * at a time": a base64 payload is one long token and trips it immediately, while a real deep
+ * link - a docs path, a slug, a tracking parameter - is comfortably under it. It is measured on
+ * ONE piece of the address, because the pieces are where a payload lives: a composed query is
+ * many short pieces and pays for its structure at the request bound instead.
+ *
+ * `MAX_NOVEL_URL_BYTES` is the second part, and the one the first replaced at 96: the total a
+ * single request may charge. At 96 it also bounded one composed query, and the measured failure
+ * was the owner's own research turn - the REST reads a research task composes (a cursorMark, a
+ * boolean query, a field list) carry 120-131 novel bytes with no piece over 64 characters, and
+ * every such read stopped the turn in autonomous. The card reported a payload shape for what is
+ * query structure: "111 bytes the model chose rather than was handed, past the 96 a real link
+ * needs". So the total bound moves to 192 - a real API request needs room a real link does not
+ * - and the payload half is held by the token bound instead, which is the part that made the
+ * numbers finite at all.
+ *
+ * Fragmentation is unchanged: the cheapest shape per byte is still one short token per request,
+ * each priced at `MIN_TOKEN_BYTES`, and the turn budget stops it after exactly
+ * `MAX_TURN_NOVEL_BYTES / MIN_TOKEN_BYTES` requests.
  */
-export const MAX_NOVEL_URL_BYTES = 96;
+export const MAX_NOVEL_TOKEN_CHARS = 64;
+
+export const MAX_NOVEL_URL_BYTES = 192;
 
 /**
  * How much material the *name* may carry beyond the part that was already allowed.
@@ -474,12 +491,37 @@ export const classifyDestination = (
       reason: `the name ${host} puts ${hostNovelty} bytes in front of ${matched} that the user's request and the pages already read do not account for`,
       reach
     };
+  /*
+   * The payload bound, on ONE piece rather than on the sum of them.
+   *
+   * It used to be a single per-address bound at 96, and the two things it was holding apart are
+   * held apart by the two bounds above it now. A composed query - the boolean a research task
+   * writes into a REST read, a cursorMark, a field list - is many short pieces totalling well
+   * over 96 bytes, and it carded: the owner's research turn in autonomous asked after every such
+   * read with a card reporting a payload shape. The payload itself is one long opaque piece, and
+   * that is the shape this catches - a base64 blob in one path segment trips it immediately,
+   * while any piece of a real link or a real query is comfortably under it.
+   *
+   * The sum keeps its own bound below, raised to give the structure room.
+   */
+  const longestToken = addressTokens(url).reduce(
+    (longest, token) => Math.max(longest, token.length),
+    0
+  );
+  if (longestToken > MAX_NOVEL_TOKEN_CHARS)
+    return {
+      sink: true,
+      host,
+      noveltyBytes,
+      reason: `one piece of this address is ${longestToken} characters the model chose rather than was handed, past the ${MAX_NOVEL_TOKEN_CHARS} a real piece of a link needs`,
+      reach
+    };
   if (noveltyBytes > MAX_NOVEL_URL_BYTES)
     return {
       sink: true,
       host,
       noveltyBytes,
-      reason: `this address carries ${noveltyBytes} bytes the model chose rather than was handed, past the ${MAX_NOVEL_URL_BYTES} a real link needs`,
+      reason: `this address carries ${noveltyBytes} bytes the model chose rather than was handed, past the ${MAX_NOVEL_URL_BYTES} a real request needs`,
       reach
     };
   const spent = Math.max(0, context.spentNoveltyBytes ?? 0);

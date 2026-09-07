@@ -1748,12 +1748,16 @@ describe('what a tainted turn may still do through shell', () => {
    * per-address bound, carried more than the whole turn is allowed and raised nothing at all.
    */
   it('measures the tenth address in a batch against what the first nine spent', () => {
-    const chunks = Array.from({ length: 22 }, (_, index) => `${'z'.repeat(90)}${index}`);
+    // A known host keeps every chunk's charge small - one opaque piece of 46 'z's over a host the
+    // turn has already read - so no piece trips the token bound and the batch's total is the only
+    // thing that can cross. It does: 22 pieces at 48 bytes each pass the turn budget mid-batch,
+    // which is the fact this test holds.
+    const chunks = Array.from({ length: 22 }, (_, index) => `${'z'.repeat(46)}${index}`);
     const batch = approvalRequirement(
       'parallel_web_read',
-      { urls: chunks.map((chunk) => `https://vendor.example/${chunk}`) },
+      { urls: chunks.map((chunk) => `https://docs.example.com/${chunk}`) },
       'balanced',
-      tainted
+      { ...tainted, knownOrigins: ['docs.example.com'] }
     );
     expect(batch?.preview).toContain('this turn has already put');
 
@@ -1765,9 +1769,9 @@ describe('what a tainted turn may still do through shell', () => {
     // And the same batch one at a time is still the same fact, so nothing was gained by splitting.
     const single = approvalRequirement(
       'parallel_web_read',
-      { urls: [`https://vendor.example/${chunks[0]}`] },
+      { urls: [`https://docs.example.com/${chunks[0]}`] },
       'balanced',
-      tainted
+      { ...tainted, knownOrigins: ['docs.example.com'] }
     );
     expect(single).toBeNull();
   });
@@ -1829,8 +1833,7 @@ describe('what a tainted turn may still do through shell', () => {
       );
     const leak = carried(`X-Data: ${'A'.repeat(96)}`);
     expect(leak?.sideEffect).toBe('external_reversible');
-    expect(leak?.action).toContain('vendor.example');
-    expect(leak?.preview).toMatch(/carries \d+ bytes the model chose/);
+    expect(leak?.preview).toMatch(/one piece of this address is \d+ characters the model chose/);
 
     // A real request header is under the per-address bound and raises nothing at all.
     expect(carried('Accept: application/json')).toBeNull();
