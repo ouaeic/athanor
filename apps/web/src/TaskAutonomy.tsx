@@ -20,17 +20,14 @@ export function TaskAutonomy({
   const [busy, setBusy] = useState(false);
   const [draft, setDraft] = useState(modes.indexOf(task.securityMode));
   const [error, setError] = useState<unknown>(null);
-  const editing = useRef(false);
   const saving = useRef(false);
   const actualMode = useRef(task.securityMode);
   const desired = useRef(modes.indexOf(task.securityMode));
   useEffect(() => {
     if (saving.current) return;
     actualMode.current = task.securityMode;
-    if (!editing.current) {
-      desired.current = modes.indexOf(task.securityMode);
-      setDraft(desired.current);
-    }
+    desired.current = modes.indexOf(task.securityMode);
+    setDraft(desired.current);
   }, [task.securityMode, task.id]);
   async function drain() {
     if (saving.current) return;
@@ -61,61 +58,21 @@ export function TaskAutonomy({
     void drain();
   }
   return (
-    <section className="garden-autonomy" aria-label="Autonomy and safety" aria-busy={busy}>
-      <div className="garden-autonomy-control">
-        <label htmlFor={`autonomy-${task.id}`}>
-          <Shield size={16} />
-          Autonomy
-        </label>
-        <div className="garden-autonomy-track">
-          <input
-            id={`autonomy-${task.id}`}
-            type="range"
-            min={0}
-            max={2}
-            step={1}
-            value={draft}
-            aria-valuetext={labels[draft]}
-            aria-describedby={`autonomy-floor-${task.id}`}
-            onPointerDown={() => {
-              editing.current = true;
-            }}
-            onKeyDown={() => {
-              editing.current = true;
-            }}
-            onChange={(event) => setDraft(Number(event.target.value))}
-            onPointerUp={(event) => {
-              editing.current = false;
-              void change(Number(event.currentTarget.value));
-            }}
-            onKeyUp={(event) => {
-              editing.current = false;
-              void change(Number(event.currentTarget.value));
-            }}
-            onBlur={(event) => {
-              editing.current = false;
-              void change(Number(event.currentTarget.value));
-            }}
-          />
-          <div>
-            {labels.map((label, index) => (
-              <button
-                type="button"
-                key={label}
-                aria-pressed={modes[index] === task.securityMode}
-                onClick={() => void change(index)}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-        </div>
-      </div>
-      <details id={`autonomy-floor-${task.id}`}>
-        <summary>{labels[modes.indexOf(task.securityMode)]} · What needs approval</summary>
-        <p>{modeFloors[task.securityMode]}</p>
-      </details>
+    <div className="garden-autonomy" aria-busy={busy}>
+      <Shield size={14} aria-hidden="true" />
+      <select
+        aria-label="Autonomy"
+        title={modeFloors[modes[draft]!]}
+        value={draft}
+        onChange={(event) => change(Number(event.target.value))}
+      >
+        {modes.map((mode, index) => (
+          <option key={mode} value={index}>
+            {labels[index]}
+          </option>
+        ))}
+      </select>
       <ErrorNotice error={error} />
-    </section>
+    </div>
   );
 }

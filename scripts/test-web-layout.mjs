@@ -608,21 +608,15 @@ try {
     ),
     'Project tools must precede the running work'
   );
-  const autonomy = page.getByRole('slider', { name: 'Autonomy', exact: true });
-  await autonomy.focus();
-  await page.keyboard.press('End');
+  const autonomy = page.getByRole('combobox', { name: 'Autonomy', exact: true });
+  await autonomy.selectOption('2');
   await page.waitForFunction(
-    () =>
-      document.querySelector('.garden-autonomy input')?.getAttribute('aria-valuetext') ===
-      'Autonomous'
+    () => document.querySelector('.garden-autonomy')?.getAttribute('aria-busy') === 'false'
   );
   assert.equal(autonomyChanges.at(-1), 'autonomous');
-  await page.keyboard.press('ArrowLeft');
+  await autonomy.selectOption('1');
   await page.waitForFunction(
-    () =>
-      document.querySelector('.garden-autonomy input')?.getAttribute('aria-valuetext') ===
-        'Balanced' &&
-      document.querySelector('.garden-autonomy')?.getAttribute('aria-busy') === 'false'
+    () => document.querySelector('.garden-autonomy')?.getAttribute('aria-busy') === 'false'
   );
   assert.equal(autonomyChanges.at(-1), 'balanced');
   for (const [width, height] of [

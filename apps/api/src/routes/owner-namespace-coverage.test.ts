@@ -1,3 +1,4 @@
+import { registerWorkspaceRoutes } from './workspaces.js';
 import { randomUUID } from 'node:crypto';
 import Fastify, { type FastifyInstance } from 'fastify';
 import cookie from '@fastify/cookie';
@@ -159,6 +160,7 @@ async function fixture() {
       ).prompt
     })
   } as unknown as RouteContext;
+  registerWorkspaceRoutes(context);
   registerUsageRoutes(context);
   registerPrivacyRoutes(context);
   registerScheduleRoutes(context);
@@ -175,6 +177,21 @@ async function fixture() {
 }
 
 describe('owner routes across project execution namespaces', () => {
+  it('opens the owned project workspace without exposing another owner or its sealed key', async () => {
+    const f = await fixture();
+    const response = await f.app.inject({
+      method: 'GET',
+      url: `/v1/workspaces/${f.project.record.id}`
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ id: f.project.record.id });
+    expect(response.json()).not.toHaveProperty('wrappedKey');
+    const foreign = await f.app.inject({
+      method: 'GET',
+      url: `/v1/workspaces/${f.foreign.record.id}`
+    });
+    expect(foreign.statusCode).toBe(404);
+  });
   it('meters every owner root and sums public aggregate storage once', async () => {
     const f = await fixture();
     const response = await f.app.inject({ method: 'GET', url: '/v1/usage' });

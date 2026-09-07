@@ -3610,9 +3610,9 @@ describe('spending the owner’s money on generated media', () => {
     // that the request describes what was asked for.
     expect(probe.generated[0]).toMatchObject({
       model: managedMediaCatalog.image.modelId,
-      size: '1024x1024',
-      output_format: 'png'
+      size: '1024x1024'
     });
+    expect(probe.generated[0]).not.toHaveProperty('output_format');
     expect(probe.written).toHaveLength(1);
     expect(probe.written[0]).toMatch(/^workspace\/generated\/.*\.png$/);
     const answer = probe.messages.find((message) => message.toolCallId === 'call-m')?.content ?? '';

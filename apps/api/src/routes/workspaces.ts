@@ -36,6 +36,13 @@ export const registerWorkspaceRoutes = (context: RouteContext): void => {
     )
   );
 
+  app.get<{ Params: { workspaceId: string } }>('/v1/workspaces/:workspaceId', async (request) => {
+    const user = requireUser(request.user);
+    const workspace = await store.getWorkspace(user.id, request.params.workspaceId);
+    if (!workspace) throw new AthanorError('workspace_not_found', 'Workspace not found', 404);
+    return workspaceResponse(workspace);
+  });
+
   app.post('/v1/workspaces', async (request, reply) => {
     const user = requireUser(request.user);
     return idempotent(request, reply, user, async () => {

@@ -429,8 +429,8 @@ export default function TaskSurface({
             Activity
           </Button>
           <Button onClick={() => setPanel('plan')}>Plan</Button>
+          <TaskAutonomy key={task.id} task={task} onTask={onTask} onRefresh={onRefresh} />
         </div>
-        <TaskAutonomy key={task.id} task={task} onTask={onTask} onRefresh={onRefresh} />
         <div className="run-summary">
           <div className={`status-line ${isWorking(task) || pendingDelivery ? 'active' : ''}`}>
             <i />
