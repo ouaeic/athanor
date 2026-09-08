@@ -563,6 +563,13 @@ function WorkspaceApp() {
         Skip to work
       </a>
       <header className="garden-masthead">
+        <button
+          className="brand-button"
+          onClick={() => navigate('work')}
+          aria-label="garden · All work"
+        >
+          <Brand />
+        </button>
         <Button
           aria-label={sidebarOpen ? 'Hide projects' : 'Show projects'}
           aria-expanded={sidebarOpen}
@@ -571,13 +578,6 @@ function WorkspaceApp() {
         >
           <PanelLeft size={19} />
         </Button>
-        <button
-          className="brand-button"
-          onClick={() => navigate('work')}
-          aria-label="garden · All work"
-        >
-          <Brand />
-        </button>
         <nav className="garden-main-navigation" aria-label="Main navigation">
           {(
             [

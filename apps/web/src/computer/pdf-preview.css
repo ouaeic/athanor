@@ -21,14 +21,26 @@
   min-width: 0;
   overflow: auto;
   width: 100%;
-  max-height: 75dvh;
+  height: min(75dvh, 900px);
   background: #d5d4ce;
   border-radius: 8px;
 }
-.pdf-page-scroll canvas {
+.pdf-page {
+  position: relative;
+  margin: 0 auto 8px;
+  background: #ffffff;
+  box-shadow: 0 2px 14px #0002;
+  display: grid;
+  place-items: center;
+}
+.pdf-page canvas {
   display: block;
   max-width: none;
-  margin: auto;
+}
+.pdf-page-placeholder {
+  color: #8a8a84;
+  font-size: 13px;
+  user-select: none;
 }
 .pdf-page-text {
   white-space: pre-wrap;

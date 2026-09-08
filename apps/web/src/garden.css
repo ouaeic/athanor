@@ -7,13 +7,11 @@
   --line: #b0c59626;
   --line-strong: #48573e;
   --accent: #d5e8a9;
-  --cream: #f2e7ca;
   --text: #eae7dc;
   --paper: #e9e4d5;
 }
 :root[data-theme='light'] {
   --accent: #405b31;
-  --cream: #3d3d30;
 }
 .garden-shell {
   height: 100dvh;
@@ -50,7 +48,7 @@
 .garden-masthead .brand {
   font-size: 34px;
   letter-spacing: -1.8px;
-  color: var(--cream);
+  color: var(--text);
   line-height: 1;
   transform: translateY(-1px);
 }
@@ -59,7 +57,7 @@
   align-items: center;
   gap: 10px;
   margin-left: auto;
-  color: var(--cream);
+  color: var(--text);
   font-size: 10px;
   letter-spacing: 0.01em;
 }
@@ -68,14 +66,14 @@
   align-items: center;
   gap: 4px;
   padding: 5px 7px;
-  border: 1px solid color-mix(in srgb, var(--cream) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text) 16%, transparent);
   border-radius: 999px;
-  background: color-mix(in srgb, var(--cream) 5%, transparent);
+  background: color-mix(in srgb, var(--text) 5%, transparent);
 }
 .garden-work-heading h1,
 .garden-output-header h2,
 .garden-progress h2 {
-  color: var(--cream);
+  color: var(--text);
 }
 .garden-masthead .brand-button {
   display: grid;
@@ -1509,4 +1507,38 @@
   .garden-voice-controls {
     grid-template-columns: minmax(0, 1fr);
   }
+}
+
+.garden-advanced-models {
+  margin-top: 6px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--raised) 24%, transparent);
+}
+.garden-advanced-models > summary {
+  cursor: pointer;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--muted);
+  list-style-position: inside;
+}
+.garden-advanced-models > summary:hover {
+  color: var(--text);
+}
+.garden-advanced-models[open] > summary {
+  border-bottom: 1px solid var(--line);
+  color: var(--text);
+}
+.garden-advanced-models .garden-prompt-models {
+  display: grid;
+  gap: 10px;
+  padding: 10px 12px 12px;
+}
+.garden-advanced-models .garden-prompt-models .field {
+  display: grid;
+  gap: 4px;
+}
+.garden-advanced-models .garden-prompt-models select {
+  width: 100%;
+  min-height: 32px;
 }

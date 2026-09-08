@@ -9,6 +9,7 @@ import { isNativeClient, patch, post, put, request } from './client';
 import { Button, ErrorNotice } from './ui';
 import { useAutosizeTextarea } from './use-autosize-textarea';
 import { MAX_TASK_SPEND_USD } from './usage-model.js';
+const PromptModelChoices = lazy(() => import('./PromptModels'));
 import {
   dictationSession,
   serialDraftWriter,
@@ -601,6 +602,14 @@ export default function Composer({
           )}
         </div>
       </div>
+      {task && (
+        <details className="garden-advanced-models">
+          <summary>Model choices for this direction</summary>
+          <Suspense fallback={<p className="muted">Loading…</p>}>
+            <PromptModelChoices taskId={task.id} disabled={editingDisabled} />
+          </Suspense>
+        </details>
+      )}
       <ErrorNotice error={error} />
       {saved && (
         <small className="draft-status" role="status">
