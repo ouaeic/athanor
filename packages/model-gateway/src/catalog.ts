@@ -172,10 +172,17 @@ export const configuredModelCatalog = (
       // Only ever narrowed on an explicit denial. `supportsTools` is null when the endpoint listed
       // no parameters at all, and reading silence as "cannot call tools" would take every model on
       // a quiet endpoint out of agent work, which is all of them on most.
-      capabilities:
-        model.supportsTools === false
+      capabilities: [
+        ...(model.supportsTools === false
           ? options.capabilities.filter((capability) => capability !== 'tools')
-          : options.capabilities,
+          : options.capabilities),
+        // Vision arrives with the modalities: a model whose input modalities accept an image is
+        // vision-capable by the same evidence, and the capability row is what every gate reads
+        // (usableCapabilities, the picker, the vision specialist ranking).
+        ...(model.inputModalities?.includes('image') && !options.capabilities.includes('vision')
+          ? (['vision'] as const)
+          : [])
+      ],
       usageClass: usageClassForPrice(model.inputUsdPerMillionTokens),
       recommendationTags: [
         options.tag,

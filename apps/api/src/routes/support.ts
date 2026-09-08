@@ -398,10 +398,12 @@ export const createServerSupport = (context: ServerBase) => {
           return (
             model.provider === 'custom' &&
             model.recommendationTags.includes('Ollama Cloud') &&
-            // Either half of the native metadata can be missing: an older build wrote rows
-            // that knew thinking and nothing else, so the modality list is repaired by the
-            // same loop rather than by a second one.
-            (model.reasoning?.supportedEfforts === undefined || !model.modalities.includes('image'))
+            // Any of the three native-metadata halves can be missing: an older build wrote rows
+            // that knew thinking and nothing else, and one knew modalities but not the vision
+            // capability the gates actually read. All three are repaired by the same loop.
+            (model.reasoning?.supportedEfforts === undefined ||
+              !model.modalities.includes('image') ||
+              !model.capabilities.includes('vision'))
           );
         });
         if (!missing.length) return;
@@ -420,6 +422,21 @@ export const createServerSupport = (context: ServerBase) => {
           const knowsEffort = model.supportsReasoningEffort !== null;
           const knowsModalities = Array.isArray(model.inputModalities);
           if (!knowsEffort && !knowsModalities) return [];
+          // The capability row is written with the modalities it follows: an image-input model
+          // is vision-capable, and usableCapabilities refuses to grant vision without both.
+          const modalities = knowsModalities ? model.inputModalities! : [];
+          const capabilities = knowsModalities
+            ? [
+                ...new Set(
+                  ModelRelease.parse(record).capabilities.concat(
+                    modalities.includes('image') &&
+                      !ModelRelease.parse(record).capabilities.includes('vision')
+                      ? (['vision'] as const)
+                      : []
+                  )
+                )
+              ]
+            : undefined;
           return [
             {
               ...record,
@@ -429,7 +446,8 @@ export const createServerSupport = (context: ServerBase) => {
                     ...(model.reasoning ? { reasoning: model.reasoning } : {})
                   }
                 : {}),
-              ...(knowsModalities ? { modalities: model.inputModalities } : {})
+              ...(knowsModalities ? { modalities } : {}),
+              ...(capabilities ? { capabilities } : {})
             }
           ];
         });

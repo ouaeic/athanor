@@ -7,7 +7,6 @@ import {
   GitBranch,
   History,
   MessageSquare,
-  Mic,
   MoreHorizontal,
   Pause,
   Play,
@@ -56,7 +55,6 @@ import './presentation.css';
 import { effortLabel } from './reasoning-options';
 const Markdown = lazy(() => import('./MarkdownBody'));
 const Composer = lazy(() => import('./Composer'));
-const VoiceSession = lazy(() => import('./voice/VoiceSession'));
 const MediaJobs = lazy(() => import('./MediaJobs'));
 const ProjectModels = lazy(() => import('./ProjectModels'));
 const CodingMissions = lazy(() => import('./CodingMissions'));
@@ -104,7 +102,6 @@ export default function TaskSurface({
     'direction' | 'history' | 'plan' | 'settings' | 'share' | 'brief' | 'models' | null
   >(null);
   const [busy, setBusy] = useState(false);
-  const [voiceOpen, setVoiceOpen] = useState(false);
   const [historyMore, setHistoryMore] = useState(false);
   const [historyPage, setHistoryPage] = useState<TaskEvent[]>([]);
   const [evidence, setEvidence] = useState<TaskEvent | null>(null);
@@ -444,12 +441,6 @@ export default function TaskSurface({
             <h1>{task.title}</h1>
           </div>
           <div className="garden-heading-actions">
-            {!task.parentTaskId && (
-              <Button onClick={() => setVoiceOpen(true)} aria-label="Live voice">
-                <Mic size={17} />
-                <span>Voice</span>
-              </Button>
-            )}
             <Button onClick={() => setPanel('share')} aria-label="Share this work">
               <Share2 size={17} />
               <span>Share</span>
@@ -860,15 +851,6 @@ export default function TaskSurface({
             </>
           ))}
       </div>
-      {voiceOpen && (
-        <Suspense fallback={null}>
-          <VoiceSession
-            task={task}
-            onClose={() => setVoiceOpen(false)}
-            onTaskChanged={() => void reload()}
-          />
-        </Suspense>
-      )}
       {panel === 'brief' && (
         <Dialog title="Your brief" onClose={() => setPanel(null)}>
           <Suspense fallback={<Spinner />}>

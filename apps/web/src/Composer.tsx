@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useRef, useState } from 'react';
-import { ArrowUpRight, Paperclip, X, Mic, Square } from 'lucide-react';
+import { ArrowUpRight, Paperclip, X, Mic, Square, SlidersHorizontal } from 'lucide-react';
 import type { Task, Workspace, TaskReasoningEffort } from '@athanor/contracts';
 import { modeFloors } from './asking-rules';
 import { effortChoices, effortLabel } from './reasoning-options';
@@ -55,6 +55,7 @@ export default function Composer({
     initialDraft?.controls?.securityMode ?? task?.securityMode ?? workspace.securityMode
   );
   const [cap, setCap] = useState(initialDraft?.controls?.spendCap ?? '');
+  const [advancedModels, setAdvancedModels] = useState(false);
   const [interrupt, setInterrupt] = useState(true);
   const [busy, setBusy] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -497,16 +498,19 @@ export default function Composer({
               </option>
               {models.map((model) => (
                 <option key={model.id} value={model.id}>
-                  {model.displayName} ·{' '}
-                  {model.recommendationTags?.includes('Ollama Cloud')
-                    ? 'Ollama Cloud'
-                    : model.provider === 'openrouter'
-                      ? 'OpenRouter'
-                      : 'Connected endpoint'}
+                  {model.displayName}
                 </option>
               ))}
             </select>
           </label>
+          <Button
+            aria-label="Model choices for this direction"
+            aria-expanded={advancedModels}
+            title="Model choices for this direction"
+            onClick={() => setAdvancedModels((open) => !open)}
+          >
+            <SlidersHorizontal size={14} />
+          </Button>
           <label className="garden-approval-select">
             <span>Approvals</span>
             <select
@@ -602,13 +606,21 @@ export default function Composer({
           )}
         </div>
       </div>
-      {task && (
-        <details className="garden-advanced-models">
-          <summary>Model choices for this direction</summary>
+      {advancedModels && (
+        <div className="garden-advanced-models open">
           <Suspense fallback={<p className="muted">Loading…</p>}>
-            <PromptModelChoices taskId={task.id} disabled={editingDisabled} />
+            <PromptModelChoices
+              {...(task ? { taskId: task.id } : { taskId: '' })}
+              disabled={editingDisabled || !task}
+            />
           </Suspense>
-        </details>
+          {!task && (
+            <small className="muted">
+              These follow the Settings choices until the work exists. Pin one per purpose there
+              after the first prompt lands.
+            </small>
+          )}
+        </div>
       )}
       <ErrorNotice error={error} />
       {saved && (

@@ -21,13 +21,14 @@ export const purposeLabels: Record<ModelPurpose, string> = {
 const automatic: PurposeModelChoice = { automatic: true, preference: 'balanced', modelId: '' };
 
 /**
- * Per-prompt model tuning: the same purpose choices the project dialog owns, scoped to the
- * direction being written and living in an advanced disclosure inside the composer.
+ * Per-prompt model tuning: a small panel beside the composer's model dropdown, holding the same
+ * purpose choices the project dialog owns.
  *
- * A choice made here is stored against the conversation (or, for a first prompt, against the
- * project root the conversation is about to become), so it is a durable instruction to the run -
- * the same mechanism the project view uses - rather than a widget that silently evaporates after
- * one send. Inheriting is always the first option: nothing here is a requirement.
+ * Two modes. Against a conversation it reads and writes that conversation's preferences, so a
+ * choice made on one prompt holds for every follow-up. Against a bare workspace - a first prompt
+ * that does not exist yet - it reads the global resolution only, as a preview of what will answer;
+ * the durable override lands in Settings or in the project dialog once the work exists. Inheriting
+ * is always the first option: nothing here is a requirement.
  */
 export default function PromptModelChoices({
   taskId,
@@ -51,7 +52,9 @@ export default function PromptModelChoices({
     let cancelled = false;
     setLoading(true);
     setError(null);
-    void get<ProjectModelPreferences>(`/v1/tasks/${taskId}/model-preferences`)
+    void get<ProjectModelPreferences>(
+      taskId ? `/v1/tasks/${taskId}/model-preferences` : '/v1/workspace-model-preferences'
+    )
       .then((current) => {
         if (cancelled) return;
         setState({
@@ -73,7 +76,7 @@ export default function PromptModelChoices({
   }, [taskId, loadedFor]);
 
   const change = (purpose: ModelPurpose, choice: PurposeModelChoice | undefined) => {
-    if (!state) return;
+    if (!state || !taskId) return;
     const next = { ...state.choices };
     if (choice) next[purpose] = choice;
     else delete next[purpose];
@@ -97,7 +100,7 @@ export default function PromptModelChoices({
   };
 
   if (!state) {
-    if (loading && !error) return <p className="muted">Loading model choices…</p>;
+    if (loading && !error) return <p className="muted">Loading…</p>;
     return error ? <p className="muted">{error}</p> : null;
   }
   return (
@@ -109,21 +112,17 @@ export default function PromptModelChoices({
           value === 'inherit' || value === 'automatic'
             ? item.effective
             : (item.options.find((option) => option.id === value) ?? null);
+        const hint =
+          effective && value !== 'inherit' && value !== 'automatic'
+            ? `${effective.displayName}${'modality' in effective ? (effective.usdPerImage != null ? ' · priced per image' : effective.usdPerMinute != null ? ' · priced per minute' : '') : effective.inputUsdPerMillionTokens != null ? ` · about ${effective.inputUsdPerMillionTokens.toFixed(2)} per million tokens in` : ''}`
+            : item.reason && value === 'inherit' && !item.available
+              ? item.reason
+              : '';
         return (
-          <Field
-            key={item.purpose}
-            label={purposeLabels[item.purpose]}
-            hint={
-              effective && value !== 'inherit' && value !== 'automatic'
-                ? `${effective.displayName}${'modality' in effective ? (effective.usdPerImage != null ? ' · priced per image' : effective.usdPerMinute != null ? ' · priced per minute' : '') : effective.inputUsdPerMillionTokens != null ? ` · about ${effective.inputUsdPerMillionTokens.toFixed(2)} per million tokens in` : ''}`
-                : item.reason && value === 'inherit' && !item.available
-                  ? item.reason
-                  : ''
-            }
-          >
+          <Field key={item.purpose} label={purposeLabels[item.purpose]} hint={hint}>
             <select
               value={value}
-              disabled={disabled || saving}
+              disabled={disabled || saving || !taskId}
               onChange={(event) =>
                 change(
                   item.purpose,
@@ -162,15 +161,6 @@ export default function PromptModelChoices({
                   }
                 >
                   {option.displayName}
-                  {'modality' in option
-                    ? option.usdPerImage != null
-                      ? ` · ${option.usdPerImage.toFixed(3)} / image`
-                      : option.usdPerMinute != null
-                        ? ` · up to ${option.usdPerMinute.toFixed(3)} / min`
-                        : ''
-                    : option.inputUsdPerMillionTokens != null
-                      ? ` · ${option.inputUsdPerMillionTokens.toFixed(2)} / M in`
-                      : ''}
                 </option>
               ))}
             </select>
