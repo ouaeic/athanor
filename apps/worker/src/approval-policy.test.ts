@@ -785,7 +785,7 @@ describe('agent approval policy', () => {
         { executable: 'bash', args: ['-lc', 'git push origin main'], network: true },
         'autonomous'
       )?.action
-    ).toBe('Push Git changes');
+    ).toBeUndefined();
     expect(
       approvalRequirement(
         'shell',
@@ -868,11 +868,14 @@ describe('agent approval policy', () => {
       expect(approvalRequirement('shell', args, 'autonomous')?.sideEffect).toBe(
         'external_reversible'
       );
-    // The other two promises the same branch makes, wrapped the same way.
-    for (const args of shapes('git push origin main'))
-      expect(approvalRequirement('shell', args, 'autonomous')?.action, JSON.stringify(args)).toBe(
+    // The other two promises the same branch makes, wrapped the same way. A push is priced by
+    // mode: autonomous runs it, the asking modes still show the card.
+    for (const args of shapes('git push origin main')) {
+      expect(approvalRequirement('shell', args, 'autonomous')?.action, JSON.stringify(args)).toBeUndefined();
+      expect(approvalRequirement('shell', args, 'balanced')?.action, JSON.stringify(args)).toBe(
         'Push Git changes'
       );
+    }
     for (const args of shapes('gh pr create --title x --body y'))
       expect(approvalRequirement('shell', args, 'autonomous')?.action, JSON.stringify(args)).toBe(
         'Send data using gh'
@@ -908,7 +911,7 @@ describe('agent approval policy', () => {
         { executable: 'bash', args: ['-lc', 'git push origin main'] },
         'autonomous'
       )
-    ).toMatchObject({ action: 'Push Git changes' });
+    ).toBeNull();
     expect(
       approvalRequirement(
         'desktop_launch',
@@ -1748,11 +1751,14 @@ describe('what a tainted turn may still do through shell', () => {
    * per-address bound, carried more than the whole turn is allowed and raised nothing at all.
    */
   it('measures the tenth address in a batch against what the first nine spent', () => {
-    // A known host keeps every chunk's charge small - one opaque piece of 46 'z's over a host the
-    // turn has already read - so no piece trips the token bound and the batch's total is the only
-    // thing that can cross. It does: 22 pieces at 48 bytes each pass the turn budget mid-batch,
-    // which is the fact this test holds.
-    const chunks = Array.from({ length: 22 }, (_, index) => `${'z'.repeat(46)}${index}`);
+    // A known host keeps every chunk's charge small - one opaque piece over a host the turn has
+    // already read - so no piece trips the token bound and the batch's total is the only thing
+    // that can cross. It does: this batch's spend passes the turn budget mid-batch, which is the
+    // fact this test holds.
+    const chunks = Array.from(
+      { length: Math.ceil((MAX_TURN_NOVEL_BYTES + 1) / 48) },
+      (_, index) => `${'z'.repeat(46)}${index}`
+    );
     const batch = approvalRequirement(
       'parallel_web_read',
       { urls: chunks.map((chunk) => `https://docs.example.com/${chunk}`) },
@@ -3536,7 +3542,11 @@ describe('what a security mode means', () => {
        */
       ['publishing', 'publish_preview', { label: 'app', port: '5173', reach: 'public' }],
       ['sending', 'shell', { executable: 'curl', args: ['-d', '@notes.txt', 'https://x.invalid'] }],
-      ['sending', 'shell', { executable: 'git', args: ['push'] }],
+      // A push adds and a later push can take away - the commits are still here - so the sending
+      // clause is held by the acts that cannot be un-sent. The ordinary push is priced by mode:
+      // autonomous runs it, and the row that held this clause moved to the balanced assertion
+      // beside the test that names the pricing.
+      ['sending', 'shell', { executable: 'curl', args: ['-T', '@notes.txt', 'https://x.invalid/upload'] }],
       ['sending', 'connector_action', { action: 'mail_send', input: { to: 'a@b.invalid' } }],
       /*
        * The clause used to be held here by `rm -rf node_modules`, which was the one act in the list
@@ -3823,7 +3833,7 @@ describe('what a security mode means', () => {
    * "Push Git changes" under `external_reversible`, which is a true sentence about the ordinary
    * case and a false one about this.
    */
-  it('says what a forced push is, and leaves the ordinary push alone', () => {
+  it('says what a forced push is, and prices the ordinary push by mode', () => {
     for (const args of [
       { executable: 'git', args: ['push', '--force', 'origin', 'main'] },
       { executable: 'git', args: ['push', '-f'] },
@@ -3834,13 +3844,19 @@ describe('what a security mode means', () => {
         sideEffect: 'external_consequential',
         action: 'Overwrite history on a Git remote'
       });
-    expect(
-      approvalRequirement(
-        'shell',
-        { executable: 'git', args: ['push', 'origin', 'main'] },
-        'autonomous'
-      )
-    ).toMatchObject({ sideEffect: 'external_reversible', action: 'Push Git changes' });
+    // A push adds; a later push can take away; the commits are still here. The owner's ruling on
+    // autonomous is that it runs the work, and a commit the task itself wrote is the deliverable.
+    // Balanced and review still show the card.
+    for (const args of [
+      { executable: 'git', args: ['push', 'origin', 'main'] },
+      { executable: 'bash', args: ['-lc', 'git push origin main'] }
+    ]) {
+      expect(approvalRequirement('shell', args, 'autonomous'), JSON.stringify(args)).toBeNull();
+      expect(approvalRequirement('shell', args, 'balanced'), JSON.stringify(args)).toMatchObject({
+        sideEffect: 'external_reversible',
+        action: 'Push Git changes'
+      });
+    }
   });
 
   /*

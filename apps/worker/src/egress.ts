@@ -138,17 +138,18 @@ export const MAX_NOVEL_HOST_BYTES = 24;
  * tainted, and an address a search handed the model costs nothing at all, so the five of eight
  * recorded research turns that only read what they were given spend zero of it.
  *
- * The three that followed links off the pages they read spend 345, 419 and 915. That last one is
- * the number to look at before changing anything here: 89.4% of the budget, for a turn that
- * followed twenty-two links on react.dev, and a turn that followed forty would ask the owner. This
- * is the dial - raise it and a deeper research pass stops asking, at the cost of a proportionally
- * larger leak before anybody is asked, because the two are the same number. What must not be
- * touched to buy that headroom is `MIN_TOKEN_BYTES`, which is what makes the number finite.
+ * The three that followed links off the pages they read spent 345, 419 and 915 at the budget this
+ * replaced - and the owner's own deep research turn spent 1,393 before its tenth composed read,
+ * eleven cards in autonomous for REST reads on hosts the turn had legitimately been sent to. The
+ * owner's ruling on autonomous is that it runs the research, and the leak this bound prices is
+ * bounded by the per-token floor either way: `MIN_TOKEN_BYTES` per request at minimum,
+ * `MAX_NOVEL_TOKEN_CHARS` for any single piece. Four times the allowance is still a fraction of
+ * one path-segment payload per request over a whole turn, and a real deep research pass fits.
  *
  * Exceeding it is a card, not a refusal. The owner can still say yes; the point is that they are
  * asked once the material leaving stops looking like addresses.
  */
-export const MAX_TURN_NOVEL_BYTES = 1_024;
+export const MAX_TURN_NOVEL_BYTES = 4_096;
 
 /**
  * What one piece of an address costs when the corpus already contains it.

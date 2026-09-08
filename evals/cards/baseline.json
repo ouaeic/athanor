@@ -152,8 +152,8 @@
   },
   "J-deploy/autonomous": {
     "calls": 6,
-    "clean": 3,
-    "tainted": 3
+    "clean": 2,
+    "tainted": 2
   },
   "K-one-shot-app/review": {
     "calls": 47,

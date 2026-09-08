@@ -478,14 +478,16 @@ describe('a recorded research turn', () => {
 
   /*
    * Pinned rather than bounded, because the headroom is the whole argument for leaving this bound
-   * switched on and a silent slide into it is what turns a guard off. 915 of 1,024 is 89.4%: this
-   * turn followed twenty-two links, and one that followed forty would ask. The dial to turn if that
-   * happens is `MAX_TURN_NOVEL_BYTES`, and the price of turning it is stated where it is declared.
+   * switched on and a silent slide into it is what turns a guard off. The 915-byte replay is the
+   * recorded worst real turn at the original 1,024 budget - 89.4% - and it is what 4,096 is
+   * measured against: the same pass now sits at 22%, and the owner's own deep research turn that
+   * spent 1,393 fits with room. The dial is `MAX_TURN_NOVEL_BYTES`, and the price of turning it is
+   * stated where it is declared.
    */
-  it('leaves 109 bytes of the turn budget unspent, which is the whole margin this bound has', () => {
+  it('spends under a quarter of the turn budget on the worst recorded real turn', () => {
     const { spent, worstAddress } = replay();
     expect(spent).toBe(915);
-    expect(MAX_TURN_NOVEL_BYTES - spent).toBe(109);
+    expect(spent).toBeLessThan(MAX_TURN_NOVEL_BYTES / 4);
     expect(worstAddress).toBeLessThanOrEqual(MAX_NOVEL_URL_BYTES);
   });
 

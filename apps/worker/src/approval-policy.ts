@@ -1838,7 +1838,16 @@ const ordinaryRequirement = (
         action: 'Overwrite history on a Git remote',
         preview: `Run ${invocation}. A forced push replaces what the remote has rather than adding to it, and the commits it discards live on that remote and not on this computer, so nothing here can put them back. Anyone who already fetched the old history keeps a copy this one no longer agrees with.`
       };
+    /*
+     * The ORDINARY push cards only where the owner asked to be shown reversible acts. Autonomous
+     * is the mode whose sentence promises what cannot be taken back, and a push is the one git
+     * verb where the work is the deliverable: what a push adds, a later push can take away, and
+     * the commits are still here. Measured against the owner's own build shape in autonomous,
+     * this was the one card left after the network fixes - on a commit the task itself had just
+     * written.
+     */
     if (
+      securityMode !== 'autonomous' &&
       commands.some(
         ([command = '', ...rest]) => command === 'git' && gitSubcommand(rest) === 'push'
       )
