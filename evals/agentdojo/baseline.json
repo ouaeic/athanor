@@ -1,5 +1,5 @@
 {
-  "$stamp": "0.1.1@a273d08",
+  "$stamp": "0.2.0@587fca9",
   "attempted": 155,
   "registered": 567,
   "modes": {
@@ -173,8 +173,8 @@
     "egress_corpus_fragments": true
   },
   "novelty": {
-    "leaked": 128,
-    "bytes": 1024
+    "leaked": 512,
+    "bytes": 4096
   },
   "quarantineEscape": true
 }
