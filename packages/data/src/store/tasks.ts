@@ -1474,6 +1474,32 @@ export class TaskStore {
     });
   }
 
+  /**
+   * Moves a single run's own money ceiling up, and only up.
+   *
+   * This exists because the ceiling that stops a run is not always an account one: a task carrying
+   * its own `max_spend_usd` is stopped by that, and the caps route cannot move it - it only knows
+   * about the daily, monthly and default-task limits. Without this the card that offers to lift a
+   * ceiling could lift two of the three, and the third sent the owner nowhere.
+   *
+   * `GREATEST` rather than an assignment, for the same reason the follow-up path anchors to what
+   * has already been spent: this is reached from a control whose whole purpose is to let stopped
+   * work continue, and a value that arrived smaller than the current ceiling - a stale card, a
+   * double submit, a retry against a limit somebody already raised - must not quietly tighten the
+   * run instead. Lowering a ceiling is a different intention and has its own route.
+   */
+  async raiseTaskSpendCeiling(userId: string, id: string, maxSpendUsd: number): Promise<boolean> {
+    const result = await this.database.query(
+      `UPDATE tasks t SET max_spend_usd = GREATEST(COALESCE(t.max_spend_usd, 0), $3::double precision),
+         updated_at = NOW()
+       WHERE t.id = $1 AND EXISTS (
+         SELECT 1 FROM workspaces w WHERE w.id = t.workspace_id AND w.user_id = $2
+       ) RETURNING t.id`,
+      [id, userId, maxSpendUsd]
+    );
+    return result.rows.length > 0;
+  }
+
   async setTaskStatusForUser(userId: string, id: string, status: string): Promise<boolean> {
     const result = await this.database.query(
       `UPDATE tasks SET status = $3, lease_owner = NULL, lease_expires_at = NULL, updated_at = NOW(),

@@ -482,7 +482,7 @@ export const agentTools: ModelTool[] = [
   {
     name: 'set_plan',
     description:
-      'Set the visible plan before material work and revise it when the approach changes. Mark steps in_progress then completed when verified. Use presentation for a task-specific surface and acknowledgment; action=describe gives its schema.',
+      'Set the visible plan before material work and revise it when the approach changes. Mark steps in_progress then completed when verified; a step may carry substeps. Use presentation for a task-specific surface and acknowledgment; action=describe gives its schema.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -531,6 +531,25 @@ export const agentTools: ModelTool[] = [
                   status: {
                     type: 'string',
                     enum: ['pending', 'in_progress', 'completed', 'skipped']
+                  },
+                  // Objects only on the wire, though the parser still takes a bare string: this
+                  // schema is resident on every request of every turn, and the `oneOf` wrapper that
+                  // advertised both cost more bytes there than the leniency is worth.
+                  substeps: {
+                    type: 'array',
+                    maxItems: 30,
+                    items: {
+                      type: 'object',
+                      additionalProperties: false,
+                      required: ['title'],
+                      properties: {
+                        title: { type: 'string' },
+                        status: {
+                          type: 'string',
+                          enum: ['pending', 'in_progress', 'completed', 'skipped']
+                        }
+                      }
+                    }
                   }
                 }
               }

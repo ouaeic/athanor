@@ -250,12 +250,62 @@ export const planStepsFromArguments = (
     const reported = textValue(record?.status) as TaskPlanStep['status'];
     const inherited = carried.get(title);
     carried.delete(title);
+    const status = PLAN_STATUSES.includes(reported) ? reported : (inherited?.status ?? 'pending');
+    /*
+     * The clock the owner reads beside a step is recovered from the plan's versions downstream;
+     * the step only needs to keep whatever the step itself already carried. Started/completed
+     * stamps are inherited across versions for an unchanged title so a re-sent plan never zeroes a
+     * duration the panel is already showing; a model that stamps its own is kept.
+     */
+    const explicitStart = textValue(record?.startedAt);
+    const explicitComplete = textValue(record?.completedAt);
+    const substeps = planSubstepsFromArguments(record?.substeps, inherited?.substeps ?? []);
     steps.push({
       id: inherited?.id ?? randomUUID(),
       title,
-      status: PLAN_STATUSES.includes(reported) ? reported : (inherited?.status ?? 'pending')
+      status,
+      ...(explicitStart || inherited?.startedAt
+        ? { startedAt: explicitStart || inherited!.startedAt! }
+        : {}),
+      ...(explicitComplete || inherited?.completedAt
+        ? { completedAt: explicitComplete || inherited!.completedAt! }
+        : {}),
+      ...(substeps.length ? { substeps } : {})
     });
     if (steps.length === MAX_PLAN_STEPS) break;
   }
   return steps;
+};
+
+/**
+ * A milestone's parts, one level deep. `substeps` replaces rather than merges only by status: a
+ * part the model re-lists keeps its identity and clock by title, so renaming one does not orphan
+ * the row the owner had open.
+ */
+const planSubstepsFromArguments = (
+  value: unknown,
+  previous: NonNullable<TaskPlanStep['substeps']>
+): NonNullable<TaskPlanStep['substeps']> => {
+  if (!Array.isArray(value)) return previous.map((sub) => ({ ...sub }));
+  const carried = new Map(previous.map((sub) => [sub.title, sub]));
+  const substeps: NonNullable<TaskPlanStep['substeps']> = [];
+  for (const entry of value) {
+    const record =
+      entry && typeof entry === 'object' ? (entry as Record<string, unknown>) : undefined;
+    const title = textValue(record ? record.title : entry)
+      .trim()
+      .slice(0, 240);
+    if (!title) continue;
+    const reported = textValue(record?.status) as TaskPlanStep['status'];
+    const inherited = carried.get(title);
+    carried.delete(title);
+    const status = PLAN_STATUSES.includes(reported) ? reported : (inherited?.status ?? 'pending');
+    substeps.push({
+      id: inherited?.id ?? randomUUID(),
+      title,
+      status
+    });
+    if (substeps.length === MAX_PLAN_STEPS) break;
+  }
+  return substeps;
 };

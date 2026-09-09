@@ -727,6 +727,91 @@
 .garden-phases [data-status='in_progress'] .garden-phase-dot {
   border-color: var(--accent);
 }
+/* A milestone with parts: the row is a summary, the parts sit indented under it. */
+.garden-phase-line {
+  display: flex;
+  gap: 11px;
+  align-items: flex-start;
+  width: 100%;
+  font-size: 12px;
+  color: var(--muted);
+}
+.garden-phase-line > span:nth-child(2) {
+  flex: 1;
+  min-width: 0;
+}
+.garden-phase-meta {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+  margin-left: auto;
+  padding-top: 2px;
+  white-space: nowrap;
+}
+.garden-phase-detail summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+}
+.garden-phase-detail summary::-webkit-details-marker {
+  display: none;
+}
+.garden-subphases {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0 0 0 24px;
+  display: grid;
+  gap: 6px;
+}
+.garden-subphases li {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 11px;
+  color: var(--muted);
+  padding: 0;
+}
+.garden-subphases li:before {
+  content: none;
+}
+/*
+ * The trajectory of the directions before this one: present, closed, and quiet. It has to be
+ * reachable without competing with the list of what is happening now, which is what the whole panel
+ * is for - so it reads as one line until it is opened.
+ */
+.garden-phase-history {
+  margin-top: 12px;
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+.garden-phase-history > summary {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--muted);
+  list-style: none;
+}
+.garden-phase-history > summary::-webkit-details-marker {
+  display: none;
+}
+.garden-phase-history .garden-phases {
+  margin-top: 8px;
+  opacity: 0.72;
+}
+.garden-subphases .garden-phase-dot {
+  width: 14px;
+  height: 14px;
+  font-size: 7px;
+}
+.garden-subphases [data-status='completed'] {
+  color: var(--accent);
+}
+.garden-phase-partial {
+  margin: 0 0 0 12px;
+  font-size: 11px;
+}
 .garden-metrics {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1011,7 +1096,7 @@
 .garden-approval-select select {
   width: auto;
   min-height: 30px;
-  padding: 0.3rem 1.5rem 0.3rem 0.35rem;
+  padding: 0.25rem 1.5rem 0.25rem 0.3rem;
   border: 0;
   background-color: transparent;
   font-size: 11px;
@@ -1021,21 +1106,13 @@
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 6px 16px;
-  margin-top: 10px;
-  padding-top: 10px;
+  gap: 4px 12px;
+  margin-top: 8px;
+  padding-top: 8px;
   border-top: 1px solid var(--line);
 }
-.garden-model-core,
-.garden-run-settings-fields {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px 16px;
-  min-width: 0;
-}
-.garden-model-core {
-  flex: 1 1 480px;
+.garden-model-settings {
+  display: contents;
 }
 .garden-model-select {
   display: flex;
@@ -1078,32 +1155,30 @@
   width: auto;
   min-height: 30px;
   max-width: 110px;
-  padding: 0.3rem 1.4rem 0.3rem 0.35rem;
+  padding: 0.25rem 1.4rem 0.25rem 0.3rem;
   border: 0;
   background: transparent;
   color: var(--text);
   font-size: 11px;
 }
 .garden-cap-control input {
-  width: 76px;
-  padding-right: 0.35rem;
+  width: 68px;
+  padding-right: 0.3rem;
 }
 .garden-model-controls label > span {
   white-space: nowrap;
 }
 @media (max-width: 760px) {
   .garden-model-controls {
-    gap: 10px;
-    flex-wrap: wrap;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+    gap: 4px 12px;
     margin-top: 7px;
     padding-top: 7px;
   }
   .garden-model-select {
     flex-basis: 100%;
-  }
-  .garden-model-core {
-    width: 100%;
-    gap: 8px;
+    max-width: none;
   }
 }
 .garden-sidebar-theme {
@@ -1510,9 +1585,6 @@
   }
 }
 
-.garden-advanced-models {
-  margin-top: 6px;
-}
 .garden-model-controls .button {
   min-height: 30px;
   padding: 5px 8px;
@@ -1523,21 +1595,15 @@
   color: var(--text);
   background: var(--raised);
 }
-.garden-advanced-models.open {
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--raised) 24%, transparent);
+.intent-toolbar .toolbar-extra {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
 }
-.garden-advanced-models .garden-prompt-models {
-  display: grid;
-  gap: 8px;
-  padding: 10px 12px 12px;
-}
-.garden-advanced-models .garden-prompt-models .field {
-  display: grid;
+.intent-toolbar .toolbar-extra .button {
+  min-height: 30px;
   gap: 4px;
-}
-.garden-advanced-models .garden-prompt-models select {
-  width: 100%;
-  min-height: 32px;
+  border-color: transparent;
+  color: var(--muted);
+  font-size: 11px;
 }

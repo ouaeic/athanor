@@ -37,9 +37,36 @@ export const TaskMilestone = z.object({
 export type TaskMilestone = z.infer<typeof TaskMilestone>;
 
 /** A projection of recorded work. Counts never imply a percentage of the owner's objective. */
+/** One milestone as the owner reads it: what it is, where it got to, and how long it took. */
+export const TaskPhase = z.object({
+  id: z.string(),
+  title: z.string(),
+  status: z.enum(['pending', 'in_progress', 'completed', 'skipped']),
+  /** When this step last became the running one; absent for a step never started. */
+  startedAt: z.string().optional(),
+  /** When this step reached a closed state; with startedAt, its wall-clock duration. */
+  completedAt: z.string().optional(),
+  /** Sub-milestones done and total, from the plan's substeps; absent when there are none. */
+  countDone: z.number().int().nonnegative().optional(),
+  countTotal: z.number().int().nonnegative().optional(),
+  /** The step's own sub-milestones, one level deep, for the expandable view. */
+  substeps: z
+    .array(
+      z.object({
+        id: z.string(),
+        title: z.string(),
+        status: z.enum(['pending', 'in_progress', 'completed', 'skipped'])
+      })
+    )
+    .optional()
+});
+export type TaskPhase = z.infer<typeof TaskPhase>;
+
 export const TaskPresentation = z.object({
   version: z.literal(1),
   taskId: z.string(),
+  /** The task's own status at projection time, so a partial completion can be labelled honestly. */
+  taskStatus: z.string().optional(),
   eventCursor: z.number().int().nonnegative(),
   results: z.array(TaskResult),
   surface: WorkSurfaceView.optional(),
@@ -70,13 +97,25 @@ export const TaskPresentation = z.object({
     .optional(),
   progress: z.object({
     kind: z.enum(['general', 'build', 'research', 'analysis', 'design']),
-    phases: z.array(
-      z.object({
-        id: z.string(),
-        title: z.string(),
-        status: z.enum(['pending', 'in_progress', 'completed', 'skipped'])
-      })
-    ),
+    phases: z.array(TaskPhase),
+    /*
+     * The milestone lists of the directions before this one, oldest first.
+     *
+     * A direction opens a new plan, and until the model writes one `phases` is empty - so sending a
+     * follow-up wiped the list the owner had been reading, and everything the run had already
+     * achieved went with it. Nothing was lost from the record; it simply stopped being shown. These
+     * are those earlier lists, kept so the trajectory of a long project reads as one thing rather
+     * than as whatever is happening this minute.
+     */
+    history: z
+      .array(
+        z.object({
+          directionEventId: z.string().nullable(),
+          startedAt: z.string(),
+          phases: z.array(TaskPhase)
+        })
+      )
+      .default([]),
     current: z.object({ title: z.string(), eventId: z.string(), startedAt: z.string() }).nullable(),
     metrics: z.array(
       z.object({ key: z.string(), label: z.string(), value: z.number().nonnegative() })

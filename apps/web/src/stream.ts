@@ -206,6 +206,17 @@ export function subscribeTaskEvents(taskId: string, options: SubscribeOptions): 
             initial = false;
           }
           if (terminal) {
+            /*
+             * The stream closed on a terminal status, but the worker can still write after it -
+             * the closing `status` and `error` of a task cancelled under a tool call land after
+             * the frame that said the task was over. They arrive out of order: `terminal` is
+             * emitted the moment status reads terminal, while the rows that explain it are still
+             * being appended. So this branch reads the backlog one more time (rows written before
+             * and right after the close), then falls through to re-open the stream on the next
+             * tick - whose own open-time reconcile picks up whatever landed in between. The task
+             * status is only polled to confirm the close, so a finished task does not pay a GET
+             * burst; an unfinished one is re-announced and the stream resumed for the rest of it.
+             */
             await reconcile();
             const task = await get<{ status: string }>(`/v1/tasks/${encodeURIComponent(taskId)}`, {
               signal

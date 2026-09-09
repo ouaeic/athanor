@@ -40,6 +40,16 @@ const STREAM_FLUSH_MIN_CHARS = 8;
 export const REASONING_FLUSH_INTERVAL_MS = 500;
 
 /**
+ * The longest silence the channel accepts before it puts something on the screen again.
+ *
+ * A tool step that runs long and a reasoning pass between flushes both leave the "Now" line
+ * showing whatever last landed; nothing in the flush path knows the turn is still alive, so
+ * the owner reads a frozen line as a dead one. A re-assert at this interval keeps the line
+ * moving without writing anything new to the transcript.
+ */
+export const STALL_HEARTBEAT_INTERVAL_MS = 5_000;
+
+/**
  * Batches streamed text into timed frames, each carrying only what arrived since the last one.
  *
  * Every frame becomes its own encrypted, row-locked timeline event, so what a frame contains is a

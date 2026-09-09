@@ -107,6 +107,21 @@ export function SpendingSettings({ onChange }: { onChange: () => void }) {
         description="Leave a money field empty for no cap. Raising an existing ceiling may require your passkey."
       >
         <ResourceState resource={limits} />
+        {/*
+         * Until this box has an answer it applies a monthly ceiling of its own, and the field below
+         * shows that number with nothing to say it is not the owner's. An owner who reads their own
+         * decision there finds out otherwise only when it stops a run - which is exactly how it was
+         * found out. The stored row's `updatedAt` sits at the epoch until something is saved, which
+         * is the same test the server uses to decide a loosening here needs no passkey.
+         */}
+        {limits.value && !(Date.parse(limits.value.updatedAt) > 0) && (
+          <p className="muted">
+            You have not set spending limits yet, so garden applies a{' '}
+            {money(limits.value.monthlyCapUsd ?? 0)} monthly ceiling as a backstop — work stops
+            there and asks you rather than spending past it. Saving this form, empty fields
+            included, replaces it with your own answer.
+          </p>
+        )}
         {limits.value && (
           <form
             className="stack"

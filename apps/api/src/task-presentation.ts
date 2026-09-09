@@ -246,6 +246,7 @@ export const buildTaskPresentation = (input: PresentationInput): TaskPresentatio
   let commands = 0,
     checksPassed = 0,
     checksFailed = 0,
+    toolFailures = 0,
     images = 0;
   const add = (
     event: TaskEvent,
@@ -278,6 +279,15 @@ export const buildTaskPresentation = (input: PresentationInput): TaskPresentatio
       });
     } else if (event.kind === 'error') {
       pending.delete(id);
+      /*
+       * Counted whether or not the call that failed was seen starting.
+       *
+       * A failure already becomes one line in the trace, and the trace keeps the last two dozen
+       * lines of the current direction - so a run that failed the same tool thirty-seven times over
+       * five hours showed the owner, at most, whichever few were recent enough to survive the
+       * window. The pattern is the thing worth knowing, and a pattern is a count.
+       */
+      toolFailures += 1;
       if (started.has(id)) add(event, 'check', event.summary, 'failed');
     } else if (event.kind === 'tool_result') {
       pending.delete(id);
@@ -348,7 +358,61 @@ export const buildTaskPresentation = (input: PresentationInput): TaskPresentatio
     }
   }
   const surface = projectWorkSurface(events, input.plan, results);
-  const phases =
+  /*
+   * Timing for a milestone is recovered by walking the plan's own versions rather than stored on
+   * the step: each `plan` event is a whole snapshot, so the first version in which a step is
+   * running is when it started and the first in which it closes is when it ended. Steps that carry
+   * their own stamps keep them - a worker that recorded one has answered more precisely than a diff
+   * can. Nothing new is written to get this, which is why it also works for runs that finished
+   * before any of it existed.
+   */
+  const firstInProgress = new Map<string, string>();
+  const firstClosed = new Map<string, string>();
+  for (const event of events) {
+    if (event.kind !== 'plan') continue;
+    const steps = record(event.payload).steps;
+    if (!Array.isArray(steps)) continue;
+    for (const value of steps) {
+      const step = record(value);
+      const id = text(step.id);
+      if (!id) continue;
+      const status = text(step.status);
+      if (status === 'in_progress' && !firstInProgress.has(id))
+        firstInProgress.set(id, event.createdAt);
+      if ((status === 'completed' || status === 'skipped') && !firstClosed.has(id))
+        firstClosed.set(id, event.createdAt);
+    }
+  }
+  const closed = (sub: { status: string }): boolean =>
+    sub.status === 'completed' || sub.status === 'skipped';
+  const toPhase = (step: Record<string, unknown>) => {
+    const id = text(step.id);
+    const substepsList = Array.isArray(step.substeps) ? step.substeps.map(record) : [];
+    const startedAt = text(step.startedAt) || firstInProgress.get(id);
+    const completedAt = text(step.completedAt) || firstClosed.get(id);
+    const parts = substepsList
+      .map((sub) => ({ id: text(sub.id), title: text(sub.title), status: text(sub.status) }))
+      .filter((sub) => sub.id && sub.title);
+    return {
+      id,
+      title: text(step.title),
+      status: text(step.status) as 'pending' | 'in_progress' | 'completed' | 'skipped',
+      ...(startedAt ? { startedAt } : {}),
+      ...(completedAt ? { completedAt } : {}),
+      ...(parts.length
+        ? {
+            countDone: parts.filter(closed).length,
+            countTotal: parts.length,
+            substeps: parts as {
+              id: string;
+              title: string;
+              status: 'pending' | 'in_progress' | 'completed' | 'skipped';
+            }[]
+          }
+        : {})
+    };
+  };
+  const matchesCurrentDirection =
     input.plan?.taskId === input.taskId &&
     (!surface.direction ||
       (input.plan.directionEventId
@@ -356,9 +420,56 @@ export const buildTaskPresentation = (input: PresentationInput): TaskPresentatio
         : Date.parse(input.plan.createdAt) >=
           Date.parse(
             events.find((event) => event.id === surface.direction?.eventId)?.createdAt ?? ''
-          )))
-      ? input.plan.steps.map(({ id, title, status }) => ({ id, title, status }))
+          )));
+  const phases =
+    input.plan && matchesCurrentDirection
+      ? input.plan.steps.map((step) => toPhase(step as unknown as Record<string, unknown>))
       : [];
+  /*
+   * The milestone lists of the directions that came before this one.
+   *
+   * `phases` is the plan of the direction being worked now, and until the model writes one it is
+   * empty - which is why a follow-up appeared to delete everything the project had done. The last
+   * plan each earlier direction reached is kept here instead, so the owner keeps the whole
+   * trajectory and not only the newest slice of it. Read from the plan events, which are already a
+   * full snapshot per version, so the newest version of each direction is simply the last one seen.
+   */
+  const perDirection = new Map<string, { startedAt: string; steps: Record<string, unknown>[] }>();
+  for (const event of events) {
+    if (event.kind !== 'plan') continue;
+    const payload = record(event.payload);
+    const steps = payload.steps;
+    if (!Array.isArray(steps) || steps.length === 0) continue;
+    const directionEventId =
+      text(payload.directionEventId) || text(record(payload.presentation).directionEventId);
+    const existing = perDirection.get(directionEventId);
+    perDirection.set(directionEventId, {
+      startedAt: existing?.startedAt ?? event.createdAt,
+      steps: steps.map(record)
+    });
+  }
+  /*
+   * Null rather than the empty string when there is nothing to exclude. A plan written before any
+   * direction existed keys on '' too, so using '' as "no current direction" would have taken that
+   * plan out of the history it belongs in - the one case where an older task has a list to keep and
+   * would have been shown none.
+   */
+  const currentDirectionId = matchesCurrentDirection
+    ? (input.plan?.directionEventId ?? surface.direction?.eventId ?? '')
+    : null;
+  const history = [...perDirection.entries()]
+    // The direction being worked now is already `phases`; repeating it below would read as the
+    // project having done the same list twice.
+    .filter(
+      ([directionEventId]) => currentDirectionId === null || directionEventId !== currentDirectionId
+    )
+    .map(([directionEventId, entry]) => ({
+      directionEventId: directionEventId || null,
+      startedAt: entry.startedAt,
+      phases: entry.steps.map(toPhase).filter((phase) => phase.id && phase.title)
+    }))
+    .filter((entry) => entry.phases.length > 0)
+    .slice(-16);
   const intentKind = outputs?.[0]?.kind;
   const kind = intentKind
     ? (
@@ -385,6 +496,7 @@ export const buildTaskPresentation = (input: PresentationInput): TaskPresentatio
   return {
     version: 1,
     taskId: input.taskId,
+    taskStatus: input.taskStatus,
     eventCursor: events.at(-1)?.sequence ?? 0,
     results,
     surface,
@@ -402,12 +514,14 @@ export const buildTaskPresentation = (input: PresentationInput): TaskPresentatio
               )
               .at(-1) ?? null)
           : null,
+      history,
       metrics: [
         { key: 'files', label: 'Files changed', value: paths.size },
         { key: 'sources', label: 'Sources found', value: sources.size },
         { key: 'commands', label: 'Commands run', value: commands },
         { key: 'checksPassed', label: 'Checks passed', value: checksPassed },
         { key: 'checksFailed', label: 'Checks failed', value: checksFailed },
+        { key: 'toolFailures', label: 'Tool calls that failed', value: toolFailures },
         {
           key: 'results',
           label: 'Results ready',

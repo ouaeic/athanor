@@ -39,6 +39,7 @@ const presentation = {
   progress: {
     kind: 'research',
     phases: [{ id: 'old', title: 'Old plan', status: 'completed' }],
+    history: [],
     current: null,
     metrics: [],
     milestones: [],

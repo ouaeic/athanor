@@ -36,6 +36,7 @@ const presentation: TaskPresentation = {
       { id: 'build', title: 'Build the game', status: 'completed' },
       { id: 'check', title: 'Verify play', status: 'in_progress' }
     ],
+    history: [],
     current: {
       title: 'Checking keyboard input',
       eventId: 'check',
@@ -147,5 +148,104 @@ describe('usable task delivery and recorded progress', () => {
     expect(html).toContain('Checking keyboard input');
     expect(html).not.toContain('garden-metrics');
     expect(html).not.toContain('50% complete');
+  });
+});
+
+/**
+ * What the progress panel actually puts on screen.
+ *
+ * Every one of these was a thing the owner said was missing: how long a step took, how far into its
+ * parts a milestone is, what the project did before the direction it is on now, and whether a run
+ * that says it finished actually finished what it listed.
+ */
+describe('the progress panel answers how far in the work is', () => {
+  const withProgress = (over: Partial<TaskPresentation['progress']>) =>
+    renderToStaticMarkup(
+      <TaskProgress
+        presentation={{ ...presentation, progress: { ...presentation.progress, ...over } }}
+        onPlan={() => undefined}
+        onEvidence={() => undefined}
+      />
+    );
+
+  it('puts a duration beside a finished step and a start time beside a running one', () => {
+    const html = withProgress({
+      phases: [
+        {
+          id: 'build',
+          title: 'Build the game',
+          status: 'completed',
+          startedAt: '2026-09-06T10:00:00.000Z',
+          completedAt: '2026-09-06T10:12:30.000Z'
+        },
+        {
+          id: 'check',
+          title: 'Verify play',
+          status: 'in_progress',
+          startedAt: '2026-09-06T10:12:30.000Z'
+        }
+      ]
+    });
+    expect(html).toContain('12m 30s');
+    expect(html).toContain('since');
+  });
+
+  it('counts a milestone`s parts on the closed row and lists them underneath', () => {
+    const html = withProgress({
+      phases: [
+        {
+          id: 'build',
+          title: 'Build the game',
+          status: 'in_progress',
+          countDone: 2,
+          countTotal: 3,
+          substeps: [
+            { id: 's1', title: 'Draw the map', status: 'completed' },
+            { id: 's2', title: 'Drop the extra', status: 'skipped' },
+            { id: 's3', title: 'Wire the keys', status: 'in_progress' }
+          ]
+        }
+      ]
+    });
+    expect(html).toContain('2/3');
+    expect(html).toContain('Draw the map');
+    expect(html).toContain('Wire the keys');
+  });
+
+  it('keeps the earlier directions on screen instead of showing an empty panel', () => {
+    const html = withProgress({
+      phases: [],
+      history: [
+        {
+          directionEventId: 'event-1',
+          startedAt: '2026-09-06T09:00:00.000Z',
+          phases: [{ id: 'a', title: 'Draw the map', status: 'completed' }]
+        }
+      ]
+    });
+    expect(html).toContain('Earlier in this project');
+    expect(html).toContain('Draw the map');
+  });
+
+  it('does not call a run complete while its own list still has steps open', () => {
+    const html = renderToStaticMarkup(
+      <TaskProgress
+        presentation={{
+          ...presentation,
+          taskStatus: 'completed',
+          progress: {
+            ...presentation.progress,
+            phases: [
+              { id: 'a', title: 'Done thing', status: 'completed' },
+              { id: 'b', title: 'Open thing', status: 'pending' }
+            ]
+          }
+        }}
+        onPlan={() => undefined}
+        onEvidence={() => undefined}
+      />
+    );
+    expect(html).toContain('1 step open');
+    expect(html).toContain('1 of 2 done');
   });
 });

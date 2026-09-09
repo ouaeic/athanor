@@ -146,6 +146,11 @@ export const taskResponse = (
   actualComputeCredits: task.actualComputeCredits,
   maxSpendUsd: task.maxSpendUsd,
   spentUsd: task.spentUsd,
+  // What tells a money stop from a Pause the owner pressed. Absent on records built by a write
+  // that did not select the column, which is not the same claim as "no ceiling stopped this".
+  spendPausedAt: task.spendPausedAt ?? null,
+  // The end of the run, as opposed to the last time anything about it was written.
+  completedAt: task.completedAt ?? null,
   queuedMessageCount: task.queuedMessageCount,
   shareCount: task.shareCount ?? 0,
   rewind: task.rewindScope ?? null,

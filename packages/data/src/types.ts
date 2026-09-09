@@ -125,6 +125,24 @@ export interface TaskRecord {
    * write or a lease reports zero rather than a number nobody computed.
    */
   spentUsd: number;
+  /**
+   * When a spending ceiling stopped this task, or null for a task nobody's ceiling stopped.
+   *
+   * The column has always existed and only the notification query ever read it, so every
+   * owner-facing read handed back a `paused` with no way to tell a money stop from a Pause the
+   * owner pressed - which is how a run stopped on a ceiling looked like it had stopped for no
+   * reason, and how Resume looked broken when it re-queued into the same ceiling a step later.
+   */
+  spendPausedAt?: string | null;
+  /**
+   * When this run reached a terminal state, cleared when a follow-up re-queues it.
+   *
+   * The column has been written by every terminal transition for as long as it has existed and read
+   * by nothing outside the store, so the only end-time a client could reach for was `updatedAt` -
+   * which moves when a conversation is renamed, pinned or shared. A run's duration measured that way
+   * grows every time the owner touches it.
+   */
+  completedAt?: string | null;
   queuedMessageCount: number;
   /**
    * Live share links - neither revoked nor expired. Optional on the record rather than zero,

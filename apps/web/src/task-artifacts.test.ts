@@ -29,6 +29,7 @@ it('supplies complete immutable metadata for a source-workspace artifact absent 
     progress: {
       kind: 'research',
       phases: [],
+      history: [],
       current: null,
       metrics: [],
       milestones: [],

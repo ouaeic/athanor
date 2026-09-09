@@ -582,6 +582,17 @@ export const Task = z.object({
   maxSpendUsd: z.number().positive().nullable().default(null),
   /** Settled provider cost for this task so far. */
   spentUsd: z.number().nonnegative().default(0),
+  /**
+   * When a spending ceiling stopped this run, or null for every other kind of stop.
+   *
+   * A paused task said nothing about why it stopped, so a run a ceiling halted was indistinguishable
+   * from one the owner paused - and pressing Resume re-queued it into the same ceiling, which
+   * stopped it again a step later and read as a Resume button that does nothing. A client that can
+   * see this can say what happened and offer the only thing that actually changes the outcome.
+   */
+  spendPausedAt: IsoDate.nullable().default(null),
+  /** When this run stopped. Null while it can still do work; cleared again by a follow-up. */
+  completedAt: IsoDate.nullable().default(null),
   queuedMessageCount: z.number().int().nonnegative().default(0),
   /**
    * How many links to a snapshot of this conversation are live - neither revoked nor expired. The
@@ -764,12 +775,40 @@ export const TaskEventKind = z.enum([
   'question_asked',
   'cost',
   /** Something the agent decided the owner should be told at that moment, not on their next visit. */
+  /**
+   * One delegated specialist's standing, so a mission the lead sent away is on the timeline as
+   * something spinning up, working and being checked rather than one opaque tool call. The
+   * payload is a `SubagentLane`; same lane, same `laneId`.
+   */
+  'subagent',
   'notice',
   'warning',
   'error',
   'completed'
 ]);
 export type TaskEventKind = z.infer<typeof TaskEventKind>;
+
+/**
+ * One delegated lane as a moment in its work. The stream of `subagent` events with one `laneId`
+ * is the lane's trajectory; latest status wins. `elapsedMs` is the mission's own clock, frozen
+ * once a terminal status arrives; `verified` says the harness re-read the report's cited sources
+ * and states whether the quoted spans held.
+ */
+export const SubagentLane = z.object({
+  laneId: z.string().min(1).max(64),
+  lane: z.enum(['research', 'coding', 'review']),
+  name: z.string().min(1).max(80),
+  status: z.enum(['started', 'working', 'waiting', 'completed', 'failed', 'verified']),
+  detail: z.string().max(500).optional(),
+  elapsedMs: z.number().nonnegative().optional(),
+  usedCredits: z.number().nonnegative().optional(),
+  allocatedCredits: z.number().nonnegative().optional(),
+  steps: z.number().int().nonnegative().optional(),
+  verified: z
+    .object({ checked: z.number().int().nonnegative(), held: z.number().int().nonnegative() })
+    .optional()
+});
+export type SubagentLane = z.infer<typeof SubagentLane>;
 
 export const TaskEvent = z.object({
   id: Id,
@@ -793,10 +832,17 @@ export const TaskEventWindowQuery = z.object({
 });
 export type TaskEventWindowQuery = z.input<typeof TaskEventWindowQuery>;
 
-export const TaskPlanStep = z.object({
+export const TaskPlanStepBase = z.object({
   id: Id,
   title: z.string().trim().min(1).max(240),
-  status: z.enum(['pending', 'in_progress', 'completed', 'skipped']).default('pending')
+  status: z.enum(['pending', 'in_progress', 'completed', 'skipped']).default('pending'),
+  startedAt: IsoDate.optional(),
+  completedAt: IsoDate.optional()
+});
+export const TaskPlanSubstep = TaskPlanStepBase;
+export const TaskPlanStep = TaskPlanStepBase.extend({
+  /** One level deep, deliberately: a milestone that needs its own milestones is a task. */
+  substeps: z.array(TaskPlanSubstep).max(30).optional()
 });
 export type TaskPlanStep = z.infer<typeof TaskPlanStep>;
 
@@ -822,10 +868,9 @@ export const UpdateTaskPlanRequest = z.object({
   branchName: z.string().trim().min(1).max(80).default('Main'),
   steps: z
     .array(
-      z.object({
+      TaskPlanStepBase.extend({
         id: Id.optional(),
-        title: z.string().trim().min(1).max(240),
-        status: z.enum(['pending', 'in_progress', 'completed', 'skipped']).default('pending')
+        substeps: z.array(TaskPlanSubstep).max(30).optional()
       })
     )
     .min(1)
@@ -1429,6 +1474,40 @@ export const SpendDecision = z.object({
   windows: z.array(SpendWindow)
 });
 export type SpendDecision = z.infer<typeof SpendDecision>;
+
+/**
+ * Why a run is stopped on money, read fresh rather than remembered.
+ *
+ * A halt records a sentence in the task's events and nothing else, so the only account of it the
+ * owner could reach was a line in a log - and the figures in that line go stale: a daily window
+ * rolls over at midnight and stops blocking anything, while a monthly one keeps blocking until
+ * somebody moves it. The verdict is therefore re-asked of the same guard the worker consults, so
+ * the card the owner reads and the brake that stopped the work cannot quote different numbers.
+ */
+export const TaskSpendBlock = z.object({
+  taskId: Id,
+  /** When a ceiling stopped this run. Null for a task no ceiling stopped. */
+  spendPausedAt: IsoDate.nullable(),
+  /** Whether a ceiling would still stop it right now, which is not the same question. */
+  blocked: z.boolean(),
+  decision: SpendDecision,
+  /** The sentence the owner reads, built by the same function the halt itself used. */
+  summary: z.string(),
+  /**
+   * True when what is blocking is a ceiling this box supplied because nobody had been asked, not
+   * one the owner chose. The card says so, because "your limit" is not true of a default and an
+   * owner who never set a limit should not be told they set one.
+   */
+  unchosen: z.boolean()
+});
+export type TaskSpendBlock = z.infer<typeof TaskSpendBlock>;
+
+/**
+ * Moving one run's own ceiling up. Only up: the route this reaches raises and never lowers, so a
+ * stale card cannot tighten a limit somebody else has already moved.
+ */
+export const RaiseTaskSpendCeilingRequest = z.object({ maxSpendUsd: TaskSpendUsd });
+export type RaiseTaskSpendCeilingRequest = z.infer<typeof RaiseTaskSpendCeilingRequest>;
 
 export const SpendLimits = z.object({
   dailyCapUsd: CapUsd.nullable(),

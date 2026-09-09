@@ -827,7 +827,9 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
             if (!response.ok) return;
             const body: unknown = await response.json();
             if (!isRecord(body) || !Array.isArray(body.capabilities)) return;
-            const capabilities: string[] = body.capabilities;
+            const capabilities = body.capabilities.filter(
+              (entry): entry is string => typeof entry === 'string'
+            );
             const thinking = capabilities.includes('thinking');
             const gptOss = /^gpt-oss(?::|$)/.test(model.id);
             // Vision is a capability the native endpoint publishes and the OpenAI-shaped list

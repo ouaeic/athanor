@@ -11,6 +11,10 @@ const ResultPreview = lazy(() =>
   import('./computer/ResultPreview').then((module) => ({ default: module.ResultPreview }))
 );
 
+/** The clock-face time a step began, for a phase still running. */
+const shortTime = (value: string): string =>
+  new Date(value).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+
 export function TaskOutputs({
   presentation,
   events = [],
@@ -385,6 +389,92 @@ export function TaskOutputs({
   );
 }
 
+/**
+ * One list of milestones, used for the direction being worked and for each earlier one.
+ *
+ * Extracted rather than duplicated because the retained trajectory has to read exactly like the
+ * live list - same ticks, same durations, same expandable parts - or the two stop being comparable,
+ * which is the whole point of keeping the earlier ones on screen.
+ */
+function PhaseList({
+  phases,
+  onPlan
+}: {
+  phases: TaskPresentation['progress']['phases'];
+  onPlan?: () => void;
+}) {
+  return (
+    <ol className="garden-phases">
+      {phases.map((phase, index) => {
+        const durationMs =
+          phase.startedAt && phase.completedAt
+            ? Date.parse(phase.completedAt) - Date.parse(phase.startedAt)
+            : undefined;
+        const durationText =
+          durationMs !== undefined && Number.isFinite(durationMs) && durationMs >= 0
+            ? durationMs < 60_000
+              ? `${Math.floor(durationMs / 1000)}s`
+              : `${Math.floor(durationMs / 60_000)}m ${Math.floor((durationMs % 60_000) / 1000)}s`
+            : null;
+        const substeps = phase.substeps ?? [];
+        const counter =
+          typeof phase.countTotal === 'number' && phase.countTotal > 0
+            ? `${phase.countDone ?? 0}/${phase.countTotal}`
+            : null;
+        const row = (
+          <span className="garden-phase-line">
+            <span className="garden-phase-dot">
+              {phase.status === 'completed' ? <Check size={12} /> : index + 1}
+            </span>
+            <span>{phase.title}</span>
+            <span className="garden-phase-meta">
+              {counter && <span className="badge">{counter}</span>}
+              {phase.status !== 'completed' && phase.startedAt && !durationText && (
+                <span className="muted">since {shortTime(phase.startedAt)}</span>
+              )}
+              {durationText && <span className="muted">{durationText}</span>}
+            </span>
+          </span>
+        );
+        return (
+          <li key={phase.id} data-status={phase.status}>
+            {substeps.length ? (
+              /*
+               * A milestone with parts expands to them. The counter sits on the closed row so a
+               * collapsed "3/5" is readable at a glance, and the details carry each part's own
+               * state.
+               *
+               * The way into the plan editor moves into the expanded list rather than staying on
+               * the row: a `summary` is already the control that opens the disclosure, and a
+               * button nested inside one is both ambiguous to click and wrong to a screen
+               * reader. A milestone with no parts keeps the plain button it always had.
+               */
+              <details className="garden-phase-detail">
+                <summary>{row}</summary>
+                <ol className="garden-subphases">
+                  {substeps.map((sub) => (
+                    <li key={sub.id} data-status={sub.status}>
+                      <span className="garden-phase-dot">
+                        {sub.status === 'completed' ? <Check size={10} /> : '·'}
+                      </span>
+                      <span>{sub.title}</span>
+                    </li>
+                  ))}
+                </ol>
+                <button className="text-button" onClick={onPlan}>
+                  Open the plan
+                </button>
+              </details>
+            ) : (
+              <button onClick={onPlan}>{row}</button>
+            )}
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
 export function TaskProgress({
   presentation,
   onEvidence,
@@ -397,6 +487,10 @@ export function TaskProgress({
   const { progress } = presentation;
   const phases = progress.phases;
   const complete = phases.filter((phase) => phase.status === 'completed').length;
+  const openCount = phases.filter(
+    (phase) => phase.status !== 'completed' && phase.status !== 'skipped'
+  ).length;
+  const partial = presentation.taskStatus === 'completed' && openCount > 0;
   return (
     <aside className="garden-progress" aria-label="Recorded progress">
       <header>
@@ -424,6 +518,12 @@ export function TaskProgress({
             </span>
           </button>
         )}
+        {partial && (
+          <p className="muted garden-phase-partial">
+            Finished with {openCount} {openCount === 1 ? 'step' : 'steps'} open — {complete} of{' '}
+            {phases.length} done
+          </p>
+        )}
       </header>
       {progress.current && (
         <div className="garden-now">
@@ -431,19 +531,25 @@ export function TaskProgress({
           <p>{progress.current.title}</p>
         </div>
       )}
-      {phases.length > 0 && (
-        <ol className="garden-phases">
-          {phases.map((phase, index) => (
-            <li key={phase.id} data-status={phase.status}>
-              <button onClick={onPlan}>
-                <span className="garden-phase-dot">
-                  {phase.status === 'completed' ? <Check size={12} /> : index + 1}
-                </span>
-                <span>{phase.title}</span>
-              </button>
-            </li>
+      {phases.length > 0 && <PhaseList phases={phases} onPlan={onPlan} />}
+      {/*
+       * Everything the project did before the direction it is working now.
+       *
+       * A follow-up starts a new plan, and until one is written `phases` is empty - so sending one
+       * looked like it deleted the list the owner had been watching. These are the earlier lists,
+       * kept and closed by default: the trajectory is there when it is wanted without competing
+       * with what is happening this minute.
+       */}
+      {progress.history.length > 0 && (
+        <details className="garden-phase-history">
+          <summary>
+            Earlier in this project
+            <span className="badge">{progress.history.length}</span>
+          </summary>
+          {progress.history.map((entry) => (
+            <PhaseList key={entry.directionEventId ?? entry.startedAt} phases={entry.phases} />
           ))}
-        </ol>
+        </details>
       )}
       <details className="garden-milestone-disclosure" open>
         <summary>

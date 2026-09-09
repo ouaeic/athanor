@@ -52,7 +52,7 @@ export interface SpendCapInput {
   warnAtPercent?: number;
 }
 
-const money = (value: number): string =>
+export const money = (value: number): string =>
   `$${value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
 const isMoney = (value: number): boolean => Number.isFinite(value) && value >= 0;
@@ -295,4 +295,66 @@ export const localDayKey = (timeZone: string, instant: Date): string => {
   }
   const date = localDate(formatter, instant);
   return `${String(date.year).padStart(4, '0')}-${String(date.month).padStart(2, '0')}-${String(date.day).padStart(2, '0')}`;
+};
+
+/*
+ * The sentences an owner reads when a ceiling stops or nearly stops a run.
+ *
+ * These lived in the worker, beside the brake that pauses the task, which was the only reader while
+ * the only account of a money stop was a line in the task's log. It is not the only reader any more:
+ * the API answers "why is this stopped, and would it still be stopped now" for the card the owner
+ * acts on, and a card that recomputed the wording would be free to quote a different number from
+ * the one the run recorded. One function, both readers.
+ */
+/*
+ * Not the `money` above: a halt can fire on a figure below a cent, and the general formatter rounds
+ * those to "$0.00" - a sentence saying a run stopped at $0.00 of a $0.00 limit explains nothing.
+ * The two are kept apart rather than reconciled because the other reader of `money` is a summary
+ * pane where four decimals are noise.
+ */
+const haltMoney = (value: number): string =>
+  value >= 0.01 || value === 0 ? `$${value.toFixed(2)}` : `$${value.toFixed(4)}`;
+
+const windowLabel = (name: string): string =>
+  ({ task: 'this task', daily: 'today', monthly: 'this month' })[name] ?? name;
+
+/**
+ * What money is committed but not yet billed, said only when there is some.
+ *
+ * `spentUsd` is money that changed hands and the contract insists it stay that way, so the figure
+ * that actually crossed the line - `projectedUsd`, which is spent plus pending plus the estimate -
+ * cannot simply replace it. But quoting the spent figure alone against the cap produced a sentence
+ * whose own arithmetic said the run should not have stopped: an open scheduled task holds its whole
+ * ceiling as `pendingUsd` from the moment it is queued, so a month with $40 spent and $65 promised
+ * blocks against a $100 cap and told its owner "Paused at $40.00 of the $100.00 limit". Naming the
+ * held part is what closes the gap between the number and the stop.
+ */
+const heldAside = (pendingUsd: number): string =>
+  pendingUsd > 0 ? `, with ${haltMoney(pendingUsd)} more promised to work already open` : '';
+
+/**
+ * Says what was spent, against what, and in which window. A ceiling the owner cannot see themselves
+ * approaching reads as a random interruption, so the number and the limit both belong in the line
+ * the interface shows.
+ *
+ * `capUsd == null` rather than `!capUsd`, twice below, for the reason the caps route states in as
+ * many words: for a ceiling, zero is a real setting and only `null` is the absence of one. A box
+ * whose owner had capped a window at zero fell through to the sentence with no numbers in it - the
+ * one case where the number is the entire explanation.
+ *
+ * Where to change it is deliberately not in the sentence. The card that renders this already draws
+ * a "Spending caps" button beside it, and a line of prose repeating a control the reader can see is
+ * narration.
+ */
+export const spendHalt = (decision: SpendDecision): string => {
+  const blocked = decision.windows.find((window) => window.name === decision.blockedBy);
+  if (blocked?.capUsd == null)
+    return `Paused: this task would go over its spending limit. ${decision.reason ?? ''}`.trim();
+  return `Paused at ${haltMoney(blocked.spentUsd)} of the ${haltMoney(blocked.capUsd)} limit for ${windowLabel(blocked.name)}${heldAside(blocked.pendingUsd)}. Raise the limit to carry on, or leave it here.`;
+};
+
+export const spendWarning = (decision: SpendDecision): string => {
+  const near = decision.windows.find((window) => decision.warnedBy.includes(window.name));
+  if (near?.capUsd == null) return 'Approaching a spending limit.';
+  return `${haltMoney(near.spentUsd)} of the ${haltMoney(near.capUsd)} limit for ${windowLabel(near.name)} has been spent${heldAside(near.pendingUsd)}.`;
 };

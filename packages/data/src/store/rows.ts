@@ -166,6 +166,14 @@ export const mapTask = (row: Record<string, unknown>): TaskRecord => {
     actualComputeCredits: Number(row.actual_compute_credits),
     maxSpendUsd: numericOrNull(row.max_spend_usd),
     spentUsd: Number(row.spent_usd ?? 0),
+    // Only present on statements that select it; absent is not the same as "no spend pause", so a
+    // row that never asked for the column reports undefined rather than null.
+    ...(row.spend_paused_at === undefined
+      ? {}
+      : { spendPausedAt: row.spend_paused_at ? iso(row.spend_paused_at) : null }),
+    ...(row.completed_at === undefined
+      ? {}
+      : { completedAt: row.completed_at ? iso(row.completed_at) : null }),
     queuedMessageCount: Number(row.queued_message_count ?? 0),
     ...(row.pending_delivery_count !== undefined
       ? {

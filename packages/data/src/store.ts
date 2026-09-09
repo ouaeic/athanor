@@ -985,6 +985,10 @@ export class DataStore {
     return this.#maintenance.scrubLegacyContentSummaries(...args);
   }
 
+  raiseTaskSpendCeiling(...args: Parameters<TaskStore['raiseTaskSpendCeiling']>) {
+    return this.#tasks.raiseTaskSpendCeiling(...args);
+  }
+
   setTaskStatusForUser(...args: Parameters<TaskStore['setTaskStatusForUser']>) {
     return this.#tasks.setTaskStatusForUser(...args);
   }

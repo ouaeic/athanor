@@ -111,3 +111,57 @@ describe('hidden directions in text the agent writes down', () => {
     expect(boundedKnowledge('Prefer an em dash - like this - over a hyphen.')).toContain('dash');
   });
 });
+
+/**
+ * A milestone's parts, and the clock a re-sent plan must not reset.
+ *
+ * `set_plan` sends the whole plan every time, so anything a step carries that the model does not
+ * re-state is lost unless it is inherited across versions by title. That already held for a step's
+ * identity; it now has to hold for its parts and its timestamps too, or the owner watching "3 of 5"
+ * beside a duration would see both jump back to nothing every time the model touched the plan.
+ */
+describe('sub-milestones and the timing a plan carries', () => {
+  it('keeps one level of parts and their reported statuses', () => {
+    const [step] = planStepsFromArguments([
+      {
+        title: 'Ship the page',
+        status: 'in_progress',
+        substeps: [{ title: 'Write it', status: 'completed' }, { title: 'Test it' }]
+      }
+    ]);
+    expect(step?.substeps?.map((part) => part.status)).toEqual(['completed', 'pending']);
+    expect(step?.substeps?.[0]?.id).toBeTruthy();
+  });
+
+  it('leaves a step with no parts carrying none, rather than an empty list', () => {
+    expect(planStepsFromArguments([{ title: 'Alone' }])[0]?.substeps).toBeUndefined();
+  });
+
+  it('keeps a part its identity across a version that re-states it', () => {
+    const first = planStepsFromArguments([{ title: 'Ship', substeps: [{ title: 'Write it' }] }]);
+    const second = planStepsFromArguments(
+      [{ title: 'Ship', substeps: [{ title: 'Write it', status: 'completed' }] }],
+      first
+    );
+    expect(second[0]?.substeps?.[0]?.id).toBe(first[0]?.substeps?.[0]?.id);
+    expect(second[0]?.substeps?.[0]?.status).toBe('completed');
+  });
+
+  it('carries a step its parts through a version that stops mentioning them', () => {
+    const first = planStepsFromArguments([
+      { title: 'Ship', substeps: [{ title: 'Write it', status: 'completed' }] }
+    ]);
+    const second = planStepsFromArguments([{ title: 'Ship', status: 'in_progress' }], first);
+    expect(second[0]?.substeps?.map((part) => part.title)).toEqual(['Write it']);
+  });
+
+  it('keeps a stamp the model set and does not invent one it did not', () => {
+    const first = planStepsFromArguments([
+      { title: 'Ship', status: 'in_progress', startedAt: '2026-09-06T10:00:00.000Z' }
+    ]);
+    expect(first[0]?.startedAt).toBe('2026-09-06T10:00:00.000Z');
+    expect(first[0]?.completedAt).toBeUndefined();
+    const second = planStepsFromArguments([{ title: 'Ship', status: 'completed' }], first);
+    expect(second[0]?.startedAt).toBe('2026-09-06T10:00:00.000Z');
+  });
+});

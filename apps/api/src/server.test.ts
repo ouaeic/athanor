@@ -3414,7 +3414,16 @@ describe('unattended recovery', () => {
        updated_at=NOW() - INTERVAL '5 minutes' WHERE id=$1`,
       [taskId]
     );
-    await database.query(`UPDATE workspaces SET status='suspended' WHERE id=$1`, [workspaceId]);
+    /*
+     * The workspace this task actually runs in, which is not always the one the seed made: a task
+     * gets its own project workspace, and suspending the parent left the run's own computer running
+     * - so the recovery below found nothing to resume and the assertion at the end of this test
+     * measured a precondition that had quietly stopped holding rather than the behaviour it names.
+     */
+    await database.query(
+      `UPDATE workspaces w SET status='suspended' FROM tasks t WHERE t.id=$1 AND w.id=t.workspace_id`,
+      [taskId]
+    );
     await database.query(
       `INSERT INTO task_schedule_runs(schedule_id,scheduled_for,task_id,outcome)
        VALUES ($1,NOW() - INTERVAL '5 minutes',$2,'queued')`,
@@ -9796,5 +9805,138 @@ describe('the phone transport', () => {
     );
     expect(tokens.rows).toHaveLength(1);
     expect(tokens.rows[0]!.revoked_at).not.toBeNull();
+  }, 30_000);
+});
+
+/**
+ * The one pause that has an answer.
+ *
+ * A ceiling stops a run by setting `spend_paused_at` and writing a sentence into the log, and until
+ * now that was the whole of it: the task read `paused`, exactly like a pause the owner had pressed,
+ * and Resume re-queued it straight back into the same ceiling so it stopped again a step later. The
+ * three things below are what turns that into a decision the owner can actually make - the fact
+ * that money stopped it, a live account of which ceiling and by how much, and a Resume that says so
+ * rather than pretending to work.
+ */
+describe('a run a spending ceiling stopped', () => {
+  test('says so on the task, refuses a resume that would only stop again, and lifts on request', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-spend-pause-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, database } = await buildServer(isolatedConfig(directory), { masterKey });
+    disposers.push(() => app.close());
+    const { cookie, taskId } = await seedOwnerWithTask(
+      app,
+      'spend-pause',
+      'Build the scoreboard page'
+    );
+
+    // Exactly the state `#haltIfOutOfMoney` leaves behind, and a ledger entry that puts the day
+    // over a ceiling the owner did choose - so the guard consulted here denies for a real reason.
+    await app.inject({
+      method: 'PUT',
+      url: '/v1/spend-limits',
+      headers: { cookie, 'idempotency-key': 'spend-pause-cap' },
+      payload: { dailyCapUsd: 1 }
+    });
+    const task = await database.query('SELECT user_id, workspace_id FROM tasks WHERE id=$1', [
+      taskId
+    ]);
+    await database.query(
+      `INSERT INTO usage_entries(id,user_id,workspace_id,task_id,kind,resource_class,quantity,unit,credits,cost_usd,state,idempotency_key)
+       VALUES ($1,$2,$3,$4,'model_inference','medium',1000,'tokens',1,2.50,'settled','spend-pause-spent')`,
+      [randomUUID(), task.rows[0]!.user_id, task.rows[0]!.workspace_id, taskId]
+    );
+    await database.query(`UPDATE tasks SET status='paused', spend_paused_at=NOW() WHERE id=$1`, [
+      taskId
+    ]);
+
+    // The task itself now carries why it stopped, which is the only thing that tells this apart
+    // from a pause the owner pressed.
+    const paused = await app.inject({
+      method: 'GET',
+      url: `/v1/tasks/${taskId}`,
+      headers: { cookie }
+    });
+    expect(paused.json<{ spendPausedAt: string | null }>().spendPausedAt).not.toBeNull();
+
+    // And the account of it names the window and the figures, read fresh rather than replayed.
+    const block = await app.inject({
+      method: 'GET',
+      url: `/v1/tasks/${taskId}/spend-block`,
+      headers: { cookie }
+    });
+    expect(block.statusCode, block.body).toBe(200);
+    const verdict = block.json<{
+      blocked: boolean;
+      unchosen: boolean;
+      summary: string;
+      decision: { blockedBy: string | null; windows: { name: string; capUsd: number | null }[] };
+    }>();
+    expect(verdict.blocked).toBe(true);
+    expect(verdict.decision.blockedBy).toBe('daily');
+    expect(verdict.summary).toContain('$1.00');
+    // A ceiling the owner set through the caps route is not one this box supplied for them.
+    expect(verdict.unchosen).toBe(false);
+
+    // Resume, while the ceiling still stands, refuses in the same words rather than re-queueing
+    // into a halt one step later.
+    const refused = await app.inject({
+      method: 'POST',
+      url: `/v1/tasks/${taskId}/resume`,
+      headers: { cookie, 'idempotency-key': 'spend-pause-resume-refused' }
+    });
+    expect(refused.statusCode, refused.body).toBe(402);
+    const refusal = refused.json<{ error: { code: string; message: string } }>();
+    expect(refusal.error.code).toBe('spend_cap_reached');
+    expect(refusal.error.message).toContain('$1.00');
+    expect(
+      (await app.inject({ method: 'GET', url: `/v1/tasks/${taskId}`, headers: { cookie } })).json<{
+        status: string;
+      }>().status
+    ).toBe('paused');
+
+    // Lifting the ceiling is what changes the answer, and then the same Resume works.
+    await database.query('UPDATE sessions SET step_up_at=NOW()');
+    const raised = await app.inject({
+      method: 'PUT',
+      url: '/v1/spend-limits',
+      headers: { cookie, 'idempotency-key': 'spend-pause-raise' },
+      payload: { dailyCapUsd: 25 }
+    });
+    expect(raised.statusCode, raised.body).toBe(200);
+    const resumed = await app.inject({
+      method: 'POST',
+      url: `/v1/tasks/${taskId}/resume`,
+      headers: { cookie, 'idempotency-key': 'spend-pause-resume-ok' }
+    });
+    expect(resumed.statusCode, resumed.body).toBe(200);
+    expect(resumed.json<{ status: string; spendPausedAt: string | null }>()).toMatchObject({
+      status: 'queued',
+      // Re-queueing answers the pause, so the task stops being one the owner has not heard about.
+      spendPausedAt: null
+    });
+  }, 30_000);
+
+  test("moves a single run's own ceiling up and never down", async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-task-ceiling-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app } = await buildServer(isolatedConfig(directory), { masterKey });
+    disposers.push(() => app.close());
+    const { cookie, taskId } = await seedOwnerWithTask(app, 'task-ceiling', 'Draft the summary');
+
+    const raise = (maxSpendUsd: number, key: string) =>
+      app.inject({
+        method: 'POST',
+        url: `/v1/tasks/${taskId}/spend-ceiling`,
+        headers: { cookie, 'idempotency-key': key },
+        payload: { maxSpendUsd }
+      });
+
+    expect((await raise(9, 'ceiling-up')).json<{ maxSpendUsd: number }>().maxSpendUsd).toBe(9);
+    // A stale card, a double submit, or a retry against a limit somebody already moved must not
+    // quietly tighten the run instead.
+    expect((await raise(3, 'ceiling-down')).json<{ maxSpendUsd: number }>().maxSpendUsd).toBe(9);
   }, 30_000);
 });

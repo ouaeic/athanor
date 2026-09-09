@@ -160,3 +160,80 @@ describe('current work presentation', () => {
     expect(projected.unavailableReferences).toBe(1);
   });
 });
+
+/**
+ * What survives a follow-up.
+ *
+ * A direction opens a new epoch and results from before it stop being "current", which is right for
+ * a written answer - the owner asked for something else, and the previous reply is history. It was
+ * wrong for a published app. Nothing unpublished it, the URL still serves, and the owner's own
+ * follow-up was what took it off the project view: measured on one real run, three publications each
+ * disappeared from the served area the moment the next direction landed.
+ */
+describe('results that outlast the direction that made them', () => {
+  const preview = (sequence: number, previewId: string): TaskEvent =>
+    event(sequence, 'preview', { previewId });
+  /** A whole result, so a fixture cannot pass by being too small to disagree with the contract. */
+  const result = (over: Partial<TaskResult> & Pick<TaskResult, 'id' | 'kind'>): TaskResult => ({
+    title: 'Result',
+    status: 'ready',
+    url: null,
+    downloadUrl: null,
+    accessPath: null,
+    evidenceEventIds: [],
+    ...over
+  });
+
+  it('keeps a live preview current across a later direction', () => {
+    const events = [
+      event(1, 'user_message', { markdown: 'Build a site' }),
+      preview(2, 'preview-one'),
+      event(3, 'user_message', { markdown: 'Now add a scoreboard' })
+    ];
+    const results = [
+      result({
+        id: 'result-one',
+        kind: 'preview',
+        previewId: 'preview-one',
+        evidenceEventIds: ['event-2']
+      })
+    ];
+    expect(projectWorkSurface(events, null, results).currentResultIds).toEqual(['result-one']);
+  });
+
+  it('keeps a published artifact current across a later direction', () => {
+    const events = [
+      event(1, 'user_message', { markdown: 'Write the report' }),
+      event(2, 'artifact', { artifactId: 'artifact-one' }),
+      event(3, 'user_message', { markdown: 'Now summarise it' })
+    ];
+    const results = [
+      result({
+        id: 'result-one',
+        kind: 'artifact',
+        artifactId: 'artifact-one',
+        evidenceEventIds: ['event-2']
+      })
+    ];
+    expect(projectWorkSurface(events, null, results).currentResultIds).toEqual(['result-one']);
+  });
+
+  it('still drops an ordinary result from a previous direction', () => {
+    const events = [
+      event(1, 'user_message', { markdown: 'Answer this' }),
+      event(2, 'assistant_message', { markdown: 'Here it is' }),
+      event(3, 'user_message', { markdown: 'Now answer that' })
+    ];
+    const results = [result({ id: 'result-one', kind: 'file', evidenceEventIds: ['event-2'] })];
+    expect(projectWorkSurface(events, null, results).currentResultIds).toEqual([]);
+  });
+
+  it('does not resurrect a result whose publication this task never recorded', () => {
+    const events = [
+      event(1, 'user_message', { markdown: 'Build a site' }),
+      event(3, 'user_message', { markdown: 'Now add a scoreboard' })
+    ];
+    const results = [result({ id: 'result-one', kind: 'preview', previewId: 'preview-elsewhere' })];
+    expect(projectWorkSurface(events, null, results).currentResultIds).toEqual([]);
+  });
+});

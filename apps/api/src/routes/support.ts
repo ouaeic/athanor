@@ -424,7 +424,8 @@ export const createServerSupport = (context: ServerBase) => {
           if (!knowsEffort && !knowsModalities) return [];
           // The capability row is written with the modalities it follows: an image-input model
           // is vision-capable, and usableCapabilities refuses to grant vision without both.
-          const modalities = knowsModalities ? model.inputModalities! : [];
+          // `knowsModalities` is the Array.isArray guard above, which already narrows this.
+          const modalities = knowsModalities ? model.inputModalities : [];
           const capabilities = knowsModalities
             ? [
                 ...new Set(

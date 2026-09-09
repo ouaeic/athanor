@@ -158,6 +158,18 @@ export function projectWorkSurface(
     });
   }
   const sequence = new Map(events.map((event) => [event.id, event.sequence]));
+  const livePreviewIds = new Set(
+    events
+      .filter((event) => event.kind === 'preview')
+      .map((event) => text(record(event.payload).previewId))
+      .filter(Boolean)
+  );
+  const liveArtifactIds = new Set(
+    events
+      .filter((event) => event.kind === 'artifact')
+      .map((event) => text(record(event.payload).artifactId))
+      .filter(Boolean)
+  );
   return {
     direction,
     directions: directions.slice(-32),
@@ -174,7 +186,18 @@ export function projectWorkSurface(
                 event.sequence > direction.sequence &&
                 event.kind === 'artifact' &&
                 record(event.payload).artifactId === result.artifactId
-            ))
+            )) ||
+          /*
+           * A follow-up is a new direction epoch, and recency alone would demote the thing the
+           * owner just published - the served app an earlier direction put up vanishes from the
+           * served area the moment they send a follow-up, even though nothing unpublished it and
+           * it is still live. What is actually outlasting the turn is a live preview or artifact,
+           * so those stay current across directions; everything else keeps the epoch rule.
+           */
+          (result.kind === 'preview' &&
+            Boolean(result.previewId) &&
+            livePreviewIds.has(result.previewId!)) ||
+          (Boolean(result.artifactId) && liveArtifactIds.has(result.artifactId!))
       )
       .map((result) => result.id),
     sources: [...sources.values()].slice(-200),

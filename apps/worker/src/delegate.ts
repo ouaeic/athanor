@@ -1,4 +1,9 @@
-import type { ModelRelease, ParallelWebReadResult, WebToolPlan } from '@athanor/contracts';
+import type {
+  ModelRelease,
+  ParallelWebReadResult,
+  SubagentLane,
+  WebToolPlan
+} from '@athanor/contracts';
 import { AthanorError, sha256 } from '@athanor/core';
 import type { TaskRecord } from '@athanor/data';
 import { type ModelMessage, type ModelToolCall } from '@athanor/model-gateway';
@@ -31,6 +36,7 @@ import {
   type DestinationVerdict
 } from './egress.js';
 import { sanitiseUntrustedText, untrustedEnvelope } from './sanitise.js';
+import { emitSubagentLane } from './subagent-events.js';
 import { agentToolsFor, specialistToolNames } from './tool-catalogue.js';
 import type { ToolContext } from './tool-dispatch.js';
 
@@ -388,6 +394,26 @@ async function runDelegatedMission(
    */
   untrustedSources?: string[];
 }> {
+  /*
+   * This mission's lane, named before anything can throw so every exit below is one event away
+   * from visible: a specialist that fails in its own setup used to leave the timeline where it
+   * started, with the owner looking at a running tool call and nothing behind it. Emissions are
+   * deliberately fire-and-forget (`.catch(() => undefined)` at the store boundary is the same
+   * posture `assistant_delta` takes) - a lane row is a report about the work, never a reason for
+   * the work to stop.
+   */
+  const laneId = `${parentCallId}:${missionIndex}`;
+  const laneStartedAt = Date.now();
+  const announceLane = (status: SubagentLane['status'], patch?: Partial<SubagentLane>): void => {
+    emitSubagentLane(context.store, task, key, {
+      laneId,
+      lane: 'research',
+      name: boundedKnowledge(mission.name, 80),
+      status,
+      elapsedMs: Date.now() - laneStartedAt,
+      ...patch
+    }).catch(() => undefined);
+  };
   const catalog = (await context.store.listModels()) as unknown as ModelRelease[];
   const model = await resolveTaskPurposeModel(context, task, 'specialist', catalog);
   const { gateway, provider } = await context.gateway(task, model);
@@ -478,6 +504,7 @@ ${clockLine(new Date(), timeZone)}
   const maxTokens = Math.min(8_192, Math.max(2_048, Math.floor(model.contextTokens * 0.1)));
   const budget = delegateBudget(task.maxComputeCredits, missionCount);
   let usageCredits = 0;
+  announceLane('started', { allocatedCredits: budget });
   // Accumulated across every step, and reported on every exit including the two that give up
   // early: a specialist that read a hostile page and then ran out of budget has still put that
   // page's content into the report the lead reads.
@@ -611,6 +638,14 @@ ${clockLine(new Date(), timeZone)}
   for (let step = 0; step < DELEGATE_MAX_STEPS; step += 1) {
     if (usageCredits >= budget) {
       const unverified = held ? unverifiedNotice(null, []) : null;
+      announceLane('failed', {
+        steps: step,
+        usedCredits: usageCredits,
+        allocatedCredits: budget,
+        detail: held
+          ? 'the mission ended on its compute budget; the report the lead got is the one it was holding'
+          : 'the mission ended on its compute budget before the specialist reported'
+      });
       return {
         name: boundedKnowledge(mission.name, 80),
         model: model.displayName,
@@ -669,6 +704,12 @@ ${clockLine(new Date(), timeZone)}
     if (specialistWeb) untrusted.add(specialistWeb);
     const credit = usageCredit(model, response.usage.inputTokens, response.usage.outputTokens);
     usageCredits += credit;
+    if (step > 0)
+      announceLane('working', {
+        steps: step,
+        usedCredits: usageCredits,
+        allocatedCredits: budget
+      });
     await context.store.recordUsage({
       userId: task.userId,
       workspaceId: task.workspaceId,
@@ -746,6 +787,46 @@ ${clockLine(new Date(), timeZone)}
           )
         : [];
       const unverified = unverifiedNotice(structured, evidenceChecks);
+      /*
+       * The lane's terminal row says which of three different endings this was, because they are
+       * three different answers to the owner's question. A report with its cited spans confirmed
+       * is `verified`: the subagent's own work being checked by the harness, which is the whole
+       * of what the check exists for. A report is `completed`; no report worth reporting is
+       * `failed`, even where the mission did all sixteen steps of reading.
+       */
+      const checked = evidenceChecks.filter((check) => check.reread);
+      const verifiedPatch = evidenceChecks.length
+        ? {
+            verified: {
+              checked: checked.length,
+              held: checked.filter((check) => check.verified).length
+            },
+            detail:
+              checked.length && checked.every((check) => check.verified)
+                ? 'the harness re-read the spot-checked sources and the quoted spans are really there'
+                : 'the harness re-read the spot-checked sources and found quoted spans that are not in them'
+          }
+        : {};
+      if (evidenceChecks.length)
+        announceLane('verified', {
+          steps: step + 1,
+          usedCredits: usageCredits,
+          allocatedCredits: budget,
+          ...verifiedPatch
+        });
+      else
+        announceLane(structured || held ? 'completed' : 'failed', {
+          steps: step + 1,
+          usedCredits: usageCredits,
+          allocatedCredits: budget,
+          detail: structured
+            ? schemaErrors.length
+              ? 'the report arrived in the lead-readable shape with slips it flagged'
+              : undefined
+            : held
+              ? 'the report stayed prose after its one correction; the report the lead got is the held one'
+              : 'the specialist stopped having read nothing, so there was no report even the correction could shape'
+        });
       return {
         name: boundedKnowledge(mission.name, 80),
         model: model.displayName,
@@ -895,6 +976,14 @@ ${clockLine(new Date(), timeZone)}
     }
   }
   const unverified = held ? unverifiedNotice(null, []) : null;
+  announceLane('failed', {
+    steps: DELEGATE_MAX_STEPS,
+    usedCredits: usageCredits,
+    allocatedCredits: budget,
+    detail: held
+      ? 'the mission reached its step bound; the report the lead got is the one it was holding'
+      : `the mission reached its ${DELEGATE_MAX_STEPS}-step bound before the specialist reported`
+  });
   return {
     name: boundedKnowledge(mission.name, 80),
     model: model.displayName,
@@ -949,7 +1038,22 @@ export async function executeDelegateTool(
         webPlan,
         context.destinationContext(state),
         state
-      )
+      ).catch(async (error: unknown) => {
+        /*
+         * A mission that throws - a provider gone quiet, a route that would not resolve - reaches
+         * the lead as this arm throwing, and it must not reach the owner as a lane that vanished:
+         * the last thing said about this specialist stays "working" forever otherwise. The throw
+         * still propagates; this only writes the row down first.
+         */
+        await emitSubagentLane(context.store, task, key, {
+          laneId: `${call.id}:${index}`,
+          lane: 'research',
+          name: boundedKnowledge(mission.name, 80),
+          status: 'failed',
+          detail: error instanceof Error ? error.message.slice(0, 240) : 'the mission threw'
+        }).catch(() => undefined);
+        throw error;
+      })
     )
   );
   return {

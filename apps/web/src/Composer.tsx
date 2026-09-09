@@ -1,4 +1,5 @@
 import { lazy, Suspense, useEffect, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import { ArrowUpRight, Paperclip, X, Mic, Square, SlidersHorizontal } from 'lucide-react';
 import type { Task, Workspace, TaskReasoningEffort } from '@athanor/contracts';
 import { modeFloors } from './asking-rules';
@@ -6,7 +7,7 @@ import { effortChoices, effortLabel } from './reasoning-options';
 import type { Bootstrap, Draft, DraftAttachment } from './model';
 import { defaultPrivacy, isWorking, text, data } from './model';
 import { isNativeClient, patch, post, put, request } from './client';
-import { Button, ErrorNotice } from './ui';
+import { Button, Dialog, ErrorNotice } from './ui';
 import { useAutosizeTextarea } from './use-autosize-textarea';
 import { MAX_TASK_SPEND_USD } from './usage-model.js';
 const PromptModelChoices = lazy(() => import('./PromptModels'));
@@ -28,6 +29,8 @@ export interface ComposerProps {
   bootstrap: Bootstrap;
   initialDraft?: Draft;
   scope?: string;
+  /** Extra trigger docked at the right of the attach/voice toolbar (shape selection lives there). */
+  toolbarExtra?: ReactNode;
   onSent: (task: Task) => void;
   onDraft: (draft: Draft) => void;
 }
@@ -37,6 +40,7 @@ export default function Composer({
   bootstrap,
   initialDraft,
   scope,
+  toolbarExtra,
   onSent,
   onDraft
 }: ComposerProps) {
@@ -419,6 +423,7 @@ export default function Composer({
               />
             </Suspense>
           )}
+          {toolbarExtra && <div className="toolbar-extra">{toolbarExtra}</div>}
           {typeof MediaRecorder !== 'undefined' && (
             <Button
               aria-label={recording ? 'Stop dictation' : 'Dictate direction'}
@@ -480,7 +485,7 @@ export default function Composer({
         </div>
       )}
       <div className="garden-model-controls">
-        <div className="garden-model-core">
+        <div className="garden-model-settings">
           <label className="garden-model-select">
             <span>Model</span>
             <select
@@ -550,8 +555,6 @@ export default function Composer({
               ))}
             </select>
           </label>
-        </div>
-        <div className="garden-run-settings-fields">
           <label className="garden-route-control">
             <span>Privacy</span>
             <select
@@ -607,7 +610,11 @@ export default function Composer({
         </div>
       </div>
       {advancedModels && (
-        <div className="garden-advanced-models open">
+        <Dialog
+          title="Model choices"
+          onClose={() => setAdvancedModels(false)}
+          {...(task ? {} : { wide: true })}
+        >
           <Suspense fallback={<p className="muted">Loading…</p>}>
             <PromptModelChoices
               {...(task ? { taskId: task.id } : { taskId: '' })}
@@ -620,7 +627,7 @@ export default function Composer({
               after the first prompt lands.
             </small>
           )}
-        </div>
+        </Dialog>
       )}
       <ErrorNotice error={error} />
       {saved && (

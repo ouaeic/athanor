@@ -16,6 +16,7 @@ import { stopCodingMissionFamily, removeCodingMissionFamily } from '../coding-mi
 import { randomUUID } from 'node:crypto';
 import {
   CreateTaskRequest,
+  RaiseTaskSpendCeilingRequest,
   TaskPageQuery,
   UpdateSecurityModeRequest,
   UpdateTaskPlanRequest,
@@ -28,6 +29,7 @@ import {
   inferModelTask,
   modelFit,
   priceCeilingFields,
+  spendHalt,
   unwrapDataKey
 } from '@athanor/core';
 import type { RoutableModel } from '@athanor/core';
@@ -570,6 +572,71 @@ export const registerTaskRoutes = (context: RouteContext): void => {
     return privateTaskPlanResponse(created, workspace);
   });
 
+  /**
+   * Why this run is stopped on money, and whether it would still be stopped if it started now.
+   *
+   * A halt writes one sentence into the task's events and sets `spend_paused_at`, and that was the
+   * whole account of it: no figures the owner could act on, and nothing that said whether the
+   * ceiling in question was one they had chosen or one this box supplied because nobody had asked
+   * them. The card that offers to raise it reads this.
+   *
+   * The verdict is recomputed rather than replayed from the halt, because it does not keep: a daily
+   * window rolls over and stops blocking, an open commitment settles for less than it reserved, and
+   * a card quoting last night's arithmetic would send the owner to raise a ceiling that is no longer
+   * in the way. `estimateUsd: 0` asks "where does this stand right now" rather than pricing a step
+   * nobody has decided to take.
+   */
+  app.get<{ Params: { taskId: string } }>('/v1/tasks/:taskId/spend-block', async (request) => {
+    const user = requireUser(request.user);
+    const task = await store.getTask(user.id, request.params.taskId);
+    if (!task) throw new AthanorError('task_not_found', 'Task not found');
+    const decision = await store.spendGuard({
+      userId: user.id,
+      taskId: task.id,
+      estimateUsd: 0,
+      includeOpenCommitments: true
+    });
+    /*
+     * The same test the caps route uses to decide a loosening needs a passkey: an epoch `updatedAt`
+     * is a box whose owner has never answered the ceiling question, so the monthly ceiling stopping
+     * them is this box's own default. Saying "your limit" of a number the owner never chose is the
+     * one thing the card must not do.
+     */
+    const limits = await store.effectiveSpendLimits(user.id);
+    const unchosen = decision.blockedBy === 'monthly' && !(Date.parse(limits.updatedAt) > 0);
+    return {
+      taskId: task.id,
+      spendPausedAt: task.spendPausedAt ?? null,
+      blocked: decision.outcome === 'deny',
+      decision,
+      summary: spendHalt(decision),
+      unchosen
+    };
+  });
+
+  /**
+   * Raises this run's own money ceiling, for the card that offers to lift the thing that stopped it.
+   *
+   * No second factor, and the reason is arithmetic rather than trust: every window is checked on the
+   * way to every step, so a run's own ceiling can only ever be the tightest of the three. Raising it
+   * cannot buy a dollar the owner's account-wide ceilings would not already have allowed - those are
+   * the limits that need a passkey to loosen, and they still do. What this moves is where a single
+   * run stops inside them.
+   */
+  app.post<{ Params: { taskId: string } }>(
+    '/v1/tasks/:taskId/spend-ceiling',
+    async (request, reply) => {
+      const user = requireUser(request.user);
+      return idempotent(request, reply, user, async () => {
+        const input = RaiseTaskSpendCeilingRequest.parse(request.body);
+        const task = await store.getTask(user.id, request.params.taskId);
+        if (!task) throw new AthanorError('task_not_found', 'Task not found');
+        await store.raiseTaskSpendCeiling(user.id, task.id, input.maxSpendUsd);
+        return privateTaskResponse((await store.getTask(user.id, task.id))!);
+      });
+    }
+  );
+
   app.post<{ Params: { taskId: string; action: string } }>(
     '/v1/tasks/:taskId/:action',
     async (request, reply) => {
@@ -596,7 +663,30 @@ export const registerTaskRoutes = (context: RouteContext): void => {
           await store.cancelTaskAndReleaseReservations(user.id, task.id);
           await stopCodingMissionFamily(context, task);
         } else {
-          if (action === 'resume') await ensureProjectExecution(context, task);
+          if (action === 'resume') {
+            /*
+             * Resume used to re-queue a run a ceiling had stopped, straight back into the same
+             * ceiling: the worker asks the guard again before its first step, gets the same denial,
+             * and pauses. From the outside that is a Resume button that does nothing - press it,
+             * watch the status flick to queued and back to paused, with no more explanation the
+             * second time than the first.
+             *
+             * The guard is therefore asked here, before anything is re-queued. It is asked and not
+             * assumed because the answer moves on its own: a daily window rolls over at midnight, so
+             * the run that could not resume last night resumes this morning with nothing changed.
+             * Only a ceiling that would still stop it refuses, and it refuses saying which one and
+             * with what figures, so the next thing the owner does can be the thing that works.
+             */
+            const verdict = await store.spendGuard({
+              userId: user.id,
+              taskId: task.id,
+              estimateUsd: 0,
+              includeOpenCommitments: true
+            });
+            if (verdict.outcome === 'deny')
+              throw new AthanorError('spend_cap_reached', spendHalt(verdict));
+            await ensureProjectExecution(context, task);
+          }
           await store.setTaskStatusForUser(user.id, task.id, status);
         }
         log.info('task.action', { taskId: task.id, userId: user.id, kind: action, status });

@@ -30,6 +30,7 @@ import {
   activeQuestion,
   data,
   date,
+  duration,
   eventText,
   isFinished,
   isWorking,
@@ -58,6 +59,8 @@ const Composer = lazy(() => import('./Composer'));
 const MediaJobs = lazy(() => import('./MediaJobs'));
 const ProjectModels = lazy(() => import('./ProjectModels'));
 const CodingMissions = lazy(() => import('./CodingMissions'));
+const SubagentLanes = lazy(() => import('./SubagentLanes'));
+const SpendBlock = lazy(() => import('./SpendBlock'));
 const Share = lazy(() => import('./Sharing'));
 const ResultPreview = lazy(() =>
   import('./computer/ResultPreview').then((module) => ({ default: module.ResultPreview }))
@@ -112,6 +115,18 @@ export default function TaskSurface({
   const [briefLoading, setBriefLoading] = useState(false);
   const [branchEvent, setBranchEvent] = useState<TaskEvent | null>(null);
   const presentation = currentWork(storedPresentation, events);
+  /*
+   * The run summary's elapsed figure is a live clock, not a snapshot. Re-rendering on a half
+   * minute keeps it honest while a task runs; a finished task's duration is fixed and the tick
+   * is wasted, so this only runs while the work could still be accruing time.
+   */
+  const [clock, setClock] = useState(() => Date.now());
+  const running = !isFinished(task);
+  useEffect(() => {
+    if (!running) return;
+    const ticker = setInterval(() => setClock(Date.now()), 30_000);
+    return () => clearInterval(ticker);
+  }, [task.id, running]);
   const onTaskRef = useRef(onTask);
   onTaskRef.current = onTask;
   const onRefreshRef = useRef(onRefresh);
@@ -257,12 +272,26 @@ export default function TaskSurface({
   const verification = data(completion.verification);
   const pendingDelivery = (presentation?.delivery?.status ?? task.deliveryStatus) === 'pending';
   const deliveryFailed = (presentation?.delivery?.status ?? task.deliveryStatus) === 'incomplete';
+  /*
+   * A run can reach `completed` with plan steps still open, and that is deliberate: the finish gate
+   * asks about them once and a turn that says in writing which ones it is leaving is allowed to
+   * stop. What was not deliberate is the word the owner then read. The panel showed "4 of 7" while
+   * the line above it said Complete, and of the two the status line is the one that gets believed -
+   * so a run that had done four of seven things announced itself as finished. The count is the
+   * honest number, so the label defers to it.
+   */
+  const openPhases = (presentation?.progress?.phases ?? []).filter(
+    (phase) => phase.status !== 'completed' && phase.status !== 'skipped'
+  ).length;
+  const partlyDone = task.status === 'completed' && openPhases > 0;
   const displayStatus =
     task.status === 'completed' && pendingDelivery
       ? 'Generating media'
       : task.status === 'completed' && deliveryFailed
         ? 'Delivery needs attention'
-        : taskStatusLabel(task);
+        : partlyDone
+          ? `Stopped with ${openPhases} step${openPhases === 1 ? '' : 's'} open`
+          : taskStatusLabel(task);
   const question = activeQuestion(events, task);
   const questionData = data(question?.payload);
   const taskDecisions = decisions.filter((decision) => decision.taskId === task.id);
@@ -276,6 +305,24 @@ export default function TaskSurface({
   const opening =
     originalBrief ??
     (events[0]?.sequence === 1 ? events.find((event) => event.kind === 'user_message') : undefined);
+  /*
+   * Everything the owner has said to this task, oldest first: the opening brief and every
+   * direction since. This is the answer to "where do I see my inputs" - a follow-up opens a new
+   * direction epoch, and without this list the earlier ones are only reachable through the raw
+   * activity log.
+   */
+  const ownerDirections = events.filter((event) =>
+    ['user_message', 'queued_message'].includes(event.kind)
+  );
+  /*
+   * How long this has taken. A finished run ends at `completedAt`, not at `updatedAt`: the latter
+   * moves when the conversation is renamed, pinned or shared, so a run measured that way keeps
+   * growing after it stopped. A run still going has to track the wall clock, and the only state
+   * that re-renders this on a tick is `clock` - so that branch reads it rather than Date.now().
+   */
+  const elapsed = isFinished(task)
+    ? duration(task.createdAt, task.completedAt ?? task.updatedAt)
+    : duration(task.createdAt, new Date(clock).toISOString());
   useEffect(() => {
     if (panel !== 'brief' || opening) return;
     const controller = new AbortController();
@@ -485,9 +532,19 @@ export default function TaskSurface({
             )}
           </div>
           <div className="row">
+            {/*
+             * Labelled, because an unattributed currency figure beside a status line is a number
+             * the owner cannot check: it could be this project, today, or the account. It is this
+             * project's own settled provider cost, and saying so is the difference between a
+             * figure that can be verified against the spending pane and one that can only be
+             * doubted.
+             */}
             <span className="muted">
-              {money(task.spentUsd)}
-              {task.maxSpendUsd !== null && ` / ${money(task.maxSpendUsd)}`}
+              <span title="Settled provider cost for this project">
+                {money(task.spentUsd)} spent
+                {task.maxSpendUsd !== null && ` of ${money(task.maxSpendUsd)}`}
+              </span>
+              {elapsed && ` · ${elapsed}${isFinished(task) ? '' : ' so far'}`}
             </span>
             {!isFinished(task) && (
               <Button
@@ -519,6 +576,18 @@ export default function TaskSurface({
         ) : (
           <div className="garden-task-layout">
             <div className="garden-task-primary">
+              {/*
+               * A run a ceiling stopped is the one pause that has an answer, and the answer is a
+               * question rather than a button - so it sits at the top of the work, above
+               * everything else the owner might read, in the same card the product asks every
+               * other question in.
+               */}
+              {task.spendPausedAt && (
+                <Suspense fallback={null}>
+                  <SpendBlock task={task} onResumed={reload} />
+                </Suspense>
+              )}
+              <SubagentLanes events={events} />
               <Suspense fallback={null}>
                 <MediaJobs taskId={task.id} onDelivered={reload} />
               </Suspense>
@@ -601,10 +670,6 @@ export default function TaskSurface({
                               : 'The result'}
                     </span>
                     <div className="row">
-                      <Button className="quiet-button" onClick={selectedContext}>
-                        Shape selection
-                        <ArrowUpRight size={14} />
-                      </Button>
                       <Button
                         className="quiet-button"
                         onClick={() =>
@@ -838,6 +903,12 @@ export default function TaskSurface({
                   workspace={workspace}
                   task={task}
                   bootstrap={bootstrap}
+                  toolbarExtra={
+                    <Button className="quiet-button" onClick={selectedContext}>
+                      Shape selection
+                      <ArrowUpRight size={14} />
+                    </Button>
+                  }
                   {...(draft ? { initialDraft: draft } : {})}
                   {...(scope ? { scope } : {})}
                   onDraft={onDraft}
@@ -852,16 +923,37 @@ export default function TaskSurface({
           ))}
       </div>
       {panel === 'brief' && (
-        <Dialog title="Your brief" onClose={() => setPanel(null)}>
-          <Suspense fallback={<Spinner />}>
-            <Markdown>
-              {opening
-                ? eventText(opening)
-                : briefLoading
-                  ? 'Loading your original direction…'
-                  : 'No opening direction is available in the first recorded events.'}
-            </Markdown>
-          </Suspense>
+        <Dialog title="What you asked" wide onClose={() => setPanel(null)}>
+          <p className="muted">Your opening direction and every direction since, oldest first.</p>
+          {briefLoading && !opening ? (
+            <Spinner label="Loading your original direction…" />
+          ) : ownerDirections.length === 0 ? (
+            <p className="muted">
+              {opening ? (
+                <Suspense fallback={null}>
+                  <Markdown>{eventText(opening)}</Markdown>
+                </Suspense>
+              ) : (
+                'No opening direction is available in the first recorded events.'
+              )}
+            </p>
+          ) : (
+            <ol className="activity-ledger">
+              {ownerDirections.map((event, index) => (
+                <li key={event.id}>
+                  <span className="activity-kind">
+                    {index === 0 ? 'Original direction' : `Direction ${index + 1}`}
+                  </span>
+                  <div>
+                    <Suspense fallback={<p>{event.summary}</p>}>
+                      <Markdown>{eventText(event)}</Markdown>
+                    </Suspense>
+                    <small className="muted">{date(event.createdAt)}</small>
+                  </div>
+                </li>
+              ))}
+            </ol>
+          )}
         </Dialog>
       )}
       {panel === 'history' && (

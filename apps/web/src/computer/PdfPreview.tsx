@@ -74,7 +74,10 @@ export default function PdfPreview({ url, name }: { url: string; name: string })
     };
     void loading.promise
       .then(async (value) => {
-        if (!active) return value.cleanup();
+        if (!active) {
+          await value.cleanup();
+          return value;
+        }
         setDocument(value);
         setPageCount(value.numPages);
         // Page sizes are measured once, from the document itself, so every placeholder has the
@@ -86,7 +89,10 @@ export default function PdfPreview({ url, name }: { url: string; name: string })
           const viewport = page.getViewport({ scale: 1 });
           sizes.push({ width: viewport.width, height: viewport.height });
         }
-        if (!active) return value.cleanup();
+        if (!active) {
+          await value.cleanup();
+          return value;
+        }
         setPageSizes(sizes);
         return value;
       })

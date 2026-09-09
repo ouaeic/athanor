@@ -324,3 +324,239 @@ describe('observed source fallback and active progress', () => {
     expect(result.progress.milestones[0]).toMatchObject({ status: 'failed' });
   });
 });
+
+/**
+ * The clock and the counter beside a milestone.
+ *
+ * The owner reads plan steps to know how far in the work is, and a bare tick answers neither "how
+ * long did that take" nor "how much of it is done". The step rows carry no clock, so timing is
+ * recovered by walking the plan's own versions: each `plan` event is a whole snapshot, so the first
+ * version in which a step is running is when it started and the first in which it closes is when it
+ * ended. Nothing new is written to get this - it is read out of history that was already there,
+ * which is why it also works for a run that finished before any of it existed.
+ */
+describe('milestone timing and sub-milestone counts', () => {
+  const at = (sequence: number, kind: TaskEvent['kind'], payload: unknown, when: string) => ({
+    ...event(sequence, kind, payload),
+    createdAt: when
+  });
+  const planWith = (steps: unknown[]) => ({
+    id: 'plan-1',
+    taskId,
+    version: 3,
+    parentVersion: null,
+    branchName: 'Main',
+    steps,
+    createdBy: 'agent',
+    createdAt: '2026-09-06T11:00:00.000Z'
+  });
+
+  it('dates a step from the plan version that started it and the one that closed it', () => {
+    const events = [
+      at(
+        1,
+        'plan',
+        { steps: [{ id: 'a', title: 'First', status: 'in_progress' }] },
+        '2026-09-06T11:10:00.000Z'
+      ),
+      at(
+        2,
+        'plan',
+        { steps: [{ id: 'a', title: 'First', status: 'completed' }] },
+        '2026-09-06T11:25:00.000Z'
+      )
+    ];
+    const built = buildTaskPresentation(
+      input({
+        events,
+        plan: planWith([{ id: 'a', title: 'First', status: 'completed' }]) as never
+      })
+    );
+    expect(built.progress.phases[0]).toMatchObject({
+      id: 'a',
+      startedAt: '2026-09-06T11:10:00.000Z',
+      completedAt: '2026-09-06T11:25:00.000Z'
+    });
+    expect(TaskPresentation.parse(built)).toBeTruthy();
+  });
+
+  it('prefers a stamp the step carries over one inferred from the versions', () => {
+    const events = [
+      at(
+        1,
+        'plan',
+        { steps: [{ id: 'a', title: 'First', status: 'in_progress' }] },
+        '2026-09-06T11:10:00.000Z'
+      )
+    ];
+    const built = buildTaskPresentation(
+      input({
+        events,
+        plan: planWith([
+          { id: 'a', title: 'First', status: 'in_progress', startedAt: '2026-09-06T09:00:00.000Z' }
+        ]) as never
+      })
+    );
+    expect(built.progress.phases[0]?.startedAt).toBe('2026-09-06T09:00:00.000Z');
+  });
+
+  it('counts a milestone by the parts that have closed, skipped included', () => {
+    const built = buildTaskPresentation(
+      input({
+        plan: planWith([
+          {
+            id: 'a',
+            title: 'Ship it',
+            status: 'in_progress',
+            substeps: [
+              { id: 'a1', title: 'Write it', status: 'completed' },
+              { id: 'a2', title: 'Drop the extra', status: 'skipped' },
+              { id: 'a3', title: 'Test it', status: 'in_progress' }
+            ]
+          }
+        ]) as never
+      })
+    );
+    expect(built.progress.phases[0]).toMatchObject({ countDone: 2, countTotal: 3 });
+    expect(built.progress.phases[0]?.substeps).toHaveLength(3);
+  });
+
+  it('leaves a milestone with no parts uncounted rather than reporting nought of nought', () => {
+    const built = buildTaskPresentation(
+      input({ plan: planWith([{ id: 'a', title: 'Alone', status: 'pending' }]) as never })
+    );
+    expect(built.progress.phases[0]?.countTotal).toBeUndefined();
+  });
+
+  it('carries the task status through, so a partial finish can be labelled as one', () => {
+    const built = buildTaskPresentation(input({ taskStatus: 'completed' }));
+    expect(built.taskStatus).toBe('completed');
+  });
+});
+
+/**
+ * Failures the owner can see the shape of.
+ *
+ * A failed tool call writes one line into the trace, and the trace shows the last two dozen lines of
+ * the current direction. Measured on one real run: thirty-seven failures over five hours, of which
+ * the owner could have seen a handful. The count is what makes "the model kept fighting a tool"
+ * visible as the thing it is.
+ */
+describe('failed tool calls are counted, not only listed', () => {
+  const failures = (built: ReturnType<typeof buildTaskPresentation>) =>
+    built.progress.metrics.find((metric) => metric.key === 'toolFailures')?.value;
+
+  it('counts every failure, including ones whose start scrolled out of the window', () => {
+    const built = buildTaskPresentation(
+      input({
+        events: [
+          event(1, 'tool_started', { toolCallId: 'a', tool: 'shell', arguments: {} }),
+          event(2, 'error', { toolCallId: 'a', tool: 'shell' }, 'shell failed'),
+          // No `tool_started` for this one - the read window began after it.
+          event(3, 'error', { toolCallId: 'b', tool: 'shell' }, 'shell failed')
+        ]
+      })
+    );
+    expect(failures(built)).toBe(2);
+  });
+
+  it('says nothing at all about a run in which nothing failed', () => {
+    expect(failures(buildTaskPresentation(input({ events: [] })))).toBeUndefined();
+  });
+});
+
+/**
+ * The list a follow-up used to delete.
+ *
+ * A direction opens a new plan, and `phases` shows only the plan of the direction being worked - so
+ * between the owner sending a follow-up and the model writing its next plan, the panel showed
+ * nothing at all, and everything the project had already done went off the screen with it. It was
+ * never lost from the record, only from the view. These keep it in the view.
+ */
+describe('the trajectory a project keeps across its directions', () => {
+  const plan = (
+    sequence: number,
+    directionEventId: string,
+    steps: { id: string; title: string; status: string }[]
+  ) => event(sequence, 'plan', { directionEventId, steps });
+
+  it('keeps the earlier direction`s list when the current one has no plan yet', () => {
+    const built = buildTaskPresentation(
+      input({
+        events: [
+          event(1, 'user_message', { markdown: 'Build the game' }),
+          plan(2, 'event-1', [{ id: 'a', title: 'Draw the map', status: 'completed' }]),
+          event(3, 'user_message', { markdown: 'Now add battles' })
+        ]
+      })
+    );
+    // Nothing is being worked to yet, which is exactly the moment the list used to vanish.
+    expect(built.progress.phases).toEqual([]);
+    expect(built.progress.history).toHaveLength(1);
+    expect(built.progress.history[0]?.phases.map((phase) => phase.title)).toEqual(['Draw the map']);
+  });
+
+  it('does not repeat the direction being worked now in its own history', () => {
+    const events = [
+      event(1, 'user_message', { markdown: 'Build the game' }),
+      plan(2, 'event-1', [{ id: 'a', title: 'Draw the map', status: 'completed' }])
+    ];
+    const built = buildTaskPresentation(
+      input({
+        events,
+        plan: {
+          id: 'plan-1',
+          taskId,
+          version: 1,
+          parentVersion: null,
+          branchName: 'Main',
+          directionEventId: 'event-1',
+          steps: [{ id: 'a', title: 'Draw the map', status: 'completed' }],
+          createdBy: 'agent',
+          createdAt: now
+        } as never
+      })
+    );
+    expect(built.progress.phases.map((phase) => phase.title)).toEqual(['Draw the map']);
+    expect(built.progress.history).toEqual([]);
+  });
+
+  it('keeps only the last plan each earlier direction reached', () => {
+    const built = buildTaskPresentation(
+      input({
+        events: [
+          event(1, 'user_message', { markdown: 'Build the game' }),
+          plan(2, 'event-1', [{ id: 'a', title: 'First attempt', status: 'in_progress' }]),
+          plan(3, 'event-1', [
+            { id: 'a', title: 'First attempt', status: 'completed' },
+            { id: 'b', title: 'Second thing', status: 'completed' }
+          ]),
+          event(4, 'user_message', { markdown: 'Now add battles' })
+        ]
+      })
+    );
+    expect(built.progress.history).toHaveLength(1);
+    expect(built.progress.history[0]?.phases.map((phase) => phase.title)).toEqual([
+      'First attempt',
+      'Second thing'
+    ]);
+  });
+});
+
+/**
+ * A plan written before any direction existed keys on no direction at all, and so does "there is no
+ * current direction". Conflating the two took the only list an older task had out of its own
+ * history - the one case where the retained trajectory had something to show and showed nothing.
+ */
+describe('a plan that predates directions', () => {
+  it('is kept in the history rather than mistaken for the current one', () => {
+    const built = buildTaskPresentation(
+      input({
+        events: [
+          event(1, 'plan', { steps: [{ id: 'a', title: 'Legacy step', status: 'completed' }] })
+        ]
+      })
+    );
+    expect(built.progress.history[0]?.phases.map((phase) => phase.title)).toEqual(['Legacy step']);
+  });
+});

@@ -871,7 +871,10 @@ describe('agent approval policy', () => {
     // The other two promises the same branch makes, wrapped the same way. A push is priced by
     // mode: autonomous runs it, the asking modes still show the card.
     for (const args of shapes('git push origin main')) {
-      expect(approvalRequirement('shell', args, 'autonomous')?.action, JSON.stringify(args)).toBeUndefined();
+      expect(
+        approvalRequirement('shell', args, 'autonomous')?.action,
+        JSON.stringify(args)
+      ).toBeUndefined();
       expect(approvalRequirement('shell', args, 'balanced')?.action, JSON.stringify(args)).toBe(
         'Push Git changes'
       );
@@ -3546,7 +3549,11 @@ describe('what a security mode means', () => {
       // clause is held by the acts that cannot be un-sent. The ordinary push is priced by mode:
       // autonomous runs it, and the row that held this clause moved to the balanced assertion
       // beside the test that names the pricing.
-      ['sending', 'shell', { executable: 'curl', args: ['-T', '@notes.txt', 'https://x.invalid/upload'] }],
+      [
+        'sending',
+        'shell',
+        { executable: 'curl', args: ['-T', '@notes.txt', 'https://x.invalid/upload'] }
+      ],
       ['sending', 'connector_action', { action: 'mail_send', input: { to: 'a@b.invalid' } }],
       /*
        * The clause used to be held here by `rm -rf node_modules`, which was the one act in the list
