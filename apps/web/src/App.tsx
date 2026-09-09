@@ -1086,27 +1086,42 @@ function ComputerStatus({
         </span>
       )}
       {plan?.windows.map((window, index) => {
-        const percent =
-          window.used === null || window.limit === null || window.limit === 0
-            ? null
-            : Math.round((window.used / window.limit) * 100);
+        /*
+         * Two providers measure two different things, and the strip now renders each in its own
+         * unit rather than treating everything as a fraction of a plan. Ollama Cloud publishes how
+         * much of a window is used, so a percentage is the whole answer. OpenRouter publishes
+         * money, and what an owner wants from money is what is left - so the balance is shown as
+         * remaining, which is the number that decides whether the next run starts.
+         */
+        const remaining =
+          window.limit !== null && window.used !== null ? window.limit - window.used : null;
         const label = window.label.startsWith('Session')
           ? 'Session'
           : window.label.startsWith('Weekly')
             ? 'Week'
-            : window.label;
-        return (
-          <span
-            key={`${window.label}-${index}`}
-            title={`${window.label}: ${window.used === null ? 'unavailable' : `${Math.round(window.used * 100)}% of plan${window.limit !== null && window.limit !== 1 ? ` of ${window.limit}` : ''}`}${window.resetsAt ? `, resets at ${new Date(window.resetsAt).toLocaleString()}` : ''}`}
-          >
-            <Gauge size={13} />
-            {label}{' '}
-            {percent === null
+            : window.label === 'Credit balance'
+              ? 'Balance'
+              : window.label === 'Key limit'
+                ? 'Key'
+                : window.label;
+        const shown =
+          window.unit === 'usd'
+            ? remaining === null
+              ? window.used === null
+                ? '—'
+                : `${money(window.used)} used`
+              : `${money(remaining)} left`
+            : window.used === null
               ? '—'
-              : window.limit === 1
-                ? `${Math.round((window.used ?? 0) * 100)}%`
-                : `${percent}%`}
+              : `${Math.round(window.used * 100)}%`;
+        const detail =
+          window.unit === 'usd'
+            ? `${window.label}: ${window.used === null ? 'spend unavailable' : `${money(window.used)} used`}${window.limit === null ? ', no limit set' : ` of ${money(window.limit)}`}`
+            : `${window.label}: ${window.used === null ? 'unavailable' : `${Math.round(window.used * 100)}% of plan`}${window.resetsAt ? `, resets at ${new Date(window.resetsAt).toLocaleString()}` : ''}`;
+        return (
+          <span key={`${window.label}-${index}`} title={detail}>
+            <Gauge size={13} />
+            {label} {shown}
           </span>
         );
       })}

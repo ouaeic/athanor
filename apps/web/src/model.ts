@@ -76,6 +76,7 @@ export interface Bootstrap {
         label: string;
         used: number | null;
         limit: number | null;
+        unit: 'fraction' | 'usd';
         resetsAt: string | null;
       }[];
       queriedAt: string;

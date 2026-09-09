@@ -9,6 +9,7 @@ import {
   MessageSquare,
   MoreHorizontal,
   Pause,
+  Square,
   Play,
   Plus,
   Share2,
@@ -102,7 +103,7 @@ export default function TaskSurface({
   const [error, setError] = useState<unknown>(null);
   const [connection, setConnection] = useState<StreamConnection>('connecting');
   const [panel, setPanel] = useState<
-    'direction' | 'history' | 'plan' | 'settings' | 'share' | 'brief' | 'models' | null
+    'direction' | 'history' | 'plan' | 'settings' | 'share' | 'brief' | 'models' | 'stop' | null
   >(null);
   const [busy, setBusy] = useState(false);
   const [historyMore, setHistoryMore] = useState(false);
@@ -547,20 +548,41 @@ export default function TaskSurface({
               {elapsed && ` · ${elapsed}${isFinished(task) ? '' : ' so far'}`}
             </span>
             {!isFinished(task) && (
-              <Button
-                className="quiet-button"
-                busy={busy}
-                onClick={() =>
-                  action(['paused', 'awaiting_resource'].includes(task.status) ? 'resume' : 'pause')
-                }
-              >
-                {['paused', 'awaiting_resource'].includes(task.status) ? (
-                  <Play size={14} />
-                ) : (
-                  <Pause size={14} />
-                )}{' '}
-                {['paused', 'awaiting_resource'].includes(task.status) ? 'Resume' : 'Pause'}
-              </Button>
+              <>
+                <Button
+                  className="quiet-button"
+                  busy={busy}
+                  onClick={() =>
+                    action(
+                      ['paused', 'awaiting_resource'].includes(task.status) ? 'resume' : 'pause'
+                    )
+                  }
+                >
+                  {['paused', 'awaiting_resource'].includes(task.status) ? (
+                    <Play size={14} />
+                  ) : (
+                    <Pause size={14} />
+                  )}{' '}
+                  {['paused', 'awaiting_resource'].includes(task.status) ? 'Resume' : 'Pause'}
+                </Button>
+                {/*
+                 * Stop belongs beside Pause, not two clicks into Work options.
+                 *
+                 * Pausing and stopping are the two things an owner wants from a run that is going
+                 * wrong, and only one of them was on the screen: the other sat inside a settings
+                 * dialog, which is not where anybody looks for a brake. It asks first, because
+                 * unlike Pause it cannot be undone - the run does not continue afterwards, though
+                 * the files and the history stay and a new direction can pick the work back up.
+                 */}
+                <Button
+                  className="quiet-button"
+                  busy={busy}
+                  onClick={() => setPanel('stop')}
+                  aria-label="Stop this work"
+                >
+                  <Square size={14} /> Stop
+                </Button>
+              </>
             )}
           </div>
         </div>
@@ -1000,6 +1022,29 @@ export default function TaskSurface({
           </ol>
         </Dialog>
       )}
+      {panel === 'stop' && (
+        <Dialog title="Stop this work?" onClose={() => setPanel(null)}>
+          <p>
+            The run stops where it is. Its files, its published links and everything it recorded
+            stay exactly as they are — send another direction later and the work picks up from here.
+          </p>
+          <p className="muted">To hold it without ending it, close this and use Pause instead.</p>
+          <ErrorNotice error={error} />
+          <div className="row">
+            <Button
+              className="primary"
+              busy={busy}
+              onClick={async () => {
+                await action('cancel');
+                setPanel(null);
+              }}
+            >
+              Stop this work
+            </Button>
+            <Button onClick={() => setPanel(null)}>Keep going</Button>
+          </div>
+        </Dialog>
+      )}
       {panel === 'plan' && (
         <Dialog title="The plan" wide onClose={() => setPanel(null)}>
           <PlanEditor
@@ -1015,14 +1060,6 @@ export default function TaskSurface({
       {panel === 'settings' && (
         <Dialog title="Work options" onClose={() => setPanel(null)}>
           <TaskOptions task={task} onTask={onTask} onRefresh={onRefresh} />
-          {!isFinished(task) && (
-            <Button busy={busy} onClick={() => action('cancel')}>
-              Stop this work
-            </Button>
-          )}
-          <p className="muted">
-            Stopping preserves its files and history. Send another direction to continue later.
-          </p>
           <Button
             onClick={() => {
               const event = [...events]
