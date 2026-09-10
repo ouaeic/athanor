@@ -1255,6 +1255,10 @@ export class DataStore {
     return this.#connectors.listManagedProviderCredentials(...args);
   }
 
+  rerouteTaskModel(...args: Parameters<TaskStore['rerouteTaskModel']>) {
+    return this.#tasks.rerouteTaskModel(...args);
+  }
+
   primaryInferenceCredential(...args: Parameters<ConnectorStore['primaryInferenceCredential']>) {
     return this.#connectors.primaryInferenceCredential(...args);
   }

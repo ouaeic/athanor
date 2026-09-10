@@ -1504,6 +1504,44 @@ export class TaskStore {
     return result.rows.length > 0;
   }
 
+  /**
+   * Re-queues a task on a different model after the one it was on stopped answering.
+   *
+   * One statement, because the three facts have to move together: the new route, the state that
+   * knows which providers have already walled, and the credits spent getting here. Split across
+   * calls, a crash between them leaves a task pointed at a new model with a state that has never
+   * heard of it, and the next turn re-routes again on the next wall from a list that lost an entry.
+   *
+   * Guarded on the lease, like every other write this worker makes about a task it is holding: a
+   * task another worker has taken is not this one's to move, and the `RETURNING` says which
+   * happened so the caller can fall back to parking rather than assume it worked.
+   */
+  async rerouteTaskModel(input: {
+    id: string;
+    workerId: string;
+    modelId: string;
+    actualComputeCredits: number;
+    agentStateCiphertext: EncryptedEnvelope;
+  }): Promise<boolean> {
+    const result = await this.database.query(
+      `UPDATE tasks SET status='queued', model_id=$3, actual_compute_credits=$4,
+         agent_state_ciphertext=$5::jsonb, lease_owner=NULL, lease_expires_at=NULL,
+         attempt=0, completed_at=NULL, updated_at=NOW()
+       WHERE id=$1 AND (lease_owner=$2 OR lease_owner IS NULL)
+       RETURNING id`,
+      [
+        input.id,
+        input.workerId,
+        input.modelId,
+        input.actualComputeCredits,
+        JSON.stringify(input.agentStateCiphertext)
+      ]
+    );
+    if (result.rows.length === 0) return false;
+    this.#signal(TASK_QUEUE_CHANNEL, input.id);
+    return true;
+  }
+
   async setTaskStatusForUser(userId: string, id: string, status: string): Promise<boolean> {
     const result = await this.database.query(
       `UPDATE tasks SET status = $3, lease_owner = NULL, lease_expires_at = NULL, updated_at = NOW(),

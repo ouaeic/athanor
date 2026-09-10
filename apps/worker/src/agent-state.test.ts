@@ -109,7 +109,8 @@ const FIELDS: ReadonlyArray<keyof AgentState> = [
   'mediaApprovals',
   'codingMissionWaiting',
   'codingMissionReviews',
-  'mainModelPreference'
+  'mainModelPreference',
+  'walledProviders'
 ];
 
 /**
@@ -123,6 +124,7 @@ const FIELDS: ReadonlyArray<keyof AgentState> = [
  */
 const FULL: Required<AgentState> = {
   mainModelPreference: '[true,"best",""]',
+  walledProviders: ['openrouter'],
   mediaApprovals: { image: { binding: 'a'.repeat(64), modelId: 'test/image' } },
   transcriptionApprovals: {
     'transcription-1': { binding: 'd'.repeat(64), sourceSha256: 'e'.repeat(64), sourceBytes: 4096 }
@@ -435,7 +437,12 @@ describe('what a new turn inherits', () => {
       'webToolMode',
       'knownOrigins',
       'knownAddresses',
-      'mainModelPreference'
+      'mainModelPreference',
+      // Carried, because a wall outlives the turn it stopped: the re-route that answers one lands
+      // the task on a different provider for its *next* turn, and a list reset in between would
+      // send it straight back to the provider that was rate-limiting it. Cleared on the first step
+      // that actually produces a response, which is the honest signal that routing is working.
+      'walledProviders'
     ]);
     expect(dropped.length + reset.length + carried.length).toBe(FIELDS.length);
   });

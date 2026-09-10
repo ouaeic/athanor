@@ -212,6 +212,7 @@ const probeStore = (task: () => TaskRecord): StoreProbe => {
     // comes from `AI_API_KEY`, not from a row, and a double that omitted this method would make
     // every turn in this file fail on a store call rather than on anything it means to test.
     listManagedProviderCredentials: async () => [],
+    rerouteTaskModel: async () => false,
     listWorkspaceMemories: async () => [],
     curateWorkspaceSkills: async () => undefined,
     listWorkspaceSkills: async () => [],
@@ -9138,6 +9139,7 @@ describe('an account holding more than one provider connection', () => {
       ...probe.store,
       listModels: async () => [forModel],
       listManagedProviderCredentials: async () => connections,
+      rerouteTaskModel: async () => false,
       getManagedProviderCredential: async () => null
     } as unknown as DataStore;
     const log: FetchLog = { calls: [], modelRequests: [] };
@@ -9170,5 +9172,141 @@ describe('an account holding more than one provider connection', () => {
     // happens to hold.
     const log = await runAgainst([connection('openrouter', 'openrouter-key')], model);
     expect(log.modelRequests).toHaveLength(0);
+  });
+});
+
+/**
+ * A wall on one provider, and another provider sitting there answering.
+ *
+ * Parking behind the provider that refused was the only possible answer while an account could
+ * hold one credential. It can now hold one per provider, so the sweep waiting up to a day for a
+ * quota to reset is the wrong answer when a route the owner has already connected would take the
+ * work now. What has to keep holding is the old behaviour on every path that has nowhere to go:
+ * a re-route is an improvement on waiting, never a replacement for it.
+ */
+describe('a task walled on one provider while another is connected', () => {
+  const aad = `inference-provider:${userId}`;
+  const connection = (provider: string) => ({
+    userId,
+    provider: `inference:${provider}`,
+    status: 'active' as const,
+    externalRef: 'self-hosted',
+    monthlyLimitUsd: 0,
+    createdAt: new Date(0).toISOString(),
+    updatedAt: new Date(0).toISOString(),
+    secretCiphertext: encryptJson(
+      {
+        provider,
+        baseUrl: PROVIDER_URL,
+        apiKey: `${provider}-key`,
+        enforceZeroDataRetention: false
+      },
+      masterKey,
+      aad
+    )
+  });
+  const elsewhere: ModelRelease = {
+    ...model,
+    id: 'openrouter/vendor/model-2',
+    providerModelId: 'vendor/model-2',
+    displayName: 'Model Two',
+    provider: 'openrouter'
+  };
+
+  const walled = async (options: {
+    on?: ModelRelease;
+    catalogue?: ModelRelease[];
+    connections?: string[];
+    already?: string[];
+  }) => {
+    const task = {
+      ...makeTask({
+        messages: [],
+        step: 2,
+        credits: 3,
+        turn: 1,
+        ...(options.already ? { walledProviders: options.already } : {})
+      }),
+      modelId: (options.on ?? model).id
+    };
+    const probe = probeStore(() => task);
+    const moves: Array<Record<string, unknown>> = [];
+    Object.assign(probe.store, {
+      listModels: async () => options.catalogue ?? [model, elsewhere],
+      listManagedProviderCredentials: async () =>
+        (options.connections ?? ['openrouter', 'ollama-cloud']).map(connection),
+      rerouteTaskModel: async (input: Record<string, unknown>) => {
+        moves.push(input);
+        return true;
+      }
+    });
+    await new AgentWorker(probe.store, config(), masterKey, runnerSecret, silentLogger).fail(
+      task,
+      new AthanorError('provider_quota_exhausted', 'The provider is out of quota')
+    );
+    return { probe, moves };
+  };
+
+  it('moves onto the provider that is answering instead of waiting a day for the one that is not', async () => {
+    const { probe, moves } = await walled({});
+    expect(moves).toHaveLength(1);
+    expect(moves[0]).toMatchObject({ modelId: elsewhere.id, workerId: 'worker-test' });
+    // Not parked as well: the sweep would find a queued task and the owner would see it counted as
+    // waiting on a resource it is no longer waiting for.
+    expect(probe.checkpoints).toHaveLength(0);
+    // The credits already spent travel with it, or the new route starts the task's budget again.
+    expect(moves[0]?.actualComputeCredits).toBe(3);
+    const told = probe.events
+      .filter((entry) => (entry.payload as { owner?: unknown } | undefined)?.owner === true)
+      .map((entry) => entry.summary);
+    expect(told.at(-1)).toContain('Model Two');
+  });
+
+  it('carries the wall into the new state so the next one does not come straight back', async () => {
+    const { moves } = await walled({});
+    const state = decryptJson<{ walledProviders?: string[] }>(
+      moves[0]?.agentStateCiphertext as never,
+      dataKey
+    );
+    expect(state.walledProviders).toEqual(['custom']);
+  });
+
+  it('parks rather than returning to a provider that has already walled this turn', async () => {
+    const { probe, moves } = await walled({ already: ['openrouter'] });
+    expect(moves).toHaveLength(0);
+    expect(probe.checkpoints).toMatchObject([{ status: 'awaiting_resource' }]);
+  });
+
+  it('parks when the only route this account reaches is the one that refused', async () => {
+    const { probe, moves } = await walled({ catalogue: [model], connections: ['ollama-cloud'] });
+    expect(moves).toHaveLength(0);
+    expect(probe.checkpoints).toMatchObject([{ status: 'awaiting_resource' }]);
+  });
+
+  /**
+   * Three providers refusing inside one turn is an outage, not a rate limit, and waiting is the
+   * right answer to an outage. Without the bound a long task would rotate for as long as the
+   * catalogue held routes, spending a request on each one to learn what the first one told it.
+   */
+  it('stops rotating once enough providers have refused', async () => {
+    const { probe, moves } = await walled({ already: ['a', 'b', 'c'] });
+    expect(moves).toHaveLength(0);
+    expect(probe.checkpoints).toMatchObject([{ status: 'awaiting_resource' }]);
+  });
+
+  it('parks, as it always did, when the store will not move the task', async () => {
+    const task = { ...makeTask({ messages: [], step: 2, credits: 0, turn: 1 }), modelId: model.id };
+    const probe = probeStore(() => task);
+    Object.assign(probe.store, {
+      listModels: async () => [model, elsewhere],
+      listManagedProviderCredentials: async () => [connection('openrouter')],
+      // Another worker holds the lease. The wall below is still the truth about this task.
+      rerouteTaskModel: async () => false
+    });
+    await new AgentWorker(probe.store, config(), masterKey, runnerSecret, silentLogger).fail(
+      task,
+      new AthanorError('provider_quota_exhausted', 'The provider is out of quota')
+    );
+    expect(probe.checkpoints).toMatchObject([{ status: 'awaiting_resource' }]);
   });
 });

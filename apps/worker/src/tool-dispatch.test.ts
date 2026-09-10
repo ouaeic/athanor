@@ -192,6 +192,7 @@ const probeStore = (task: () => TaskRecord): StoreProbe => {
     // has never opened Settings; a double without this method fails every turn on the store call
     // that looks for saved connections rather than on what the case is about.
     listManagedProviderCredentials: async () => [],
+    rerouteTaskModel: async () => false,
     listWorkspaceMemories: spy(calls, 'listWorkspaceMemories', () => []),
     curateWorkspaceSkills: spy(calls, 'curateWorkspaceSkills', () => undefined),
     listWorkspaceSkills: spy(calls, 'listWorkspaceSkills', () => []),

@@ -16,6 +16,7 @@ import {
   encryptJson,
   inferenceCredentialAad,
   AthanorError,
+  selectModel,
   sha256,
   unwrapDataKey,
   type MemoryDeadEndCheck
@@ -26,7 +27,7 @@ import {
   readProjectModelPreferences,
   mergeProjectModelChoices
 } from '@athanor/data';
-import type { DataStore, TaskRecord } from '@athanor/data';
+import type { DataStore, TaskRecord, WorkspaceRecord } from '@athanor/data';
 import {
   isProviderWall,
   ModelGateway,
@@ -2160,6 +2161,15 @@ export class AgentWorker {
       if (generated.outcome === 'retry') continue;
       const { response } = generated;
       /*
+       * A provider that has just answered is not walled any more, whatever it was doing an hour ago.
+       *
+       * The list exists to stop a task rotating between two providers inside one bad afternoon, and
+       * a billed response is proof the afternoon is over. Left uncleared it would only ever grow:
+       * three walls across a week-long task would exhaust the re-route budget for the rest of its
+       * life and put it back to parking on the first wall after that.
+       */
+      if (state.walledProviders?.length) delete state.walledProviders;
+      /*
        * What the step said: the provenance notice for anything the provider fetched itself, the
        * assistant message into the window, and - only when this is a new answer rather than a round
        * the harness asked for - the reply onto the owner's timeline. @see recordAssistantStep in
@@ -2242,6 +2252,88 @@ export class AgentWorker {
     });
   }
 
+  /**
+   * How many providers one task will try before it accepts that waiting is the answer.
+   *
+   * Three, because the bound is about not thrashing rather than about exhausting the catalogue: an
+   * account with three providers all refusing inside one turn is having an outage, not a rate
+   * limit, and parking is the right response to an outage.
+   */
+  static readonly #MAX_WALL_REROUTES = 3;
+
+  /**
+   * Moves a walled task onto a provider that is answering, or reports that there is none.
+   *
+   * Returns true when the task has been re-queued on a new route and the caller must not also park
+   * it. Everything here is allowed to fail into `false`: a re-route is an improvement on waiting,
+   * never a replacement for it, and a task that cannot be moved must still reach the parking path
+   * with its wall intact.
+   */
+  async #rerouteAroundWall(
+    task: TaskRecord,
+    workspace: WorkspaceRecord,
+    error: AthanorError
+  ): Promise<boolean> {
+    try {
+      const key = unwrapDataKey(workspace.wrappedKey!, this.#masterKey, workspace.id);
+      const current = await this.store.getTask(task.userId, task.id);
+      if (!current?.agentStateCiphertext) return false;
+      const state = decryptJson<AgentState>(current.agentStateCiphertext, key);
+      const catalog = (await this.store.listModels()) as unknown as ModelRelease[];
+      const walledModel = catalog.find((entry) => entry.id === task.modelId);
+      // The provider that refused, not the model: a quota is spent per account per provider, and
+      // moving to that provider's next model would meet the same wall a moment later.
+      const walled = [
+        ...new Set([...(state.walledProviders ?? []), walledModel?.provider ?? ''].filter(Boolean))
+      ];
+      if (walled.length > AgentWorker.#MAX_WALL_REROUTES) return false;
+      /*
+       * Only routes this account can actually reach. Without this the selector would happily hand
+       * back a model from a provider the owner has never connected, and the next turn would fail
+       * on `provider_model_mismatch` - a worse failure than the wall, because it does not lift.
+       */
+      const connections = await this.#inferenceConnections(task);
+      const namespaces = new Set<string>(
+        [...connections.keys()].map((vendor) => (vendor === 'openrouter' ? 'openrouter' : 'custom'))
+      );
+      const reachable = catalog.filter(
+        (entry) => namespaces.has(entry.provider) && !walled.includes(entry.provider)
+      );
+      if (reachable.length === 0) return false;
+      const chosen = selectModel(reachable, {
+        privacyRoute: task.privacyRoute === 'provider_zdr' ? 'provider_zdr' : 'external',
+        requiredCapabilities: ['chat', 'tools'],
+        requiredModalities: ['text'],
+        minContextTokens: 16_000,
+        preference: 'balanced',
+        taskKind: 'general'
+      }).choice?.model;
+      if (!chosen || chosen.id === task.modelId) return false;
+      state.walledProviders = walled;
+      const moved = await this.store.rerouteTaskModel({
+        id: task.id,
+        workerId: this.config.WORKER_ID,
+        modelId: chosen.id,
+        actualComputeCredits: state.credits,
+        agentStateCiphertext: encryptJson(state, key, `task-state:${task.id}`)
+      });
+      if (!moved) return false;
+      await event(
+        this.store,
+        task,
+        key,
+        'status',
+        `${walledModel?.displayName ?? 'The chosen model'} is not answering, so this moved to ${chosen.displayName} and carried on`,
+        { owner: true, code: error.code, from: task.modelId, to: chosen.id }
+      ).catch(() => undefined);
+      return true;
+    } catch {
+      // A re-route that cannot be worked out is not a failure of its own: the wall below is still
+      // the truth about this task, and parking is still a correct answer to it.
+      return false;
+    }
+  }
+
   async fail(task: TaskRecord, error: unknown, durationMs?: number): Promise<void> {
     const workspace = await this.store.getWorkspaceById(task.workspaceId).catch(() => null);
     if (
@@ -2287,6 +2379,31 @@ export class AgentWorker {
       });
       return;
     }
+    /*
+     * A wall on one provider is not a reason to stop when the owner has another.
+     *
+     * Parking behind the provider that refused, and waiting up to a day for it to lift, was the
+     * only possible answer while an account could hold one credential: there was nowhere else to
+     * go. An account can now hold a connection per provider, so a rate limit or an outage on one is
+     * a reason to re-point this task at a route that is answering and let it carry on.
+     *
+     * Between turns rather than inside one, deliberately. `TurnRun` freezes the model for the run
+     * and `requestDerivationBreach` fails the turn if the request stops matching what the run says
+     * - a guarantee worth more than the few seconds a mid-turn swap would save. The task is
+     * re-queued on the new route and picks up from its own saved state.
+     *
+     * Bounded by the providers already tried, which is what stops two providers having a bad
+     * afternoon from bouncing a task between them; when every reachable one has walled, this falls
+     * through to the parking below and behaves exactly as it did before.
+     */
+    if (
+      error instanceof AthanorError &&
+      isProviderWall(error) &&
+      PARKABLE_PROVIDER_WALLS.has(error.code) &&
+      workspace?.wrappedKey &&
+      (await this.#rerouteAroundWall(task, workspace, error))
+    )
+      return;
     const message = error instanceof Error ? error.message : 'Task failed';
     // Both halves have to hold. `isProviderWall` answers whether waiting is any use, and
     // `PARKABLE_PROVIDER_WALLS` answers whether anything on this box would ever ask again: a code

@@ -3108,6 +3108,7 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
     // No saved connection: the fixture's provider comes from the environment, which is the shape a
     // self-hosted box configured through `control.env` has.
     listManagedProviderCredentials: async () => [],
+    rerouteTaskModel: async () => false,
     listWorkspaceMemories: async () => knowledgeRows,
     /*
      * The owner's own standing words, which the window reads whole on every single turn.

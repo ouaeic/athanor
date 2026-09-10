@@ -1291,6 +1291,54 @@ describe('DataStore', () => {
   });
 
   /**
+   * Re-pointing a walled task at a provider that is answering, and refusing to do it to a task
+   * somebody else is holding.
+   *
+   * Three facts move together here - the route, the state that knows which providers have already
+   * refused, and the credits spent getting this far - because a crash between them leaves a task
+   * pointed at a model its own saved state has never heard of.
+   */
+  it('re-queues a walled task on another route, and only for the worker holding it', async () => {
+    const user = await store.createUser({ username: 'reroute', displayName: 'Reroute' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'Main'));
+    const task = await store.createTask(taskInput(user.id, workspace.id));
+    await store.leaseNextTask('worker-1');
+    const state = { v: 1, iv: 'state-a', tag: 'state-b', ciphertext: 'walled-openrouter' };
+
+    // Another worker's task is not this one's to move, whatever it knows about the wall.
+    await expect(
+      store.rerouteTaskModel({
+        id: task.id,
+        workerId: 'worker-2',
+        modelId: 'elsewhere',
+        actualComputeCredits: 3,
+        agentStateCiphertext: state
+      })
+    ).resolves.toBe(false);
+    await expect(store.getTask(user.id, task.id)).resolves.toMatchObject({ modelId: 'qwen' });
+
+    await expect(
+      store.rerouteTaskModel({
+        id: task.id,
+        workerId: 'worker-1',
+        modelId: 'elsewhere',
+        actualComputeCredits: 3,
+        agentStateCiphertext: state
+      })
+    ).resolves.toBe(true);
+    await expect(store.getTask(user.id, task.id)).resolves.toMatchObject({
+      modelId: 'elsewhere',
+      status: 'queued',
+      actualComputeCredits: 3,
+      leaseOwner: null,
+      agentStateCiphertext: state
+    });
+    // Queued and unleased means the next worker can take it - which is the whole point of moving
+    // it rather than parking it - and the attempt count does not punish it for the wall.
+    expect(await store.leaseNextTask('worker-2')).toMatchObject({ id: task.id, attempt: 1 });
+  });
+
+  /**
    * The outage this ordering exists to end: a turn that takes the worker process down with it is
    * back in the queue the moment systemd restarts, and by age it is ahead of everything the owner
    * sent while it was crashing. Ordered by attempt first, it drops a place per death and is out of
