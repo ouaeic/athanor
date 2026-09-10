@@ -1313,6 +1313,47 @@ describe('runtime context in the cached preamble', () => {
     expect(before).toContain('df -h /home/athanor');
   });
 
+  /**
+   * The owner has been able to route each job to its own model for a while, and the lead was never
+   * told - so it chose between answering a sub-question itself and handing it to `delegate`
+   * without knowing whether the specialist behind that call was a stronger reasoner or a cheaper
+   * one. It is not discoverable either: no tool result names the model that produced it.
+   */
+  describe('the other models on this computer', () => {
+    const clock = { now: new Date('2026-08-02T09:41:22Z'), timeZone: 'Europe/London' };
+    const withRoster = (roster: Array<{ job: string; model: string }>) =>
+      runtimeContext(
+        workspace(1_000),
+        'https://preview.example.com',
+        clock,
+        '',
+        '',
+        false,
+        'in_house',
+        undefined,
+        roster
+      );
+
+    it('names each job and the model that answers it', () => {
+      const line = withRoster([
+        { job: 'research and review specialists (delegate)', model: 'Deep Thinker' },
+        { job: 'repository changes (coding_agent)', model: 'Code Smith' }
+      ]);
+      expect(line).toContain('research and review specialists (delegate) on Deep Thinker');
+      expect(line).toContain('repository changes (coding_agent) on Code Smith');
+    });
+
+    /*
+     * The default box routes everything to one model, and telling that model its summariser is
+     * itself is bytes on every request buying nothing. The absence is the feature.
+     */
+    it('costs not one byte on a computer where one model does everything', () => {
+      expect(withRoster([])).toBe(
+        runtimeContext(workspace(1_000), 'https://preview.example.com', clock)
+      );
+    });
+  });
+
   it('states the date, the local time and the time zone the schedule tool asks for', () => {
     const line = runtimeContext(workspace(1_000), 'https://preview.example.com', {
       now: new Date('2026-08-02T09:41:22Z'),

@@ -108,6 +108,44 @@ export const TaskPresentation = z.object({
       resultLimitReached: z.boolean().optional()
     })
     .optional(),
+  /*
+   * What the run itself said when it stopped, for the owner who was not watching.
+   *
+   * Every one of these fields was already recorded - `finish` declares a summary, its deliverables
+   * and its verification, and the `completed` event carries the lot - and none of it was ever
+   * presented as an ending. The owner got a status line reading Complete and a timeline they had
+   * to read backwards to find out what had been produced or what was still wrong.
+   *
+   * Absent while the run is going, and absent on a run that ended without a finish - a crash or a
+   * cancellation has no account of itself to give, and inventing one here would be athanor putting
+   * words in the model's mouth.
+   */
+  outcome: z
+    .object({
+      summary: z.string(),
+      at: z.string(),
+      /*
+       * No list of deliverables here, deliberately.
+       *
+       * `finish` declares them and they are the model's own unverified strings - a run that has
+       * read a hostile page can declare any address it likes, and a card that printed them would
+       * be athanor vouching for a link it never resolved. `results` above is the answer to "what
+       * can I open": every entry there is a preview, artifact or file this box actually holds, and
+       * the presentation's own test asserts a declared address never reaches the owner.
+       */
+      /**
+       * `verified` means the harness ran the acceptance checks the run declared and they passed.
+       * `not_applicable` is the conversational answer that had nothing external to check. The two
+       * are never collapsed, because "checked" and "nothing to check" are different promises.
+       */
+      verification: z.enum(['verified', 'not_applicable', 'unverified']),
+      evidence: z.number().int().nonnegative().default(0),
+      /** What the run says is still wrong. Shown even when the status line says Complete. */
+      remainingRisks: z.array(z.string()).default([]),
+      /** Plan steps left open at the finish, so the count and the status line cannot disagree. */
+      openSteps: z.number().int().nonnegative().default(0)
+    })
+    .optional(),
   progress: z.object({
     kind: z.enum(['general', 'build', 'research', 'analysis', 'design']),
     phases: z.array(TaskPhase),

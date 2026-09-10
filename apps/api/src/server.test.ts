@@ -1166,6 +1166,51 @@ describe('API production boundaries', () => {
     expect(advancedPlan.json<{ outputs: unknown[] }>().outputs).toEqual([
       { kind: 'document', title: 'Confidential report', files: ['report.pdf'] }
     ]);
+    /*
+     * The parts survive an owner's edit.
+     *
+     * `substeps` reached the wire when sub-milestones did and this route's mapping did not move
+     * with it, so opening the plan and pressing Save deleted every part of every milestone - and
+     * said nothing, because the write succeeded and the version incremented. A part the owner has
+     * just typed carries no id, which is the second half of the same defect.
+     */
+    const withParts = await app.inject({
+      method: 'POST',
+      url: `/v1/tasks/${taskId}/plan`,
+      headers: { cookie: cookie! },
+      payload: {
+        expectedVersion: 2,
+        steps: [
+          {
+            title: 'Read the private inputs',
+            status: 'completed',
+            substeps: [
+              { title: 'Open the archive', status: 'completed' },
+              { title: 'Check the totals', status: 'pending' }
+            ]
+          },
+          { title: 'Prepare the confidential result', status: 'in_progress' }
+        ]
+      }
+    });
+    expect(withParts.statusCode, withParts.body).toBe(200);
+    const saved = withParts.json<{
+      steps: Array<{ id: string; substeps?: Array<{ id: string; title: string; status: string }> }>;
+    }>();
+    expect(saved.steps[0]?.substeps).toMatchObject([
+      { title: 'Open the archive', status: 'completed' },
+      { title: 'Check the totals', status: 'pending' }
+    ]);
+    // Minted here, because the presentation folds a part's timing on by its id.
+    for (const part of saved.steps[0]!.substeps!) expect(part.id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(saved.steps[1]?.substeps).toBeUndefined();
+    // Sealed like the rest of the plan: a part is owner text and never sits in the clear.
+    expect(
+      JSON.stringify(
+        (await database.query('SELECT steps_ciphertext FROM task_plans WHERE task_id=$1', [taskId]))
+          .rows
+      )
+    ).not.toContain('Open the archive');
     const stalePlan = await app.inject({
       method: 'POST',
       url: `/v1/tasks/${taskId}/plan`,

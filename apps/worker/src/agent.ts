@@ -58,7 +58,7 @@ import {
   type PreparedContext
 } from './context.js';
 import { taskFailureRecord } from './failure-record.js';
-import { pinnedPurposeModel } from './purpose-model.js';
+import { pinnedPurposeModel, taskModelRoster } from './purpose-model.js';
 import { workerLogger, type Logger } from './log.js';
 import {
   botWallSite,
@@ -1968,6 +1968,24 @@ export class AgentWorker {
      * the same disease at a new address. Recency also makes it more salient, not less, so the
      * clock can now be fresher than it was and still free.
      */
+    /*
+     * Resolved once for the turn, not once per step.
+     *
+     * The runtime block is rewritten on every step because its tail position makes rewriting free
+     * in cache terms - but "free to write" is not "free to compute": the roster costs three store
+     * reads and two selections, and none of that changes inside a turn. It is read here and
+     * captured, so the per-step rewrite is a string interpolation.
+     */
+    const modelRoster = await taskModelRoster(
+      {
+        store: this.store,
+        masterKey: this.#masterKey,
+        inferenceCredential: (forTask) => this.#inferenceCredential(forTask)
+      },
+      task,
+      catalog,
+      model.id
+    ).catch(() => []);
     const refreshRuntimeContext = (): void =>
       refreshRuntimeContext_(this.#window, {
         workspace,
@@ -1977,7 +1995,8 @@ export class AgentWorker {
         toolchainSummary,
         machineSummary,
         unattended,
-        webPlan
+        webPlan,
+        modelRoster
       });
     // Called here as well as in the step loop so a window saved when this block lived at index 1
     // is migrated before the preamble blocks below choose where they go.

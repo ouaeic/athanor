@@ -898,7 +898,13 @@ export const UpdateTaskPlanRequest = z.object({
     .array(
       TaskPlanStepBase.extend({
         id: Id.optional(),
-        substeps: z.array(TaskPlanSubstep).max(30).optional()
+        // Optional on the parts for the same reason it is optional on the steps: a part the owner
+        // has just typed has no id yet, and refusing the write over one would make adding a part
+        // through the editor impossible while adding a step stayed fine.
+        substeps: z
+          .array(TaskPlanSubstep.extend({ id: Id.optional() }))
+          .max(30)
+          .optional()
       })
     )
     .min(1)

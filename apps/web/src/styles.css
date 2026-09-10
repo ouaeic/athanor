@@ -894,11 +894,35 @@ canvas {
 .mode-floor svg {
   margin-top: 3px;
 }
+.plan-editor-group {
+  display: grid;
+  gap: 8px;
+}
 .plan-editor-step {
   display: grid;
   grid-template-columns: 1fr 135px 40px;
   gap: 10px;
   align-items: center;
+}
+/* The parts sit under the milestone they belong to, indented and quieter, so the shape of the
+   plan is readable before any of the words are. */
+.plan-editor-substeps {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 22px;
+  display: grid;
+  gap: 6px;
+  border-left: 1px solid var(--line);
+}
+.plan-editor-substeps > li {
+  display: grid;
+  grid-template-columns: 1fr 135px 40px;
+  gap: 10px;
+  align-items: center;
+}
+.plan-editor-substeps input,
+.plan-editor-substeps select {
+  font-size: 12px;
 }
 .activity-ledger {
   list-style: none;
@@ -1618,8 +1642,15 @@ canvas {
   .plan-editor-step {
     grid-template-columns: 1fr 36px;
   }
-  .plan-editor-step input {
+  .plan-editor-step input,
+  .plan-editor-substeps input {
     grid-column: 1/-1;
+  }
+  .plan-editor-substeps > li {
+    grid-template-columns: 1fr 36px;
+  }
+  .plan-editor-substeps {
+    padding-left: 12px;
   }
   .plan-editor-step select {
     font-size: 12px;

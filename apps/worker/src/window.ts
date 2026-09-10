@@ -80,6 +80,8 @@ export interface RuntimeContextInput {
   readonly machineSummary: string;
   readonly unattended: boolean;
   readonly webPlan: WebToolPlan;
+  /** @see taskModelRoster - empty unless the owner routed a job to a different model. */
+  readonly modelRoster?: ReadonlyArray<{ job: string; model: string }>;
 }
 
 /** What the preamble is assembled from. */
@@ -341,7 +343,8 @@ export const refreshRuntimeContext = (deps: WindowDeps, input: RuntimeContextInp
     toolchainSummary,
     machineSummary,
     unattended,
-    webPlan
+    webPlan,
+    modelRoster
   } = input;
   const content = runtimeContext(
     { ...workspace, securityMode: task.securityMode },
@@ -354,7 +357,8 @@ export const refreshRuntimeContext = (deps: WindowDeps, input: RuntimeContextInp
     // The money, from the two facts that decide it: what this turn has billed so far and the
     // ceiling the API set when the task was created. @see spendLine in `context.ts` for why it is
     // quantised and why it says nothing below the share.
-    { credits: state.credits, maxCredits: task.maxComputeCredits }
+    { credits: state.credits, maxCredits: task.maxComputeCredits },
+    modelRoster ?? []
   );
   const last = state.messages.at(-1);
   // Nothing is touched when the block is already last and already says this - a removal and a

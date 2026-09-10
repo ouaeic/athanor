@@ -513,10 +513,30 @@ export const registerTaskRoutes = (context: RouteContext): void => {
       : null;
     const previousOutputs = previousContent?.outputs;
     const outputs = input.outputs ?? previousOutputs;
+    /*
+     * The parts come through with the step that owns them.
+     *
+     * `substeps` reached the wire when sub-milestones did, and this mapping did not move with it -
+     * so a plan the model had broken into parts lost every one of them the moment an owner opened
+     * the editor and pressed Save. Nothing said so: the write succeeded, the version incremented,
+     * and the detail was simply gone from the version that replaced it.
+     *
+     * Ids are minted here for the parts as well as the steps, because a part the owner has just
+     * typed has none and the presentation folds timing onto a step by its id.
+     */
     const steps: TaskPlanStep[] = input.steps.map((step) => ({
       id: step.id ?? randomUUID(),
       title: step.title,
-      status: step.status ?? 'pending'
+      status: step.status ?? 'pending',
+      ...(step.substeps
+        ? {
+            substeps: step.substeps.map((sub) => ({
+              id: sub.id ?? randomUUID(),
+              title: sub.title,
+              status: sub.status ?? 'pending'
+            }))
+          }
+        : {})
     }));
     const key = unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id);
     let created;

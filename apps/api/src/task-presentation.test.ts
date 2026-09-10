@@ -704,3 +704,144 @@ describe('the account a milestone gives of itself', () => {
     expect(built.progress.phases[0]?.detail).toBeUndefined();
   });
 });
+
+/**
+ * The run's own account of how it ended.
+ *
+ * `finish` has always declared a summary, its deliverables and its verification, and the
+ * `completed` event has always carried all of it. None of it was ever presented as an ending: an
+ * owner returning to a finished run got a status line reading Complete and a trace to read
+ * backwards. This is that payload, promoted to the panel.
+ */
+describe('how a finished run says it went', () => {
+  const completion = {
+    summary: 'Rebuilt the importer and re-ran the March batch against it.',
+    deliverables: ['reports/march.csv', 'https://garden.test/__athanor/preview/real/'],
+    verification: {
+      status: 'verified',
+      evidence: [
+        { claim: 'the batch completes', source: 'tool_result' },
+        { claim: 'the totals match', source: 'tool_result' }
+      ],
+      remainingRisks: ['The 2024 archive is still unmigrated.']
+    }
+  };
+
+  it('reads the ending off the completed event the run already writes', () => {
+    const result = buildTaskPresentation(
+      input({ events: [event(1, 'completed', completion, 'Task completed')] })
+    );
+    expect(result.outcome).toMatchObject({
+      summary: 'Rebuilt the importer and re-ran the March batch against it.',
+      verification: 'verified',
+      evidence: 2,
+      remainingRisks: ['The 2024 archive is still unmigrated.']
+    });
+    expect(TaskPresentation.parse(result).outcome?.at).toBe(now);
+  });
+
+  /**
+   * A project with several directions has a `completed` event per direction. Showing the first one
+   * over work that is running now would announce an ending that has not happened.
+   */
+  /**
+   * A finish declares its own deliverables, and they are the model's unverified strings: a run that
+   * has read a hostile page can declare any address it likes. Printing them on the card would be
+   * athanor vouching for a link it never resolved, so the card names none of them and `results` -
+   * which this box resolved itself - is the answer to what can be opened.
+   */
+  it('never prints an address the model declared for itself', () => {
+    const result = buildTaskPresentation(
+      input({
+        events: [
+          event(1, 'completed', {
+            ...completion,
+            deliverables: ['https://untrusted.test/collect?q=1']
+          })
+        ]
+      })
+    );
+    expect(JSON.stringify(result)).not.toContain('untrusted.test');
+  });
+
+  it('says nothing about an ending while the run is going', () => {
+    const result = buildTaskPresentation(
+      input({
+        taskStatus: 'running',
+        events: [event(1, 'completed', completion), event(2, 'user_message', {}, 'Now do April')]
+      })
+    );
+    expect(result.outcome).toBeUndefined();
+  });
+
+  it('shows the newest ending when a project has finished more than once', () => {
+    const result = buildTaskPresentation(
+      input({
+        events: [
+          event(1, 'completed', completion),
+          event(2, 'user_message', {}, 'Now do April'),
+          event(
+            3,
+            'completed',
+            { ...completion, summary: 'April too.', verification: { status: 'not_applicable' } },
+            'Task completed'
+          )
+        ]
+      })
+    );
+    expect(result.outcome).toMatchObject({
+      summary: 'April too.',
+      verification: 'not_applicable',
+      evidence: 0,
+      remainingRisks: []
+    });
+  });
+
+  /**
+   * A finish that declared no verification is not the same as one that verified nothing, and the
+   * card must not let the first read as the second.
+   */
+  it('does not call an unverified finish checked', () => {
+    const result = buildTaskPresentation(
+      input({ events: [event(1, 'completed', { summary: 'Done.' })] })
+    );
+    expect(result.outcome).toMatchObject({ verification: 'unverified', evidence: 0 });
+  });
+
+  it('falls back to the event summary when the payload carries no words of its own', () => {
+    const result = buildTaskPresentation(
+      input({ events: [event(1, 'completed', {}, 'Task completed')] })
+    );
+    expect(result.outcome?.summary).toBe('Task completed');
+  });
+
+  /**
+   * The count and the status line disagreeing is the point: a run may legitimately stop with steps
+   * open, and the owner should be told which number is which.
+   */
+  it('counts the plan steps still open at the finish', () => {
+    const steps = [
+      { id: 'a', title: 'Read the schema', status: 'completed' },
+      { id: 'b', title: 'Write the importer', status: 'completed' },
+      { id: 'c', title: 'Migrate the archive', status: 'pending' },
+      { id: 'd', title: 'Delete the old path', status: 'skipped' }
+    ];
+    const result = buildTaskPresentation(
+      input({
+        events: [event(1, 'plan', { steps }, 'Plan set'), event(2, 'completed', completion)],
+        plan: {
+          id: 'plan-1',
+          taskId,
+          version: 1,
+          parentVersion: null,
+          branchName: 'Main',
+          steps,
+          createdBy: 'agent',
+          createdAt: now
+        } as never
+      })
+    );
+    // Skipped is a decision, not an omission, so it does not count as left open.
+    expect(result.outcome?.openSteps).toBe(1);
+  });
+});

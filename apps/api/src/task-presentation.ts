@@ -561,6 +561,49 @@ export const buildTaskPresentation = (input: PresentationInput): TaskPresentatio
               ? 'build'
               : 'general';
   const active = ['queued', 'planning', 'running'].includes(input.taskStatus);
+  /*
+   * The run's own account of how it ended, read off the `completed` event it already writes.
+   *
+   * The newest one, because a project with several directions has one per direction and the owner
+   * is being shown how *this* run ended. Only while the task is actually finished: a completed
+   * event from an earlier direction, shown over work that is running now, would read as an ending
+   * that has not happened.
+   */
+  const finished = active
+    ? undefined
+    : [...events].reverse().find((event) => event.kind === 'completed');
+  const finishPayload = finished ? record(finished.payload) : undefined;
+  const finishVerification = record(finishPayload?.verification);
+  /** Model-written lines, bounded and trimmed. Never addresses - see the contract's note. */
+  const strings = (value: unknown, max: number): string[] =>
+    Array.isArray(value)
+      ? value
+          .map((item) => compact(item, 240))
+          .filter((item) => item.length > 0)
+          .slice(0, max)
+      : [];
+  const outcome: TaskPresentation['outcome'] = finished
+    ? {
+        summary: compact(finishPayload?.summary, 400) || finished.summary,
+        at: finished.createdAt,
+        verification:
+          finishVerification.status === 'verified'
+            ? 'verified'
+            : finishVerification.status === 'not_applicable'
+              ? 'not_applicable'
+              : 'unverified',
+        evidence: Array.isArray(finishVerification.evidence)
+          ? finishVerification.evidence.length
+          : 0,
+        remainingRisks: strings(finishVerification.remainingRisks, 12),
+        // Counted off the plan rather than off the finish, because the two disagreeing is the
+        // whole point: a run may legitimately stop with steps open, and the owner should be told
+        // which number is which rather than shown "Complete" over a list that is 4 of 7.
+        openSteps: phases.filter(
+          (phase) => phase.status !== 'completed' && phase.status !== 'skipped'
+        ).length
+      }
+    : undefined;
   return {
     version: 1,
     taskId: input.taskId,
@@ -569,6 +612,7 @@ export const buildTaskPresentation = (input: PresentationInput): TaskPresentatio
     results,
     surface,
     ...(outputs === undefined ? {} : { outputs }),
+    ...(outcome ? { outcome } : {}),
     progress: {
       kind,
       phases,

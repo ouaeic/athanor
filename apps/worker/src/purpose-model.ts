@@ -129,3 +129,42 @@ export async function applyProjectMainModel(
   task.reasoningEffort = effort;
   Object.assign(state, nextState);
 }
+
+/**
+ * What jobs on this computer are answered by a model other than the one reading this.
+ *
+ * The owner has been able to route each job to its own model for a while, and the lead was never
+ * told: it chose between doing a piece of research itself and handing it to `delegate` without
+ * knowing whether the specialist behind that call was a stronger reasoner or a cheaper one. The
+ * decision is different in the two cases, and it is not a decision the model can work out by
+ * trying - nothing in any tool result names the route that answered it.
+ *
+ * Only the routes that actually differ from the lead. On a box where one model does everything -
+ * which is every box until somebody opens the settings - this returns nothing and costs nothing,
+ * which is the point: the line exists to describe a choice the owner made, not to describe the
+ * default back to itself.
+ *
+ * Failure is silence. A roster that cannot be resolved is a sentence the model does not get; it is
+ * never a reason to fail a turn, because the turn's actual work does not depend on it.
+ */
+export async function taskModelRoster(
+  context: PurposeContext,
+  task: TaskRecord,
+  catalog: readonly ModelRelease[],
+  leadModelId: string
+): Promise<Array<{ job: string; model: string }>> {
+  const jobs = [
+    { purpose: 'specialist', job: 'research and review specialists (delegate)' },
+    { purpose: 'coding', job: 'repository changes (coding_agent)' }
+  ] as const;
+  const roster: Array<{ job: string; model: string }> = [];
+  for (const entry of jobs) {
+    try {
+      const model = await resolveTaskPurposeModel(context, task, entry.purpose, catalog);
+      if (model.id !== leadModelId) roster.push({ job: entry.job, model: model.displayName });
+    } catch {
+      // A job whose route will not resolve is a job the model should not be told it has.
+    }
+  }
+  return roster;
+}

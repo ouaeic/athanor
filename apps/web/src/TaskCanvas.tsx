@@ -487,6 +487,48 @@ function PhaseList({
   );
 }
 
+/**
+ * How the run ended, in its own words, at the top of the panel rather than at the bottom of a
+ * timeline.
+ *
+ * Every field here was already being recorded and none of it was ever shown as an ending: the
+ * owner who came back to a finished run got a status line reading Complete and had to read the
+ * trace backwards to find out what had been produced. Risks are not tucked into a disclosure -
+ * a run that says something is still wrong has said the most important thing on the card.
+ */
+function Outcome({ outcome }: { outcome: NonNullable<TaskPresentation['outcome']> }) {
+  const verification =
+    outcome.verification === 'verified'
+      ? `Checked — ${outcome.evidence} ${outcome.evidence === 1 ? 'piece' : 'pieces'} of evidence`
+      : outcome.verification === 'not_applicable'
+        ? 'An answer, with nothing external to check'
+        : 'Finished without a verification';
+  return (
+    <section className="garden-outcome" aria-label="How it finished">
+      <header className="row between">
+        <span className="eyebrow">How it finished</span>
+        <span className="muted">{shortTime(outcome.at)}</span>
+      </header>
+      <p className="garden-outcome-summary">{outcome.summary}</p>
+      <p className="muted">
+        {verification}
+        {outcome.openSteps > 0 &&
+          ` · ${outcome.openSteps} plan ${outcome.openSteps === 1 ? 'step' : 'steps'} left open`}
+      </p>
+      {outcome.remainingRisks.length > 0 && (
+        <>
+          <span className="eyebrow">Still open</span>
+          <ul className="garden-outcome-list garden-outcome-risks">
+            {outcome.remainingRisks.map((item) => (
+              <li key={item}>{item}</li>
+            ))}
+          </ul>
+        </>
+      )}
+    </section>
+  );
+}
+
 export function TaskProgress({
   presentation,
   onEvidence,
@@ -543,6 +585,7 @@ export function TaskProgress({
           <p>{progress.current.title}</p>
         </div>
       )}
+      {presentation.outcome && <Outcome outcome={presentation.outcome} />}
       {phases.length > 0 && <PhaseList phases={phases} onPlan={onPlan} />}
       {/*
        * Everything the project did before the direction it is working now.
