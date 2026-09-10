@@ -3664,5 +3664,23 @@ CREATE INDEX IF NOT EXISTS model_releases_connection_idx ON model_releases(conne
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS lifetime TEXT NOT NULL DEFAULT 'standard'
   CHECK(lifetime IN ('brief','standard','sustained'));
 `
+  },
+  {
+    version: 100,
+    name: 'preview_idle_window',
+    /*
+     * The idle window a preview renews by, kept on the preview instead of read from one constant.
+     *
+     * A `brief` conversation's page was created with a twenty-four hour deadline and every visit
+     * renewed it to the global thirty days, because the renewal read the constant rather than the
+     * row - so the first person to open a short-lived page turned it into a long-lived one, and
+     * the lifetime flag stopped meaning anything the moment anybody looked at it.
+     *
+     * Nullable with no backfill: NULL means the ordinary window, which is what every existing row
+     * already renews by, so nothing serving today changes when this lands.
+     */
+    sql: `
+ALTER TABLE workspace_previews ADD COLUMN IF NOT EXISTS idle_interval INTERVAL;
+`
   }
 ] as const;

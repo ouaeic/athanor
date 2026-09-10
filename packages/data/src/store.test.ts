@@ -1985,6 +1985,59 @@ describe('DataStore', () => {
     await expect(store.getConnector(user.id, connector.id)).resolves.toBeNull();
   });
 
+  /**
+   * A visit renews a preview by its own window, not by the global one.
+   *
+   * A `brief` conversation's page is created with a twenty-four hour deadline, and the renewal
+   * used to read the thirty-day constant - so the first person to open a short-lived page turned
+   * it into a long-lived one and the owner's lifetime choice stopped meaning anything. Publishing
+   * and unpublishing renew on the same path and had the same defect.
+   */
+  it('renews a short-lived preview by its own window rather than the ordinary one', async () => {
+    const user = await store.createUser({ username: 'brief-preview', displayName: 'Brief' });
+    const workspace = await store.createWorkspace(workspaceInput(user.id, 'App'));
+    const brief = await store.createWorkspacePreview({
+      userId: user.id,
+      workspaceId: workspace.id,
+      label: 'Mock-up',
+      port: 3000,
+      slug: '1123456789abcdef0123456789abcdef',
+      accessTokenHash: 'brief-hash',
+      idleInterval: '24 hours'
+    });
+    const ordinary = await store.createWorkspacePreview({
+      userId: user.id,
+      workspaceId: workspace.id,
+      label: 'The app itself',
+      port: 3001,
+      slug: '2123456789abcdef0123456789abcdef',
+      accessTokenHash: 'ordinary-hash'
+    });
+    const hoursOut = async (id: string): Promise<number> => {
+      const row = await database.query('SELECT expires_at FROM workspace_previews WHERE id=$1', [
+        id
+      ]);
+      return (Date.parse(String(row.rows[0]!.expires_at)) - Date.now()) / 3_600_000;
+    };
+    expect(await hoursOut(brief.id)).toBeLessThan(25);
+
+    // The visit that used to undo it.
+    await store.touchWorkspacePreview(brief.id);
+    expect(await hoursOut(brief.id)).toBeLessThan(25);
+    await store.touchWorkspacePreview(ordinary.id);
+    // A preview with no window of its own is every preview that existed before the column, and it
+    // still renews to the ordinary one.
+    expect(await hoursOut(ordinary.id)).toBeGreaterThan(24 * 20);
+
+    // Publishing drops the deadline entirely, and coming back to private restores this preview's
+    // own window rather than handing it the long one.
+    await store.publishWorkspacePreview(user.id, brief.id, 'public', 'public-hash');
+    await expect(
+      store.publishWorkspacePreview(user.id, brief.id, 'private', 'private-hash')
+    ).resolves.toMatchObject({ visibility: 'private' });
+    expect(await hoursOut(brief.id)).toBeLessThan(25);
+  });
+
   it('limits, rotates, publishes, expires, and revokes isolated workspace previews', async () => {
     const user = await store.createUser({ username: 'preview', displayName: 'Preview' });
     const workspace = await store.createWorkspace({

@@ -923,8 +923,9 @@ export class WorkspaceStore {
       if (Number(count.rows[0]?.count ?? 0) >= maxPreviews) throw new Error('preview_limit');
       const result = await tx.query(
         `INSERT INTO workspace_previews(
-           id,user_id,workspace_id,label,port,slug,access_token_hash,entry_path,expires_at
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW()+$9::interval) RETURNING *`,
+           id,user_id,workspace_id,label,port,slug,access_token_hash,entry_path,expires_at,
+           idle_interval
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW()+$9::interval,$10::interval) RETURNING *`,
         [
           randomUUID(),
           input.userId,
@@ -934,7 +935,12 @@ export class WorkspaceStore {
           input.slug,
           input.accessTokenHash,
           input.entryPath ?? null,
-          input.idleInterval ?? PREVIEW_IDLE_INTERVAL
+          input.idleInterval ?? PREVIEW_IDLE_INTERVAL,
+          // NULL when this preview takes the ordinary window, so the renewal reads the constant
+          // and one place stays authoritative for it. A window of its own is written down, because
+          // the renewal has to know it: a deadline that is not recorded is a deadline the next
+          // visit cannot honour.
+          input.idleInterval ?? null
         ]
       );
       return mapWorkspacePreview(result.rows[0]!);
@@ -1005,7 +1011,8 @@ export class WorkspaceStore {
   ): Promise<WorkspacePreviewRecord | null> {
     const result = await this.database.query(
       `UPDATE workspace_previews SET visibility=$3,access_token_hash=$4,
-       expires_at=CASE WHEN $3='public' THEN NULL ELSE NOW()+$5::interval END,
+       expires_at=CASE WHEN $3='public' THEN NULL
+         ELSE NOW()+COALESCE(idle_interval,$5::interval) END,
        status='active',published_at=CASE WHEN $3='public' THEN NOW() ELSE published_at END,
        updated_at=NOW() WHERE id=$1 AND user_id=$2 RETURNING *`,
       [id, userId, visibility, accessTokenHash, PREVIEW_IDLE_INTERVAL]
@@ -1023,16 +1030,23 @@ export class WorkspaceStore {
   }
 
   /**
-   * Records a visit, and pushes the idle deadline back out with it.
+   * Records a visit, and pushes the idle deadline back out by this preview's own window.
    *
    * This is what makes a private preview persistent: use is the renewal, so nothing has to be
    * re-published and no ceiling has to be chosen. A published site has no deadline to move, so the
    * CASE leaves its NULL alone rather than accidentally giving it one.
+   *
+   * `idle_interval` and not the constant, because renewing by the constant is how a short-lived
+   * page became a long-lived one. A `brief` conversation's preview is created with a twenty-four
+   * hour deadline and the first visit used to push it to thirty days - so the lifetime the owner
+   * chose survived exactly until somebody opened the page it produced. A row with no window of its
+   * own falls back to the ordinary one, which is every preview that existed before this column.
    */
   async touchWorkspacePreview(id: string): Promise<void> {
     await this.database.query(
       `UPDATE workspace_previews SET last_accessed_at=NOW(),
-       expires_at=CASE WHEN expires_at IS NULL THEN NULL ELSE NOW()+$2::interval END
+       expires_at=CASE WHEN expires_at IS NULL THEN NULL
+         ELSE NOW()+COALESCE(idle_interval,$2::interval) END
        WHERE id=$1 AND status='active'`,
       [id, PREVIEW_IDLE_INTERVAL]
     );
