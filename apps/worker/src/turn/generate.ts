@@ -234,6 +234,9 @@ export const generateModelStep = async (
         gateway.chat(provider, {
           ...routeTo(model),
           ...nativeRequest,
+          // How to choose between the companies serving this model. Absent on a route where there
+          // is only ever one of them. @see providerPreferences.
+          ...(run.providerPreferences ? { providerPreferences: run.providerPreferences } : {}),
           // No provider-side tools ride here, on any route. The agent's request offers the model
           // the tools the model calls; the provider's search is spent by `#providerWebSearch`, on
           // a request built for it, when the model calls `web_search`. Sending it alongside would

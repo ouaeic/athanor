@@ -2131,3 +2131,120 @@ describe('OpenAICompatibleAdapter', () => {
     });
   });
 });
+
+/**
+ * Which of the companies serving a model gets the work.
+ *
+ * The aggregator serves one model from several at different prices and wildly different speeds,
+ * and given no preference it picks among the cheapest weighted by the inverse square of price -
+ * the wrong objective for an agent, whose turn is dozens of sequential calls. The comparison is
+ * asked of the aggregator rather than attempted here: its throughput figures come from every
+ * request it has ever served, where a single box only ever sees the endpoints it was already
+ * routed to.
+ */
+describe('the operator an agent request asks for', () => {
+  const capture = () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const request = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : input.toString();
+      if (url.endsWith('/models'))
+        return new Response(JSON.stringify({ data: [{ id: 'vendor/model' }] }), { status: 200 });
+      // Only the call that carries the request. The zero-data-retention route probes
+      // `/endpoints/zdr` first, and a capture that took every body would report that GET's empty
+      // one as the request and quietly pass every assertion below against nothing.
+      if (!url.includes('/chat/completions'))
+        return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      const body = typeof init?.body === 'string' ? init.body : '{}';
+      bodies.push(JSON.parse(body) as Record<string, unknown>);
+      return new Response(
+        JSON.stringify({
+          model: 'vendor/model',
+          provider: 'Novita',
+          choices: [{ finish_reason: 'stop', message: { content: 'done' } }],
+          usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 }
+        }),
+        { status: 200 }
+      );
+    });
+    return { bodies, request };
+  };
+  const ask = async (
+    over: Record<string, unknown>,
+    options: { zdr?: boolean; provider?: string } = {}
+  ) => {
+    const { bodies, request } = capture();
+    const adapter = new OpenAICompatibleAdapter({
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: 'k',
+      provider: options.provider ?? 'openrouter',
+      privacyRoute: 'provider_zdr',
+      enforceZeroDataRetention: options.zdr ?? false,
+      fetch: request as typeof fetch
+    });
+    await adapter.chat({
+      model: 'vendor/model',
+      messages: [{ role: 'user', content: 'go' }],
+      tools: [],
+      temperature: 0.2,
+      ...over
+    });
+    return bodies[0]!;
+  };
+  const rule = { sort: 'price' as const, preferred_min_throughput: 60 };
+
+  it('asks for the cheapest operator above a throughput the aggregator checks itself', async () => {
+    const body = await ask({ providerPreferences: rule });
+    expect(body.provider).toMatchObject({ sort: 'price', preferred_min_throughput: 60 });
+  });
+
+  /*
+   * Not a preference, and never traded against one. An endpoint that drops the tool list does not
+   * fail - it answers in prose while the harness waits for a call, which reads as the model having
+   * become stupid rather than as a routing fault.
+   */
+  it('never accepts an operator that would drop the tool list', async () => {
+    const body = await ask({ providerPreferences: rule });
+    expect(body.provider).toMatchObject({ require_parameters: true });
+  });
+
+  /*
+   * The throughput floor deprioritises rather than excludes, so it can never fail a request on its
+   * own - but a route that also turned fallbacks off would, and would trade the whole point of an
+   * aggregator for a speed preference.
+   */
+  it('keeps falling back when every preferred operator is busy', async () => {
+    expect(await ask({ providerPreferences: rule })).toHaveProperty(
+      'provider.allow_fallbacks',
+      true
+    );
+  });
+
+  it('sends nothing at all when this computer has no preference', async () => {
+    expect(await ask({})).not.toHaveProperty('provider');
+  });
+
+  it('does not send an aggregator’s routing block to a route with no operators to choose', async () => {
+    const body = await ask({ providerPreferences: rule }, { provider: 'ollama-cloud' });
+    expect(body).not.toHaveProperty('provider');
+  });
+
+  /*
+   * The privacy floor is not a routing preference and is never weakened by one: a request that
+   * enforces zero data retention still says so with a speed rule beside it.
+   */
+  it('keeps the data-retention refusal alongside the speed rule', async () => {
+    const body = await ask({ providerPreferences: rule }, { zdr: true });
+    expect(body.provider).toMatchObject({
+      sort: 'price',
+      preferred_min_throughput: 60,
+      zdr: true,
+      data_collection: 'deny',
+      allow_fallbacks: true
+    });
+  });
+
+  it('passes on an operator the owner struck off', async () => {
+    const body = await ask({ providerPreferences: { ...rule, ignore: ['novita'] } });
+    expect(body.provider).toMatchObject({ ignore: ['novita'] });
+  });
+});

@@ -9,6 +9,7 @@ export * from './mail-protocol.js';
 export * from './mime.js';
 export * from './errors.js';
 export * from './model-policy.js';
+export * from './endpoint-routing.js';
 export * from './purpose-model.js';
 export * from './network-scope.js';
 export * from './preview-ports.js';

@@ -100,6 +100,24 @@ export const ModelRequest = z.object({
       request: z.literal(0)
     })
     .optional(),
+  /**
+   * How to choose between the companies serving this model, in the aggregator's own fields.
+   *
+   * It serves one model from several independent operators at different prices and wildly
+   * different speeds, and given no preference it picks among the cheapest weighted by the inverse
+   * square of price - the wrong objective for an agent, whose turn is dozens of sequential calls.
+   * @see providerPreferences in core, which turns the owner's rule into these.
+   *
+   * Every field here deprioritises rather than excludes, so none of them can be the reason a
+   * request fails.
+   */
+  providerPreferences: z
+    .object({
+      sort: z.enum(['price', 'throughput']).optional(),
+      preferred_min_throughput: z.number().positive().optional(),
+      ignore: z.array(z.string().min(1)).max(30).optional()
+    })
+    .optional(),
   nativeInputCreditLimit: z.number().nonnegative().optional(),
   nativeInputApprovedCostUsd: z.number().finite().nonnegative().optional(),
   messages: z.array(ModelMessage).min(1),

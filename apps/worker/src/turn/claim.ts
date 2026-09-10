@@ -29,6 +29,8 @@ import type { AgentState, AgentWorkerConfig, InferenceCredential } from '../agen
 import { BASE_SYSTEM_PROMPT, COMPACT_CONTEXT_TOOL } from '../context.js';
 import { agentToolsFor } from '../tools.js';
 import { applyProjectMainModel } from '../purpose-model.js';
+import { routingPolicyFor } from '../routing-policy.js';
+import { providerPreferences, type ProviderPreferences } from '@athanor/core';
 
 /** What claiming a turn needs from the worker that owns it. */
 export interface TurnClaimDeps {
@@ -66,6 +68,12 @@ export interface TurnRun {
   readonly timeZone: string;
   readonly unattended: boolean;
   readonly webPlan: WebToolPlan;
+  /**
+   * How this turn's requests choose between the companies serving the model, or absent where there
+   * is nothing to choose between. @see providerPreferences - resolved once here because it costs a
+   * store read and nothing it depends on changes inside a turn.
+   */
+  readonly providerPreferences: ProviderPreferences | undefined;
   /** Capabilities this box does not currently have, which are not described to the model. */
   readonly withdrawnTools: Set<string>;
   readonly requestTools: ModelTool[];
@@ -180,6 +188,24 @@ export const claimTurn = async (
     forceInHouse: deps.config.AI_FORCE_INHOUSE_WEB,
     ...(savedState?.webToolMode ? { startedMode: savedState.webToolMode } : {})
   });
+  /*
+   * Which of the companies serving this model should get the work.
+   *
+   * The aggregator serves one model from several at different prices and wildly different speeds,
+   * and given no preference it picks among the cheapest weighted by the inverse square of price.
+   * For an agent that is the wrong objective: a turn is dozens of sequential calls, so throughput
+   * is the wall-clock cost of the whole task, and the cheapest operator of a model is routinely the
+   * slowest by a large factor.
+   *
+   * The choosing is asked of the aggregator rather than done here, because the comparison needs
+   * per-endpoint throughput figures taken across every request it has ever served - a measurement
+   * no single computer can approach, since a box only ever sees the endpoints it was already
+   * routed to. @see providerPreferences.
+   */
+  const routing =
+    credential.provider === 'openrouter'
+      ? providerPreferences(await routingPolicyFor(deps.store, task.userId))
+      : undefined;
   const withdrawnTools = new Set<string>();
   /**
    * Capabilities this box does not currently have are not described to the model.
@@ -303,6 +329,7 @@ export const claimTurn = async (
       timeZone,
       unattended,
       webPlan,
+      providerPreferences: routing,
       withdrawnTools,
       requestTools,
       reservedTokens,

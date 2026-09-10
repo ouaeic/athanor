@@ -85,6 +85,27 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
                   ),
                 'Connection verified and saved'
               );
+              /*
+               * Saved with the connection it belongs to rather than under its own button.
+               *
+               * It is a property of how this account uses that aggregator, so it is edited on the
+               * connection form and travels with it. Written after the connection and never
+               * blocking it: a routing preference that failed to save must not make an owner think
+               * their key did.
+               */
+              if (selected === 'openrouter')
+                void put('/v1/account/preferences', {
+                  providerRouting: {
+                    objective: fieldValue(form, 'routingObjective'),
+                    minimumTokensPerSecond: Number(form.get('minimumTokensPerSecond') ?? 60),
+                    ignoredProviders: fieldValue(form, 'ignoredProviders')
+                      .split(',')
+                      .map((name) => name.trim())
+                      .filter(Boolean)
+                  }
+                })
+                  .then(() => preferences.refresh())
+                  .catch(() => undefined);
             }}
           >
             <div className="management-note">
@@ -153,6 +174,69 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
                 </>
               )}
             </div>
+            {selected === 'openrouter' && (
+              /*
+               * Which operator serves a model, when several do.
+               *
+               * The aggregator lists a handful for most models at different prices and wildly
+               * different speeds, and given no preference it picks among the cheapest weighted by
+               * the inverse square of price - so a model whose fastest operator runs at 142 tokens
+               * a second and whose cheapest runs at 3 lands on the second one most of the time. For
+               * a chat box that is a slower reply; for an agent it is a task that takes a day
+               * instead of twenty minutes, because a turn is dozens of sequential calls.
+               *
+               * Behind a disclosure because the defaults are the right answer for almost everyone,
+               * and open to be edited because the trade is the owner's to make.
+               */
+              <details className="stack">
+                <summary>Which operator serves a model</summary>
+                <p className="muted">
+                  Several companies serve most models, at different prices and very different
+                  speeds, and left alone OpenRouter picks among the cheapest — which for agent work
+                  is usually the slowest. Speed is judged by OpenRouter's own measurements across
+                  every request it serves, not by this computer. Operators that log or retain your
+                  data are already excluded by the zero-data-retention setting.
+                </p>
+                <div className="management-grid">
+                  <Field label="Choose">
+                    <select
+                      name="routingObjective"
+                      defaultValue={
+                        preferences.value?.preferences.providerRouting?.objective ??
+                        'cheapest_fast_enough'
+                      }
+                    >
+                      <option value="cheapest_fast_enough">The cheapest that is fast enough</option>
+                      <option value="fastest">The fastest, whatever it costs</option>
+                      <option value="cheapest">The cheapest, however slow</option>
+                    </select>
+                  </Field>
+                  <Field
+                    label="Fast enough means"
+                    hint="Tokens per second, checked against OpenRouter's own measurements of each operator."
+                  >
+                    <input
+                      name="minimumTokensPerSecond"
+                      type="number"
+                      min={0}
+                      max={10000}
+                      defaultValue={
+                        preferences.value?.preferences.providerRouting?.minimumTokensPerSecond ?? 60
+                      }
+                    />
+                  </Field>
+                  <Field label="Never use" hint="Operator names, separated by commas.">
+                    <input
+                      name="ignoredProviders"
+                      placeholder="e.g. Together, Chutes"
+                      defaultValue={(
+                        preferences.value?.preferences.providerRouting?.ignoredProviders ?? []
+                      ).join(', ')}
+                    />
+                  </Field>
+                </div>
+              </details>
+            )}
             <label className="management-check">
               <input
                 name="zdr"

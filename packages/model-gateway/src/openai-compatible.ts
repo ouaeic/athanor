@@ -1095,12 +1095,30 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
         ...(input.sessionId && !nativeOpenAI ? { session_id: input.sessionId } : {}),
         ...outputCap,
         ...(input.onTextDelta ? { stream: true, stream_options: { include_usage: true } } : {}),
+        /*
+         * Which of the companies serving this model gets the work.
+         *
+         * `preferred_min_throughput` is the field that makes the owner's rule expressible at all:
+         * it compares each endpoint against the aggregator's own throughput statistics, which come
+         * from every request it has ever served. Nothing on this side could do that comparison -
+         * those per-endpoint figures are not readable through its API, and a box measuring its own
+         * traffic would only ever see the endpoints it was already routed to.
+         *
+         * It deprioritises rather than excludes, so it cannot be the reason a request fails, and it
+         * composes with `sort`: the threshold partitions the list and the sort orders inside each
+         * part. `require_parameters` is separate and not a preference - an endpoint that drops the
+         * tool list does not fail, it answers in prose while the harness waits for a call.
+         */
         ...((this.#enforceZeroDataRetention && !nativeOpenAI) ||
-        ((nativeParts.length || input.textPriceCeiling) && this.provider === 'openrouter')
+        ((nativeParts.length || input.textPriceCeiling || input.providerPreferences) &&
+          this.provider === 'openrouter')
           ? {
               provider: {
                 ...(this.#enforceZeroDataRetention
                   ? { zdr: true, data_collection: 'deny', require_parameters: true }
+                  : {}),
+                ...(input.providerPreferences && this.provider === 'openrouter'
+                  ? { ...input.providerPreferences, require_parameters: true }
                   : {}),
                 allow_fallbacks: nativeParts.length || input.textPriceCeiling ? false : true,
                 ...(input.textPriceCeiling

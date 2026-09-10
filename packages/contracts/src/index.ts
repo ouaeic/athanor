@@ -2104,7 +2104,47 @@ export const ApiError = z.object({
  * ignore what it does not know rather than refuse the whole object - but each key it does know is
  * validated, so a device cannot write a shape another device will choke on.
  */
+/**
+ * How this account picks between the operators serving one model on an aggregator.
+ *
+ * The aggregator lists several for most models at different prices and wildly different speeds, and
+ * its own default picks among the cheapest weighted by the inverse square of price - which is the
+ * wrong objective for an agent, whose turn is dozens of sequential calls. Its routing preference
+ * cannot express the right one either: it takes a single sort key, and this is a floor and then a
+ * sort.
+ *
+ * Data policy is not here because it is not a preference: the zero-data-retention route already
+ * refuses operators that log, at the request, and an owner who wants that wants it for every model
+ * rather than as a routing tie-break.
+ */
+export const ProviderRouting = z.object({
+  /**
+   * - `cheapest_fast_enough` is the default and the rule worth having: of the operators fast enough
+   *   to be worth using, take the cheapest. It is the only one of the three that trades.
+   * - `fastest` ignores price. Worth it on work whose cost is the owner's attention.
+   * - `cheapest` ignores speed, and is the aggregator's own default made explicit.
+   */
+  objective: z
+    .enum(['cheapest_fast_enough', 'fastest', 'cheapest'])
+    .default('cheapest_fast_enough'),
+  /**
+   * Tokens per second, below which an operator is not worth its lower price.
+   *
+   * Compared against the aggregator's own per-endpoint figures, which come from every request it
+   * has ever served. An absolute rate rather than a share of the fastest, because a share is not
+   * computable from outside: those per-endpoint figures are declared on its public endpoints route
+   * and returned as null on every endpoint of every model, so nothing but the aggregator knows
+   * what the fastest one is doing. The threshold is this side's; the comparison is theirs.
+   */
+  minimumTokensPerSecond: z.number().int().min(0).max(10000).default(60),
+  /** Operators this account will not be served by, whatever they charge. */
+  ignoredProviders: z.array(z.string().trim().min(1).max(60)).max(30).default([])
+});
+export type ProviderRouting = z.infer<typeof ProviderRouting>;
+
 export const OwnerPreferences = z.object({
+  /** @see ProviderRouting - absent means the defaults, which is the owner's rule unchanged. */
+  providerRouting: ProviderRouting.optional(),
   modelPurposes: z
     .object({ specialist: PurposeModelChoice.optional(), coding: PurposeModelChoice.optional() })
     .optional(),
