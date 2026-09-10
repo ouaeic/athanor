@@ -193,6 +193,8 @@ const probeStore = (task: () => TaskRecord): StoreProbe => {
     // that looks for saved connections rather than on what the case is about.
     listManagedProviderCredentials: async () => [],
     rerouteTaskModel: async () => false,
+    recordModelThroughputCeiling: async () => undefined,
+    modelThroughputCeiling: async () => null,
     listWorkspaceMemories: spy(calls, 'listWorkspaceMemories', () => []),
     curateWorkspaceSkills: spy(calls, 'curateWorkspaceSkills', () => undefined),
     listWorkspaceSkills: spy(calls, 'listWorkspaceSkills', () => []),
@@ -593,6 +595,13 @@ const dispatch = async (
       providerPaths.push(url.slice(providerBaseUrl.length));
       const routed = options.route?.(url, init);
       if (routed) return routed;
+      /*
+       * The catalogue route naming the companies that serve a model and what they charge, which a
+       * turn reads to work out the price cap it will accept. Metadata rather than generation, and
+       * answered as such: served from `bodies` it would eat the frames of the step behind it and
+       * shift every model response in the case by one.
+       */
+      if (url.includes('/endpoints')) return json({ data: { endpoints: [] } });
       if (typeof init?.body === 'string')
         modelRequests.push(JSON.parse(init.body) as Record<string, unknown>);
       const next = bodies[Math.min(served, bodies.length - 1)] ?? '';

@@ -29,6 +29,7 @@ import {
 } from '@athanor/data';
 import type { DataStore, TaskRecord, WorkspaceRecord } from '@athanor/data';
 import {
+  fetchGenerationThroughput,
   isProviderWall,
   ModelGateway,
   MediaRouteResolver,
@@ -844,9 +845,19 @@ export class AgentWorker {
       reservedTokens: number;
       turn: number;
       reasoningEffort: ReasoningEffort | undefined;
+      /** @see TurnRun.measuringThroughput - true on the turn that reads the model's ceiling. */
+      measuringThroughput?: boolean;
     }
   ): Promise<void> {
-    const { response, model, preparedContext, reservedTokens, turn, reasoningEffort } = input;
+    const {
+      response,
+      model,
+      preparedContext,
+      reservedTokens,
+      turn,
+      reasoningEffort,
+      measuringThroughput
+    } = input;
     // What the request that just went out actually weighed, replacing this side's estimate of it.
     // Compaction was decided from characters-divided-by-four while this exact number arrived on
     // every response and was spent only on billing; the estimate cannot see a tokeniser's real
@@ -911,6 +922,20 @@ export class AgentWorker {
         : {}),
       providerRef: `${response.metadata.provider}:${response.metadata.model}`
     });
+    /*
+     * How fast the quickest company serving this model actually runs, asked of the aggregator about
+     * the request it has just served.
+     *
+     * Only on a turn routed by throughput for want of a ceiling, which is the one turn where the
+     * company that answered IS the aggregator's own quickest. Every figure comes back from them -
+     * the generation time, the completion tokens and the company's name - so this is their
+     * measurement of their own choice, not a stopwatch held on this side.
+     *
+     * After the answer the owner is waiting for has been delivered, and never able to fail the
+     * turn: its only purpose is to make the next turn's routing better informed.
+     */
+    if (measuringThroughput && response.metadata.generationId)
+      await this.#recordThroughputCeiling(task, model, response.metadata.generationId);
     await event(this.store, task, key, 'cost', `Step ${state.step + 1} completed`, {
       credits: credit,
       costUsd,
@@ -2350,6 +2375,38 @@ export class AgentWorker {
       // A re-route that cannot be worked out is not a failure of its own: the wall below is still
       // the truth about this task, and parking is still a correct answer to it.
       return false;
+    }
+  }
+
+  /**
+   * Reads the aggregator's own account of a generation and keeps it as the model's speed ceiling.
+   *
+   * The credential is fetched rather than passed because this runs after the turn's own work is
+   * done, on a path where failing is free. Everything about it degrades to silence: no credential,
+   * no answer, a short generation not worth timing - the ceiling simply stays unmeasured and the
+   * next turn routes by throughput and tries again.
+   */
+  async #recordThroughputCeiling(
+    task: TaskRecord,
+    model: ModelRelease,
+    generationId: string
+  ): Promise<void> {
+    try {
+      const credential = await this.#inferenceCredential(task);
+      if (credential.provider !== 'openrouter' || !credential.apiKey) return;
+      const measured = await fetchGenerationThroughput({
+        baseUrl: this.config.OPENROUTER_BASE_URL,
+        apiKey: credential.apiKey,
+        generationId
+      });
+      if (!measured) return;
+      await this.store.recordModelThroughputCeiling({
+        modelId: model.id,
+        tokensPerSecond: measured.tokensPerSecond,
+        providerName: measured.provider
+      });
+    } catch {
+      // An unmeasured ceiling is the state this started in, and the next turn asks again.
     }
   }
 

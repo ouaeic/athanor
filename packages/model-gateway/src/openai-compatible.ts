@@ -96,6 +96,7 @@ interface Options {
 }
 
 interface CompletionBody {
+  id?: string;
   model?: string;
   error?: unknown;
   choices?: Array<{
@@ -143,6 +144,7 @@ type ContentBlock =
 const BLOCK_CONTENT_ROLES = new Set<ModelMessage['role']>(['system', 'user', 'tool']);
 
 interface StreamChunk {
+  id?: string;
   model?: string;
   provider?: string;
   error?: unknown;
@@ -1098,15 +1100,14 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
         /*
          * Which of the companies serving this model gets the work.
          *
-         * `preferred_min_throughput` is the field that makes the owner's rule expressible at all:
-         * it compares each endpoint against the aggregator's own throughput statistics, which come
-         * from every request it has ever served. Nothing on this side could do that comparison -
-         * those per-endpoint figures are not readable through its API, and a box measuring its own
-         * traffic would only ever see the endpoints it was already routed to.
+         * `preferred_min_throughput` and `sort` are both applied by the aggregator, against
+         * throughput figures taken across every request it has ever served. Nothing on this side
+         * could do the comparison: those per-endpoint figures are readable by no API client at all,
+         * which is why the floor arrives as a number and the ranking as a name.
          *
-         * It deprioritises rather than excludes, so it cannot be the reason a request fails, and it
-         * composes with `sort`: the threshold partitions the list and the sort orders inside each
-         * part. `require_parameters` is separate and not a preference - an endpoint that drops the
+         * The floor deprioritises rather than excludes, so it cannot fail a request, and it
+         * composes with `sort`: the threshold partitions the field and the sort orders inside each
+         * part. `require_parameters` is separate and not a preference - a company that drops the
          * tool list does not fail, it answers in prose while the harness waits for a call.
          */
         ...((this.#enforceZeroDataRetention && !nativeOpenAI) ||
@@ -1474,7 +1475,8 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
           ? {}
           : { timeToFirstTokenMs: Math.round(firstToken.at - started) }),
         privacyRoute: this.privacyRoute,
-        ...(body.provider ? { upstreamProvider: body.provider } : {})
+        ...(body.provider ? { upstreamProvider: body.provider } : {}),
+        ...(body.id ? { generationId: body.id } : {})
       }
     };
   }
@@ -1566,6 +1568,15 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
     let finishReason: string | undefined;
     let model: string | undefined;
     let upstreamProvider: string | undefined;
+    /*
+     * The aggregator's own handle on this generation.
+     *
+     * Its generation-stats route answers with `generation_time`, the completion token count and the
+     * company that served the request - all measured by the aggregator - and tokens over time is
+     * the throughput figure it will not publish per endpoint. That is the one number a relative
+     * speed rule needs, and this id is the only way to ask for it.
+     */
+    let generationId: string | undefined;
     let usage: CompletionBody['usage'];
     const consume = async (line: string): Promise<void> => {
       if (!line.startsWith('data:')) return;
@@ -1585,6 +1596,7 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
       if (fault) throw fault;
       model = chunk.model ?? model;
       upstreamProvider = chunk.provider ?? upstreamProvider;
+      generationId = chunk.id ?? generationId;
       usage = chunk.usage ?? usage;
       const choice = chunk.choices?.[0];
       finishReason = choice?.finish_reason ?? finishReason;
@@ -1774,6 +1786,7 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
       );
     return {
       ...(model ? { model } : {}),
+      ...(generationId ? { id: generationId } : {}),
       ...(upstreamProvider ? { provider: upstreamProvider } : {}),
       generatedChars: budget.characters(),
       frames,

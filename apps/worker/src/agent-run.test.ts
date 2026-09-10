@@ -213,6 +213,8 @@ const probeStore = (task: () => TaskRecord): StoreProbe => {
     // every turn in this file fail on a store call rather than on anything it means to test.
     listManagedProviderCredentials: async () => [],
     rerouteTaskModel: async () => false,
+    recordModelThroughputCeiling: async () => undefined,
+    modelThroughputCeiling: async () => null,
     listWorkspaceMemories: async () => [],
     curateWorkspaceSkills: async () => undefined,
     listWorkspaceSkills: async () => [],
@@ -610,6 +612,16 @@ const installFetch = (
     const url = input instanceof Request ? input.url : input.toString();
     log.calls.push(`${init?.method ?? 'GET'} ${url}`);
     if (url.startsWith(PROVIDER_URL)) {
+      /*
+       * The catalogue route that says which companies serve a model and what they charge, which a
+       * turn reads to work out the price cap it will accept. It is metadata rather than generation
+       * and must be answered as such: served from `providerBodies` it would eat the frames of the
+       * step that follows it and shift every model response in the test by one.
+       */
+      if (url.includes('/endpoints'))
+        return new Response(JSON.stringify({ data: { endpoints: [] } }), {
+          headers: { 'content-type': 'application/json' }
+        });
       // Generation is an ordinary request to the configured provider, so it arrives here too. It
       // is answered from its own stub: routing it to the inference frames would hand a media call
       // an SSE body and make the next model step read someone else's turn.
@@ -9140,6 +9152,8 @@ describe('an account holding more than one provider connection', () => {
       listModels: async () => [forModel],
       listManagedProviderCredentials: async () => connections,
       rerouteTaskModel: async () => false,
+      recordModelThroughputCeiling: async () => undefined,
+      modelThroughputCeiling: async () => null,
       getManagedProviderCredential: async () => null
     } as unknown as DataStore;
     const log: FetchLog = { calls: [], modelRequests: [] };
@@ -9301,7 +9315,9 @@ describe('a task walled on one provider while another is connected', () => {
       listModels: async () => [model, elsewhere],
       listManagedProviderCredentials: async () => [connection('openrouter')],
       // Another worker holds the lease. The wall below is still the truth about this task.
-      rerouteTaskModel: async () => false
+      rerouteTaskModel: async () => false,
+      recordModelThroughputCeiling: async () => undefined,
+      modelThroughputCeiling: async () => null
     });
     await new AgentWorker(probe.store, config(), masterKey, runnerSecret, silentLogger).fail(
       task,

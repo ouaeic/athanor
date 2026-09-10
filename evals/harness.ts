@@ -3109,6 +3109,8 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
     // self-hosted box configured through `control.env` has.
     listManagedProviderCredentials: async () => [],
     rerouteTaskModel: async () => false,
+    recordModelThroughputCeiling: async () => undefined,
+    modelThroughputCeiling: async () => null,
     listWorkspaceMemories: async () => knowledgeRows,
     /*
      * The owner's own standing words, which the window reads whole on every single turn.

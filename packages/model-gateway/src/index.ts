@@ -26,3 +26,4 @@ export * from './realtime-catalog.js';
 export { nativeTranscriptionBound, type TranscriptionBound } from './transcription-cost.js';
 
 export * from './media-routing.js';
+export * from './openrouter-generation.js';

@@ -28,6 +28,8 @@ const support = (models: RoutableModel[], native = false) =>
       // call that looks for saved connections rather than on what the case is about.
       listManagedProviderCredentials: async () => [],
       rerouteTaskModel: async () => false,
+      recordModelThroughputCeiling: async () => undefined,
+      modelThroughputCeiling: async () => null,
       listModels: async () => models,
       effectiveSpendLimits: async () => ({})
     },

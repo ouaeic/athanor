@@ -73,6 +73,8 @@ export interface TurnGenerateDeps {
       reservedTokens: number;
       turn: number;
       reasoningEffort: ReasoningEffort | undefined;
+      /** @see TurnRun.measuringThroughput - true on the turn that reads the model's ceiling. */
+      measuringThroughput?: boolean;
     }
   ): Promise<void>;
   /** Reached here only to repair a window the route refused as too large. */
@@ -327,7 +329,8 @@ export const generateModelStep = async (
             preparedContext,
             reservedTokens,
             turn,
-            reasoningEffort
+            reasoningEffort,
+            measuringThroughput: run.measuringThroughput
           })
           .catch(() => undefined);
       await honorUserControl();
@@ -403,7 +406,8 @@ export const generateModelStep = async (
     preparedContext,
     reservedTokens,
     turn,
-    reasoningEffort
+    reasoningEffort,
+    measuringThroughput: run.measuringThroughput
   });
   /*
    * The repeat, now that it has been paid for.

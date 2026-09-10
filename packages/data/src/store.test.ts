@@ -1986,6 +1986,60 @@ describe('DataStore', () => {
   });
 
   /**
+   * How fast the quickest company serving a model runs, kept so a speed floor can be a share of it.
+   *
+   * The aggregator will compare each company against a threshold but publishes no per-endpoint
+   * throughput to compute one from, so this is read from its own account of a generation it routed
+   * by throughput - its measurement, of its own choice of fastest.
+   */
+  it('keeps a model’s speed ceiling, replaces it, and withholds a stale one', async () => {
+    await store.recordModelThroughputCeiling({
+      modelId: 'vendor/model',
+      tokensPerSecond: 142,
+      providerName: 'Novita'
+    });
+    await expect(store.modelThroughputCeiling('vendor/model')).resolves.toEqual({
+      tokensPerSecond: 142,
+      providerName: 'Novita'
+    });
+
+    // Replaced rather than averaged: this is a ceiling other companies are judged against, and the
+    // quickest one changes when the aggregator's fleet does. A mean would blend a company retired
+    // last week into a threshold applied today.
+    await store.recordModelThroughputCeiling({
+      modelId: 'vendor/model',
+      tokensPerSecond: 90,
+      providerName: 'Someone Else'
+    });
+    await expect(store.modelThroughputCeiling('vendor/model')).resolves.toEqual({
+      tokensPerSecond: 90,
+      providerName: 'Someone Else'
+    });
+
+    // A figure that is not a measurement is not stored at all, rather than stored as zero and read
+    // back as a ceiling that would put the floor on the ground.
+    await store.recordModelThroughputCeiling({
+      modelId: 'other/model',
+      tokensPerSecond: 0,
+      providerName: 'Nobody'
+    });
+    await expect(store.modelThroughputCeiling('other/model')).resolves.toBeNull();
+
+    /*
+     * Withheld rather than aged. A stale ceiling that is too high deprioritises every company at
+     * once, and a price sort over a wholly deprioritised field returns the cheapest - which turns
+     * the rule silently back into the aggregator's own default. Absent is safe; wrong is not.
+     */
+    await database.query(
+      "UPDATE model_throughput_ceiling SET sampled_at = NOW() - INTERVAL '5 days'"
+    );
+    await expect(store.modelThroughputCeiling('vendor/model')).resolves.toBeNull();
+    await expect(store.modelThroughputCeiling('vendor/model', 24 * 7)).resolves.toMatchObject({
+      tokensPerSecond: 90
+    });
+  });
+
+  /**
    * A visit renews a preview by its own window, not by the global one.
    *
    * A `brief` conversation's page is created with a twenty-four hour deadline, and the renewal

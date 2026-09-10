@@ -97,7 +97,7 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
                 void put('/v1/account/preferences', {
                   providerRouting: {
                     objective: fieldValue(form, 'routingObjective'),
-                    minimumTokensPerSecond: Number(form.get('minimumTokensPerSecond') ?? 60),
+                    throughputFloorPercent: Number(form.get('throughputFloorPercent') ?? 40),
                     ignoredProviders: fieldValue(form, 'ignoredProviders')
                       .split(',')
                       .map((name) => name.trim())
@@ -193,9 +193,10 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
                 <p className="muted">
                   Several companies serve most models, at different prices and very different
                   speeds, and left alone OpenRouter picks among the cheapest — which for agent work
-                  is usually the slowest. Speed is judged by OpenRouter's own measurements across
-                  every request it serves, not by this computer. Operators that log or retain your
-                  data are already excluded by the zero-data-retention setting.
+                  is usually the slowest. Your computer asks for the cheapest company that still
+                  reaches a share of the fastest one's speed on that model. Both comparisons are
+                  OpenRouter's own, across every request it serves. Companies that log or retain
+                  your data are already excluded by the zero-data-retention setting.
                 </p>
                 <div className="management-grid">
                   <Field label="Choose">
@@ -213,15 +214,15 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
                   </Field>
                   <Field
                     label="Fast enough means"
-                    hint="Tokens per second, checked against OpenRouter's own measurements of each operator."
+                    hint="Percentage of the speed the quickest company reaches on that model, so it scales with what the model can actually do."
                   >
                     <input
-                      name="minimumTokensPerSecond"
+                      name="throughputFloorPercent"
                       type="number"
                       min={0}
-                      max={10000}
+                      max={100}
                       defaultValue={
-                        preferences.value?.preferences.providerRouting?.minimumTokensPerSecond ?? 60
+                        preferences.value?.preferences.providerRouting?.throughputFloorPercent ?? 40
                       }
                     />
                   </Field>

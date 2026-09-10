@@ -1142,6 +1142,14 @@ export class DataStore {
     return this.#billing.listModels(...args);
   }
 
+  recordModelThroughputCeiling(...args: Parameters<BillingStore['recordModelThroughputCeiling']>) {
+    return this.#billing.recordModelThroughputCeiling(...args);
+  }
+
+  modelThroughputCeiling(...args: Parameters<BillingStore['modelThroughputCeiling']>) {
+    return this.#billing.modelThroughputCeiling(...args);
+  }
+
   recordUsage(...args: Parameters<BillingStore['recordUsage']>) {
     return this.#billing.recordUsage(...args);
   }

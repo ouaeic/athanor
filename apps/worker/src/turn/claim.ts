@@ -29,8 +29,8 @@ import type { AgentState, AgentWorkerConfig, InferenceCredential } from '../agen
 import { BASE_SYSTEM_PROMPT, COMPACT_CONTEXT_TOOL } from '../context.js';
 import { agentToolsFor } from '../tools.js';
 import { applyProjectMainModel } from '../purpose-model.js';
-import { routingPolicyFor } from '../routing-policy.js';
-import { providerPreferences, type ProviderPreferences } from '@athanor/core';
+import { routingForTurn } from '../routing-policy.js';
+import type { ProviderPreferences } from '@athanor/core';
 
 /** What claiming a turn needs from the worker that owns it. */
 export interface TurnClaimDeps {
@@ -74,6 +74,14 @@ export interface TurnRun {
    * store read and nothing it depends on changes inside a turn.
    */
   readonly providerPreferences: ProviderPreferences | undefined;
+  /**
+   * Whether this turn is the one that measures how fast the model's quickest company runs.
+   *
+   * The rule needs a ceiling to take its share of, and the aggregator publishes none - so a turn
+   * with no fresh ceiling is routed to the quickest company it has and its generation is read
+   * afterwards for the figure. The turn loses nothing by it: it is on the fastest route there is.
+   */
+  readonly measuringThroughput: boolean;
   /** Capabilities this box does not currently have, which are not described to the model. */
   readonly withdrawnTools: Set<string>;
   readonly requestTools: ModelTool[];
@@ -197,15 +205,18 @@ export const claimTurn = async (
    * is the wall-clock cost of the whole task, and the cheapest operator of a model is routinely the
    * slowest by a large factor.
    *
-   * The choosing is asked of the aggregator rather than done here, because the comparison needs
-   * per-endpoint throughput figures taken across every request it has ever served - a measurement
-   * no single computer can approach, since a box only ever sees the endpoints it was already
-   * routed to. @see providerPreferences.
+   * Both halves of the rule are applied by the aggregator: it compares each company's throughput
+   * against the floor, using figures taken across every request it has ever served, and orders what
+   * clears it by price. What this side supplies is the floor, as a share of how fast the model's
+   * quickest company actually runs. @see providerPreferences.
    */
   const routing =
     credential.provider === 'openrouter'
-      ? providerPreferences(await routingPolicyFor(deps.store, task.userId))
-      : undefined;
+      ? await routingForTurn({ store: deps.store, model, userId: task.userId }).catch(() => ({
+          preferences: undefined,
+          measuring: false
+        }))
+      : { preferences: undefined, measuring: false };
   const withdrawnTools = new Set<string>();
   /**
    * Capabilities this box does not currently have are not described to the model.
@@ -329,7 +340,8 @@ export const claimTurn = async (
       timeZone,
       unattended,
       webPlan,
-      providerPreferences: routing,
+      providerPreferences: routing.preferences,
+      measuringThroughput: routing.measuring,
       withdrawnTools,
       requestTools,
       reservedTokens,

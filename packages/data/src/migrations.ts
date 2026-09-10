@@ -3682,5 +3682,35 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS lifetime TEXT NOT NULL DEFAULT 'stand
     sql: `
 ALTER TABLE workspace_previews ADD COLUMN IF NOT EXISTS idle_interval INTERVAL;
 `
+  },
+  {
+    version: 101,
+    name: 'model_throughput_ceiling',
+    /*
+     * How fast the quickest company serving a model runs, in the aggregator's own numbers.
+     *
+     * A speed floor has to be relative - some models cannot reach sixty tokens a second on any
+     * company, and a fixed bar there would deprioritise every endpoint they have - and relative
+     * needs a ceiling to be a share of. The aggregator will compare each company against a
+     * threshold but publishes no per-endpoint figures to compute one from: `throughput_last_30m` is
+     * declared on its endpoints route and returned null everywhere, for an API key as much as for
+     * nobody.
+     *
+     * What it does answer is its own generation-stats route, for a request it has already served:
+     * generation time, completion tokens, and the company that served it. Asked of a request the
+     * aggregator itself routed by throughput, that measures the fastest company serving the model.
+     * One row per model, and every number in it theirs.
+     *
+     * Not keyed by user. Which company is quickest at a model is a fact about the model and the
+     * aggregator's fleet, not about whoever is paying.
+     */
+    sql: `
+CREATE TABLE IF NOT EXISTS model_throughput_ceiling (
+  model_id TEXT PRIMARY KEY,
+  tokens_per_second DOUBLE PRECISION NOT NULL,
+  provider_name TEXT NOT NULL,
+  sampled_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+`
   }
 ] as const;

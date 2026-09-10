@@ -231,6 +231,57 @@ export class BillingStore {
     );
   }
 
+  /**
+   * Records how fast the quickest company serving a model ran, as the aggregator measured it.
+   *
+   * Replaces rather than averages. This is a ceiling other companies are judged against, and the
+   * quickest one changes when the aggregator's fleet changes; a running mean would blend a company
+   * retired last week into a threshold applied today. Freshness is what makes it trustworthy, so
+   * the row carries when it was taken and the reader decides.
+   */
+  async recordModelThroughputCeiling(input: {
+    modelId: string;
+    tokensPerSecond: number;
+    providerName: string;
+  }): Promise<void> {
+    if (!Number.isFinite(input.tokensPerSecond) || input.tokensPerSecond <= 0) return;
+    await this.database.query(
+      `INSERT INTO model_throughput_ceiling(model_id,tokens_per_second,provider_name)
+       VALUES ($1,$2,$3)
+       ON CONFLICT (model_id) DO UPDATE SET
+         tokens_per_second=EXCLUDED.tokens_per_second,
+         provider_name=EXCLUDED.provider_name,
+         sampled_at=NOW()`,
+      [input.modelId, input.tokensPerSecond, input.providerName]
+    );
+  }
+
+  /**
+   * The fastest measured rate for a model, or null when there is none fresh enough to use.
+   *
+   * Withheld rather than aged: a threshold taken from a fortnight-old ceiling is applied to a fleet
+   * that may have re-provisioned twice since, and a stale ceiling that is too high deprioritises
+   * every company at once - which silently turns the rule back into the aggregator's own
+   * cheapest-first default. Absent is safe; wrong is not.
+   */
+  async modelThroughputCeiling(
+    modelId: string,
+    freshHours = 48
+  ): Promise<{ tokensPerSecond: number; providerName: string } | null> {
+    const result = await this.database.query(
+      `SELECT tokens_per_second,provider_name FROM model_throughput_ceiling
+       WHERE model_id=$1 AND sampled_at > NOW() - ($2 || ' hours')::interval`,
+      [modelId, String(Math.max(1, Math.trunc(freshHours)))]
+    );
+    const row = result.rows[0];
+    return row
+      ? {
+          tokensPerSecond: Number(row.tokens_per_second),
+          providerName: String(row.provider_name)
+        }
+      : null;
+  }
+
   async listModels(): Promise<Array<Record<string, unknown>>> {
     const result = await this.database.query('SELECT * FROM model_releases ORDER BY display_name');
     return result.rows.map((row) => {

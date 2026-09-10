@@ -2190,11 +2190,11 @@ describe('the operator an agent request asks for', () => {
     });
     return bodies[0]!;
   };
-  const rule = { sort: 'price' as const, preferred_min_throughput: 60 };
+  const rule = { sort: 'price' as const, preferred_min_throughput: 56 };
 
-  it('asks for the cheapest operator above a throughput the aggregator checks itself', async () => {
+  it('asks for the cheapest company clearing a floor the aggregator checks itself', async () => {
     const body = await ask({ providerPreferences: rule });
-    expect(body.provider).toMatchObject({ sort: 'price', preferred_min_throughput: 60 });
+    expect(body.provider).toMatchObject({ sort: 'price', preferred_min_throughput: 56 });
   });
 
   /*
@@ -2208,9 +2208,9 @@ describe('the operator an agent request asks for', () => {
   });
 
   /*
-   * The throughput floor deprioritises rather than excludes, so it can never fail a request on its
-   * own - but a route that also turned fallbacks off would, and would trade the whole point of an
-   * aggregator for a speed preference.
+   * The floor deprioritises rather than excludes, so it can never fail a request on its own - but a
+   * route that also turned fallbacks off would fail on one busy company, and would trade the whole
+   * point of an aggregator for a speed preference.
    */
   it('keeps falling back when every preferred operator is busy', async () => {
     expect(await ask({ providerPreferences: rule })).toHaveProperty(
@@ -2236,7 +2236,7 @@ describe('the operator an agent request asks for', () => {
     const body = await ask({ providerPreferences: rule }, { zdr: true });
     expect(body.provider).toMatchObject({
       sort: 'price',
-      preferred_min_throughput: 60,
+      preferred_min_throughput: 56,
       zdr: true,
       data_collection: 'deny',
       allow_fallbacks: true

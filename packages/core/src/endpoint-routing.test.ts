@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_ROUTING_POLICY,
   providerPreferences,
+  shouldMeasureCeiling,
   type RoutingPolicy
 } from './endpoint-routing.js';
 
@@ -11,67 +12,83 @@ const policy = (over: Partial<RoutingPolicy> = {}): RoutingPolicy => ({
 });
 
 /**
- * The owner's rule: the cheapest operator that is at least fast enough to be worth its lower price,
- * and where several cost the same, the fastest of those.
- *
- * The comparison is the aggregator's, deliberately. Its throughput figures come from every request
- * it has ever served; a single computer measuring its own traffic sees only the endpoints it was
- * already routed to, which is both a tiny sample and a self-selecting one. So the rule is expressed
- * in the aggregator's own fields and applied against its own data.
+ * The owner's rule: the cheapest company reaching some share of the fastest one's speed. Both
+ * halves are the aggregator's to apply - it compares each company's throughput against the floor
+ * using figures taken across every request it has ever served, then orders what clears it by price.
+ * This side supplies the floor and nothing else.
  */
-describe('asking for the cheapest operator that is fast enough', () => {
-  it('sends a throughput floor and then sorts on price', () => {
-    // The two halves of the sentence, in that order: `preferred_min_throughput` pushes the slow
-    // endpoints to the back of the list, and `sort` picks the cheapest of what is left in front.
-    expect(providerPreferences()).toMatchObject({
+describe('asking for the cheapest company that is fast enough', () => {
+  /*
+   * The real table this was built against: Novita 142 tokens a second, DeepInfra 16, io.net 3, with
+   * io.net at half the price. At 40% of 142 the floor is 56, so both slower companies fall behind
+   * it and the price sort returns the only one in front. Without the floor that same price sort
+   * returns io.net, which is what the aggregator does by default and is three tokens a second.
+   */
+  it('floors at the owner’s share of the fastest, and sorts the survivors on price', () => {
+    expect(providerPreferences(policy(), 142)).toEqual({
       sort: 'price',
-      preferred_min_throughput: 60
+      preferred_min_throughput: 56
     });
   });
 
-  it('carries the owner’s own floor rather than a built-in one', () => {
-    expect(providerPreferences(policy({ minimumTokensPerSecond: 25 }))).toMatchObject({
-      preferred_min_throughput: 25
+  /**
+   * The property that makes a fixed rate unusable. A model whose quickest company manages forty
+   * tokens a second is judged against forty; a fixed sixty would deprioritise every endpoint it
+   * has, and a price sort over a wholly deprioritised field returns the cheapest - the aggregator's
+   * own default, and the exact defect this replaces. A wrong floor fails silently into the old
+   * behaviour, which is why it can never be a constant.
+   */
+  it('scales the floor to what the model can actually reach', () => {
+    expect(providerPreferences(policy(), 40).preferred_min_throughput).toBe(16);
+    expect(providerPreferences(policy(), 900).preferred_min_throughput).toBe(360);
+  });
+
+  it('carries the owner’s own share', () => {
+    expect(providerPreferences(policy({ throughputFloorPercent: 75 }), 142)).toMatchObject({
+      preferred_min_throughput: 106
     });
   });
 
   /*
-   * An owner who asked for the cheapest has said slowness is acceptable. Sending a floor as well
-   * would contradict the instruction they just gave, and quietly - they would see a price sort in
-   * the setting and a throughput preference on the wire.
+   * Rounded down: a company sitting exactly on the owner's share is one they said they would
+   * accept, and a fraction of a token per second should not be what shuts it out.
    */
-  it('names no floor when the owner asked for the cheapest, however slow', () => {
-    const preferences = providerPreferences(policy({ objective: 'cheapest' }));
-    expect(preferences).toEqual({ sort: 'price' });
+  it('rounds the floor down rather than to nearest', () => {
+    expect(providerPreferences(policy(), 142.9).preferred_min_throughput).toBe(57);
   });
 
-  it('drops the price sort when the owner asked for the fastest', () => {
-    expect(providerPreferences(policy({ objective: 'fastest' }))).toEqual({ sort: 'throughput' });
+  it('never asks for a floor of zero, which is a preference that filters nothing', () => {
+    expect(providerPreferences(policy({ throughputFloorPercent: 0 }), 142)).toEqual({
+      sort: 'price'
+    });
   });
 
-  it('passes on the operators the owner has struck off, normalised', () => {
+  /**
+   * With no ceiling there is no share to take, and the honest answer is to go and get one: sorting
+   * by throughput routes to the company the aggregator ranks quickest, which is both a good route
+   * to be on and the only way to learn what quickest means here.
+   */
+  it('asks for the fastest while it still has nothing to take a share of', () => {
+    expect(providerPreferences(policy(), null)).toEqual({ sort: 'throughput' });
+    expect(shouldMeasureCeiling(policy(), null)).toBe(true);
+    expect(shouldMeasureCeiling(policy(), 142)).toBe(false);
+  });
+
+  it('does not go measuring for an owner who asked for fastest or cheapest', () => {
+    expect(shouldMeasureCeiling(policy({ objective: 'fastest' }), null)).toBe(false);
+    expect(shouldMeasureCeiling(policy({ objective: 'cheapest' }), null)).toBe(false);
+  });
+
+  it('follows the owner to fastest or cheapest, and names no floor for either', () => {
+    expect(providerPreferences(policy({ objective: 'fastest' }), 142)).toEqual({
+      sort: 'throughput'
+    });
+    expect(providerPreferences(policy({ objective: 'cheapest' }), 142)).toEqual({ sort: 'price' });
+  });
+
+  it('passes on the companies the owner struck off, normalised', () => {
     expect(
-      providerPreferences(policy({ ignoredProviders: ['  Novita ', 'DeepInfra', '  '] }))
-    ).toMatchObject({ ignore: ['novita', 'deepinfra'] });
-  });
-
-  it('says nothing about operators when the owner has struck none off', () => {
-    expect(providerPreferences()).not.toHaveProperty('ignore');
-  });
-
-  /*
-   * A floor of zero is not a floor. Sending it would be a preference that reads as one and filters
-   * nothing, which is worse than the absence it is equivalent to.
-   */
-  it('omits a floor of zero rather than sending one', () => {
-    expect(providerPreferences(policy({ minimumTokensPerSecond: 0 }))).not.toHaveProperty(
-      'preferred_min_throughput'
-    );
-  });
-
-  it('sends a whole number, because the field is a rate and not a measurement', () => {
-    expect(providerPreferences(policy({ minimumTokensPerSecond: 56.8 }))).toMatchObject({
-      preferred_min_throughput: 57
-    });
+      providerPreferences(policy({ ignoredProviders: ['  Novita ', 'DeepInfra', ' '] }), 142).ignore
+    ).toEqual(['novita', 'deepinfra']);
   });
 });

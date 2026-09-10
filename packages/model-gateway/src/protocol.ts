@@ -106,9 +106,11 @@ export const ModelRequest = z.object({
    * It serves one model from several independent operators at different prices and wildly
    * different speeds, and given no preference it picks among the cheapest weighted by the inverse
    * square of price - the wrong objective for an agent, whose turn is dozens of sequential calls.
-   * @see providerPreferences in core, which turns the owner's rule into these.
+   * Both fields are applied by the aggregator against figures taken across every request it has
+   * ever served, and neither is readable from outside. @see providerPreferences in core, which
+   * turns the owner's rule into them.
    *
-   * Every field here deprioritises rather than excludes, so none of them can be the reason a
+   * `preferred_min_throughput` deprioritises rather than excludes, so it can never be the reason a
    * request fails.
    */
   providerPreferences: z
@@ -275,6 +277,13 @@ export interface ModelResponse {
     timeToFirstTokenMs?: number;
     privacyRoute: string;
     upstreamProvider?: string;
+    /**
+     * The aggregator's own handle on this generation, for asking it afterwards how the request
+     * actually went. Its generation-stats route reports `generation_time`, the completion tokens
+     * and the serving company - all its own measurements - and tokens over time is the per-endpoint
+     * throughput figure it declares nowhere else. @see fetchGenerationThroughput.
+     */
+    generationId?: string;
   };
 }
 
