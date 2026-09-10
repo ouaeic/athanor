@@ -1,0 +1,233 @@
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
+import { Check, Search } from 'lucide-react';
+import { Dialog } from './ui.js';
+import type { ModelPickerProps, PickerModel } from './ModelPicker.js';
+import { mediaRouteIsRetired } from './media-state.js';
+import { get } from './client.js';
+import './model-choices.css';
+
+const providerName = (model: PickerModel) => {
+  const parts = model.id.split('/');
+  return model.provider === 'openrouter' && parts.length > 2 ? parts[1]! : model.provider;
+};
+const price = (value: number) =>
+  `$${value.toLocaleString(undefined, { maximumFractionDigits: 4 })}`;
+function details(model: PickerModel): string {
+  return [
+    model.contextTokens
+      ? `${new Intl.NumberFormat(undefined, { notation: 'compact' }).format(model.contextTokens)} context`
+      : '',
+    model.modalities?.includes('image') ? 'Vision' : '',
+    model.reasoning?.supportedEfforts?.length ? 'Adjustable reasoning' : '',
+    model.inputUsdPerMillionTokens != null && model.outputUsdPerMillionTokens != null
+      ? `${price(model.inputUsdPerMillionTokens)} in / ${price(model.outputUsdPerMillionTokens)} out per million tokens`
+      : '',
+    model.usdPerImage != null ? `${price(model.usdPerImage)} / image` : '',
+    model.usdPerMinute != null ? `${price(model.usdPerMinute)} / minute` : '',
+    model.usdPerSecond != null ? `From ${price(model.usdPerSecond)} / second` : '',
+    model.usdPerMillionCharacters != null
+      ? `${price(model.usdPerMillionCharacters)} / million characters`
+      : ''
+  ]
+    .filter(Boolean)
+    .join(' · ');
+}
+export default function ModelBrowser({
+  label,
+  value,
+  models: providedModels,
+  loadDetails = false,
+  shortcuts = [],
+  onChange,
+  onClose
+}: ModelPickerProps & { onClose: () => void }) {
+  const [query, setQuery] = useState('');
+  const [provider, setProvider] = useState('');
+  const [active, setActive] = useState(0);
+  const [catalogue, setCatalogue] = useState<PickerModel[]>([]);
+  useEffect(() => {
+    if (!loadDetails) return;
+    const controller = new AbortController();
+    void get<PickerModel[]>('/v1/models', { signal: controller.signal })
+      .then((models) => {
+        if (!controller.signal.aborted) setCatalogue(models);
+      })
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, [loadDetails]);
+  const models = useMemo(() => {
+    const byId = new Map(catalogue.map((model) => [model.id, model]));
+    return providedModels.map((model) => ({ ...byId.get(model.id), ...model }));
+  }, [providedModels, catalogue]);
+  const search = useRef<HTMLInputElement>(null);
+  const list = useRef<HTMLDivElement>(null);
+  const id = useId();
+  const providers = useMemo(() => [...new Set(models.map(providerName))].sort(), [models]);
+  const rows = useMemo(() => {
+    const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    const matches = (text: string) => words.every((word) => text.toLowerCase().includes(word));
+    const concrete = models
+      .filter(
+        (model) =>
+          (!provider || providerName(model) === provider) &&
+          matches(
+            `${model.displayName} ${model.id} ${model.provider} ${Array.isArray(model.capabilities) ? model.capabilities.join(' ') : ''}`
+          )
+      )
+      .sort(
+        (a, b) =>
+          providerName(a).localeCompare(providerName(b)) ||
+          a.displayName.localeCompare(b.displayName)
+      )
+      .map((model) => ({
+        value: model.id,
+        label: model.displayName,
+        identity: model.id,
+        group: providerName(model),
+        detail: details(model),
+        reason:
+          (mediaRouteIsRetired(model)
+            ? 'This generation route has retired'
+            : model.unavailableReason) ||
+          (model.availability && model.availability !== 'available'
+            ? model.availability.replaceAll('_', ' ')
+            : '')
+      }));
+    return [
+      ...shortcuts
+        .filter((item) => !provider && matches(item.label))
+        .map((item) => ({ ...item, identity: '', group: 'Selection', reason: '' })),
+      ...(value &&
+      !models.some((model) => model.id === value) &&
+      !shortcuts.some((item) => item.value === value) &&
+      !provider &&
+      matches(value)
+        ? [
+            {
+              value,
+              label: value,
+              identity: '',
+              group: 'Saved choice',
+              detail: '',
+              reason: 'Unavailable in the connected catalogue'
+            }
+          ]
+        : []),
+      ...concrete
+    ];
+  }, [models, shortcuts, query, provider, value]);
+  useEffect(() => {
+    search.current?.focus();
+  }, []);
+  useEffect(() => {
+    list.current?.querySelector('[data-active="true"]')?.scrollIntoView({ block: 'nearest' });
+  }, [active]);
+  const move = (direction: number) => {
+    if (!rows.length) return;
+    for (let step = 1; step <= rows.length; step++) {
+      const next = (active + direction * step + rows.length) % rows.length;
+      if (!rows[next]!.reason) {
+        setActive(next);
+        break;
+      }
+    }
+  };
+  return (
+    <Dialog title={`Choose ${label.toLowerCase()}`} onClose={onClose} wide>
+      <div className="model-browser">
+        <div className="model-browser-search">
+          <Search size={18} aria-hidden="true" />
+          <input
+            ref={search}
+            type="search"
+            role="combobox"
+            aria-label="Search models"
+            placeholder="Search models, providers or capabilities…"
+            aria-autocomplete="list"
+            aria-expanded="true"
+            aria-controls={id}
+            aria-activedescendant={rows[active] ? `${id}-${active}` : undefined}
+            value={query}
+            onChange={(event) => {
+              setQuery(event.target.value);
+              setActive(0);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+                event.preventDefault();
+                move(event.key === 'ArrowDown' ? 1 : -1);
+              }
+              if (event.key === 'Enter') {
+                event.preventDefault();
+                if (rows[active] && !rows[active].reason) onChange(rows[active].value);
+              }
+            }}
+          />
+        </div>
+        <div className="model-browser-filter">
+          <label>
+            Provider{' '}
+            <select
+              aria-label="Filter models by provider"
+              value={provider}
+              onChange={(event) => {
+                setProvider(event.target.value);
+                setActive(0);
+              }}
+            >
+              <option value="">All providers</option>
+              {providers.map((name) => (
+                <option key={name} value={name}>
+                  {name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <small className="muted" role="status">
+            {rows.length} {rows.length === 1 ? 'choice' : 'choices'}
+          </small>
+        </div>
+        <div ref={list} className="model-browser-list" role="listbox" id={id} aria-label={label}>
+          {rows.map((row, index) => (
+            <div key={row.value}>
+              {rows[index - 1]?.group !== row.group && (
+                <div className="model-browser-group" role="presentation">
+                  {row.group}
+                </div>
+              )}
+              <button
+                type="button"
+                role="option"
+                id={`${id}-${index}`}
+                aria-selected={row.value === value}
+                aria-disabled={Boolean(row.reason)}
+                data-active={index === active}
+                tabIndex={-1}
+                className="model-browser-option"
+                onMouseMove={() => setActive(index)}
+                onClick={() => {
+                  if (!row.reason) onChange(row.value);
+                }}
+              >
+                <span>
+                  <strong>{row.label}</strong>
+                  {row.identity && <small>{row.identity}</small>}
+                  {(row.reason || row.detail) && (
+                    <small className={row.reason ? 'model-unavailable' : ''}>
+                      {row.reason || row.detail}
+                    </small>
+                  )}
+                </span>
+                {row.value === value && <Check size={17} aria-hidden="true" />}
+              </button>
+            </div>
+          ))}
+          {!rows.length && (
+            <p className="empty">No matching models. Try another name or provider.</p>
+          )}
+        </div>
+        <small className="muted">↑ ↓ to browse · Enter to choose · Esc to close</small>
+      </div>
+    </Dialog>
+  );
+}

@@ -15,6 +15,8 @@ import {
 import { money } from '../model.js';
 import { mediaRouteIsRetired, mediaRetirementDate } from '../media-state.js';
 import AudioReceipts from '../AudioReceipts';
+import DefaultModels from './DefaultModels.js';
+import ModelPicker from '../ModelPicker.js';
 
 interface Provider {
   configured: boolean;
@@ -43,6 +45,7 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
   const [choice, setChoice] = useState('');
   const [query, setQuery] = useState('');
   const [mediaSelections, setMediaSelections] = useState<Record<string, string>>({});
+  const mediaAction = useAction(() => onChange());
   const selected = choice || provider.value?.provider || 'openrouter';
   return (
     <>
@@ -52,7 +55,7 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
         description="Bring your own provider. Your computer uses your credentials directly."
       >
         <ResourceState resource={provider} />
-        {provider.value && (
+        {provider.value && preferences.value && (
           <form
             className="stack"
             key={provider.value.source + provider.value.provider}
@@ -60,52 +63,48 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
               event.preventDefault();
               const form = new FormData(event.currentTarget);
               const apiKey = fieldValue(form, 'apiKey');
-              void action.run(
-                () =>
-                  sensitive(() =>
-                    put('/v1/providers', {
-                      provider: selected,
-                      ...(apiKey ? { apiKey } : {}),
-                      ...(selected === 'openai-compatible'
-                        ? {
-                            baseUrl: fieldValue(form, 'baseUrl'),
-                            modelId: fieldValue(form, 'modelId'),
-                            contextTokens: Number(form.get('contextTokens')),
-                            capabilities: [
-                              'chat',
-                              'tools',
-                              ...(form.has('vision') ? ['vision'] : []),
-                              ...(form.has('reasoning') ? ['reasoning'] : [])
-                            ],
-                            modalities: ['text', ...(form.has('vision') ? ['image'] : [])]
-                          }
-                        : {}),
-                      enforceZeroDataRetention: form.has('zdr')
-                    })
-                  ),
-                'Connection verified and saved'
-              );
-              /*
-               * Saved with the connection it belongs to rather than under its own button.
-               *
-               * It is a property of how this account uses that aggregator, so it is edited on the
-               * connection form and travels with it. Written after the connection and never
-               * blocking it: a routing preference that failed to save must not make an owner think
-               * their key did.
-               */
-              if (selected === 'openrouter')
-                void put('/v1/account/preferences', {
-                  providerRouting: {
-                    objective: fieldValue(form, 'routingObjective'),
-                    throughputFloorPercent: Number(form.get('throughputFloorPercent') ?? 40),
-                    ignoredProviders: fieldValue(form, 'ignoredProviders')
-                      .split(',')
-                      .map((name) => name.trim())
-                      .filter(Boolean)
+              void action.run(async () => {
+                await sensitive(() =>
+                  put('/v1/providers', {
+                    provider: selected,
+                    ...(apiKey ? { apiKey } : {}),
+                    ...(selected === 'openai-compatible'
+                      ? {
+                          baseUrl: fieldValue(form, 'baseUrl'),
+                          modelId: fieldValue(form, 'modelId'),
+                          contextTokens: Number(form.get('contextTokens')),
+                          capabilities: [
+                            'chat',
+                            'tools',
+                            ...(form.has('vision') ? ['vision'] : []),
+                            ...(form.has('reasoning') ? ['reasoning'] : [])
+                          ],
+                          modalities: ['text', ...(form.has('vision') ? ['image'] : [])]
+                        }
+                      : {}),
+                    enforceZeroDataRetention: form.has('zdr')
+                  })
+                );
+                if (selected === 'openrouter') {
+                  try {
+                    await put('/v1/account/preferences', {
+                      providerRouting: {
+                        objective: fieldValue(form, 'routingObjective'),
+                        throughputFloorPercent: Number(form.get('throughputFloorPercent') ?? 40),
+                        ignoredProviders: fieldValue(form, 'ignoredProviders')
+                          .split(',')
+                          .map((name) => name.trim())
+                          .filter(Boolean)
+                      }
+                    });
+                  } catch (cause) {
+                    throw new Error(
+                      'Connection saved, but operator routing was not saved. Retry Verify and save.',
+                      { cause }
+                    );
                   }
-                })
-                  .then(() => preferences.refresh())
-                  .catch(() => undefined);
+                }
+              }, 'Connection and routing verified and saved');
             }}
           >
             <div className="management-note">
@@ -273,166 +272,10 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
         )}
       </Section>
       <Section
-        title="Your model preference"
-        description="Keep automatic selection or choose a particular model for your work."
+        title="Model defaults"
+        description="Choose the main agent and the models behind its specialist work. New projects inherit these defaults."
       >
-        <ResourceState resource={preferences} />
-        {preferences.value && (
-          <form
-            className="stack"
-            onSubmit={(event) => {
-              event.preventDefault();
-              const form = new FormData(event.currentTarget);
-              void action.run(() => {
-                if (fieldValue(form, 'selection') === 'manual' && !fieldValue(form, 'modelId'))
-                  throw new Error('Choose a model before saving manual selection.');
-                return put('/v1/account/preferences', {
-                  model: {
-                    automatic: fieldValue(form, 'selection') === 'automatic',
-                    preference: fieldValue(form, 'preference'),
-                    modelId: fieldValue(form, 'modelId')
-                  }
-                });
-              });
-            }}
-          >
-            <div className="management-grid">
-              <Field label="Selection">
-                <select
-                  name="selection"
-                  defaultValue={
-                    preferences.value.preferences.model?.automatic === false
-                      ? 'manual'
-                      : 'automatic'
-                  }
-                >
-                  <option value="automatic">Automatic for the work</option>
-                  <option value="manual">My chosen model</option>
-                </select>
-              </Field>
-              <Field label="Automatic preference">
-                <select
-                  name="preference"
-                  defaultValue={preferences.value.preferences.model?.preference ?? 'balanced'}
-                >
-                  <option value="balanced">Balanced</option>
-                  <option value="fast">Faster</option>
-                  <option value="best">Higher quality</option>
-                </select>
-              </Field>
-              <Field label="Chosen model">
-                <select
-                  name="modelId"
-                  defaultValue={preferences.value.preferences.model?.modelId ?? ''}
-                >
-                  <option value="">Choose a model</option>
-                  {models.value?.map((model) => (
-                    <option
-                      key={model.id}
-                      value={model.id}
-                      disabled={model.availability !== 'available'}
-                    >
-                      {model.displayName}
-                      {model.availability !== 'available' ? ` · ${model.availability}` : ''}
-                    </option>
-                  ))}
-                </select>
-              </Field>
-            </div>
-            <Button type="submit" busy={action.busy}>
-              Save preference
-            </Button>
-            <ActionFeedback action={action} />
-          </form>
-        )}
-      </Section>
-      <Section
-        title="Specialist defaults"
-        description="Used by projects that inherit these choices. These agents use the same connected provider and task approval rules."
-      >
-        {preferences.value && (
-          <form
-            className="stack"
-            onSubmit={(event) => {
-              event.preventDefault();
-              const form = new FormData(event.currentTarget);
-              const modelPurposes = Object.fromEntries(
-                ['specialist', 'coding'].map((purpose) => [
-                  purpose,
-                  {
-                    automatic: fieldValue(form, `${purpose}-model`) === '',
-                    modelId: fieldValue(form, `${purpose}-model`),
-                    preference: fieldValue(form, `${purpose}-preference`)
-                  }
-                ])
-              );
-              void action.run(
-                () => put('/v1/account/preferences', { modelPurposes }),
-                'Specialist defaults saved'
-              );
-            }}
-          >
-            {(['specialist', 'coding'] as const).map((purpose) => (
-              <div className="management-grid" key={purpose}>
-                <Field label={purpose === 'specialist' ? 'Research specialists' : 'Coding agents'}>
-                  <select
-                    name={`${purpose}-model`}
-                    defaultValue={
-                      preferences.value?.preferences.modelPurposes?.[purpose]?.automatic === false
-                        ? preferences.value.preferences.modelPurposes[purpose]?.modelId
-                        : ''
-                    }
-                  >
-                    <option value="">Automatic</option>
-                    {preferences.value?.preferences.modelPurposes?.[purpose]?.automatic === false &&
-                      !models.value?.some(
-                        (model) =>
-                          model.id ===
-                          preferences.value?.preferences.modelPurposes?.[purpose]?.modelId
-                      ) && (
-                        <option
-                          value={preferences.value.preferences.modelPurposes[purpose]?.modelId}
-                        >
-                          {preferences.value.preferences.modelPurposes[purpose]?.modelId} ·
-                          unavailable
-                        </option>
-                      )}
-                    {models.value?.map((model) => (
-                      <option
-                        value={model.id}
-                        key={model.id}
-                        disabled={
-                          model.availability !== 'available' &&
-                          model.id !==
-                            preferences.value?.preferences.modelPurposes?.[purpose]?.modelId
-                        }
-                      >
-                        {model.displayName}
-                      </option>
-                    ))}
-                  </select>
-                </Field>
-                <Field label="Preference">
-                  <select
-                    name={`${purpose}-preference`}
-                    defaultValue={
-                      preferences.value?.preferences.modelPurposes?.[purpose]?.preference ??
-                      'balanced'
-                    }
-                  >
-                    <option value="balanced">Balanced</option>
-                    <option value="fast">Faster</option>
-                    <option value="best">Higher quality</option>
-                  </select>
-                </Field>
-              </div>
-            ))}
-            <Button type="submit" busy={action.busy}>
-              Save specialist defaults
-            </Button>
-            <ActionFeedback action={action} />
-          </form>
-        )}
+        <DefaultModels key={provider.value?.provider ?? 'loading'} onChange={onChange} />
       </Section>
       <Section
         title="Images, video, voice and transcription"
@@ -445,7 +288,7 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
             onSubmit={(event) => {
               event.preventDefault();
               const form = new FormData(event.currentTarget);
-              void action.run(async () => {
+              void mediaAction.run(async () => {
                 const choices = Object.fromEntries(
                   media.value!.modalities.flatMap((item) => {
                     if (!item.available) return [[item.modality, item.choice]];
@@ -473,7 +316,8 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
                     ];
                   })
                 );
-                await put('/v1/media/models', choices);
+                const saved = await put<MediaSettings>('/v1/media/models', choices);
+                media.setValue(saved);
                 setMediaSelections({});
               }, 'Generation choices saved');
             }}
@@ -505,32 +349,22 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
                       <p className="muted">{item.reason ?? 'No compatible route is available.'}</p>
                     ) : (
                       <div className="management-grid">
-                        <Field label={`${item.modality} model`}>
-                          <select
-                            name={`${item.modality}-model`}
+                        <div className="field">
+                          <span>{item.modality} model</span>
+                          <ModelPicker
+                            label={`${item.modality} model`}
                             value={modelId}
-                            onChange={(event) =>
+                            models={item.options}
+                            disabled={mediaAction.busy}
+                            shortcuts={[{ value: '', label: 'Automatic' }]}
+                            onChange={(value) =>
                               setMediaSelections((values) => ({
                                 ...values,
-                                [item.modality]: event.target.value
+                                [item.modality]: value
                               }))
                             }
-                          >
-                            <option value="">Automatic</option>
-                            {item.options.map((option) => (
-                              <option
-                                value={option.id}
-                                key={option.id}
-                                disabled={
-                                  Boolean(option.unavailableReason) || mediaRouteIsRetired(option)
-                                }
-                              >
-                                {option.displayName}
-                                {mediaRouteIsRetired(option) ? ' · retired' : ''}
-                              </option>
-                            ))}
-                          </select>
-                        </Field>
+                          />
+                        </div>
                         <Field label={`${item.modality} preference`}>
                           <select
                             name={`${item.modality}-preference`}
@@ -584,10 +418,10 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
               Further generation asks for approval after the conversation reaches{' '}
               {money(media.value.approvalThresholdUsd)} in generation costs.
             </p>
-            <Button type="submit" busy={action.busy}>
+            <Button type="submit" busy={mediaAction.busy}>
               Save generation choices
             </Button>
-            <ActionFeedback action={action} />
+            <ActionFeedback action={mediaAction} />
           </form>
         )}
       </Section>

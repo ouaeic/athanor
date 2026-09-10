@@ -1,6 +1,7 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ProviderSettings } from './Providers';
+import ModelBrowser from '../ModelBrowser.js';
 import type * as Management from '../management.js';
 
 vi.mock('../management.js', async (importOriginal) => {
@@ -48,11 +49,31 @@ describe('retired generation selection', () => {
     const upcoming = renderToStaticMarkup(<ProviderSettings onChange={() => undefined} />);
     expect(upcoming).toContain('Scheduled to retire');
     expect(upcoming).toContain('September 24, 2026');
-    expect(upcoming).not.toMatch(/<option[^>]*value="openai\/sora-2"[^>]*disabled/);
+    expect(upcoming).toContain('video model: Sora 2');
     vi.setSystemTime(new Date('2026-09-24T00:00:00Z'));
     const retired = renderToStaticMarkup(<ProviderSettings onChange={() => undefined} />);
-    expect(retired).toMatch(/<option[^>]*value="openai\/sora-2"[^>]*disabled=""[^>]*selected=""/);
+    expect(retired).toContain('video model: Sora 2');
     expect(retired).toContain('Retired');
     expect(retired).toContain('No replacement is selected automatically');
+    // The picker and the generation save guard must refuse the same retired route without losing its identity.
+    const picker = renderToStaticMarkup(
+      <ModelBrowser
+        label="video model"
+        value="openai/sora-2"
+        models={[
+          {
+            id: 'openai/sora-2',
+            provider: 'openai',
+            displayName: 'Sora 2',
+            retirementAt: '2026-09-24T00:00:00.000Z'
+          }
+        ]}
+        onChange={() => undefined}
+        onClose={() => undefined}
+      />
+    );
+    expect(picker).toMatch(/role="option"[^>]*aria-selected="true"[^>]*aria-disabled="true"/);
+    expect(picker).toContain('openai/sora-2');
+    expect(picker).toContain('This generation route has retired');
   });
 });

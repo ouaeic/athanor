@@ -29,10 +29,12 @@ import {
   inferModelTask,
   modelFit,
   priceCeilingFields,
+  selectPurposeModel,
   spendHalt,
   unwrapDataKey
 } from '@athanor/core';
 import type { RoutableModel } from '@athanor/core';
+import { writeProjectModelPreferences } from '@athanor/data';
 import { ownerPriceCeiling, resumableTaskStatuses } from '../context.js';
 import { withTaskDeliveryStatus } from '../task-delivery-status.js';
 import { requireUser } from '../http/auth-hook.js';
@@ -207,15 +209,39 @@ export const registerTaskRoutes = (context: RouteContext): void => {
         })
       );
       const routed = started(
-        modelsForUser(user).then(async (catalog) => ({
-          catalog,
-          chosen: input.modelId
-            ? null
-            : await pickModelUnderPriceCeiling(user.id, catalog, {
-                privacyRoute: input.privacyRoute,
-                taskKind: inferModelTask(input.prompt)
-              })
-        }))
+        modelsForUser(user).then(async (catalog) => {
+          const main = input.modelChoices?.main;
+          if (main) {
+            const resolved = selectPurposeModel({
+              purpose: 'main',
+              choice: main,
+              catalog,
+              privacyRoute: input.privacyRoute,
+              taskKind: inferModelTask(input.prompt),
+              ceiling: ownerPriceCeiling(await store.effectiveSpendLimits(user.id))
+            });
+            if (!resolved.model)
+              throw new AthanorError(
+                'model_unavailable',
+                resolved.reason ?? 'No model is available for this project'
+              );
+            if (input.modelId && input.modelId !== resolved.model.id)
+              throw new AthanorError(
+                'model_choice_conflict',
+                'The prompt and project must choose the same main model'
+              );
+            return { catalog, chosen: { model: resolved.model, message: null } };
+          }
+          return {
+            catalog,
+            chosen: input.modelId
+              ? null
+              : await pickModelUnderPriceCeiling(user.id, catalog, {
+                  privacyRoute: input.privacyRoute,
+                  taskKind: inferModelTask(input.prompt)
+                })
+          };
+        })
       );
       const workspace = (await workspaceRead)();
       if (!workspace?.wrappedKey)
@@ -273,6 +299,11 @@ export const registerTaskRoutes = (context: RouteContext): void => {
             )
           : created;
         if (!titled) throw new AthanorError('task_unavailable', 'The task could not be named', 409);
+        if (input.modelChoices && Object.keys(input.modelChoices).length)
+          await writeProjectModelPreferences(store, masterKey, titled, {
+            expectedRevision: 0,
+            choices: input.modelChoices
+          });
         return {
           task: titled,
           execution: await beginProjectExecution(context, titled, input.attachments ?? [])

@@ -77,7 +77,16 @@ const purposeSurface = async (
       purpose,
       ...resolved,
       effective: result.model,
-      options: models,
+      options: models.map((model) => ({
+        ...model,
+        unavailableReason: selectPurposeModel({
+          purpose,
+          choice: { automatic: false, preference: resolved.choice.preference, modelId: model.id },
+          catalog: [model],
+          privacyRoute,
+          ceiling: ownerPriceCeiling(limits)
+        }).reason
+      })),
       available: Boolean(result.model),
       reason: result.reason
     };
@@ -115,7 +124,8 @@ export const projectModelSettings = async (
 /** The same surface, global-only, for the composer of a prompt that does not exist yet. */
 const workspaceModelSettings = async (
   context: RouteContext,
-  user: UserRecord
+  user: UserRecord,
+  privacyRoute: 'provider_zdr' | 'external'
 ): Promise<ProjectModelPreferences> => {
   const owner = OwnerPreferences.parse(user.preferences);
   const { secret } = await context.inferenceCredential(user.id);
@@ -124,11 +134,11 @@ const workspaceModelSettings = async (
     ...(owner.model ? { main: owner.model } : {}),
     ...('modelPurposes' in owner ? (owner.modelPurposes as ProjectModelChoices) : {})
   };
-  const purposes = await purposeSurface(context, user, {}, global, 'provider_zdr');
+  const purposes = await purposeSurface(context, user, {}, global, privacyRoute);
   return {
     projectTaskId: '',
     revision: 0,
-    choices: {},
+    choices: global,
     purposes
   };
 };
@@ -138,8 +148,20 @@ export const registerProjectModelRoutes = (context: RouteContext): void => {
     '/v1/tasks/:taskId/model-preferences',
     (request) => projectModelSettings(context, requireUser(request.user), request.params.taskId)
   );
-  context.app.get('/v1/workspace-model-preferences', (request) =>
-    workspaceModelSettings(context, requireUser(request.user))
+  context.app.get<{ Querystring: { privacyRoute?: string } }>(
+    '/v1/workspace-model-preferences',
+    async (request) => {
+      const user = requireUser(request.user);
+      const { secret } = await context.inferenceCredential(user.id);
+      return workspaceModelSettings(
+        context,
+        user,
+        request.query.privacyRoute === 'external' ||
+          (!request.query.privacyRoute && !secret.enforceZeroDataRetention)
+          ? 'external'
+          : 'provider_zdr'
+      );
+    }
   );
   context.app.put<{ Params: { taskId: string } }>(
     '/v1/tasks/:taskId/model-preferences',

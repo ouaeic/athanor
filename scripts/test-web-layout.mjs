@@ -69,7 +69,8 @@ const time = '2026-09-06T00:00:00Z';
 const workspace = {
   id: '10000000-0000-4000-8000-000000000001',
   name: 'My computer',
-  status: 'ready',
+  status: 'running',
+  securityMode: 'balanced',
   region: 'local',
   storageBytes: 0,
   storageLimitBytes: 10000000000,
@@ -162,6 +163,7 @@ const presentation = {
       }
     ],
     current: null,
+    history: [],
     metrics: [{ key: 'checks', label: 'Checks passed', value: 1 }],
     milestones,
     updatedAt: time
@@ -204,6 +206,92 @@ const previewHtml =
   '<!doctype html><title>Playable fixture</title><button onclick="this.textContent=Number(this.textContent)+1">0</button>';
 const errors = [];
 let draft;
+const modelDrafts = new Map();
+let projectChoices = {},
+  projectRevision = 0,
+  defaultChoices = {};
+let failModelSave = false,
+  createdModelRequest;
+let generationChoices = {};
+const generationModel = {
+  id: 'fixture/image-studio',
+  provider: 'fixture',
+  providerModelId: 'image-studio',
+  displayName: 'Image Studio',
+  modality: 'image',
+  usdPerImage: 0.05,
+  usdPerMinute: null,
+  usdPerSecond: null,
+  usdPerMillionCharacters: null,
+  unavailableReason: null
+};
+const generationSurface = () => ({
+  approvalThresholdUsd: 1,
+  modalities: [
+    {
+      modality: 'image',
+      available: true,
+      choice: generationChoices.image ?? { automatic: true, preference: 'balanced', modelId: '' },
+      effective: generationModel,
+      options: [generationModel],
+      reason: null
+    }
+  ]
+});
+const modelCatalog = [
+  ...bootstrap.models.map((model) => ({ ...model, contextTokens: 128000 })),
+  ...Array.from({ length: 80 }, (_, index) => ({
+    ...bootstrap.models[0],
+    id: `openrouter/${index % 2 ? 'beta' : 'alpha'}/model-${index}`,
+    provider: 'openrouter',
+    displayName: `Research model ${index}`,
+    contextTokens: 200000,
+    inputUsdPerMillionTokens: 0.25,
+    outputUsdPerMillionTokens: 1,
+    modalities: ['text', 'image'],
+    capabilities: ['chat', 'tools', 'reasoning']
+  })),
+  {
+    ...bootstrap.models[0],
+    id: 'retired/model',
+    displayName: 'Retired research model',
+    contextTokens: 128000,
+    availability: 'unavailable'
+  }
+];
+const modelSurface = (project) => ({
+  projectTaskId: project ? task.id : '',
+  revision: project ? projectRevision : 0,
+  choices: project ? projectChoices : defaultChoices,
+  purposes: [
+    'main',
+    'specialist',
+    'coding',
+    'summarise',
+    'title',
+    'image',
+    'audio',
+    'transcription',
+    'video'
+  ].map((purpose) => {
+    const choice = (project && projectChoices[purpose]) ||
+      defaultChoices[purpose] || { automatic: true, preference: 'balanced', modelId: '' };
+    return {
+      purpose,
+      source:
+        project && projectChoices[purpose]
+          ? 'project'
+          : defaultChoices[purpose]
+            ? 'global'
+            : 'automatic',
+      choice,
+      options: ['image', 'audio', 'transcription', 'video'].includes(purpose) ? [] : modelCatalog,
+      effective: modelCatalog.find((model) => model.id === choice.modelId) ?? modelCatalog[0],
+      available: true,
+      reason: null
+    };
+  })
+});
 let missions = [];
 let mediaJobs = [];
 let mediaAssets = [];
@@ -373,7 +461,6 @@ const voiceProposal = {
   expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
   messageId: null
 };
-let voiceConfirm, voiceReceipt;
 const autonomyChanges = [];
 try {
   const context = await browser.newContext({
@@ -390,7 +477,70 @@ try {
     if (path.startsWith('/__athanor/preview/'))
       return route.fulfill({ contentType: 'text/html', body: previewHtml });
     if (!path.startsWith('/v1/')) return route.continue();
-    if (path === '/v1/bootstrap') return json(bootstrap);
+    if (path === '/v1/bootstrap')
+      return json({ ...bootstrap, models: modelCatalog, drafts: [...modelDrafts.values()] });
+    if (path === '/v1/workspace-model-preferences') return json(modelSurface(false));
+    if (path.endsWith('/model-preferences')) {
+      if (route.request().method() === 'PUT') {
+        const input = route.request().postDataJSON();
+        if (failModelSave) {
+          failModelSave = false;
+          return route.fulfill({
+            status: 503,
+            json: { error: { message: 'Model storage is temporarily unavailable' } }
+          });
+        }
+        if (input.expectedRevision !== projectRevision)
+          return route.fulfill({
+            status: 409,
+            json: { error: { message: 'Model choices changed on another device' } }
+          });
+        projectChoices = input.choices;
+        projectRevision++;
+      }
+      return json(modelSurface(true));
+    }
+    if (path === '/v1/models') return json(modelCatalog);
+    if (path === '/v1/providers')
+      return json({
+        configured: true,
+        source: 'server_environment',
+        provider: 'openrouter',
+        hasApiKey: true,
+        enforceZeroDataRetention: true
+      });
+    if (path === '/v1/media/models') {
+      if (route.request().method() === 'PUT') generationChoices = route.request().postDataJSON();
+      return json(generationSurface());
+    }
+    if (path === '/v1/account/preferences') {
+      if (route.request().method() === 'PUT') {
+        const input = route.request().postDataJSON();
+        if (input.model && failModelSave) {
+          failModelSave = false;
+          return route.fulfill({
+            status: 503,
+            json: { error: { message: 'Model defaults could not be saved' } }
+          });
+        }
+        if (input.model) defaultChoices.main = input.model;
+        if (input.modelPurposes) defaultChoices = { ...defaultChoices, ...input.modelPurposes };
+      }
+      return json({
+        preferences: {
+          model: defaultChoices.main,
+          modelPurposes: Object.fromEntries(
+            Object.entries(defaultChoices).filter(([purpose]) => purpose !== 'main')
+          )
+        }
+      });
+    }
+    if (path === '/v1/tasks' && route.request().method() === 'POST') {
+      createdModelRequest = route.request().postDataJSON();
+      projectChoices = createdModelRequest.modelChoices ?? {};
+      projectRevision++;
+      return json(task);
+    }
     if (path === '/v1/audio/transcriptions/options') return json(dictationOptions);
     if (path === '/v1/voice/models')
       return json({
@@ -429,11 +579,6 @@ try {
     if (path === '/v1/voice-sessions') return json([voiceSession]);
     if (path === '/v1/audio/transcriptions/receipts') return json([]);
     if (path === `/v1/voice-sessions/${voiceSession.id}/proposals`) return json([voiceProposal]);
-    if (path === `/v1/voice-sessions/${voiceSession.id}/proposals/${voiceProposal.id}/confirm`) {
-      voiceConfirm = route.request().postDataJSON();
-      voiceProposal.status = 'confirmed';
-      return json(voiceProposal);
-    }
     if (path === `/v1/voice-sessions/${voiceSession.id}/receipts`)
       return json(
         voiceSession.pendingUsd
@@ -447,13 +592,6 @@ try {
             ]
           : []
       );
-    if (path === `/v1/voice-sessions/${voiceSession.id}/reconcile`) {
-      voiceReceipt = route.request().postDataJSON();
-      voiceSession.pendingUsd = 0;
-      voiceSession.settledUsd = 0.025;
-      voiceSession.status = 'ended';
-      return json(voiceSession);
-    }
     if (path === '/v1/audio/transcriptions') {
       transcriptions.push(route.request().postDataJSON());
       assert.match(route.request().headers()['idempotency-key'], /^[0-9a-f-]{36}$/i);
@@ -547,6 +685,9 @@ try {
     if (path === '/v1/previews/fixture/access') return json({ url: presentation.results[0].url });
     if (path === '/v1/drafts') {
       draft = route.request().postDataJSON();
+      const key = draft.taskId ?? `new:${draft.workspaceId}`;
+      if (draft.body || draft.controls || draft.attachments?.length) modelDrafts.set(key, draft);
+      else modelDrafts.delete(key);
       return json({ saved: true });
     }
     if (path.endsWith('/presentation'))
@@ -637,10 +778,16 @@ try {
         main: box('.garden-main'),
         scroll: box('.garden-task-scroll'),
         composer: box('.garden-task-composer'),
+        textarea: box('.intent-editor > textarea'),
+        toolbar: box('.intent-toolbar'),
         viewportHeight: innerHeight
       };
     });
     assert.equal(layout.document, width, 'The page must not scroll sideways');
+    assert(
+      layout.textarea.bottom <= layout.toolbar.top,
+      'Prompt actions must never overlap the text input'
+    );
     assert(
       layout.scroll.bottom <= layout.composer.top + 1,
       'The composer must not overlap the work'
@@ -1046,11 +1193,11 @@ try {
     payload: { question: 'Which keys should move the player?', options: ['Arrow keys', 'WASD'] }
   };
   await page.reload();
-  await page.getByRole('button', { name: 'Reply to the question', exact: true }).click();
+  await page.getByLabel('Your answer').waitFor();
   await page.getByLabel('Your answer').fill('Use both arrow keys and WASD.');
   await page.getByRole('button', { name: 'Send answer', exact: true }).click();
   await page
-    .getByRole('button', { name: 'Reply to the question', exact: true })
+    .getByRole('button', { name: 'Send answer', exact: true })
     .waitFor({ state: 'detached' });
   assert.deepEqual(
     childAnswer,
@@ -1236,73 +1383,6 @@ try {
   assert.match(durationQuote, /provider receipt determines the final charge/);
   assert.equal(await dictationPage.evaluate(() => window.dictationFixture.requests), 2);
   await dictationPage.close();
-  const voicePage = await context.newPage();
-  voicePage.on('pageerror', (error) => errors.push(error.message));
-  await voicePage.addInitScript(() => {
-    window.voiceMicrophoneRequests = 0;
-    Object.defineProperty(navigator, 'mediaDevices', {
-      value: {
-        getUserMedia: () => {
-          window.voiceMicrophoneRequests++;
-          return new Promise(() => {});
-        }
-      }
-    });
-  });
-  await voicePage.goto(`${origin}/?task=${task.id}`);
-  await voicePage.getByRole('button', { name: 'Live voice', exact: true }).click();
-  const voiceDialog = voicePage.getByRole('dialog', { name: 'Live voice', exact: true });
-  await voiceDialog.getByRole('combobox', { name: 'Voice model', exact: true }).waitFor();
-  assert.equal(await voicePage.evaluate(() => window.voiceMicrophoneRequests), 0);
-  const liveStart = voiceDialog.getByRole('button', { name: 'Start live voice', exact: true });
-  assert.equal(await liveStart.isEnabled(), false);
-  await voiceDialog
-    .getByRole('spinbutton', { name: 'Session limit (USD)', exact: true })
-    .fill('0.5');
-  assert.equal(
-    await liveStart.isEnabled(),
-    false,
-    'Voice cost approval does not grant retention consent'
-  );
-  await voiceDialog.getByRole('checkbox').check();
-  assert.equal(await liveStart.isEnabled(), true);
-  await voiceDialog.getByRole('slider').fill('2');
-  assert.equal(await voiceDialog.getByRole('slider').getAttribute('aria-valuetext'), 'medium');
-  await voiceDialog.getByText('Add a quiet mode to the maze.', { exact: true }).waitFor();
-  assert.equal(voiceConfirm, undefined, 'A model proposal is not an owner direction');
-  await voiceDialog.getByRole('button', { name: 'Send this direction', exact: true }).click();
-  await voiceDialog.getByText('Suggested direction · confirmed', { exact: true }).waitFor();
-  assert.deepEqual(voiceConfirm, { digest: 'exact-voice-proposal-digest' });
-  await voiceDialog.getByText('Voice response · $0.03 pending', { exact: true }).click();
-  const settle = voiceDialog.getByRole('button', { name: 'Record provider receipt', exact: true });
-  assert.equal(await settle.isEnabled(), false, 'Missing usage must never become zero by default');
-  await voiceDialog
-    .getByRole('spinbutton', { name: 'Final provider charge (USD)', exact: true })
-    .fill('0.015');
-  await voiceDialog
-    .getByRole('textbox', { name: /^Provider receipt reference/ })
-    .fill('invoice-audio-123');
-  await settle.click();
-  await voiceDialog
-    .getByRole('heading', { name: 'Pending audio charges', exact: true })
-    .waitFor({ state: 'hidden' });
-  assert.deepEqual(voiceReceipt, {
-    receiptId: 'voice-receipt',
-    costUsd: 0.015,
-    providerReceiptRef: 'invoice-audio-123'
-  });
-  await voicePage.setViewportSize({ width: 390, height: 844 });
-  assert(
-    await voiceDialog.evaluate((element) => element.scrollWidth <= element.clientWidth + 1),
-    'The voice panel must fit a phone'
-  );
-  await voiceDialog.evaluate((element) => {
-    element.scrollTop = 0;
-  });
-  await voicePage.screenshot({ path: resolve(report, 'voice-preflight-phone.png') });
-  await voiceDialog.getByRole('button', { name: 'Close Live voice', exact: true }).click();
-  assert.equal(await voicePage.evaluate(() => window.voiceMicrophoneRequests), 0);
-  await voicePage.close();
   const approvalPage = await context.newPage();
   approvalPage.on('pageerror', (error) => errors.push(error.message));
   await approvalPage.setViewportSize({ width: 390, height: 844 });
@@ -1392,7 +1472,7 @@ try {
     );
     await card.getByRole('button', { name: 'Deny', exact: true }).scrollIntoViewIfNeeded();
     const actionsFit = await card.locator('.decision-actions').evaluate((element) => {
-      const scroll = document.querySelector('.garden-task-scroll').getBoundingClientRect();
+      const scroll = document.querySelector('.garden-task-composer').getBoundingClientRect();
       const buttons = [...element.querySelectorAll('button')];
       return (
         buttons.length === 2 &&
@@ -1407,7 +1487,7 @@ try {
         })
       );
     });
-    assert(actionsFit, 'Approval actions must remain in the visible work area above the composer');
+    assert(actionsFit, 'Approval actions must remain visible in the prompt area');
     await card.screenshot({ path: resolve(report, `approval-reason-${theme}-phone.png`) });
   }
   approvalFailures = [
@@ -1453,10 +1533,185 @@ try {
   assert.equal(await card.getByRole('button', { name: 'Expired', exact: true }).isEnabled(), false);
   assert.equal(approvalRequests.length, 5, 'Expired decisions must not submit');
   await approvalPage.close();
+  approvals = [];
+  const modelsPage = await context.newPage();
+  await modelsPage.goto(`${origin}/?task=${task.id}`);
+  await modelsPage
+    .getByRole('button', { name: 'Model choices for this direction', exact: true })
+    .click();
+  const advanced = modelsPage.getByRole('dialog', { name: 'Model choices', exact: true });
+  await advanced.getByRole('region', { name: 'Coding agents', exact: true }).waitFor();
+  assert.equal(await advanced.locator('.model-choice-card').count(), 9);
+  const pick = async (surface, label, modelId) => {
+    await surface.getByRole('button', { name: new RegExp(`^${label}:`) }).click();
+    const search = modelsPage.getByRole('combobox', { name: 'Search models', exact: true });
+    await search.fill(modelId);
+    await search.press('Enter');
+  };
+  await pick(advanced, 'Coding agents', 'openrouter/beta/model-79');
+  failModelSave = true;
+  await advanced.getByRole('button', { name: 'Save project choices', exact: true }).click();
+  await advanced
+    .getByRole('alert')
+    .filter({ hasText: 'Model storage is temporarily unavailable' })
+    .waitFor();
+  assert.equal(projectChoices.coding, undefined, 'A failed save must not change saved choices');
+  assert.match(
+    await advanced.getByRole('region', { name: 'Coding agents', exact: true }).textContent(),
+    /Research model 79/
+  );
+  await advanced.getByRole('button', { name: 'Save project choices', exact: true }).click();
+  await advanced.getByText('Project model choices saved', { exact: true }).waitFor();
+  assert.equal(projectChoices.coding.modelId, 'openrouter/beta/model-79');
+  await modelsPage.screenshot({ path: resolve(report, 'models-project-desktop.png') });
+  await advanced.getByRole('button', { name: 'Close Model choices', exact: true }).click();
+  await modelsPage.reload();
+  await modelsPage.getByRole('button', { name: 'Models', exact: true }).click();
+  const projectModels = modelsPage.getByRole('dialog', { name: 'Project models', exact: true });
+  await projectModels
+    .getByRole('button', { name: 'Coding agents: Research model 79', exact: true })
+    .waitFor();
+  await projectModels.getByRole('button', { name: 'Close Project models', exact: true }).click();
+
+  await modelsPage.getByRole('button', { name: /^Model for this direction:/ }).click();
+  const modelSearch = modelsPage.getByRole('combobox', { name: 'Search models', exact: true });
+  await modelsPage
+    .getByRole('combobox', { name: 'Filter models by provider', exact: true })
+    .selectOption('beta');
+  assert.equal(
+    await modelsPage.getByRole('option').filter({ hasText: 'openrouter/alpha/' }).count(),
+    0
+  );
+  await modelSearch.fill('model-79');
+  await modelsPage.screenshot({ path: resolve(report, 'model-browser-desktop.png') });
+  await modelSearch.press('Enter');
+  await modelsPage
+    .getByRole('button', { name: 'Model for this direction: Research model 79', exact: true })
+    .waitFor();
+  assert(
+    await modelsPage
+      .getByRole('button', { name: 'Model for this direction: Research model 79', exact: true })
+      .evaluate((element) => element === document.activeElement),
+    'Model selection must restore keyboard focus'
+  );
+  await modelsPage.getByRole('button', { name: /^Model for this direction:/ }).click();
+  await modelsPage.getByRole('option', { name: 'Fixture reasoning model', exact: true }).click();
+  await modelsPage
+    .getByRole('button', { name: 'Model for this direction: Fixture reasoning model', exact: true })
+    .waitFor();
+
+  if (!(await modelsPage.getByRole('button', { name: 'Plant an idea', exact: true }).isVisible()))
+    await modelsPage.getByRole('button', { name: 'Show projects', exact: true }).click();
+  await modelsPage.getByRole('button', { name: 'Plant an idea', exact: true }).click();
+  const newWork = modelsPage.getByRole('dialog', { name: 'Begin something new', exact: true });
+  await newWork
+    .getByRole('button', { name: 'Model choices for this direction', exact: true })
+    .click();
+  await pick(advanced, 'Main agent', 'openrouter/alpha/model-78');
+  await pick(advanced, 'Research specialists', 'openrouter/beta/model-79');
+  await advanced.getByRole('button', { name: 'Close Model choices', exact: true }).click();
+  await newWork.getByText('Draft saved', { exact: true }).waitFor();
+  assert.equal(modelDrafts.get(`new:${workspace.id}`).body, '');
+  assert.equal(
+    modelDrafts.get(`new:${workspace.id}`).controls.modelChoices.specialist.modelId,
+    'openrouter/beta/model-79'
+  );
+  await modelsPage.reload();
+  await modelsPage.getByRole('button', { name: 'Plant an idea', exact: true }).click();
+  await newWork
+    .getByRole('button', { name: 'Model for this direction: Research model 78', exact: true })
+    .waitFor();
+  await newWork
+    .getByLabel('Describe what you want to do')
+    .fill('A longer prompt should remain fully readable as it wraps across lines. '.repeat(40));
+  await modelsPage.setViewportSize({ width: 390, height: 844 });
+  assert(
+    await newWork.evaluate((element) => {
+      const input = element.querySelector('textarea').getBoundingClientRect();
+      const toolbar = element.querySelector('.intent-toolbar').getBoundingClientRect();
+      return input.bottom <= toolbar.top && element.scrollWidth <= element.clientWidth;
+    }),
+    'A long prompt must keep the send button outside the input on a phone'
+  );
+  await modelsPage.screenshot({ path: resolve(report, 'prompt-long-phone.png') });
+  await modelsPage.setViewportSize({ width: 1440, height: 1000 });
+  await newWork
+    .getByLabel('Describe what you want to do')
+    .fill('Use my saved project model choices.');
+  await newWork.getByRole('button', { name: 'Begin', exact: true }).click();
+  await newWork.waitFor({ state: 'detached' });
+  assert.equal(createdModelRequest.modelChoices.main.modelId, 'openrouter/alpha/model-78');
+  assert.equal(createdModelRequest.modelChoices.specialist.modelId, 'openrouter/beta/model-79');
+  assert.equal(
+    modelDrafts.has(`new:${workspace.id}`),
+    false,
+    'Successful delivery must clear the saved draft'
+  );
+
+  await modelsPage.getByRole('button', { name: 'Settings', exact: true }).click();
+  await modelsPage.getByRole('heading', { name: 'Model defaults', exact: true }).waitFor();
+  await pick(modelsPage, 'Condensing long work', 'openrouter/alpha/model-78');
+  await pick(modelsPage, 'Naming a conversation', 'openrouter/beta/model-79');
+  failModelSave = true;
+  await modelsPage.getByRole('button', { name: 'Save model defaults', exact: true }).click();
+  await modelsPage
+    .getByRole('alert')
+    .filter({ hasText: 'Model defaults could not be saved' })
+    .waitFor();
+  assert.equal(
+    defaultChoices.title,
+    undefined,
+    'A failed default save must retain the previous server preferences'
+  );
+  await modelsPage.getByRole('button', { name: 'Save model defaults', exact: true }).click();
+  await modelsPage.getByText('Model defaults saved', { exact: true }).waitFor();
+  await pick(modelsPage, 'image model', 'fixture/image-studio');
+  await modelsPage.getByRole('button', { name: 'Save generation choices', exact: true }).click();
+  await modelsPage.getByText('Generation choices saved', { exact: true }).waitFor();
+  assert.equal(generationChoices.image.modelId, 'fixture/image-studio');
+  await modelsPage.reload();
+  await modelsPage.getByRole('button', { name: 'Settings', exact: true }).click();
+  await modelsPage
+    .getByRole('button', { name: 'Naming a conversation: Research model 79', exact: true })
+    .waitFor();
+  await modelsPage
+    .getByRole('button', { name: 'Condensing long work: Research model 78', exact: true })
+    .waitFor();
+  await modelsPage
+    .getByRole('button', { name: 'image model: Image Studio', exact: true })
+    .waitFor();
+  await modelsPage.screenshot({ path: resolve(report, 'model-defaults-desktop.png') });
+  await modelsPage.setViewportSize({ width: 390, height: 844 });
+  await modelsPage
+    .getByRole('button', { name: 'Naming a conversation: Research model 79', exact: true })
+    .click();
+  await modelsPage.getByRole('combobox', { name: 'Search models', exact: true }).fill('retired');
+  assert.equal(
+    await modelsPage
+      .getByRole('option', { name: /Retired research model/ })
+      .getAttribute('aria-disabled'),
+    'true'
+  );
+  await modelsPage.getByRole('combobox', { name: 'Search models', exact: true }).press('Enter');
+  assert.equal(defaultChoices.title.modelId, 'openrouter/beta/model-79');
+  await modelsPage.screenshot({ path: resolve(report, 'model-browser-phone.png') });
+  assert.equal(await modelsPage.evaluate(() => document.documentElement.scrollWidth), 390);
+  await modelsPage.getByRole('combobox', { name: 'Search models', exact: true }).press('Escape');
+  await modelsPage.close();
   assert.deepEqual(errors, [], 'The browser must not report uncaught errors');
   console.log(
-    'Browser checks passed: viewport layout, phone focus, effort drafts, playable links, downloads, state-preserving expansion, recorded evidence, mission review, media recovery, analysis sessions, device authorization, dictation consent, live voice recovery, and denial feedback with authentication retry.'
+    'Browser checks passed: viewport layout, phone focus, effort drafts, playable links, downloads, state-preserving expansion, recorded evidence, mission review, media recovery, analysis sessions, device authorization, dictation consent, model selection persistence, and denial feedback with authentication retry.'
   );
+} catch (error) {
+  console.error(errors);
+  for (const [index, page] of browser
+    .contexts()
+    .flatMap((context) => context.pages())
+    .entries()) {
+    console.error((await page.locator('body').innerText()).slice(0, 8000));
+    await page.screenshot({ path: resolve(report, `failure-${index}.png`) });
+  }
+  throw error;
 } finally {
   await browser.close();
   await new Promise((done) => server.close(done));

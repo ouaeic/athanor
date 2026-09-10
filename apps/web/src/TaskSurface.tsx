@@ -913,7 +913,7 @@ export default function TaskSurface({
         )}
       </div>
       {panel === 'models' && (
-        <Dialog title="Project models" onClose={() => setPanel(null)}>
+        <Dialog title="Project models" onClose={() => setPanel(null)} wide>
           <Suspense fallback={<Spinner />}>
             <ProjectModels taskId={task.id} onChange={onRefresh} />
           </Suspense>

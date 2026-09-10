@@ -1062,6 +1062,9 @@ canvas {
   font: 24px Georgia;
 }
 .intent-editor {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
   background: var(--raised);
   border: 1px solid var(--line-strong);
   border-radius: 14px;
@@ -1070,6 +1073,7 @@ canvas {
   box-shadow: 0 20px 60px #09110922;
 }
 .intent-editor > textarea {
+  flex: 0 0 auto;
   display: block;
   width: 100%;
   padding: 8px 5px 17px;
@@ -1091,6 +1095,17 @@ canvas {
   justify-content: space-between;
   gap: 15px;
   align-items: center;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+  padding-top: 8px;
+}
+.intent-toolbar > .primary {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.intent-toolbar > .row {
+  min-width: 0;
+  flex-wrap: wrap;
 }
 .intent-toolbar .row {
   gap: 0;

@@ -89,6 +89,7 @@ export function Dialog({
       className={`dialog ${wide ? 'wide' : ''}`}
       onCancel={(event) => {
         event.preventDefault();
+        event.stopPropagation();
         onClose();
       }}
     >

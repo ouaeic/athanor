@@ -1266,7 +1266,7 @@ export const UpdateProjectModelPreferences = z
   })
   .strict();
 export const ProjectModelPreferences = z.object({
-  projectTaskId: Id,
+  projectTaskId: z.union([Id, z.literal('')]),
   revision: z.number().int().nonnegative(),
   choices: ProjectModelChoices,
   purposes: z.array(
@@ -1277,7 +1277,12 @@ export const ProjectModelPreferences = z.object({
       available: z.boolean(),
       reason: z.string().nullable(),
       effective: z.union([MediaModelOption, ModelRelease]).nullable(),
-      options: z.array(z.union([MediaModelOption, ModelRelease]))
+      options: z.array(
+        z.union([
+          MediaModelOption,
+          ModelRelease.extend({ unavailableReason: z.string().nullable().optional() })
+        ])
+      )
     })
   )
 });
@@ -1650,6 +1655,7 @@ export const CreateTaskRequest = z.object({
   prompt: z.string().min(1).max(200_000),
   title: z.string().min(1).max(TASK_TITLE_MAX_LENGTH).optional(),
   modelId: z.string().optional(),
+  modelChoices: ProjectModelChoices.optional(),
   reasoningEffort: TaskReasoningEffort.optional(),
   privacyRoute: PrivacyRoute.default('provider_zdr'),
   securityMode: SecurityMode.optional(),
@@ -2145,13 +2151,18 @@ export const OwnerPreferences = z.object({
   /** @see ProviderRouting - absent means the defaults, which is the owner's rule unchanged. */
   providerRouting: ProviderRouting.optional(),
   modelPurposes: z
-    .object({ specialist: PurposeModelChoice.optional(), coding: PurposeModelChoice.optional() })
+    .object({
+      specialist: PurposeModelChoice.optional(),
+      coding: PurposeModelChoice.optional(),
+      summarise: PurposeModelChoice.optional(),
+      title: PurposeModelChoice.optional()
+    })
     .optional(),
   model: z
     .object({
       automatic: z.boolean(),
       preference: z.enum(['fast', 'balanced', 'best']),
-      modelId: z.string().max(200)
+      modelId: z.string().max(300)
     })
     .optional(),
   /**
@@ -2196,6 +2207,8 @@ export const SaveDraftRequest = z.object({
   controls: z
     .object({
       modelId: z.string().max(300),
+      modelChoices: ProjectModelChoices.optional(),
+      lifetime: TaskLifetime.optional(),
       reasoningEffort: TaskReasoningEffort,
       securityMode: SecurityMode.optional(),
       privacyRoute: PrivacyRoute,

@@ -14,6 +14,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { seedModels } from '@athanor/model-gateway';
+import { ProjectModelPreferences } from '@athanor/contracts';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import type { ApiConfig } from '../config.js';
 import { buildServer } from '../server.js';
@@ -324,6 +325,141 @@ const buildHarness = async (options: {
     }
   };
 };
+
+describe('model choices across settings, drafts and the first prompt', () => {
+  test('round-trips auxiliary defaults and controls without prompt text, then creates the project with its choices', async () => {
+    const harness = await buildHarness({ catalogScope: 'reviewed_open_weight' });
+    const headers = { cookie: harness.cookie };
+    const choice = { automatic: false, preference: 'balanced', modelId: SWIFT };
+    const defaults = await harness.app.inject({
+      method: 'PUT',
+      url: '/v1/account/preferences',
+      headers,
+      payload: { model: choice, modelPurposes: { summarise: choice, title: choice } }
+    });
+    expect(defaults.statusCode, defaults.body).toBe(200);
+    const global = await harness.app.inject({
+      method: 'GET',
+      url: '/v1/workspace-model-preferences',
+      headers
+    });
+    expect(global.statusCode, global.body).toBe(200);
+    const surface = ProjectModelPreferences.parse(global.json());
+    expect(surface.choices).toMatchObject({ main: choice, summarise: choice, title: choice });
+    expect(surface.purposes).not.toHaveLength(0);
+    expect(surface.purposes.find((item) => item.purpose === 'summarise')?.effective?.id).toBe(
+      SWIFT
+    );
+
+    const modelChoices = {
+      main: { ...choice, modelId: MIDDLE },
+      coding: choice,
+      image: { automatic: true, preference: 'best', modelId: '' }
+    };
+    const controls = {
+      modelId: MIDDLE,
+      modelChoices,
+      reasoningEffort: 'auto',
+      privacyRoute: 'provider_zdr',
+      spendCap: ''
+    };
+    const draft = await harness.app.inject({
+      method: 'PUT',
+      url: '/v1/drafts',
+      headers,
+      payload: { workspaceId: harness.workspaceId, body: '', controls }
+    });
+    expect(draft.statusCode, draft.body).toBe(200);
+    const bootstrap = await harness.app.inject({ method: 'GET', url: '/v1/bootstrap', headers });
+    expect(bootstrap.statusCode, bootstrap.body).toBe(200);
+    expect(bootstrap.json<{ drafts: unknown[] }>().drafts).toEqual([
+      expect.objectContaining({ body: '', controls })
+    ]);
+
+    const payload = {
+      workspaceId: harness.workspaceId,
+      prompt: 'Create a project using these choices',
+      modelChoices
+    };
+    const createHeaders = { ...headers, 'idempotency-key': 'model-choices-create-0001' };
+    const created = await harness.app.inject({
+      method: 'POST',
+      url: '/v1/tasks',
+      headers: createHeaders,
+      payload
+    });
+    expect(created.statusCode, created.body).toBe(200);
+    const task = created.json<{ id: string; modelId: string }>();
+    expect(task.modelId).toBe(MIDDLE);
+    const read = await harness.app.inject({
+      method: 'GET',
+      url: `/v1/tasks/${task.id}/model-preferences`,
+      headers
+    });
+    expect(read.statusCode, read.body).toBe(200);
+    expect(ProjectModelPreferences.parse(read.json())).toMatchObject({
+      revision: 1,
+      choices: modelChoices
+    });
+    const retried = await harness.app.inject({
+      method: 'POST',
+      url: '/v1/tasks',
+      headers: createHeaders,
+      payload
+    });
+    expect(retried.statusCode, retried.body).toBe(200);
+    expect(retried.json<{ id: string }>().id).toBe(task.id);
+
+    const conflict = await harness.app.inject({
+      method: 'PUT',
+      url: `/v1/tasks/${task.id}/model-preferences`,
+      headers: { ...headers, 'idempotency-key': 'model-choice-conflict-0001' },
+      payload: { expectedRevision: 0, choices: {} }
+    });
+    expect(conflict.statusCode, conflict.body).toBe(409);
+    const retained = await harness.app.inject({
+      method: 'GET',
+      url: `/v1/tasks/${task.id}/model-preferences`,
+      headers
+    });
+    expect(ProjectModelPreferences.parse(retained.json()).choices).toEqual(modelChoices);
+
+    const cleared = await harness.app.inject({
+      method: 'PUT',
+      url: '/v1/drafts',
+      headers,
+      payload: { workspaceId: harness.workspaceId, body: '', attachments: [] }
+    });
+    expect(cleared.statusCode, cleared.body).toBe(200);
+    const empty = await harness.app.inject({ method: 'GET', url: '/v1/bootstrap', headers });
+    expect(empty.json<{ drafts: unknown[] }>().drafts).toEqual([]);
+  });
+
+  test('rolls back creation if project preferences cannot be saved', async () => {
+    const harness = await buildHarness({ catalogScope: 'reviewed_open_weight' });
+    const before = await harness.store.listTasks(harness.userId, harness.workspaceId);
+    const write = vi
+      .spyOn(harness.store, 'putProjectModelPreferences')
+      .mockRejectedValueOnce(new Error('Storage unavailable'));
+    const result = await harness.app.inject({
+      method: 'POST',
+      url: '/v1/tasks',
+      headers: { cookie: harness.cookie, 'idempotency-key': 'model-choices-rollback-0001' },
+      payload: {
+        workspaceId: harness.workspaceId,
+        prompt: 'Do not queue without my choices',
+        modelId: SWIFT,
+        modelChoices: { coding: { automatic: false, preference: 'fast', modelId: MIDDLE } }
+      }
+    });
+    expect(result.statusCode, result.body).toBe(500);
+    expect(write).toHaveBeenCalledOnce();
+    write.mockRestore();
+    expect(await harness.store.listTasks(harness.userId, harness.workspaceId)).toHaveLength(
+      before.length
+    );
+  });
+});
 
 describe('the owner preference on an unattended pick', () => {
   /**

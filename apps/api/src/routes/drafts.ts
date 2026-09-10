@@ -39,7 +39,7 @@ export const registerDraftRoutes = (context: RouteContext): void => {
       workspaceId: workspace.id,
       taskId: input.taskId ?? null,
       bodyCiphertext:
-        body || attachments.length
+        body || attachments.length || input.controls
           ? encryptJson(
               {
                 body: input.body,

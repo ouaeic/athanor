@@ -1,12 +1,20 @@
 import { lazy, Suspense, useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { ArrowUpRight, Paperclip, X, Mic, Square, SlidersHorizontal } from 'lucide-react';
-import type { Task, Workspace, TaskLifetime, TaskReasoningEffort } from '@athanor/contracts';
+import type {
+  Task,
+  Workspace,
+  TaskLifetime,
+  TaskReasoningEffort,
+  ProjectModelChoices,
+  ProjectModelPreferences
+} from '@athanor/contracts';
 import { modeFloors } from './asking-rules';
 import { effortChoices, effortLabel } from './reasoning-options';
 import type { Bootstrap, Draft, DraftAttachment } from './model';
 import { defaultPrivacy, isWorking, text, data } from './model';
-import { isNativeClient, patch, post, put, request } from './client';
+import { get, isNativeClient, patch, post, put, request } from './client';
+import ModelPicker from './ModelPicker.js';
 import { Button, Dialog, ErrorNotice } from './ui';
 import { useAutosizeTextarea } from './use-autosize-textarea';
 import { MAX_TASK_SPEND_USD } from './usage-model.js';
@@ -49,6 +57,10 @@ export default function Composer({
     initialDraft?.attachments ?? []
   );
   const [modelId, setModelId] = useState(initialDraft?.controls?.modelId ?? '');
+  const [modelChoices, setModelChoices] = useState<ProjectModelChoices>(
+    initialDraft?.controls?.modelChoices ?? {}
+  );
+  const [projectMain, setProjectMain] = useState<string | null>(null);
   const [reasoningEffort, setReasoningEffort] = useState<TaskReasoningEffort>(
     initialDraft?.controls?.reasoningEffort ?? task?.reasoningEffort ?? 'auto'
   );
@@ -61,7 +73,9 @@ export default function Composer({
    * Only offered when starting work - a run already under way has a lifetime, and changing it
    * mid-flight would move a ceiling the turn is already being held to.
    */
-  const [lifetime, setLifetime] = useState<TaskLifetime>('standard');
+  const [lifetime, setLifetime] = useState<TaskLifetime>(
+    initialDraft?.controls?.lifetime ?? 'standard'
+  );
   const [securityMode, setSecurityMode] = useState<Task['securityMode']>(
     initialDraft?.controls?.securityMode ?? task?.securityMode ?? workspace.securityMode
   );
@@ -87,11 +101,50 @@ export default function Composer({
   const mounted = useRef(true);
   const draftTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const draftRevision = useRef(0);
+  const pendingDraft = useRef<Draft | null>(null);
   const [draftWrites] = useState(() =>
     serialDraftWriter<Draft>((draft) => put('/v1/drafts', draft))
   );
   const onDraftRef = useRef(onDraft);
   onDraftRef.current = onDraft;
+  useEffect(() => {
+    if (!task) return;
+    const controller = new AbortController();
+    let currentPreferences: ProjectModelPreferences | null = null;
+    const apply = (current: ProjectModelPreferences) => {
+      if (controller.signal.aborted || current.revision < (currentPreferences?.revision ?? 0))
+        return;
+      currentPreferences = current;
+      setProjectMain(
+        current.choices.main
+          ? (current.purposes.find((item) => item.purpose === 'main')?.effective?.id ?? null)
+          : null
+      );
+    };
+    const load = () => {
+      void get<ProjectModelPreferences>(`/v1/tasks/${task.id}/model-preferences`, {
+        signal: controller.signal
+      })
+        .then(apply)
+        .catch(() => undefined);
+    };
+    const updated = (event: Event) => {
+      const next = (event as CustomEvent<ProjectModelPreferences>).detail;
+      if (next.projectTaskId !== (currentPreferences?.projectTaskId ?? task.id)) return;
+      if (JSON.stringify(next.choices.main) !== JSON.stringify(currentPreferences?.choices.main)) {
+        changed.current = true;
+        setModelId('');
+        setReasoningEffort('auto');
+      }
+      apply(next);
+    };
+    load();
+    window.addEventListener('garden-model-preferences', updated);
+    return () => {
+      controller.abort();
+      window.removeEventListener('garden-model-preferences', updated);
+    };
+  }, [task?.id]);
   useEffect(() => {
     if (!changed.current || sending.current || busy) return;
     const draft: Draft = {
@@ -99,9 +152,17 @@ export default function Composer({
       taskId: task?.id ?? null,
       body,
       attachments,
-      controls: { modelId, reasoningEffort, securityMode, privacyRoute, spendCap: cap }
+      controls: {
+        modelId,
+        reasoningEffort,
+        securityMode,
+        privacyRoute,
+        spendCap: cap,
+        ...(!task ? { modelChoices, lifetime } : {})
+      }
     };
     onDraftRef.current(draft);
+    pendingDraft.current = draft;
     const revision = ++draftRevision.current;
     draftTimer.current = setTimeout(() => {
       setSaved('Saving draft…');
@@ -110,6 +171,7 @@ export default function Composer({
         .then(() => {
           if (mounted.current && !sending.current && revision === draftRevision.current)
             setSaved('Draft saved');
+          if (pendingDraft.current === draft) pendingDraft.current = null;
         })
         .catch((err: unknown) => {
           if (mounted.current && !sending.current && revision === draftRevision.current) {
@@ -125,6 +187,8 @@ export default function Composer({
     body,
     attachments,
     modelId,
+    modelChoices,
+    lifetime,
     reasoningEffort,
     securityMode,
     privacyRoute,
@@ -169,6 +233,9 @@ export default function Composer({
       voice.current?.dispose();
       voiceState.current = 'idle';
       if (draftTimer.current) clearTimeout(draftTimer.current);
+      if (pendingDraft.current && !sending.current) {
+        void draftWrites.save(pendingDraft.current).catch(() => undefined);
+      }
     };
   }, []);
   async function upload(files: FileList | readonly File[] | null): Promise<boolean> {
@@ -270,6 +337,7 @@ export default function Composer({
       prompt,
       attachments: attachments.map((file) => file.path),
       ...(modelId ? { modelId } : {}),
+      ...(!task && Object.keys(modelChoices).length ? { modelChoices } : {}),
       reasoningEffort,
       securityMode,
       privacyRoute,
@@ -290,6 +358,7 @@ export default function Composer({
         { idempotencyKey: operation.current.key }
       );
       changed.current = false;
+      pendingDraft.current = null;
       if (mounted.current) {
         setBody('');
         setAttachments([]);
@@ -336,10 +405,11 @@ export default function Composer({
   const recording = dictationState === 'recording';
   const voiceBusy = dictationState !== 'idle';
   const editingDisabled = busy || Boolean(pendingTask);
-  const models = bootstrap.models.filter(
-    (model) => model.availability === 'available' && model.privacyRoute === privacyRoute
+  const models = bootstrap.models.filter((model) => model.privacyRoute === privacyRoute);
+  const projectModel = models.find((model) => model.id === (projectMain || task?.modelId));
+  const selectedModel = models.find(
+    (model) => model.id === (modelId || projectMain || task?.modelId)
   );
-  const selectedModel = models.find((model) => model.id === (modelId || task?.modelId));
   const efforts = effortChoices(selectedModel?.reasoning);
   return (
     <form
@@ -496,28 +566,42 @@ export default function Composer({
       )}
       <div className="garden-model-controls">
         <div className="garden-model-settings">
-          <label className="garden-model-select">
+          <div className="garden-model-select">
             <span>Model</span>
-            <select
-              aria-label="Model for this direction"
-              value={modelId}
+            <ModelPicker
+              label="Model for this direction"
+              loadDetails
+              value={!task && modelChoices.main?.automatic ? '__automatic' : modelId}
+              models={models}
+              shortcuts={[
+                {
+                  value: '',
+                  label: task
+                    ? (projectModel?.displayName ?? 'Current project model')
+                    : 'Use global default'
+                },
+                ...(!task ? [{ value: '__automatic', label: 'Automatic for this project' }] : [])
+              ]}
               disabled={editingDisabled || uploading || voiceBusy}
-              onChange={(event) => {
+              onChange={(value) => {
                 changed.current = true;
-                setModelId(event.target.value);
+                setModelId(value === '__automatic' ? '' : value);
+                if (!task)
+                  setModelChoices((current) => {
+                    const next = { ...current };
+                    if (!value) delete next.main;
+                    else
+                      next.main = {
+                        automatic: value === '__automatic',
+                        preference: current.main?.preference ?? 'balanced',
+                        modelId: value === '__automatic' ? '' : value
+                      };
+                    return next;
+                  });
                 setReasoningEffort('auto');
               }}
-            >
-              <option value="">
-                {task ? (selectedModel?.displayName ?? 'Current model') : 'Automatic selection'}
-              </option>
-              {models.map((model) => (
-                <option key={model.id} value={model.id}>
-                  {model.displayName}
-                </option>
-              ))}
-            </select>
-          </label>
+            />
+          </div>
           <Button
             aria-label="Model choices for this direction"
             aria-expanded={advancedModels}
@@ -534,7 +618,10 @@ export default function Composer({
                 title="How long anything this publishes stays up, and how far past one step budget the run may carry itself"
                 value={lifetime}
                 disabled={editingDisabled}
-                onChange={(event) => setLifetime(event.target.value as TaskLifetime)}
+                onChange={(event) => {
+                  changed.current = true;
+                  setLifetime(event.target.value as TaskLifetime);
+                }}
               >
                 <option value="brief">Minutes — output expires in a day</option>
                 <option value="standard">Normal</option>
@@ -595,6 +682,11 @@ export default function Composer({
                 changed.current = true;
                 setPrivacyRoute(event.target.value === 'external' ? 'external' : 'provider_zdr');
                 setModelId('');
+                setModelChoices((current) => {
+                  const next = { ...current };
+                  delete next.main;
+                  return next;
+                });
                 setReasoningEffort('auto');
               }}
             >
@@ -606,6 +698,9 @@ export default function Composer({
             <span>{task ? 'Extra limit' : 'Limit'}</span>
             <input
               type="number"
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') event.preventDefault();
+              }}
               min="0.01"
               max={MAX_TASK_SPEND_USD}
               disabled={editingDisabled || uploading || voiceBusy}
@@ -636,23 +731,22 @@ export default function Composer({
         </div>
       </div>
       {advancedModels && (
-        <Dialog
-          title="Model choices"
-          onClose={() => setAdvancedModels(false)}
-          {...(task ? {} : { wide: true })}
-        >
+        <Dialog title="Model choices" onClose={() => setAdvancedModels(false)} wide>
           <Suspense fallback={<p className="muted">Loading…</p>}>
             <PromptModelChoices
               {...(task ? { taskId: task.id } : { taskId: '' })}
-              disabled={editingDisabled || !task}
+              disabled={editingDisabled}
+              choices={modelChoices}
+              privacyRoute={privacyRoute}
+              onChange={(choices) => {
+                changed.current = true;
+                setModelChoices(choices);
+                setModelId(choices.main?.automatic === false ? choices.main.modelId : '');
+                if (JSON.stringify(choices.main) !== JSON.stringify(modelChoices.main))
+                  setReasoningEffort('auto');
+              }}
             />
           </Suspense>
-          {!task && (
-            <small className="muted">
-              These follow the Settings choices until the work exists. Pin one per purpose there
-              after the first prompt lands.
-            </small>
-          )}
         </Dialog>
       )}
       <ErrorNotice error={error} />
