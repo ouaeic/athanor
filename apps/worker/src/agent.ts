@@ -57,6 +57,7 @@ import {
   type PreparedContext
 } from './context.js';
 import { taskFailureRecord } from './failure-record.js';
+import { pinnedPurposeModel } from './purpose-model.js';
 import { workerLogger, type Logger } from './log.js';
 import {
   botWallSite,
@@ -365,7 +366,23 @@ export class AgentWorker {
       assertProviderConfigured: (task) => this.#assertProviderConfigured(task),
       gateway: (task, model) => this.#gateway(task, model),
       withLeaseRenewal: (task, operation) => this.#withLeaseRenewal(task, operation),
-      currentCatalog: (fallback) => this.#currentCatalog(fallback)
+      currentCatalog: (fallback) => this.#currentCatalog(fallback),
+      /*
+       * The context the purpose resolver needs, assembled rather than passing `this`: it wants a
+       * store, the master key and a way to read this task's credential, and the worker holds all
+       * three privately.
+       */
+      pinnedSummariser: (task, catalog) =>
+        pinnedPurposeModel(
+          {
+            store,
+            masterKey: this.#masterKey,
+            inferenceCredential: (forTask) => this.#inferenceCredential(forTask)
+          },
+          task,
+          'summarise',
+          catalog
+        )
     };
     this.#memoryCapture = {
       store,

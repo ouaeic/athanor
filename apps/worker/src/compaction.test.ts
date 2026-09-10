@@ -334,3 +334,62 @@ describe('what a compaction costs', () => {
     expect(outcome?.estimatedTokensAfter).toBeLessThan(outcome?.estimatedTokensBefore ?? 0);
   });
 });
+
+/**
+ * Whose model does the summarising.
+ *
+ * `compactionModel` takes the cheapest capable route on the task's own provider, and that is the
+ * right answer when nobody has said otherwise - it is what every run did before an owner could
+ * hold an opinion. What it could not do is be overruled, and this is not a small number: the
+ * context rig records around a million summariser tokens per configuration, spent on a task's
+ * longest and most expensive turns.
+ */
+describe('the model a compaction runs on', () => {
+  const pinned: ModelRelease = {
+    ...SUMMARISER,
+    id: 'pinned-summariser',
+    providerModelId: 'test/pinned'
+  };
+
+  /** Runs one compaction and reports the model handed to the gateway to do it. */
+  const summariserUsed = async (
+    pinnedSummariser: (() => Promise<ModelRelease | null>) | undefined
+  ): Promise<string | undefined> => {
+    const held = harness();
+    let chosen: ModelRelease | undefined;
+    const deps = {
+      ...held.deps,
+      ...(pinnedSummariser ? { pinnedSummariser } : {}),
+      gateway: async (task: TaskRecord, model: ModelRelease) => {
+        chosen = model;
+        return (held.deps as unknown as { gateway: CompactionDeps['gateway'] }).gateway(
+          task,
+          model
+        );
+      }
+    } as unknown as CompactionDeps;
+    await compactTurnContext(deps, held.task, held.key, held.state, {
+      model: LEAD,
+      catalog: [SUMMARISER],
+      maxOutputTokens: 4_000,
+      reservedTokens: 0,
+      trigger: 'budget',
+      turn: 0
+    });
+    return chosen?.id;
+  };
+
+  it('uses the owner`s pin over the automatic pick', async () => {
+    expect(await summariserUsed(async () => pinned)).toBe(pinned.id);
+  });
+
+  it('falls back to the automatic pick when the pin cannot be honoured', async () => {
+    // A summary must never take a long turn down: an unresolvable pin is a preference nobody can
+    // act on, not a failure, and the run carries on exactly as it did before one was expressed.
+    expect(await summariserUsed(async () => null)).toBe(SUMMARISER.id);
+  });
+
+  it('leaves a caller that knows nothing about pins exactly as it was', async () => {
+    expect(await summariserUsed(undefined)).toBe(SUMMARISER.id);
+  });
+});

@@ -49,7 +49,15 @@ const purposeSurface = async (
           modality.effective?.unavailableReason ??
           (modality.effective ? null : (modality.reason ?? 'The selected model is unavailable.'))
       };
-    if (purpose !== 'main' && purpose !== 'specialist' && purpose !== 'coding')
+    // The text purposes the selector knows how to answer for. Anything else at this point is a
+    // media modality the connected provider did not offer, which the branch below says plainly.
+    if (
+      purpose !== 'main' &&
+      purpose !== 'specialist' &&
+      purpose !== 'coding' &&
+      purpose !== 'summarise' &&
+      purpose !== 'title'
+    )
       return {
         purpose,
         ...resolved,

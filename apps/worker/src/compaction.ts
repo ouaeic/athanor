@@ -36,6 +36,15 @@ import { withRequestDeadline } from './turn-lifecycle.js';
 export interface CompactionDeps {
   readonly store: DataStore;
   assertProviderConfigured(task: TaskRecord): Promise<void>;
+  /**
+   * The model the owner pinned for summarising, when they pinned one. Optional on the deps because
+   * every caller that does not care about the choice - the tests among them - keeps working
+   * without it, and its absence means exactly what an unset preference means.
+   */
+  pinnedSummariser?: (
+    task: TaskRecord,
+    catalog: readonly ModelRelease[]
+  ) => Promise<ModelRelease | null>;
   gateway(
     task: TaskRecord,
     model: ModelRelease
@@ -160,11 +169,22 @@ export const compactTurnContext = async (
     input.maxOutputTokens,
     input.reservedTokens
   );
-  const summariser = compactionModel(
-    await deps.currentCatalog(input.catalog),
-    input.model,
-    task.privacyRoute
-  );
+  /*
+   * The owner's choice first, the automatic pick otherwise.
+   *
+   * `compactionModel` takes the cheapest capable route on this task's provider, which is the right
+   * answer when nobody has said anything - and it is what every run did before this. What it could
+   * not do is be overruled: an owner who wanted their summarising on one particular route had no
+   * way to say so, and this is not a small number - the context rig records around a million
+   * summariser tokens per configuration, spent on a task's longest and most expensive turns.
+   *
+   * A pin that cannot be honoured resolves to nothing rather than throwing, so a summary never
+   * takes a long turn down.
+   */
+  const catalogue = await deps.currentCatalog(input.catalog);
+  const summariser =
+    (await deps.pinnedSummariser?.(task, catalogue)) ??
+    compactionModel(catalogue, input.model, task.privacyRoute);
   // `finish` demands ids that live only on the raw tool messages this compaction is about to
   // drop, so they are carried forward deterministically rather than left to a summariser that is
   // asked for prose. Without this every long task ends on a rejected completion.

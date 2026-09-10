@@ -15,7 +15,12 @@ export const purposeLabels: Record<ModelPurpose, string> = {
   image: 'Images',
   audio: 'Speech',
   transcription: 'Transcription',
-  video: 'Video'
+  video: 'Video',
+  // The two auxiliary jobs a long task does on its own account. Named for what they are rather
+  // than for the mechanism, because an owner choosing a model here is choosing who writes the
+  // running brief when a window fills, not choosing a compaction strategy.
+  summarise: 'Condensing long work',
+  title: 'Naming a conversation'
 };
 
 const automatic: PurposeModelChoice = { automatic: true, preference: 'balanced', modelId: '' };

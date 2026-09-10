@@ -1208,6 +1208,20 @@ export const MediaSettings = z.object({
 });
 export type MediaSettings = z.infer<typeof MediaSettings>;
 
+/**
+ * The jobs an owner may point at a particular model.
+ *
+ * The first three drive a conversation, the four media ones make a file, and the last two are the
+ * auxiliary calls a long task makes on its own account. Those two were routed automatically and
+ * were not choosable, which is the gap: `summarise` in particular is not a small number - the
+ * context rig records around a million summariser tokens per configuration, spent on a task's
+ * longest and most expensive turns, and an owner who wants that on a specific cheap model had no
+ * way to say so.
+ *
+ * Automatic remains the default for both and keeps exactly the behaviour they had: `compactionModel`
+ * already picks the cheapest capable route on the task's own provider and privacy route, which is
+ * the right answer when nobody has an opinion. What is new is being able to hold one.
+ */
 export const ModelPurpose = z.enum([
   'main',
   'specialist',
@@ -1215,7 +1229,9 @@ export const ModelPurpose = z.enum([
   'image',
   'audio',
   'transcription',
-  'video'
+  'video',
+  'summarise',
+  'title'
 ]);
 export type ModelPurpose = z.infer<typeof ModelPurpose>;
 export const PurposeModelChoice = MediaModelChoice.refine(
@@ -1231,7 +1247,9 @@ export const ProjectModelChoices = z
     image: PurposeModelChoice.optional(),
     audio: PurposeModelChoice.optional(),
     transcription: PurposeModelChoice.optional(),
-    video: PurposeModelChoice.optional()
+    video: PurposeModelChoice.optional(),
+    summarise: PurposeModelChoice.optional(),
+    title: PurposeModelChoice.optional()
   })
   .strict();
 export type ProjectModelChoices = z.infer<typeof ProjectModelChoices>;
