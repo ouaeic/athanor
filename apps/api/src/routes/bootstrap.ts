@@ -90,7 +90,7 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
       store.listTaskPage(user.id),
       store.listTaskSchedules(user.id),
       modelsForUser(user),
-      store.getManagedProviderCredential(user.id, 'inference'),
+      store.primaryInferenceCredential(user.id),
       store.usageTotals(user.id, periodStart, periodEnd),
       openDrafts(),
       requiresZeroDataRetention(user.id),

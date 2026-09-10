@@ -62,6 +62,9 @@ const ProjectModels = lazy(() => import('./ProjectModels'));
 const CodingMissions = lazy(() => import('./CodingMissions'));
 const SubagentLanes = lazy(() => import('./SubagentLanes'));
 const SpendBlock = lazy(() => import('./SpendBlock'));
+const WorkDirections = lazy(() =>
+  import('./WorkDirections').then((module) => ({ default: module.WorkDirections }))
+);
 const Share = lazy(() => import('./Sharing'));
 const ResultPreview = lazy(() =>
   import('./computer/ResultPreview').then((module) => ({ default: module.ResultPreview }))
@@ -607,6 +610,26 @@ export default function TaskSurface({
               {task.spendPausedAt && (
                 <Suspense fallback={null}>
                   <SpendBlock task={task} onResumed={reload} />
+                </Suspense>
+              )}
+              {/*
+               * What the owner asked for, on the page rather than behind a button.
+               *
+               * This component was written, styled and tested and then never rendered anywhere -
+               * so the answer to "where are my prompts and follow-ups" was the raw activity log.
+               * It sits above the work because it is the thing the work is answering, and it
+               * collapses every earlier direction into one line so a long project does not open
+               * with its own history.
+               */}
+              {presentation?.surface && (
+                <Suspense fallback={null}>
+                  <WorkDirections
+                    surface={presentation.surface}
+                    onRevisit={(eventId) => {
+                      const event = events.find((item) => item.id === eventId);
+                      if (event) setBranchEvent(event);
+                    }}
+                  />
                 </Suspense>
               )}
               <SubagentLanes events={events} />

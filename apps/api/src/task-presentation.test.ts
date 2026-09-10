@@ -560,3 +560,147 @@ describe('a plan that predates directions', () => {
     expect(built.progress.history[0]?.phases.map((phase) => phase.title)).toEqual(['Legacy step']);
   });
 });
+
+/**
+ * What a milestone says about itself on hover.
+ *
+ * Written by nobody: the events between a step starting and closing are what that step did, so the
+ * line is counted off the activity already recorded. It costs no tokens, cannot be forgotten by a
+ * model that was busy, and is there for runs that finished before any of this existed.
+ */
+describe('the account a milestone gives of itself', () => {
+  const at = (sequence: number, kind: TaskEvent['kind'], payload: unknown, when: string) => ({
+    ...event(sequence, kind, payload),
+    createdAt: when
+  });
+  const planWith = (steps: unknown[]) => ({
+    id: 'plan-1',
+    taskId,
+    version: 2,
+    parentVersion: null,
+    branchName: 'Main',
+    steps,
+    createdBy: 'agent',
+    createdAt: '2026-09-06T11:00:00.000Z'
+  });
+
+  it('counts only what happened inside the step`s own window', () => {
+    const events = [
+      // Before the step starts: must not be counted against it.
+      at(
+        1,
+        'tool_started',
+        { toolCallId: 'x', tool: 'file_write', arguments: { path: 'early.ts' } },
+        '2026-09-06T10:00:00.000Z'
+      ),
+      at(
+        2,
+        'tool_result',
+        { toolCallId: 'x', result: { ok: true, path: 'early.ts' } },
+        '2026-09-06T10:00:01.000Z'
+      ),
+      at(
+        3,
+        'plan',
+        { steps: [{ id: 'a', title: 'Build', status: 'in_progress' }] },
+        '2026-09-06T11:00:00.000Z'
+      ),
+      at(
+        4,
+        'tool_started',
+        { toolCallId: 'y', tool: 'file_write', arguments: { path: 'app/index.html' } },
+        '2026-09-06T11:05:00.000Z'
+      ),
+      at(
+        5,
+        'tool_result',
+        { toolCallId: 'y', result: { ok: true, path: 'app/index.html' } },
+        '2026-09-06T11:05:01.000Z'
+      ),
+      at(
+        6,
+        'plan',
+        { steps: [{ id: 'a', title: 'Build', status: 'completed' }] },
+        '2026-09-06T11:10:00.000Z'
+      )
+    ];
+    const built = buildTaskPresentation(
+      input({ events, plan: planWith([{ id: 'a', title: 'Build', status: 'completed' }]) as never })
+    );
+    const phase = built.progress.phases[0];
+    expect(phase?.detail).toContain('1 file changed');
+    expect(phase?.detail).toContain('app/index.html');
+    expect(phase?.detail).not.toContain('early.ts');
+  });
+
+  it('gives a part its own window and its own account', () => {
+    const events = [
+      at(
+        1,
+        'plan',
+        {
+          steps: [
+            {
+              id: 'a',
+              title: 'Ship',
+              status: 'in_progress',
+              substeps: [{ id: 'a1', title: 'Write it', status: 'in_progress' }]
+            }
+          ]
+        },
+        '2026-09-06T11:00:00.000Z'
+      ),
+      at(
+        2,
+        'tool_started',
+        { toolCallId: 'y', tool: 'file_write', arguments: { path: 'app/page.tsx' } },
+        '2026-09-06T11:02:00.000Z'
+      ),
+      at(
+        3,
+        'tool_result',
+        { toolCallId: 'y', result: { ok: true, path: 'app/page.tsx' } },
+        '2026-09-06T11:02:01.000Z'
+      ),
+      at(
+        4,
+        'plan',
+        {
+          steps: [
+            {
+              id: 'a',
+              title: 'Ship',
+              status: 'in_progress',
+              substeps: [{ id: 'a1', title: 'Write it', status: 'completed' }]
+            }
+          ]
+        },
+        '2026-09-06T11:03:00.000Z'
+      )
+    ];
+    const built = buildTaskPresentation(
+      input({
+        events,
+        plan: planWith([
+          {
+            id: 'a',
+            title: 'Ship',
+            status: 'in_progress',
+            substeps: [{ id: 'a1', title: 'Write it', status: 'completed' }]
+          }
+        ]) as never
+      })
+    );
+    const part = built.progress.phases[0]?.substeps?.[0];
+    expect(part?.startedAt).toBe('2026-09-06T11:00:00.000Z');
+    expect(part?.completedAt).toBe('2026-09-06T11:03:00.000Z');
+    expect(part?.detail).toContain('app/page.tsx');
+  });
+
+  it('says nothing about a step nothing was recorded inside', () => {
+    const built = buildTaskPresentation(
+      input({ plan: planWith([{ id: 'a', title: 'Untouched', status: 'pending' }]) as never })
+    );
+    expect(built.progress.phases[0]?.detail).toBeUndefined();
+  });
+});

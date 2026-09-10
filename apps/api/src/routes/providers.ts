@@ -73,7 +73,7 @@ export const registerProviderRoutes = (context: RouteContext): void => {
     const user = requireUser(request.user);
     await requireRecentStepUp(request, user);
     return idempotent(request, reply, user, async () => {
-      const existingCredential = await store.getManagedProviderCredential(user.id, 'inference');
+      const existingCredential = await store.primaryInferenceCredential(user.id);
       const existingSecret =
         existingCredential?.status === 'active'
           ? decryptJson<InferenceSecret>(
@@ -296,9 +296,18 @@ export const registerProviderRoutes = (context: RouteContext): void => {
       const mediaRoutes = mediaModels
         ? await mediaRoutesFor(saved, mediaModels)
         : await mediaRoutesFor(saved, undefined).catch(() => ({}));
+      /*
+       * Keyed by vendor, so a second connection joins the first instead of overwriting it.
+       *
+       * The key used to be the role - one row called `inference` - which is the whole reason
+       * connecting Ollama Cloud took OpenRouter away. The legacy row is removed in the same breath
+       * as the vendor-keyed one is written, so an account that had a single connection ends up
+       * holding exactly the same connection under its new name rather than two copies of it that
+       * can drift apart.
+       */
       await store.upsertManagedProviderCredential({
         userId: user.id,
-        provider: 'inference',
+        provider: `inference:${input.provider}`,
         secretCiphertext: encryptJson(
           { ...saved, ...(mediaRoutes ? { mediaRoutes } : {}) },
           masterKey,
@@ -308,6 +317,31 @@ export const registerProviderRoutes = (context: RouteContext): void => {
         monthlyLimitUsd: 0,
         status: 'active'
       });
+      const legacy = await store.getManagedProviderCredential(user.id, 'inference');
+      if (legacy) {
+        const previous = decryptJson<InferenceSecret>(
+          legacy.secretCiphertext,
+          masterKey,
+          inferenceCredentialAad(user.id)
+        );
+        /*
+         * Never over the row this request just wrote. A legacy credential for the *same* vendor is
+         * the older copy of what was just saved, and copying it forward would put the previous key
+         * back a line after the new one was stored. A legacy credential for a *different* vendor is
+         * a connection this account already had, and moving it to its own key is what keeps it
+         * rather than stranding it under a name nothing reads any more.
+         */
+        if (previous.provider !== input.provider)
+          await store.upsertManagedProviderCredential({
+            userId: user.id,
+            provider: `inference:${previous.provider}`,
+            secretCiphertext: legacy.secretCiphertext,
+            externalRef: legacy.externalRef,
+            monthlyLimitUsd: legacy.monthlyLimitUsd,
+            status: 'active'
+          });
+        await store.removeManagedProviderCredential(user.id, 'inference');
+      }
       await recordSecurityEvent(store, {
         userId: user.id,
         kind: 'inference_provider_configured',
@@ -344,8 +378,20 @@ export const registerProviderRoutes = (context: RouteContext): void => {
   app.delete('/v1/providers', async (request, reply) => {
     const user = requireUser(request.user);
     await requireRecentStepUp(request, user);
-    return idempotent(request, reply, user, async () => ({
-      deleted: await store.deleteManagedProviderCredential(user.id, 'inference')
-    }));
+    return idempotent(request, reply, user, async () => {
+      /*
+       * Disconnecting takes every connection, not one row called `inference`.
+       *
+       * An account can hold several now, and a delete that removed only the legacy key would leave
+       * a box reporting no provider while the worker still held a usable one - which is worse than
+       * either state on its own.
+       */
+      const connections = await store.listManagedProviderCredentials(user.id);
+      let deleted = false;
+      for (const connection of connections)
+        deleted =
+          (await store.removeManagedProviderCredential(user.id, connection.provider)) || deleted;
+      return { deleted };
+    });
   });
 };

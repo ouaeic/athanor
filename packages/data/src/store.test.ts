@@ -7137,7 +7137,8 @@ describe('the upgrade path onto rows an older athanor wrote', () => {
     76: 1,
     78: 1,
     84: 1,
-    95: 1
+    95: 1,
+    98: 1
   };
 
   /**
@@ -7316,6 +7317,65 @@ describe('the upgrade path onto rows an older athanor wrote', () => {
     await database.exec(migrations.find((entry) => entry.version === 95)!.sql);
     expect(await origins()).toEqual(expected);
     expect((await unchanged()).rows).toEqual(before);
+  });
+
+  /**
+   * Migration 98 gives every catalogue row the connection that reaches it.
+   *
+   * Before it, `provider` was doing two jobs: naming the id namespace a model lives in, and naming
+   * the credential that can call it. That is why a box could hold one provider - every
+   * non-OpenRouter endpoint shared the bucket called `custom`. The backfill has to seed the new
+   * column from the old one for rows an older athanor wrote, and it has to leave the ids alone: a
+   * finished task names its model by id, and a rewritten id is a history that stops resolving.
+   */
+  it('gives an older catalogue its connection without touching the ids tasks name', async () => {
+    await migrateBelow(98);
+    await seedOwner();
+    expect(await hasColumn('model_releases', 'connection_id')).toBe(false);
+    const insert = async (id: string, provider: string) =>
+      database.query(
+        `INSERT INTO model_releases(
+           id,provider_model_id,display_name,provider,revision,availability,openness,license,
+           commercial_use,privacy_route,context_tokens,modalities,capabilities,usage_class,
+           recommendation_tags
+         ) VALUES ($1,$1,$1,$2,'r1','available','permissive_open_weight','apache-2.0',true,
+           'provider_zdr',128000,'[]'::jsonb,'[]'::jsonb,'light','[]'::jsonb)`,
+        [id, provider]
+      );
+    await insert('openrouter/vendor/one', 'openrouter');
+    await insert('custom/glm-5.3-flash', 'custom');
+    const before = (await database.query('SELECT id FROM model_releases ORDER BY id')).rows.map(
+      (row) => String(row.id)
+    );
+
+    await apply(98);
+
+    const rows = await database.query(
+      'SELECT id,provider,connection_id FROM model_releases ORDER BY id'
+    );
+    expect(rows.rows.map((row) => String(row.id))).toEqual(before);
+    expect(
+      Object.fromEntries(rows.rows.map((row) => [String(row.id), String(row.connection_id)]))
+    ).toEqual({
+      'custom/glm-5.3-flash': 'custom',
+      'openrouter/vendor/one': 'openrouter'
+    });
+
+    // Idempotent: the backfill only fills what is still null, so a row a later write has already
+    // claimed for a different connection is not dragged back to its namespace by a re-run.
+    await database.query(
+      `UPDATE model_releases SET connection_id='ollama-cloud' WHERE id='custom/glm-5.3-flash'`
+    );
+    await database.exec(migrations.find((entry) => entry.version === 98)!.sql);
+    expect(
+      String(
+        (
+          await database.query(
+            `SELECT connection_id FROM model_releases WHERE id='custom/glm-5.3-flash'`
+          )
+        ).rows[0]!.connection_id
+      )
+    ).toBe('ollama-cloud');
   });
 
   it('has an upgrade test for every migration that rewrites rows rather than reshaping them', () => {

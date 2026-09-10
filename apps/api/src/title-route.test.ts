@@ -23,6 +23,10 @@ const support = (models: RoutableModel[], native = false) =>
   createServerSupport({
     store: {
       getManagedProviderCredential: async () => null,
+      // Nothing saved: the credential comes from the environment, which is the shape a self-hosted
+      // box configured through `control.env` has. A double missing this method fails on the store
+      // call that looks for saved connections rather than on what the case is about.
+      listManagedProviderCredentials: async () => [],
       listModels: async () => models,
       effectiveSpendLimits: async () => ({})
     },

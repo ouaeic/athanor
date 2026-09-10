@@ -468,6 +468,56 @@ export class AgentWorker {
    * so the lookup lives here rather than being written twice with two chances to disagree about
    * which credential wins.
    */
+  /**
+   * The account's connections, by vendor.
+   *
+   * An account holds one credential per provider it has connected, keyed `inference:<vendor>`, and
+   * two older shapes exist beside them: `'inference'` from when a box could hold exactly one, and
+   * `'openrouter'` from before that, which sealed a bare `{apiKey}` without the account's AAD. All
+   * three are read, because an install that has not opened Settings since is still reaching its
+   * provider through one of the old ones.
+   */
+  async #inferenceConnections(task: TaskRecord): Promise<Map<string, InferenceCredential>> {
+    const connections = new Map<string, InferenceCredential>();
+    for (const row of await this.store.listManagedProviderCredentials(task.userId)) {
+      if (row.status !== 'active') continue;
+      try {
+        const secret: InferenceCredential =
+          row.provider === 'openrouter'
+            ? {
+                provider: 'openrouter',
+                baseUrl: this.config.OPENROUTER_BASE_URL,
+                apiKey: decryptJson<{ apiKey: string }>(row.secretCiphertext, this.#masterKey)
+                  .apiKey,
+                enforceZeroDataRetention: true
+              }
+            : decryptJson<InferenceCredential>(
+                row.secretCiphertext,
+                this.#masterKey,
+                inferenceCredentialAad(task.userId)
+              );
+        // Newest wins on a tie: `listManagedProviderCredentials` orders by `updated_at` descending,
+        // so a vendor-keyed row written today takes precedence over the legacy row it replaced.
+        if (!connections.has(secret.provider)) connections.set(secret.provider, secret);
+      } catch {
+        // A credential this worker cannot open is one it does not have. One unreadable row must not
+        // take the others down with it, which is what a throw here would do.
+      }
+    }
+    /*
+     * A box whose provider comes from its environment has no rows at all, and that is the
+     * documented self-hosted install: `AI_API_KEY` or `OPENROUTER_API_KEY` in `control.env`, never
+     * a visit to Settings. `#inferenceCredential` is the one place that fallback is written down,
+     * so it answers here too rather than being restated - restating it is how the two would come to
+     * disagree about what a box with no saved credential can reach.
+     */
+    if (connections.size === 0) {
+      const only = await this.#inferenceCredential(task).catch(() => undefined);
+      if (only) connections.set(only.provider, only);
+    }
+    return connections;
+  }
+
   async #inferenceCredential(task: TaskRecord, resolveMedia = false): Promise<InferenceCredential> {
     const credential =
       (await this.store.getManagedProviderCredential(task.userId, 'inference')) ??
@@ -531,12 +581,33 @@ export class AgentWorker {
     credential: { provider: string; enforceZeroDataRetention: boolean };
   }> {
     const gateway = new ModelGateway();
-    const secret = await this.#inferenceCredential(task);
-    const expectedProvider = secret.provider === 'openrouter' ? 'openrouter' : 'custom';
-    if (model.provider !== expectedProvider)
+    /*
+     * The credential is chosen by the model, not by the account.
+     *
+     * This used to read the one credential an account had and refuse any model whose namespace did
+     * not match it - which is what made a box single-provider: connecting Ollama Cloud took
+     * OpenRouter's models away, and a conversation pinned to one of them failed here, after it had
+     * started. An account now holds a connection per provider, so the question is whether *this*
+     * model has a key behind it.
+     *
+     * `custom` is one namespace shared by every non-OpenRouter vendor, so a row in it is served by
+     * whichever such connection exists; the tag on the row says which vendor listed it. The failure
+     * is still a refusal rather than a silent fallback to another provider's key: sending an
+     * account's OpenRouter credential to an endpoint it was not issued for is the one outcome worse
+     * than stopping.
+     */
+    const connections = await this.#inferenceConnections(task);
+    const vendor =
+      model.provider === 'openrouter'
+        ? 'openrouter'
+        : ([...connections.keys()].find((name) => name !== 'openrouter') ?? null);
+    const secret = vendor ? connections.get(vendor) : undefined;
+    if (!secret)
       throw new AthanorError(
         'provider_model_mismatch',
-        `The selected model belongs to ${model.provider}, but ${secret.provider} is configured`
+        connections.size === 0
+          ? 'Add a model provider in Settings before starting agent work'
+          : `The selected model belongs to ${model.provider}, and this account has no connection that reaches it`
       );
     gateway.register(
       model.provider,

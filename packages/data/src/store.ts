@@ -1249,6 +1249,22 @@ export class DataStore {
     return this.#connectors.getManagedProviderCredential(...args);
   }
 
+  listManagedProviderCredentials(
+    ...args: Parameters<ConnectorStore['listManagedProviderCredentials']>
+  ) {
+    return this.#connectors.listManagedProviderCredentials(...args);
+  }
+
+  primaryInferenceCredential(...args: Parameters<ConnectorStore['primaryInferenceCredential']>) {
+    return this.#connectors.primaryInferenceCredential(...args);
+  }
+
+  removeManagedProviderCredential(
+    ...args: Parameters<ConnectorStore['removeManagedProviderCredential']>
+  ) {
+    return this.#connectors.removeManagedProviderCredential(...args);
+  }
+
   upsertManagedProviderCredential(
     ...args: Parameters<ConnectorStore['upsertManagedProviderCredential']>
   ) {

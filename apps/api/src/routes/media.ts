@@ -28,7 +28,9 @@ export const registerMediaRoutes = (context: RouteContext): void => {
     const user = requireUser(request.user);
     return idempotent(request, reply, user, async () => {
       const input = MediaModelSelection.parse(request.body);
-      const credential = await store.getManagedProviderCredential(user.id, 'inference');
+      // Whatever key this account's credential lives under, and written back to that same key: a
+      // media choice belongs in the row it was read from.
+      const credential = await store.primaryInferenceCredential(user.id);
       if (credential?.status !== 'active')
         throw new AthanorError(
           'provider_setup_required',
@@ -43,7 +45,7 @@ export const registerMediaRoutes = (context: RouteContext): void => {
       const routes = await mediaRoutesFor(secret, input);
       await store.upsertManagedProviderCredential({
         userId: user.id,
-        provider: 'inference',
+        provider: credential.provider,
         secretCiphertext: encryptJson(
           { ...secret, mediaModels: input, ...(routes ? { mediaRoutes: routes } : {}) },
           masterKey,

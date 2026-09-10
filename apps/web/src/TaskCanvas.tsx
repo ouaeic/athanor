@@ -421,8 +421,16 @@ function PhaseList({
           typeof phase.countTotal === 'number' && phase.countTotal > 0
             ? `${phase.countDone ?? 0}/${phase.countTotal}`
             : null;
+        /*
+         * The hover is the step's own account of itself, counted off what it recorded, with its
+         * timing appended. A step nothing was recorded inside says only what it is, rather than
+         * claiming an empty summary.
+         */
+        const hover = [phase.title, phase.detail, durationText && `took ${durationText}`]
+          .filter(Boolean)
+          .join(' — ');
         const row = (
-          <span className="garden-phase-line">
+          <span className="garden-phase-line" title={hover}>
             <span className="garden-phase-dot">
               {phase.status === 'completed' ? <Check size={12} /> : index + 1}
             </span>
@@ -453,7 +461,11 @@ function PhaseList({
                 <summary>{row}</summary>
                 <ol className="garden-subphases">
                   {substeps.map((sub) => (
-                    <li key={sub.id} data-status={sub.status}>
+                    <li
+                      key={sub.id}
+                      data-status={sub.status}
+                      title={[sub.title, sub.detail].filter(Boolean).join(' — ')}
+                    >
                       <span className="garden-phase-dot">
                         {sub.status === 'completed' ? <Check size={10} /> : '·'}
                       </span>

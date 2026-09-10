@@ -372,26 +372,93 @@ export const buildTaskPresentation = (input: PresentationInput): TaskPresentatio
     if (event.kind !== 'plan') continue;
     const steps = record(event.payload).steps;
     if (!Array.isArray(steps)) continue;
-    for (const value of steps) {
+    /*
+     * Parts are walked with their steps, on the same ids.
+     *
+     * A sub-milestone carries no clock of its own either, and its id is as stable across versions
+     * as its parent's - so this one first-seen-running / first-seen-closed pass answers for both.
+     * Walking only the outer list left every part without a window, and a part with no window
+     * cannot say what happened inside it.
+     */
+    const visit = (value: unknown): void => {
       const step = record(value);
       const id = text(step.id);
-      if (!id) continue;
+      if (!id) return;
       const status = text(step.status);
       if (status === 'in_progress' && !firstInProgress.has(id))
         firstInProgress.set(id, event.createdAt);
       if ((status === 'completed' || status === 'skipped') && !firstClosed.has(id))
         firstClosed.set(id, event.createdAt);
-    }
+      if (Array.isArray(step.substeps)) for (const part of step.substeps) visit(part);
+    };
+    for (const value of steps) visit(value);
   }
   const closed = (sub: { status: string }): boolean =>
     sub.status === 'completed' || sub.status === 'skipped';
+  /*
+   * What happened while one step was the running one, in a line.
+   *
+   * The milestones are already derived from this task's own events, and each carries the moment it
+   * was recorded - so the ones that fall inside a step's window are, by construction, what that
+   * step did. Counting them by kind says more in a hover than any three of their titles would, and
+   * the newest title is added because "4 changes" is a shape and "app/index.html" is the work.
+   *
+   * A window that is still open runs to now, so a step in progress describes itself too. A step
+   * with no window, or none recorded inside it, gets nothing rather than a sentence about zero.
+   */
+  const accountOf = (startedAt?: string, completedAt?: string): string | undefined => {
+    if (!startedAt) return undefined;
+    const from = Date.parse(startedAt);
+    const to = completedAt ? Date.parse(completedAt) : Number.POSITIVE_INFINITY;
+    if (!Number.isFinite(from)) return undefined;
+    const inside = milestones.filter((milestone) => {
+      const at = Date.parse(milestone.createdAt);
+      return Number.isFinite(at) && at >= from && at <= to;
+    });
+    if (inside.length === 0) return undefined;
+    const counts = new Map<string, number>();
+    for (const milestone of inside)
+      counts.set(milestone.kind, (counts.get(milestone.kind) ?? 0) + 1);
+    const label: Record<string, [string, string]> = {
+      change: ['file changed', 'files changed'],
+      source: ['source read', 'sources read'],
+      check: ['check', 'checks'],
+      result: ['result', 'results'],
+      approval: ['approval', 'approvals'],
+      process: ['command run', 'commands run'],
+      checkpoint: ['checkpoint', 'checkpoints']
+    };
+    const parts = [...counts.entries()]
+      .sort((left, right) => right[1] - left[1])
+      .slice(0, 3)
+      .map(([kind, count]) => {
+        const [one, many] = label[kind] ?? [kind, kind];
+        return `${count} ${count === 1 ? one : many}`;
+      });
+    const newest = inside.at(-1)?.title;
+    return [parts.join(', '), newest].filter(Boolean).join(' · ').slice(0, 240);
+  };
   const toPhase = (step: Record<string, unknown>) => {
     const id = text(step.id);
     const substepsList = Array.isArray(step.substeps) ? step.substeps.map(record) : [];
     const startedAt = text(step.startedAt) || firstInProgress.get(id);
     const completedAt = text(step.completedAt) || firstClosed.get(id);
+    const detail = accountOf(startedAt, completedAt);
     const parts = substepsList
-      .map((sub) => ({ id: text(sub.id), title: text(sub.title), status: text(sub.status) }))
+      .map((sub) => {
+        const subId = text(sub.id);
+        const subStarted = text(sub.startedAt) || firstInProgress.get(subId);
+        const subClosed = text(sub.completedAt) || firstClosed.get(subId);
+        const subDetail = accountOf(subStarted, subClosed);
+        return {
+          id: subId,
+          title: text(sub.title),
+          status: text(sub.status),
+          ...(subStarted ? { startedAt: subStarted } : {}),
+          ...(subClosed ? { completedAt: subClosed } : {}),
+          ...(subDetail ? { detail: subDetail } : {})
+        };
+      })
       .filter((sub) => sub.id && sub.title);
     return {
       id,
@@ -399,6 +466,7 @@ export const buildTaskPresentation = (input: PresentationInput): TaskPresentatio
       status: text(step.status) as 'pending' | 'in_progress' | 'completed' | 'skipped',
       ...(startedAt ? { startedAt } : {}),
       ...(completedAt ? { completedAt } : {}),
+      ...(detail ? { detail } : {}),
       ...(parts.length
         ? {
             countDone: parts.filter(closed).length,

@@ -482,7 +482,7 @@ export const agentTools: ModelTool[] = [
   {
     name: 'set_plan',
     description:
-      'Set the visible plan before material work and revise it when the approach changes. Mark steps in_progress then completed when verified; a step may carry substeps. Use presentation for a task-specific surface and acknowledgment; action=describe gives its schema.',
+      'Set the visible plan before material work and revise it when the approach changes. Mark steps in_progress then completed when verified. Break a step into substeps when it has parts worth following, and add substeps as you discover work rather than only at the start - the owner watches these statuses. Use presentation for a task-specific surface and acknowledgment; action=describe gives its schema.',
     parameters: {
       type: 'object',
       additionalProperties: false,

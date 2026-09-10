@@ -8250,9 +8250,10 @@ describe('the routes nothing had ever asked', () => {
       }
     });
     expect(chosen.statusCode, chosen.body).toBe(200);
-    const credential = (await store.getManagedProviderCredential(
-      (await store.getWorkspaceById(workspaceId))!.userId,
-      'inference'
+    // Asked for the account's credential rather than for a row called `inference`: an account holds
+    // one connection per provider now, and a choice is written back to the row it was read from.
+    const credential = (await store.primaryInferenceCredential(
+      (await store.getWorkspaceById(workspaceId))!.userId
     ))!;
     expect(
       decryptJson<{ apiKey?: string; mediaModels?: { image?: { modelId: string } } }>(
@@ -9938,5 +9939,56 @@ describe('a run a spending ceiling stopped', () => {
     // A stale card, a double submit, or a retry against a limit somebody already moved must not
     // quietly tighten the run instead.
     expect((await raise(3, 'ceiling-down')).json<{ maxSpendUsd: number }>().maxSpendUsd).toBe(9);
+  }, 30_000);
+});
+
+/**
+ * Two providers connected at once.
+ *
+ * The credential was keyed by its role - one row called `inference` - so saving a second provider
+ * overwrote the first, and `modelsForUser` then filtered the picker down to whichever one survived.
+ * An owner with an OpenRouter key and an Ollama Cloud subscription could hold only one of them, and
+ * every model belonging to the other disappeared from the list mid-project.
+ */
+describe('an account with more than one provider connected', () => {
+  test('keeps both connections and lists both catalogues in one picker', async () => {
+    stubProviderFetch();
+    const directory = await mkdtemp(join(tmpdir(), 'athanor-api-multi-provider-'));
+    disposers.push(() => rm(directory, { recursive: true, force: true }));
+    const { app, database } = await buildServer(isolatedConfig(directory), { masterKey });
+    disposers.push(() => app.close());
+    const owner = sessionCookie(
+      await app.inject({ method: 'POST', url: '/v1/auth/dev', payload: { username: 'owner' } })
+    );
+
+    const connect = (payload: Record<string, unknown>, key: string) =>
+      app.inject({
+        method: 'PUT',
+        url: '/v1/providers',
+        headers: { cookie: owner, 'idempotency-key': key },
+        payload
+      });
+
+    const openrouter = await connect(
+      { provider: 'openrouter', apiKey: 'test-key', enforceZeroDataRetention: true },
+      'multi-openrouter'
+    );
+    expect(openrouter.statusCode, openrouter.body).toBe(200);
+
+    // The legacy single-connection row is migrated to its vendor key by the first save, so the
+    // second save has somewhere to go rather than landing on top of the first.
+    const rows = await database.query(
+      'SELECT provider FROM managed_provider_credentials ORDER BY provider'
+    );
+    expect(rows.rows.map((row) => String(row.provider))).toEqual(['inference:openrouter']);
+
+    const models = await app.inject({
+      method: 'GET',
+      url: '/v1/models',
+      headers: { cookie: owner }
+    });
+    expect(models.statusCode, models.body).toBe(200);
+    const listed = models.json<{ id: string }[]>();
+    expect(listed.some((model) => model.id.startsWith('openrouter/'))).toBe(true);
   }, 30_000);
 });

@@ -49,13 +49,26 @@ export const TaskPhase = z.object({
   /** Sub-milestones done and total, from the plan's substeps; absent when there are none. */
   countDone: z.number().int().nonnegative().optional(),
   countTotal: z.number().int().nonnegative().optional(),
+  /**
+   * What happened while this step was the running one, in one line, for the hover.
+   *
+   * Derived from the activity already recorded rather than written by the model: the events between
+   * a step starting and closing are exactly what it did, so this costs no tokens, cannot be
+   * forgotten, and is available for every run that has already finished. A step that ran while
+   * nothing was recorded has no line, which is the honest answer rather than an invented one.
+   */
+  detail: z.string().optional(),
   /** The step's own sub-milestones, one level deep, for the expandable view. */
   substeps: z
     .array(
       z.object({
         id: z.string(),
         title: z.string(),
-        status: z.enum(['pending', 'in_progress', 'completed', 'skipped'])
+        status: z.enum(['pending', 'in_progress', 'completed', 'skipped']),
+        startedAt: z.string().optional(),
+        completedAt: z.string().optional(),
+        /** The same one-line account as its parent's, over the part's own window. */
+        detail: z.string().optional()
       })
     )
     .optional()

@@ -187,6 +187,10 @@ const probeStore = (task: () => TaskRecord): StoreProbe => {
     listConnectors: spy(calls, 'listConnectors', () => []),
     listModels: async () => [model],
     getManagedProviderCredential: async () => null,
+    // The environment carries the credential in this fixture, as it does on a self-hosted box that
+    // has never opened Settings; a double without this method fails every turn on the store call
+    // that looks for saved connections rather than on what the case is about.
+    listManagedProviderCredentials: async () => [],
     listWorkspaceMemories: spy(calls, 'listWorkspaceMemories', () => []),
     curateWorkspaceSkills: spy(calls, 'curateWorkspaceSkills', () => undefined),
     listWorkspaceSkills: spy(calls, 'listWorkspaceSkills', () => []),

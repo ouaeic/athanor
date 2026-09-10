@@ -249,3 +249,72 @@ describe('the progress panel answers how far in the work is', () => {
     expect(html).toContain('1 of 2 done');
   });
 });
+
+/**
+ * The hover, which is where the account of a finished step lives.
+ *
+ * Nothing writes these lines: they are counted off the activity the step recorded. The panel has to
+ * put them somewhere reachable without adding a row to a list whose whole job is to stay short.
+ */
+describe('what a milestone says when you hover it', () => {
+  it('carries its own account and its duration on the row', () => {
+    const html = renderToStaticMarkup(
+      <TaskProgress
+        presentation={{
+          ...presentation,
+          progress: {
+            ...presentation.progress,
+            phases: [
+              {
+                id: 'build',
+                title: 'Build the game',
+                status: 'completed',
+                startedAt: '2026-09-06T10:00:00.000Z',
+                completedAt: '2026-09-06T10:12:30.000Z',
+                detail: '4 files changed · app/index.html'
+              }
+            ]
+          }
+        }}
+        onPlan={() => undefined}
+        onEvidence={() => undefined}
+      />
+    );
+    expect(html).toContain('4 files changed');
+    expect(html).toContain('took 12m 30s');
+  });
+
+  it('carries a part`s account on the part', () => {
+    const html = renderToStaticMarkup(
+      <TaskProgress
+        presentation={{
+          ...presentation,
+          progress: {
+            ...presentation.progress,
+            phases: [
+              {
+                id: 'build',
+                title: 'Build',
+                status: 'in_progress',
+                countDone: 1,
+                countTotal: 2,
+                substeps: [
+                  {
+                    id: 's1',
+                    title: 'Draw the map',
+                    status: 'completed',
+                    detail: '2 files changed'
+                  },
+                  { id: 's2', title: 'Wire the keys', status: 'pending' }
+                ]
+              }
+            ]
+          }
+        }}
+        onPlan={() => undefined}
+        onEvidence={() => undefined}
+      />
+    );
+    expect(html).toContain('Draw the map — 2 files changed');
+  });
+});

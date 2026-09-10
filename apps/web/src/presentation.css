@@ -183,6 +183,20 @@
   font-weight: 600;
   margin-right: 0.4rem;
 }
+/*
+ * The earlier directions, closed. A long project has a lot of them and they are context rather than
+ * the thing being worked on, so the panel opens as one line and expands on request.
+ */
+.garden-direction-history > summary {
+  cursor: pointer;
+  font-size: 0.82rem;
+  color: var(--muted, #727c69);
+  padding: 0.35rem 0;
+  list-style: none;
+}
+.garden-direction-history > summary::-webkit-details-marker {
+  display: none;
+}
 .garden-prior-direction {
   display: flex;
   gap: 0.6rem;

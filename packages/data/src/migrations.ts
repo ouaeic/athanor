@@ -3616,5 +3616,33 @@ CREATE TABLE IF NOT EXISTS project_model_preferences (
     sql: `
 ALTER TABLE task_message_queue ADD COLUMN IF NOT EXISTS security_mode TEXT CHECK(security_mode IN ('review','balanced','autonomous'));
 `
+  },
+  {
+    version: 98,
+    name: 'model_connections',
+    /*
+     * Which connection serves a model, so an account can hold more than one at a time.
+     *
+     * `provider` was doing two jobs: naming the id namespace a model lives in - every id is
+     * `<provider>/<model>` - and naming the credential that reaches it. That collapsed every
+     * non-OpenRouter endpoint into one bucket called `custom`, so connecting Ollama Cloud replaced
+     * a configured endpoint rather than joining it, and the picker could only ever show one
+     * provider's rows.
+     *
+     * Splitting the second job onto its own column is what makes several connections possible
+     * without touching a single existing id. `custom/glm-5.3-flash` stays exactly that string -
+     * finished tasks name their model by id and history has to keep reading - while the row now
+     * also says which connection can actually call it.
+     *
+     * The backfill is deliberately blunt because it can afford to be: at the moment this runs an
+     * account has at most one non-OpenRouter connection, so every `custom` row belongs to it, and
+     * the API resolves the exact vendor from the credential it already holds. Rows written after
+     * this carry their connection from the start.
+     */
+    sql: `
+ALTER TABLE model_releases ADD COLUMN IF NOT EXISTS connection_id TEXT;
+UPDATE model_releases SET connection_id=provider WHERE connection_id IS NULL;
+CREATE INDEX IF NOT EXISTS model_releases_connection_idx ON model_releases(connection_id);
+`
   }
 ] as const;

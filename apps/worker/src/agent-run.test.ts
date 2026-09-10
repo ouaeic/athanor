@@ -205,6 +205,10 @@ const probeStore = (task: () => TaskRecord): StoreProbe => {
     listConnectors: async () => [],
     listModels: async () => [model],
     getManagedProviderCredential: async () => null,
+    // Nothing saved, which is the shape a box configured from its environment has: the credential
+    // comes from `AI_API_KEY`, not from a row, and a double that omitted this method would make
+    // every turn in this file fail on a store call rather than on anything it means to test.
+    listManagedProviderCredentials: async () => [],
     listWorkspaceMemories: async () => [],
     curateWorkspaceSkills: async () => undefined,
     listWorkspaceSkills: async () => [],
@@ -9091,4 +9095,77 @@ describe('owner effort reaches the paid request', () => {
       expect(states.at(-1)).toMatchObject({ ownerReasoningEffort: effort });
     }
   );
+});
+
+/**
+ * Two providers connected at once, which is what a box could not do.
+ *
+ * The credential used to be chosen by the account — one row, one provider — and any model outside
+ * its namespace was refused here, after the conversation had started. So connecting Ollama Cloud
+ * took OpenRouter's models away and a conversation pinned to one of them stopped working. The
+ * credential is now chosen by the model, and the refusal that remains is the one that matters: a
+ * model no connection reaches must not be sent another provider's key.
+ */
+describe('an account holding more than one provider connection', () => {
+  const aad = `inference-provider:${userId}`;
+  const connection = (provider: string, apiKey: string, baseUrl = PROVIDER_URL) => ({
+    userId,
+    provider: `inference:${provider}`,
+    status: 'active' as const,
+    externalRef: 'self-hosted',
+    monthlyLimitUsd: 0,
+    createdAt: new Date(0).toISOString(),
+    updatedAt: new Date(0).toISOString(),
+    secretCiphertext: encryptJson(
+      { provider, baseUrl, apiKey, enforceZeroDataRetention: false },
+      masterKey,
+      aad
+    )
+  });
+
+  const runAgainst = async (
+    connections: ReturnType<typeof connection>[],
+    forModel: ModelRelease
+  ): Promise<FetchLog> => {
+    // The task names its model by id, so the fixture keeps `model.id` and only the namespace and
+    // provider move - which is the axis these cases are about.
+    const task = { ...makeTask(), modelId: forModel.id };
+    const probe = probeStore(() => task);
+    const store = {
+      ...probe.store,
+      listModels: async () => [forModel],
+      listManagedProviderCredentials: async () => connections,
+      getManagedProviderCredential: async () => null
+    } as unknown as DataStore;
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([textFrame('thinking')], log);
+    await new AgentWorker(store, config({ TASK_MAX_STEPS: 1 }), masterKey, runnerSecret)
+      .run(task)
+      .catch(() => undefined);
+    return log;
+  };
+
+  it('reaches a custom-namespace model while OpenRouter is also connected', async () => {
+    const log = await runAgainst(
+      [connection('openrouter', 'openrouter-key'), connection('ollama-cloud', 'ollama-key')],
+      model
+    );
+    expect(log.modelRequests.length).toBeGreaterThan(0);
+  });
+
+  it('reaches an OpenRouter model while a custom endpoint is also connected', async () => {
+    const log = await runAgainst(
+      [connection('openrouter', 'openrouter-key'), connection('ollama-cloud', 'ollama-key')],
+      { ...model, id: 'openrouter/vendor/model-1', provider: 'openrouter' }
+    );
+    expect(log.modelRequests.length).toBeGreaterThan(0);
+  });
+
+  it('refuses a model no connection reaches rather than spending another provider`s key', async () => {
+    // Only OpenRouter is connected, and the model lives in the custom namespace. The old code would
+    // also have refused; what matters is that it still does, and does not fall back to the key it
+    // happens to hold.
+    const log = await runAgainst([connection('openrouter', 'openrouter-key')], model);
+    expect(log.modelRequests).toHaveLength(0);
+  });
 });

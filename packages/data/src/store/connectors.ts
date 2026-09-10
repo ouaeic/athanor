@@ -309,6 +309,71 @@ export class ConnectorStore {
       : null;
   }
 
+  /**
+   * Every inference connection an account holds, newest first.
+   *
+   * One credential per account was the whole reason a box could reach one provider at a time: the
+   * key was the role, `'inference'`, so saving OpenRouter overwrote Ollama Cloud rather than
+   * joining it. The key is now the connection - `inference:openrouter`, `inference:ollama-cloud` -
+   * and this is what turns that into a list the picker and the worker can both read.
+   *
+   * The legacy single-connection rows are returned alongside, under the keys they were written
+   * with, because an install that has not saved a provider since is still holding its credential
+   * in one of them and must keep working untouched.
+   */
+  async listManagedProviderCredentials(
+    userId: string,
+    prefix = 'inference'
+  ): Promise<ManagedProviderCredentialRecord[]> {
+    const result = await this.database.query(
+      `SELECT * FROM managed_provider_credentials
+       WHERE user_id=$1 AND (provider=$2 OR provider LIKE $2 || ':%' OR provider='openrouter')
+       ORDER BY updated_at DESC`,
+      [userId, prefix]
+    );
+    return result.rows.map((row) => ({
+      userId: String(row.user_id),
+      provider: String(row.provider),
+      secretCiphertext: json<EncryptedEnvelope>(row.secret_ciphertext),
+      externalRef: String(row.external_ref),
+      monthlyLimitUsd: Number(row.monthly_limit_usd),
+      status: String(row.status) as ManagedProviderCredentialRecord['status'],
+      createdAt: iso(row.created_at),
+      updatedAt: iso(row.updated_at)
+    }));
+  }
+
+  /**
+   * The account's primary inference credential, whatever key it happens to live under.
+   *
+   * There are three: `inference:<vendor>` for a connection saved since an account could hold more
+   * than one, `inference` for the single-connection era, and `openrouter` from before that. Callers
+   * that want "this account's provider" - the media picker, the bootstrap's `configured` flag -
+   * were all written against the literal `'inference'` and stopped finding anything the moment
+   * saves moved to the vendor-keyed form.
+   *
+   * The record is returned whole, `provider` key included, because the callers that read it also
+   * write it back: a media choice belongs in the row it was read from, and a writer that guessed
+   * the key would strand the choice under a name nothing reads.
+   *
+   * Primary is most recently updated, which is the connection the owner last touched.
+   */
+  async primaryInferenceCredential(
+    userId: string
+  ): Promise<ManagedProviderCredentialRecord | null> {
+    const rows = await this.listManagedProviderCredentials(userId);
+    return rows.find((row) => row.status === 'active') ?? null;
+  }
+
+  /** Removes one connection. The catalogue rows it wrote are pruned by the caller that knows them. */
+  async removeManagedProviderCredential(userId: string, provider: string): Promise<boolean> {
+    const result = await this.database.query(
+      'DELETE FROM managed_provider_credentials WHERE user_id=$1 AND provider=$2 RETURNING provider',
+      [userId, provider]
+    );
+    return result.rows.length > 0;
+  }
+
   async upsertManagedProviderCredential(input: {
     userId: string;
     provider: string;
