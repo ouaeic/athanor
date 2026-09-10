@@ -9633,3 +9633,53 @@ describe('the turns a tool was reached in', () => {
     expect(quarter.tasks.map((task) => task.id)).not.toContain(theirs.id);
   });
 });
+
+/**
+ * A column nothing writes is a column nothing can rely on.
+ *
+ * Migration 98 backfilled `connection_id`, and the very next catalogue refresh wrote rows with a
+ * null in it, because no writer had been taught to fill it. The default belongs in the statement
+ * rather than in every caller: the namespace and the connection are the same string for every
+ * provider that exists today, and the column is what lets them stop being.
+ */
+describe('the connection a catalogue row belongs to', () => {
+  it('is filled on every write, whether or not the caller named one', async () => {
+    const own = createDatabase({ driver: 'pglite', pglitePath: ':memory:' });
+    await migrateDatabase(own);
+    const store = new DataStore(own);
+    const row = (id: string, provider: string, extra: Record<string, unknown> = {}) => ({
+      id,
+      providerModelId: id,
+      displayName: id,
+      provider,
+      revision: 'r1',
+      availability: 'available',
+      openness: 'permissive_open_weight',
+      license: 'apache-2.0',
+      commercialUse: true,
+      privacyRoute: 'provider_zdr',
+      contextTokens: 128_000,
+      modalities: ['text'],
+      capabilities: ['chat'],
+      usageClass: 'light',
+      recommendationTags: [],
+      measuredQuality: null,
+      measuredLatencyMs: null,
+      metadata: {},
+      ...extra
+    });
+    await store.upsertModels([
+      row('custom/unnamed', 'custom'),
+      row('custom/named', 'custom', { connectionId: 'ollama-cloud' })
+    ]);
+    const written = await own.query(
+      `SELECT id,connection_id FROM model_releases WHERE id LIKE 'custom/%named' ORDER BY id`
+    );
+    expect(
+      Object.fromEntries(
+        written.rows.map((entry) => [String(entry.id), String(entry.connection_id)])
+      )
+    ).toEqual({ 'custom/named': 'ollama-cloud', 'custom/unnamed': 'custom' });
+    await own.close();
+  });
+});

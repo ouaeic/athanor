@@ -156,14 +156,25 @@ export class BillingStore {
 
   async #upsertModel(database: Database, model: Record<string, unknown>): Promise<void> {
     await database.query(
+      /*
+       * `connection_id` defaults to `provider` rather than being threaded through every writer.
+       *
+       * Migration 98 backfilled the column and the catalogue refresh promptly wrote four rows with
+       * a null in it, because no writer had been taught to fill it - which is how a new column
+       * quietly becomes one nothing can rely on. Defaulting here means every row has an answer from
+       * the moment it is written, and a caller that knows better still supplies one: the namespace
+       * and the connection are the same string today for every provider that exists, and the column
+       * is what lets them stop being.
+       */
       `INSERT INTO model_releases(
-        id,provider_model_id,display_name,provider,revision,availability,openness,license,commercial_use,
+        id,provider_model_id,display_name,provider,connection_id,revision,availability,openness,license,commercial_use,
         privacy_route,context_tokens,modalities,capabilities,usage_class,recommendation_tags,
         measured_quality,measured_latency_ms,metadata,updated_at
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,$14,$15::jsonb,$16,$17,$18::jsonb,NOW())
+      ) VALUES ($1,$2,$3,$4,COALESCE($19,$4),$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,$14,$15::jsonb,$16,$17,$18::jsonb,NOW())
       ON CONFLICT(id) DO UPDATE SET
         provider_model_id=EXCLUDED.provider_model_id,
         display_name=EXCLUDED.display_name, provider=EXCLUDED.provider,
+        connection_id=EXCLUDED.connection_id,
         revision=EXCLUDED.revision, availability=EXCLUDED.availability,
         openness=EXCLUDED.openness, license=EXCLUDED.license,
         commercial_use=EXCLUDED.commercial_use, privacy_route=EXCLUDED.privacy_route,
@@ -212,7 +223,10 @@ export class BillingStore {
           // applies to catalogues that actually carry live endpoint data.
           providerAvailable: model.providerAvailable,
           zeroDataRetentionAvailable: model.zeroDataRetentionAvailable
-        })
+        }),
+        // The connection this row belongs to, when a caller knows it; otherwise the namespace
+        // stands in, which is what every provider that exists today would have supplied anyway.
+        typeof model.connectionId === 'string' ? model.connectionId : null
       ]
     );
   }
