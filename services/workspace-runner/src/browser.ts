@@ -1700,6 +1700,15 @@ export class BrowserManager {
     private readonly options: {
       executablePath?: string | undefined;
       /**
+       * How far down the scheduler this workspace's browser sits, and what applies it.
+       *
+       * Absent or zero leaves the browser at the runner's own priority, which is what every
+       * installation had before there was a reason to move it. The applier is injected so the walk
+       * over `/proc` can be exercised on a host that has none.
+       */
+      browserCpuNice?: number | undefined;
+      dampenBrowserCpu?: ((profileDir: string, niceness: number) => Promise<number>) | undefined;
+      /**
        * How the throwaway browser behind the research fan-out and the search route is started.
        * Present so those two paths can be exercised without a Chromium on the machine running the
        * tests; unset everywhere else, which is the real launch below.
@@ -1865,7 +1874,33 @@ export class BrowserManager {
     return this.#sessions.has(workspaceId) || this.#starting.has(workspaceId);
   }
 
+  /**
+   * Lowers the priority of one workspace's Chromium tree, best-effort and silent.
+   *
+   * Never a reason to fail a launch or a sweep: a browser that could not be niced runs exactly as
+   * it did before this existed. Off entirely when no applier is wired, which is every test in this
+   * package and any host without a `/proc` to walk.
+   */
+  async #dampen(profileDir: string): Promise<void> {
+    const niceness = this.options.browserCpuNice ?? 0;
+    const apply = this.options.dampenBrowserCpu;
+    if (!apply || niceness <= 0) return;
+    // No log line: this is routine housekeeping that runs every minute, and a message per pass
+    // would bury the ones worth reading. The effect is the point, and `nice` is visible in `ps`.
+    await apply(profileDir, niceness).catch(() => 0);
+  }
+
   async retireIdle(isViewed: (workspaceId: string) => boolean = () => false): Promise<string[]> {
+    /*
+     * Re-applied on the sweep the retirement already runs, because the tree changes under it: a tab
+     * opened since the last pass has a renderer nobody has niced, and a GPU process that crashed
+     * and came back is new. A process already at the target is skipped without a syscall, so a
+     * steady session costs one `/proc` walk a minute and nothing else.
+     */
+    // The profile is where `#start` puts it, derived from the root the session already carries
+    // rather than stored twice - two copies of one path is how they come to disagree.
+    for (const [, session] of this.#sessions)
+      await this.#dampen(path.join(session.root, '.athanor', 'browser'));
     const retired: string[] = [];
     for (const [workspaceId, session] of this.#sessions) {
       if (
@@ -1940,6 +1975,15 @@ export class BrowserManager {
       }
     }
     if (!context) throw refused instanceof Error ? refused : new Error('Browser did not start');
+    /*
+     * Applied as soon as there is something to apply it to, and again on the sweep below.
+     *
+     * Chromium forks for the life of a session - a renderer per tab, a fresh GPU process after a
+     * crash - and a child forked before this ran keeps the priority it inherited. One pass here
+     * catches the startup tree, including the GPU process that is the one that actually pins this
+     * machine; the minute sweep catches everything after.
+     */
+    await this.#dampen(profile);
     let closed = false;
     let active: Session | undefined;
     // Page creation and desktop control can both await while Chromium exits.

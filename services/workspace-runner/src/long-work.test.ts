@@ -34,6 +34,7 @@ const runnerConfig = (workspaceRoot: string, secret: string): RunnerConfig =>
     TAR_EXECUTABLE: '/usr/bin/tar',
     SNAPSHOT_EXECUTABLE: path.resolve('../../scripts/athanor-snapshot'),
     BROWSER_USE_DESKTOP_DISPLAY: false,
+    BROWSER_CPU_NICE: 0,
     // Deliberately different from each other, which is the property under test. On the shipped
     // configuration they are an hour and a day.
     MAX_EXECUTION_SECONDS: 30,

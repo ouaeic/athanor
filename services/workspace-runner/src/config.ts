@@ -16,6 +16,16 @@ const Config = z.object({
     .string()
     .default('true')
     .transform((value) => value !== 'false'),
+  /**
+   * How far down the scheduler the session browser sits, as a nice value.
+   *
+   * This host has no GPU, so a headful Chromium renders through SwiftShader and any animated page
+   * pins the machine - measured at about thirteen of sixteen cores, held for as long as the page
+   * stayed open. Ten is a weight, not a cap: the browser still gets the whole processor when
+   * nothing else wants it, and yields to the agent's own commands when they do, which is the same
+   * argument `athanor-runner.service` makes for its own `CPUWeight`. Zero switches it off.
+   */
+  BROWSER_CPU_NICE: z.coerce.number().int().min(0).max(19).default(10),
   DESKTOP_BRIDGE_EXECUTABLE: z.string().optional(),
   DESKTOP_SESSION_EXECUTABLE: z.string().optional(),
   SYSTEM_PACKAGE_HELPER: z.string().optional(),

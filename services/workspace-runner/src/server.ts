@@ -39,6 +39,7 @@ import {
 import { inspectAudioSource, prepareAudio } from './audio.js';
 import { authenticateRunnerRequest, requireScope } from './auth.js';
 import { BotWallError, BrowserManager, type BrowserStreamState } from './browser.js';
+import { dampenBrowserCpu, linuxBrowserCpuDeps } from './browser-cpu.js';
 import { TAB_IDLE_MS, TAB_SWEEP_MS } from './browser-tabs.js';
 import { registerFileDownloadRoutes } from './file-downloads.js';
 import { ComputationManager } from './computation.js';
@@ -309,6 +310,17 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
   // ordinary desktop and a person taking over finds the browser on the screen they are watching.
   const browser = new BrowserManager({
     executablePath: config.BROWSER_EXECUTABLE_PATH,
+    /*
+     * The session browser yields to the work it is meant to be serving.
+     *
+     * A host with no GPU renders through SwiftShader, and any animated page pins it - measured on
+     * one installation at about thirteen of sixteen cores, held for as long as the page stayed
+     * open. A weight rather than a cap, for the reason this service's own unit file gives about
+     * `CPUWeight`: the browser still gets the whole processor when nothing else wants it.
+     */
+    browserCpuNice: config.BROWSER_CPU_NICE,
+    dampenBrowserCpu: (profileDir, niceness) =>
+      dampenBrowserCpu(linuxBrowserCpuDeps, profileDir, niceness),
     desktopDisplay: config.BROWSER_USE_DESKTOP_DISPLAY
       ? (workspaceId, root) => desktop.displayEnvironment(workspaceId, root)
       : undefined,

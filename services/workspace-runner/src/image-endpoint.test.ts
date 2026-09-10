@@ -36,6 +36,7 @@ const runnerConfig = (workspaceRoot: string, secret: string, converter: string):
   TAR_EXECUTABLE: '/usr/bin/tar',
   SNAPSHOT_EXECUTABLE: path.resolve('../../scripts/athanor-snapshot'),
   BROWSER_USE_DESKTOP_DISPLAY: false,
+  BROWSER_CPU_NICE: 0,
   MAX_EXECUTION_SECONDS: 30,
   RESOURCE_LIMIT_EXECUTABLE: '/usr/bin/prlimit',
   IMAGE_CONVERT_EXECUTABLE: converter,
