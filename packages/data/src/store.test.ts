@@ -9683,3 +9683,51 @@ describe('the connection a catalogue row belongs to', () => {
     await own.close();
   });
 });
+
+/**
+ * How long a published page stays up, which depends on what the run was for.
+ *
+ * Every publication got the same month of idle life whatever it was for, so a ten-minute mock-up
+ * left a website serving until somebody remembered to remove it — which is how a box ends up
+ * hosting a list of pages nobody asked for. A run that declared itself brief says so at the moment
+ * it publishes, rather than leaving something later to guess.
+ */
+describe('how long a published preview lives', () => {
+  const seed = async (own: Database) => {
+    const store = new DataStore(own);
+    const user = await store.createUser({ username: 'owner', displayName: 'Owner' });
+    const workspace = await store.createWorkspace({
+      userId: user.id,
+      name: 'Computer',
+      storageLimitBytes: 1024 ** 3,
+      imageRevision: 'fixture',
+      region: 'auto',
+      wrappedKey: 'fixture'
+    });
+    return { store, user, workspace };
+  };
+
+  it('gives a brief run a day and everything else the ordinary window', async () => {
+    const own = createDatabase({ driver: 'pglite', pglitePath: ':memory:' });
+    await migrateDatabase(own);
+    const { store, user, workspace } = await seed(own);
+    const make = (slug: string, idleInterval?: string) =>
+      store.createWorkspacePreview({
+        userId: user.id,
+        workspaceId: workspace.id,
+        label: slug,
+        port: 8080,
+        slug,
+        accessTokenHash: slug,
+        ...(idleInterval ? { idleInterval } : {})
+      });
+    const ordinary = await make('ordinary');
+    const brief = await make('brief', '24 hours');
+    const hours = (value: string | null) =>
+      value === null ? null : Math.round((Date.parse(value) - Date.now()) / 3_600_000);
+    expect(hours(ordinary.expiresAt)).toBeGreaterThan(24 * 25);
+    expect(hours(brief.expiresAt)).toBeGreaterThan(20);
+    expect(hours(brief.expiresAt)).toBeLessThanOrEqual(24);
+    await own.close();
+  });
+});

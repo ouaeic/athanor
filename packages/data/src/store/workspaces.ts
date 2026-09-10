@@ -901,6 +901,15 @@ export class WorkspaceStore {
     accessTokenHash: string;
     entryPath?: string | null;
     maxPreviews?: number;
+    /**
+     * How long this one may sit idle before it expires, as a Postgres interval.
+     *
+     * A `brief` conversation publishes something to be looked at and closed, and giving it the same
+     * month of idle life as everything else is how a box ends up serving a list of pages nobody
+     * remembers asking for. Absent means the ordinary idle window, which is what every conversation
+     * had before a run could say how long it was meant to live.
+     */
+    idleInterval?: string;
   }): Promise<WorkspacePreviewRecord> {
     const maxPreviews = input.maxPreviews ?? MAX_WORKSPACE_PREVIEWS;
     return this.database.transaction(async (tx) => {
@@ -925,7 +934,7 @@ export class WorkspaceStore {
           input.slug,
           input.accessTokenHash,
           input.entryPath ?? null,
-          PREVIEW_IDLE_INTERVAL
+          input.idleInterval ?? PREVIEW_IDLE_INTERVAL
         ]
       );
       return mapWorkspacePreview(result.rows[0]!);

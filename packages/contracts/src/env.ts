@@ -144,6 +144,17 @@ export const sharedEnv = {
    */
   TASK_MAX_SELF_CONTINUATIONS: z.coerce.number().int().min(0).max(3).default(2),
   /**
+   * The ceiling for a run the owner declared sustained, where the work was always going to outlast
+   * their attention - a long analysis, a dataset that takes days.
+   *
+   * Far higher than the interactive ceiling and still a ceiling, because a bound nothing enforces
+   * is not one. What actually stops such a run is money: the spend guard runs before every step of
+   * every renewed budget, so this buys wall clock and steps and never allowance. Sixty budgets at
+   * the default step size is roughly seven thousand steps - a long analysis rather than an infinite
+   * one - and each ceiling still has to be earned by passing a harness-executed acceptance check.
+   */
+  TASK_SUSTAINED_SELF_CONTINUATIONS: z.coerce.number().int().min(0).max(500).default(60),
+  /**
    * Where this box's own API listens. The API binds it; the notifier posts an answer the owner
    * types on the phone to the same task-message route the web client and the command line use, so
    * the conversation is unparked by that route's checks and idempotency rather than by a second

@@ -3644,5 +3644,25 @@ ALTER TABLE model_releases ADD COLUMN IF NOT EXISTS connection_id TEXT;
 UPDATE model_releases SET connection_id=provider WHERE connection_id IS NULL;
 CREATE INDEX IF NOT EXISTS model_releases_connection_idx ON model_releases(connection_id);
 `
+  },
+  {
+    version: 99,
+    name: 'task_lifetime',
+    /*
+     * How long a conversation is meant to live, declared rather than assumed.
+     *
+     * Every task was bounded as the middle case: one renewable step budget, and anything it
+     * published left serving until somebody removed it. A ten-minute mock-up therefore left a
+     * website hosted indefinitely, and a three-day analysis stopped at a ceiling designed for a
+     * conversation somebody was watching.
+     *
+     * No backfill statement, and that is the point: the column defaults to the behaviour every
+     * existing row already has, so nothing that is running changes under a deploy. A run only moves
+     * off `standard` because somebody said so.
+     */
+    sql: `
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS lifetime TEXT NOT NULL DEFAULT 'standard'
+  CHECK(lifetime IN ('brief','standard','sustained'));
+`
   }
 ] as const;

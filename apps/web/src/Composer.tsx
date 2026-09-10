@@ -1,7 +1,7 @@
 import { lazy, Suspense, useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { ArrowUpRight, Paperclip, X, Mic, Square, SlidersHorizontal } from 'lucide-react';
-import type { Task, Workspace, TaskReasoningEffort } from '@athanor/contracts';
+import type { Task, Workspace, TaskLifetime, TaskReasoningEffort } from '@athanor/contracts';
 import { modeFloors } from './asking-rules';
 import { effortChoices, effortLabel } from './reasoning-options';
 import type { Bootstrap, Draft, DraftAttachment } from './model';
@@ -55,6 +55,13 @@ export default function Composer({
   const [privacyRoute, setPrivacyRoute] = useState(
     initialDraft?.controls?.privacyRoute ?? task?.privacyRoute ?? defaultPrivacy(bootstrap)
   );
+  /*
+   * How long this conversation is meant to live, which two very different things read: how long
+   * anything it publishes stays up, and how far past one step budget the run may carry itself.
+   * Only offered when starting work - a run already under way has a lifetime, and changing it
+   * mid-flight would move a ceiling the turn is already being held to.
+   */
+  const [lifetime, setLifetime] = useState<TaskLifetime>('standard');
   const [securityMode, setSecurityMode] = useState<Task['securityMode']>(
     initialDraft?.controls?.securityMode ?? task?.securityMode ?? workspace.securityMode
   );
@@ -267,6 +274,9 @@ export default function Composer({
       securityMode,
       privacyRoute,
       ...(limit !== undefined ? { maxSpendUsd: limit } : {}),
+      // Only on a new conversation, and only when it is not the default: a follow-up inherits the
+      // lifetime the run already has, and sending `standard` explicitly would say nothing.
+      ...(task || lifetime === 'standard' ? {} : { lifetime }),
       ...(task ? { interrupt } : { workspaceId: workspace.id })
     };
     const signature = JSON.stringify(payload);
@@ -516,6 +526,22 @@ export default function Composer({
           >
             <SlidersHorizontal size={14} />
           </Button>
+          {!task && (
+            <label className="garden-approval-select">
+              <span>Runs for</span>
+              <select
+                aria-label="How long this work is meant to run"
+                title="How long anything this publishes stays up, and how far past one step budget the run may carry itself"
+                value={lifetime}
+                disabled={editingDisabled}
+                onChange={(event) => setLifetime(event.target.value as TaskLifetime)}
+              >
+                <option value="brief">Minutes — output expires in a day</option>
+                <option value="standard">Normal</option>
+                <option value="sustained">Days — keeps going unattended</option>
+              </select>
+            </label>
+          )}
           <label className="garden-approval-select">
             <span>Approvals</span>
             <select

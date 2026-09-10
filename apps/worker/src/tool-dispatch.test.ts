@@ -134,6 +134,7 @@ const config = (overrides: Partial<WorkerConfig> = {}): TestConfig => ({
   // asserting about.
   TASK_MAX_STEPS: 1,
   TASK_MAX_SELF_CONTINUATIONS: 0,
+  TASK_SUSTAINED_SELF_CONTINUATIONS: 0,
   ...overrides
 });
 

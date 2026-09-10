@@ -174,6 +174,9 @@ export const mapTask = (row: Record<string, unknown>): TaskRecord => {
     ...(row.completed_at === undefined
       ? {}
       : { completedAt: row.completed_at ? iso(row.completed_at) : null }),
+    // `optionalText` rather than `String`: the column is text and nullable, and stringifying an
+    // unexpected shape would put "[object Object]" into a field the worker branches on.
+    ...(row.lifetime === undefined ? {} : { lifetime: optionalText(row.lifetime) ?? 'standard' }),
     queuedMessageCount: Number(row.queued_message_count ?? 0),
     ...(row.pending_delivery_count !== undefined
       ? {

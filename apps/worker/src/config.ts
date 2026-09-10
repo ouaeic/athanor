@@ -94,7 +94,14 @@ const Config = z.object({
    * not stop is far worse than one that stops early. Zero switches it off and restores the old
    * behaviour exactly; the ceiling of three is a hard bound on how far this can ever be turned up.
    */
-  TASK_MAX_SELF_CONTINUATIONS: z.coerce.number().int().min(0).max(3).default(2)
+  TASK_MAX_SELF_CONTINUATIONS: z.coerce.number().int().min(0).max(3).default(2),
+  /**
+   * The same ceiling for a run the owner declared sustained, where the work was always going to
+   * outlast their attention. Declared in `@athanor/contracts`' shared env beside the interactive
+   * one and restated here because this schema names the keys the worker reads rather than
+   * inheriting them; the two must agree, and the shared file is the one that decides.
+   */
+  TASK_SUSTAINED_SELF_CONTINUATIONS: z.coerce.number().int().min(0).max(500).default(60)
 });
 
 export type WorkerConfig = z.infer<typeof Config>;
