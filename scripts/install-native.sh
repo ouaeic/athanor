@@ -624,14 +624,14 @@ runuser -u "$runner_user" -- env \
 
 # Let that Chromium build its own renderer sandbox. Ubuntu refuses unprivileged user namespaces
 # under AppArmor from 23.10, and the profiles it ships cover its own packaged browsers rather than
-# the one athanor manages - so without this the browser falls back to running unsandboxed, or on a
-# stricter kernel does not start. Skipped rather than fatal where AppArmor is absent, because a
+# the one athanor manages. A host that denies the sandbox cannot start the browser. Skipped
+# rather than fatal where AppArmor is absent, because a
 # Debian box without it has nothing to refuse in the first place.
 if [ -d /etc/apparmor.d ] && command -v apparmor_parser >/dev/null 2>&1; then
   install_asset 0644 "$athanor_root/infra/native/athanor-chromium.apparmor" \
     /etc/apparmor.d/athanor-chromium
   apparmor_parser -r /etc/apparmor.d/athanor-chromium 2>/dev/null ||
-    warn "the Chromium AppArmor profile did not load; the browser will run with its renderer sandbox off"
+    warn "the Chromium AppArmor profile did not load; browser startup requires its renderer sandbox. Load the profile and run garden doctor before using the browser."
 fi
 
 # SELinux, which the RHEL family enforces by default and which nothing here used to mention at all.
