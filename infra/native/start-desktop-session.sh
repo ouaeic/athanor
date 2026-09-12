@@ -6,6 +6,13 @@ display_number="${2:?display number is required}"
 state_dir="$workspace_root/.athanor/desktop"
 environment_file="$state_dir/environment"
 
+for desktop_binary in /usr/bin/Xvfb /usr/bin/xdpyinfo /usr/bin/dbus-run-session; do
+  [ -x "$desktop_binary" ] || {
+    printf 'Desktop prerequisite is missing: %s. Run sudo garden update to repair the installation.\n' "$desktop_binary" >&2
+    exit 1
+  }
+done
+
 # Rejects anything that is not exactly <digits>x<digits>, because these values become Xvfb
 # arguments.
 valid_resolution() {

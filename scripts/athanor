@@ -687,6 +687,16 @@ doctor() {
       check_note "spending cap: no account came back from the database, so there is none to report"
     fi
   fi
+  missing_desktop_tools=""
+  for desktop_binary in Xvfb xdpyinfo xprop xrandr xdotool dbus-run-session; do
+    command -v "$desktop_binary" >/dev/null 2>&1 ||
+      missing_desktop_tools="$missing_desktop_tools $desktop_binary"
+  done
+  if [ -z "$missing_desktop_tools" ]; then
+    check_ok "desktop prerequisites: display, window inspection and control"
+  else
+    check_warn "desktop tooling is missing:$missing_desktop_tools. Run sudo garden update to repair the installation"
+  fi
   # "It could not make my CV" is the report this exists to pre-empt. The skill library prescribes
   # these by name, so a gap here is a job that fails in front of the owner rather than here.
   document_python=/usr/local/lib/athanor/python/bin/python3

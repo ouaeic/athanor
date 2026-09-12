@@ -124,6 +124,7 @@ athanor_detect_host() {
 # a `python3-pyarrow` that does not resolve would mean the pattern is broken for all five, and
 # openSUSE installs would already be failing on the four that shipped before this one.
 athanor_package_table() {
+  # DNF resolves file provides, so X11 utilities work with both split and grouped RPM packages.
   cat <<'TABLE'
 capability	debian	rhel	arch	suse
 accessibility	at-spi2-core	at-spi2-core	at-spi2-core	at-spi2-core
@@ -183,7 +184,9 @@ unzip	unzip	unzip	unzip	unzip
 util-linux	util-linux	util-linux	util-linux	util-linux
 wmctrl	wmctrl	wmctrl	wmctrl	wmctrl
 xvfb	xvfb	xorg-x11-server-Xvfb	xorg-server-xvfb	xorg-x11-server
-xrandr	x11-xserver-utils	xorg-x11-server-utils	xorg-xrandr	xrandr
+xrandr	x11-xserver-utils	/usr/bin/xrandr	xorg-xrandr	xrandr
+xdpyinfo	x11-utils	/usr/bin/xdpyinfo	xorg-xdpyinfo	xdpyinfo
+xprop	x11-utils	/usr/bin/xprop	xorg-xprop	xprop
 xdotool	xdotool	xdotool	xdotool	xdotool
 zip	zip	zip	zip	zip
 TABLE
