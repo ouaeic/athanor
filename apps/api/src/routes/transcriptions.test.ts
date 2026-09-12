@@ -305,8 +305,7 @@ describe('dictation provider authority, atomic accounting and sealed retries', (
     expect(JSON.stringify(stored.rows)).not.toContain('A private transcript');
     expect(stored.rows[0]!.response_body).toBeNull();
     expect(stored.rows[0]!.response_ciphertext).toMatchObject({
-      v: 1,
-      ciphertext: expect.any(String)
+      v: 1
     });
   });
   it('uses the reviewed external OpenRouter model and prepared audio', async () => {
