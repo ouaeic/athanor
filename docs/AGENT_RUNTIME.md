@@ -328,54 +328,37 @@ or redirect unless the model explicitly runs an interpreter and passes the scrip
 
 ### How long work is allowed to take
 
-Three lengths, and they are different mechanisms rather than three settings on one dial.
+A **foreground** command holds the turn open and is bounded by `MAX_EXECUTION_SECONDS`.
+A **background session** returns a process id immediately and is bounded by
+`MAX_BACKGROUND_SECONDS`. A **finite job** uses that same background deadline and adds a durable
+record. A **declared service** has no deadline and restarts after every exit, including a successful
+exit; use a finite job for work that is meant to finish.
 
-A **foreground** command holds the turn open and may run up to `MAX_EXECUTION_SECONDS`, an hour by
-default. A **background** command returns a session id immediately and runs for as long as it asked
-for, up to `MAX_BACKGROUND_SECONDS`, a day by default. A **declared service** has no deadline at all
-and is restarted whenever it exits - including when it exits successfully, so it is the wrong home
-for work that is meant to finish.
+The runner refuses a requested timeout above its configured limit before starting. Background
+responses and polls include `deadlineAt` and `remainingMs`. A service has no deadline.
 
-Asking for longer than the box allows is refused before anything starts, in a sentence naming both
-numbers: what was asked for, and what this box allows.
+Declare finite work with `shell(background=true, job=...)`. Garden retains its identity, bounded
+logs, terminal result and original deadline across runner restarts. A completed job never runs again.
+A job interrupted without a recovery command is reported as interrupted, with its partial files
+still available, rather than restarted from the beginning.
 
-**Twenty-four hours is the most an agent can actually obtain, and raising `MAX_BACKGROUND_SECONDS`
-does not change that.** There are two ceilings on this path and only one of them is the owner's. The
-runner's is `MAX_BACKGROUND_SECONDS` in `/etc/athanor/runner.env`, a day by default, settable up to
-2,147,483 seconds - about twenty-four days, which is where a deadline stops fitting in the signed
-32-bit millisecond count `setTimeout` takes, and a runner given more refuses to start rather than
-kill every job the instant it begins. The other ceiling is in the agent's own tool: `shell` declares
-`timeoutSeconds` with `maximum: 86400` and describes it to the model as up to 24 hours in the
-background. That schema is a static object in `apps/worker/src/tool-catalogue.ts`, identical on
-every box that sends `shell` at all: the per-box narrowing withdraws whole tools and rewrites only
-`connector_action`, never this. Nothing in garden validates a tool call against it either - the
-`shell` arm passes the model's arguments to the runner unchanged, so the cap is what the model is
-told rather than something the worker enforces - but a model that follows its own schema never asks
-for more than a day. So an owner with a forty-hour assembly who raises the runner ceiling has raised
-it for a caller that is not the model: the route accepts forty hours from anything holding the
-runner's shared secret, and the agent still asks for at most twenty-four. Until the `shell` schema
-changes, work longer than a day has to be split into stages that checkpoint (see below), each one
-inside the day.
+For checkpointable work, also declare `checkpointResumeCommand`. The application must write a
+valid checkpoint into the workspace and the command must continue safely from it. Approval covers
+both the initial command and the recovery command. On runner startup Garden reclaims the previous
+process and launches only that stored recovery command, subject to the original deadline and the
+current workspace isolation. A failed recovery remains visible; it does not become a service restart
+loop. `process(action=resume)` resolves and reviews the stored recovery command before a manual
+retry. Cancellation and an expired deadline do not grant another run.
 
-Every answer about a background session - the one that starts it and every poll after - carries
-`deadlineAt` and `remainingMs`, so the deadline is known from the first moment rather than
-discovered when the work is already gone. A service carries neither, because it has no deadline.
+An ordinary background session has no durable record and does not come back after a runner restart.
+A computation session's in-memory interpreter state is also distinct from a finite job: use files and
+checkpointable stages when an analysis must recover after maintenance or a crash. Garden does not
+infer a checkpoint or reconstruct arbitrary program memory.
 
-Two things end a long job that the owner should know about in advance:
-
-- **The deadline.** The process is killed, whatever it wrote to a file is still there, and the
-  reason is appended to the job's own log so a poll reads a deadline rather than an unexplained
-  crash. Nothing resumes it.
-- **A restart of the computer**, including the one an update performs. A declared service comes
-  back; an ordinary background command does not, and is not recorded anywhere. The runner publishes
-  what it is holding on its own `/healthz`, and `athanor update` reads it: it refuses by hand and
-  stands down unattended while background commands are running, and
-  [docs/OPERATIONS.md](OPERATIONS.md) says exactly what survives. That gate is only as good as the
-  runner answering it - against a runner older than the field the update says out loud that it
-  cannot tell, and goes ahead.
-
-Work that must outlive either of those has to checkpoint its own progress into a file in the
-workspace and be startable from where it left off. The computer does not do that for it.
+The updater still checks unfinished background work before maintenance, including checkpointable
+jobs. Declaring recovery is a safeguard against interruption, not permission to interrupt active
+work. [Operations](OPERATIONS.md#what-an-update-stops-and-what-comes-back) describes the update gate
+and the explicit operator override.
 
 ## Web search
 

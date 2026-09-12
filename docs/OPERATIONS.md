@@ -437,28 +437,27 @@ retries. A worker that cannot be reached counts as idle.
 
 ### What an update stops, and what comes back
 
-An update stops the whole server for the backup and the rebuild, which stops the workspace runner,
-which stops every command it is holding. Three different things happen to them:
+An update stops the server for the backup and rebuild, including the workspace runner and its
+commands. Recovery depends on how the work was declared:
 
-- A **declared service** comes back. Its record lives in the workspace's `.athanor/services.json`,
-  and the runner relaunches it as it comes up.
-- A **foreground command** belongs to a task, and a task in flight already holds the update off.
-- An **ordinary background command** - what an agent starts for a long analysis - does not come
-  back and is not written down anywhere. It is killed, and the agent that polls its session id
-  afterwards is told the process was not found.
+- A **declared service** is relaunched from its saved record.
+- A **foreground command** belongs to a task; active tasks hold the update off.
+- A **finite job** retains its identity, bounded logs, result and original deadline. An interrupted
+  job resumes only through its declared checkpoint recovery command. Without one it remains
+  interrupted and preserves partial files. Completed, cancelled and expired jobs do not restart.
+- An **ordinary background session** has no durable record and does not come back. Polling its old
+  session id reports that the process was not found.
 
-That last case is why an unattended run now stands down for background work. The idle gate above
-counts tasks, and a background command deliberately outlives the task that started it, so before
-this a twenty-hour job could be killed at three in the morning by a timer with nothing to say for
-itself. `athanor update` by hand refuses for the same reason and names what is running; set
-`ATHANOR_UPDATE_OVER_BACKGROUND_WORK=1` to update anyway.
+Both manual and unattended updates check unfinished background work as well as active tasks.
+Manual updates refuse and name the running work; unattended updates defer to their next window.
+`ATHANOR_UPDATE_OVER_BACKGROUND_WORK=1` is an explicit operator override. A runner too old to report
+background work produces a warning because the updater cannot establish that the workspace is idle.
 
-A runner from before this existed does not report the count. The update then says it could not tell
-and goes ahead, rather than treating silence as an all-clear or refusing to update for ever.
-
-**Nothing resumes a background command across a restart.** A job that must survive one has to write
-its own progress to a file in the workspace and be startable from where it left off; the computer
-cannot do that for it.
+For recoverable finite work, use `shell(background=true, job=...)` and declare a
+`checkpointResumeCommand` that safely continues the application's saved checkpoint. Approval
+covers that deferred command too. The checkpoint must be written by the application; Garden does
+not reconstruct arbitrary interpreter memory or extend the original job deadline. Keep important
+results in workspace files even when a job has a recovery command.
 
 The unit files are installed on every install and update but are never enabled by them, so the
 choice survives updates.
