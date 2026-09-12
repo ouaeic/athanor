@@ -65,10 +65,11 @@ jobs:
             . scripts/athanor-host.sh
             athanor_detect_host
             packages=""
-            for capability in poppler tesseract tesseract-english ffmpeg \
+            for capability in poppler tesseract tesseract-english ffmpeg qpdf img2pdf graphviz \
               office-writer office-impress office-calc \
               python python-pip python-docx python-openpyxl python-pillow \
-              python-lxml python-xlsxwriter \
+              python-lxml python-xlsxwriter python-pandas python-pyarrow python-matplotlib \
+              python-scipy python-statsmodels \
               font-carlito font-caladea font-liberation font-dejavu font-noto; do
               name=$(athanor_package_for "$capability" "$athanor_family")
               [ -n "$name" ] ||

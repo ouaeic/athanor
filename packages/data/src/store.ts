@@ -1169,6 +1169,10 @@ export class DataStore {
     return this.#billing.mergeUserPreferences(...args);
   }
 
+  getMessageDraft(...args: Parameters<BillingStore['getMessageDraft']>) {
+    return this.#billing.getMessageDraft(...args);
+  }
+
   saveMessageDraft(...args: Parameters<BillingStore['saveMessageDraft']>) {
     return this.#billing.saveMessageDraft(...args);
   }

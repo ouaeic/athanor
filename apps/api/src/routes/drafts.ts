@@ -1,56 +1,113 @@
-/**
- * The half-typed message, saved where every one of the owner's devices can pick it up.
- */
-
 import { SaveDraftRequest } from '@athanor/contracts';
-import { AthanorError, encryptJson, unwrapDataKey } from '@athanor/core';
+import {
+  AthanorError,
+  decryptJson,
+  deriveServiceSecret,
+  encryptJson,
+  sha256,
+  unwrapDataKey
+} from '@athanor/core';
+import { createHmac } from 'node:crypto';
+import type { z } from 'zod';
 import { requireUser } from '../http/auth-hook.js';
 import type { RouteContext } from '../http/server-context.js';
+import { sessionCookieName } from '../session.js';
+
+const DraftScope = SaveDraftRequest.pick({ workspaceId: true, taskId: true });
 
 export const registerDraftRoutes = (context: RouteContext): void => {
-  const { app, store, masterKey } = context;
-  /**
-   * The owner's choices, saved where every one of their devices can read them.
-   *
-   * Merged rather than replaced, so a phone saving one key does not wipe what a laptop saved a
-   * second earlier. Returned in full so the caller ends up holding what the server now holds
-   * rather than what it hoped it had written.
-   */
-  /**
-   * The half-typed message, kept where the owner's other device can find it.
-   *
-   * Sealed with the workspace key like the conversation it belongs to - a draft is the owner's
-   * words, and the box holds no plaintext of those anywhere else either. An empty body deletes the
-   * row rather than storing emptiness for every conversation ever opened.
-   */
-  app.put('/v1/drafts', async (request) => {
-    const user = requireUser(request.user);
-    const input = SaveDraftRequest.parse(request.body);
-    const workspace = await store.getWorkspace(user.id, input.workspaceId);
+  const { app, store, masterKey, idempotent, secure } = context;
+  const workspaceFor = async (userId: string, input: z.infer<typeof DraftScope>) => {
+    const workspace = await store.getWorkspace(userId, input.workspaceId);
     if (!workspace?.wrappedKey)
       throw new AthanorError('workspace_not_found', 'Workspace not found', 404);
-    const body = input.body.trim();
-    // Files already uploaded count as a draft even with nothing typed yet: dropping the row on an
-    // empty body would have thrown away the attachments the owner had just spent a minute
-    // uploading, which is the state a message that is mostly files sits in.
-    const attachments = (input.attachments ?? []).filter((item) => item.path);
-    await store.saveMessageDraft({
-      userId: user.id,
+    if (input.taskId) {
+      const task = await store.getTask(userId, input.taskId);
+      if (!task || task.workspaceId !== workspace.id)
+        throw new AthanorError(
+          'task_not_found',
+          'This conversation is not in the selected workspace',
+          404
+        );
+    }
+    return workspace;
+  };
+  app.get('/v1/drafts/device-key', async (request, reply) => {
+    const user = requireUser(request.user);
+    const token = request.cookies[sessionCookieName(secure)];
+    const sessionId = token ? await store.getSessionPublicId(user.id, sha256(token)) : null;
+    if (!sessionId)
+      throw new AthanorError('authentication_required', 'A signed-in device is required', 401);
+    const secret = Buffer.from(deriveServiceSecret(masterKey, 'device-drafts'), 'base64url');
+    const key = createHmac('sha256', secret)
+      .update(JSON.stringify([user.id, sessionId]))
+      .digest('base64url');
+    reply.header('Cache-Control', 'no-store');
+    return { userId: user.id, sessionId, key };
+  });
+  app.get('/v1/drafts', async (request, reply) => {
+    const user = requireUser(request.user);
+    const input = DraftScope.parse(request.query);
+    const workspace = await workspaceFor(user.id, input);
+    const row = await store.getMessageDraft(user.id, workspace.id, input.taskId ?? null);
+    const content = row?.bodyCiphertext
+      ? decryptJson<{
+          body: string;
+          attachments?: unknown[];
+          controls?: unknown;
+        }>(
+          row.bodyCiphertext,
+          unwrapDataKey(workspace.wrappedKey!, masterKey, workspace.id),
+          `draft:${workspace.id}`
+        )
+      : { body: '', attachments: [] };
+    reply.header('Cache-Control', 'no-store');
+    return {
+      ...content,
       workspaceId: workspace.id,
       taskId: input.taskId ?? null,
-      bodyCiphertext:
-        body || attachments.length || input.controls
-          ? encryptJson(
-              {
-                body: input.body,
-                attachments,
-                ...(input.controls ? { controls: input.controls } : {})
-              },
-              unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id),
-              `draft:${workspace.id}`
-            )
-          : null
-    });
-    return { saved: true };
+      attachments: content.attachments ?? [],
+      revision: row?.revision ?? 0,
+      updatedAt: row?.updatedAt
+    };
+  });
+  app.put('/v1/drafts', async (request, reply) => {
+    const user = requireUser(request.user);
+    const input = SaveDraftRequest.parse(request.body);
+    const workspace = await workspaceFor(user.id, input);
+    return idempotent(
+      request,
+      reply,
+      user,
+      async () => {
+        const attachments = (input.attachments ?? []).filter((item) => item.path);
+        const receipt = await store.saveMessageDraft({
+          userId: user.id,
+          workspaceId: workspace.id,
+          taskId: input.taskId ?? null,
+          expectedRevision: input.expectedRevision,
+          bodyCiphertext:
+            input.body.trim() || attachments.length || input.controls
+              ? encryptJson(
+                  {
+                    body: input.body,
+                    attachments,
+                    ...(input.controls ? { controls: input.controls } : {})
+                  },
+                  unwrapDataKey(workspace.wrappedKey!, masterKey, workspace.id),
+                  `draft:${workspace.id}`
+                )
+              : null
+        });
+        if (!receipt)
+          throw new AthanorError(
+            'draft_conflict',
+            'A newer draft was saved on another device. Choose which version to keep.',
+            409
+          );
+        return { saved: true, ...receipt };
+      },
+      { databaseOnly: true }
+    );
   });
 };

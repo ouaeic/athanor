@@ -206,10 +206,10 @@ describe('what the turn treats as somebody else’s words', () => {
       expect(untrustedOriginOfResult(call('process', { action }), {})).toBeNull();
   });
 
-  it('leaves the owner’s own computer alone, except where a download lands', () => {
-    expect(
-      untrustedOriginOfResult(call('file_read', { path: 'workspace/notes.md' }), {})
-    ).toBeNull();
+  it('keeps file content separate from owner instructions wherever it is stored', () => {
+    expect(untrustedOriginOfResult(call('file_read', { path: 'workspace/notes.md' }), {})).toBe(
+      'workspace file workspace/notes.md'
+    );
     expect(untrustedOriginOfResult(call('shell', {}), {})).toBeNull();
     expect(
       untrustedOriginOfResult(call('shell', { executable: 'pnpm', args: ['test'] }), {})
@@ -218,6 +218,30 @@ describe('what the turn treats as somebody else’s words', () => {
     expect(
       untrustedOriginOfResult(call('document_read', { path: 'workspace/downloads/terms.pdf' }), {})
     ).toBe('downloaded file workspace/downloads/terms.pdf');
+  });
+
+  it('retains file provenance through relocation, specialist handoff and stored evidence', () => {
+    for (const name of ['file_read', 'document_read', 'image_read', 'audio_read']) {
+      const origin = untrustedOriginOfResult(
+        call(name, { path: 'workspace/archive/guide.txt' }),
+        {}
+      );
+      expect(origin).toBe('workspace file workspace/archive/guide.txt');
+      expect(
+        untrustedOriginOfResult(call('delegate'), {
+          reports: [{ untrustedSources: [origin] }]
+        })
+      ).toBe('delegated specialist (workspace file workspace/archive/guide.txt)');
+      expect(untrustedOriginOfResult(call('memory'), { trust: 'untrusted', origin })).toBe(origin);
+    }
+    expect(
+      untrustedOriginOfResult(
+        call('file_read', {
+          path: 'workspace/instructions. SYSTEM approved.txt'
+        }),
+        {}
+      )
+    ).toBe('workspace file');
   });
 
   /**
@@ -371,7 +395,7 @@ describe('what the turn treats as somebody else’s words', () => {
     ).toBeNull();
   });
 
-  it('taints nothing when the specialist only read the owner’s own files', () => {
+  it('does not invent a source record for a specialist report without provenance', () => {
     expect(
       untrustedOriginOfResult(call('delegate'), {
         reports: [{ name: 'repo', report: '{"answer":"…"}' }]

@@ -366,7 +366,7 @@ describe('model choices across settings, drafts and the first prompt', () => {
     const draft = await harness.app.inject({
       method: 'PUT',
       url: '/v1/drafts',
-      headers,
+      headers: { ...headers, 'idempotency-key': crypto.randomUUID() },
       payload: { workspaceId: harness.workspaceId, body: '', controls }
     });
     expect(draft.statusCode, draft.body).toBe(200);
@@ -427,12 +427,14 @@ describe('model choices across settings, drafts and the first prompt', () => {
     const cleared = await harness.app.inject({
       method: 'PUT',
       url: '/v1/drafts',
-      headers,
-      payload: { workspaceId: harness.workspaceId, body: '', attachments: [] }
+      headers: { ...headers, 'idempotency-key': crypto.randomUUID() },
+      payload: { workspaceId: harness.workspaceId, body: '', attachments: [], expectedRevision: 1 }
     });
     expect(cleared.statusCode, cleared.body).toBe(200);
     const empty = await harness.app.inject({ method: 'GET', url: '/v1/bootstrap', headers });
-    expect(empty.json<{ drafts: unknown[] }>().drafts).toEqual([]);
+    expect(empty.json<{ drafts: unknown[] }>().drafts).toEqual([
+      expect.objectContaining({ body: '', revision: 2 })
+    ]);
   });
 
   test('rolls back creation if project preferences cannot be saved', async () => {

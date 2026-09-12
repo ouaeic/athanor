@@ -13,19 +13,21 @@ import { modeFloors } from './asking-rules';
 import { effortChoices, effortLabel } from './reasoning-options';
 import type { Bootstrap, Draft, DraftAttachment } from './model';
 import { defaultPrivacy, isWorking, text, data } from './model';
-import { get, isNativeClient, patch, post, put, request } from './client';
+import { get, isNativeClient, patch, post, request } from './client';
 import ModelPicker from './ModelPicker.js';
+import { ConfirmButton } from './management';
 import { Button, Dialog, ErrorNotice } from './ui';
 import { useAutosizeTextarea } from './use-autosize-textarea';
 import { MAX_TASK_SPEND_USD } from './usage-model.js';
 const PromptModelChoices = lazy(() => import('./PromptModels'));
 import {
   dictationSession,
-  serialDraftWriter,
   spendCap,
   transcriptionPayload,
   uploadAttachments
 } from './composer-operations.js';
+import { DraftConflict, DraftSync } from './draft-sync';
+import { draftStorage, keepsDeviceDrafts, recoveryFor, writeDraft } from './draft-storage';
 import type { DictationState } from './composer-operations.js';
 import type { DictationConsent } from './dictation-preflight';
 const LocalFolderAttachments = lazy(() => import('./LocalFolderAttachments.js'));
@@ -85,28 +87,76 @@ export default function Composer({
   const [busy, setBusy] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<unknown>(null);
-  const [saved, setSaved] = useState('');
+  const [saved, setSaved] = useState(
+    initialDraft?.recoveryId ? 'Recovered draft from this device' : ''
+  );
+  const [draftConflict, setDraftConflict] = useState<Draft | null>(null);
   const [dictationState, setDictationState] = useState<DictationState>('idle');
   const [dictationSetup, setDictationSetup] = useState(false);
   const [pendingTask, setPendingTask] = useState<Task | null>(null);
+  const [pendingSend, setPendingSend] = useState(Boolean(recoveryFor(initialDraft)?.submission));
   const fileInput = useRef<HTMLInputElement>(null);
   const input = useAutosizeTextarea(body);
   const voice = useRef<ReturnType<typeof dictationSession> | null>(null);
   const voiceState = useRef<DictationState>('idle');
   const dictationConsent = useRef<DictationConsent | null>(null);
   const uploadController = useRef<AbortController | null>(null);
-  const operation = useRef<{ signature: string; key: string } | null>(null);
   const changed = useRef(false);
   const sending = useRef(false);
   const mounted = useRef(true);
   const draftTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const draftRevision = useRef(0);
   const pendingDraft = useRef<Draft | null>(null);
-  const [draftWrites] = useState(() =>
-    serialDraftWriter<Draft>((draft) => put('/v1/drafts', draft))
-  );
   const onDraftRef = useRef(onDraft);
   onDraftRef.current = onDraft;
+  const [draftWrites] = useState(
+    () =>
+      new DraftSync({
+        draft: initialDraft ?? {
+          workspaceId: workspace.id,
+          taskId: task?.id ?? null,
+          body: '',
+          attachments: []
+        },
+        recovery: recoveryFor(initialDraft),
+        storage: draftStorage,
+        write: writeDraft,
+        onStatus: (status, cause) => {
+          if (!mounted.current || sending.current) return;
+          setSaved(
+            status === 'pending_delivery'
+              ? 'Send not confirmed · retry safely below'
+              : status === 'synced'
+                ? 'Draft synced'
+                : status === 'device'
+                  ? keepsDeviceDrafts()
+                    ? 'Saved on this device · waiting to sync'
+                    : 'Draft not synced'
+                  : status === 'saving'
+                    ? 'Saving draft…'
+                    : status === 'conflict'
+                      ? 'Choose a draft version'
+                      : 'Draft not saved'
+          );
+          if (status === 'conflict' && cause instanceof DraftConflict)
+            setDraftConflict(cause.server);
+          else if (status === 'unsaved') setError(cause);
+        },
+        onSynced: (draft) => {
+          if (pendingDraft.current && draft.revision !== undefined)
+            pendingDraft.current.revision = draft.revision;
+          onDraftRef.current(pendingDraft.current ?? draft);
+        }
+      })
+  );
+  useEffect(() => {
+    const sync = () => {
+      void draftWrites.flush().catch(() => undefined);
+    };
+    sync();
+    window.addEventListener('online', sync);
+    return () => window.removeEventListener('online', sync);
+  }, [draftWrites]);
   useEffect(() => {
     if (!task) return;
     const controller = new AbortController();
@@ -164,20 +214,24 @@ export default function Composer({
     onDraftRef.current(draft);
     pendingDraft.current = draft;
     const revision = ++draftRevision.current;
+    void draftWrites.stage(draft).catch(() => undefined);
     draftTimer.current = setTimeout(() => {
       setSaved('Saving draft…');
       void draftWrites
-        .save(draft)
+        .flush()
         .then(() => {
           if (mounted.current && !sending.current && revision === draftRevision.current)
-            setSaved('Draft saved');
+            setSaved('Draft synced');
           if (pendingDraft.current === draft) pendingDraft.current = null;
         })
         .catch((err: unknown) => {
-          if (mounted.current && !sending.current && revision === draftRevision.current) {
-            setSaved('Draft not synced');
+          if (
+            mounted.current &&
+            !sending.current &&
+            revision === draftRevision.current &&
+            !keepsDeviceDrafts()
+          )
             setError(err);
-          }
         });
     }, 650);
     return () => {
@@ -287,10 +341,10 @@ export default function Composer({
   });
   async function finishDelivery(result: Task) {
     try {
-      await draftWrites.save(clearedDraft());
-      operation.current = null;
+      await draftWrites.finishSubmission(clearedDraft());
       if (mounted.current) {
         setPendingTask(null);
+        setPendingSend(false);
         setSaved('');
         onSent(result);
       }
@@ -307,6 +361,35 @@ export default function Composer({
       }
     }
   }
+  async function resolveDraft(choice: 'device' | 'server') {
+    setBusy(true);
+    try {
+      const draft = await draftWrites.resolve(choice);
+      if (choice === 'server') {
+        changed.current = false;
+        pendingDraft.current = null;
+        setBody(draft.body);
+        setAttachments(draft.attachments);
+        setModelId(draft.controls?.modelId ?? '');
+        setModelChoices(draft.controls?.modelChoices ?? {});
+        setReasoningEffort(draft.controls?.reasoningEffort ?? task?.reasoningEffort ?? 'auto');
+        setPrivacyRoute(
+          draft.controls?.privacyRoute ?? task?.privacyRoute ?? defaultPrivacy(bootstrap)
+        );
+        setSecurityMode(
+          draft.controls?.securityMode ?? task?.securityMode ?? workspace.securityMode
+        );
+        setLifetime(draft.controls?.lifetime ?? 'standard');
+        setCap(draft.controls?.spendCap ?? '');
+      }
+      setDraftConflict(null);
+      setError(null);
+    } catch (cause) {
+      setError(cause);
+    } finally {
+      setBusy(false);
+    }
+  }
   async function send() {
     if (
       dictationSetup ||
@@ -318,6 +401,10 @@ export default function Composer({
       pendingTask
     )
       return;
+    if (!navigator.onLine) {
+      setError(new Error('You are offline. Your draft is kept; reconnect before sending.'));
+      return;
+    }
     let limit: number | undefined;
     try {
       limit = spendCap(cap);
@@ -347,15 +434,37 @@ export default function Composer({
       ...(task || lifetime === 'standard' ? {} : { lifetime }),
       ...(task ? { interrupt } : { workspaceId: workspace.id })
     };
-    const signature = JSON.stringify(payload);
-    if (operation.current?.signature !== signature)
-      operation.current = { signature, key: crypto.randomUUID() };
+    const previous = draftWrites.pendingSubmission;
+    const signature = previous?.signature ?? JSON.stringify(payload);
+    const submittedPayload: unknown = previous ? JSON.parse(previous.signature) : payload;
     try {
       await draftWrites.flush();
+      const key = await draftWrites.prepareSubmission(
+        signature,
+        pendingDraft.current ?? {
+          workspaceId: workspace.id,
+          taskId: task?.id ?? null,
+          body,
+          attachments,
+          controls: {
+            modelId,
+            modelChoices,
+            lifetime,
+            reasoningEffort,
+            securityMode,
+            privacyRoute,
+            spendCap: cap
+          }
+        }
+      );
+      setPendingSend(true);
       const result = await post<Task>(
         task ? `/v1/tasks/${task.id}/messages` : '/v1/tasks',
-        payload,
-        { idempotencyKey: operation.current.key }
+        submittedPayload,
+        {
+          idempotencyKey: key,
+          ...(previous ? { headers: { 'idempotency-replay-only': 'true' } } : {})
+        }
       );
       changed.current = false;
       pendingDraft.current = null;
@@ -366,7 +475,10 @@ export default function Composer({
       onDraftRef.current(clearedDraft());
       await finishDelivery(result);
     } catch (err) {
-      if (mounted.current) setError(err);
+      if (mounted.current) {
+        setError(err);
+        if (err instanceof DraftConflict) setDraftConflict(err.server);
+      }
     } finally {
       sending.current = false;
       if (mounted.current) setBusy(false);
@@ -404,7 +516,7 @@ export default function Composer({
   }
   const recording = dictationState === 'recording';
   const voiceBusy = dictationState !== 'idle';
-  const editingDisabled = busy || Boolean(pendingTask);
+  const editingDisabled = busy || Boolean(pendingTask) || pendingSend;
   const models = bootstrap.models.filter((model) => model.privacyRoute === privacyRoute);
   const projectModel = models.find((model) => model.id === (projectMain || task?.modelId));
   const selectedModel = models.find(
@@ -526,7 +638,15 @@ export default function Composer({
           }
           busy={busy}
         >
-          {task ? (isWorking(task) ? (interrupt ? 'Update run' : 'Queue next') : 'Send') : 'Begin'}
+          {pendingSend
+            ? 'Retry send'
+            : task
+              ? isWorking(task)
+                ? interrupt
+                  ? 'Update run'
+                  : 'Queue next'
+                : 'Send'
+              : 'Begin'}
           <ArrowUpRight size={18} />
         </Button>
       </div>
@@ -543,6 +663,23 @@ export default function Composer({
               ? 'Recording…'
               : 'Transcribing…'}
           <Button onClick={() => voice.current?.cancel()}>Cancel dictation</Button>
+        </div>
+      )}
+      {pendingSend && !pendingTask && !busy && (
+        <div className="draft-conflict" role="status">
+          <p>
+            The earlier send was not confirmed. Retry send looks up the saved receipt for that exact
+            request. It does not start another task.
+          </p>
+          <ConfirmButton
+            label="Keep as an unsent draft"
+            description="The earlier request may already have created work. Check All work before sending this as a new request. Keep the text and discard its saved retry identity?"
+            action={async () => {
+              await draftWrites.abandonSubmission();
+              setPendingSend(false);
+              setError(null);
+            }}
+          />
         </div>
       )}
       {pendingTask && (
@@ -750,6 +887,24 @@ export default function Composer({
         </Dialog>
       )}
       <ErrorNotice error={error} />
+      {draftConflict && (
+        <div className="draft-conflict" role="alert">
+          <strong>A newer draft exists on another device.</strong>
+          <p>Your text is kept here. Choose which version to continue with.</p>
+          <details>
+            <summary>View the other draft</summary>
+            <pre>{draftConflict.body || '(No text)'}</pre>
+          </details>
+          <div className="row">
+            <Button disabled={busy} onClick={() => void resolveDraft('device')}>
+              Keep my draft
+            </Button>
+            <Button disabled={busy} onClick={() => void resolveDraft('server')}>
+              Use other draft
+            </Button>
+          </div>
+        </div>
+      )}
       {saved && (
         <small className="draft-status" role="status">
           {saved}

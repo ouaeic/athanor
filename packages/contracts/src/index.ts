@@ -811,6 +811,7 @@ export const TaskEventKind = z.enum([
   'subagent',
   'notice',
   'warning',
+  'provenance',
   'error',
   'completed'
 ]);
@@ -2202,6 +2203,7 @@ export type OwnerPreferences = z.infer<typeof OwnerPreferences>;
 /** A half-typed message, saved against the conversation it belongs to, or none for a new one. */
 export const SaveDraftRequest = z.object({
   workspaceId: Id,
+  expectedRevision: z.number().int().nonnegative().default(0),
   taskId: Id.nullish(),
   body: z.string().max(200_000),
   controls: z

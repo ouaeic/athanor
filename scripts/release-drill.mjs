@@ -137,6 +137,7 @@ const REQUIRED_MODULES = [
   'numpy',
   'openpyxl',
   'pandas',
+  'pyarrow',
   'pptx',
   'pypdf',
   'scipy',

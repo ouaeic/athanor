@@ -6374,7 +6374,7 @@ describe('a half-typed message', () => {
     const saved = await app.inject({
       method: 'PUT',
       url: '/v1/drafts',
-      headers: { cookie },
+      headers: { cookie, 'idempotency-key': crypto.randomUUID() },
       payload: {
         workspaceId,
         body: 'a sentence begun on another device',
@@ -6434,15 +6434,17 @@ describe('a half-typed message', () => {
     const stored = await database.query('SELECT body_ciphertext FROM message_drafts');
     expect(JSON.stringify(stored.rows[0])).not.toContain('another device');
 
-    // Emptying it removes the row rather than keeping emptiness for every conversation opened.
+    // A cleared draft retains a revision, so an offline device cannot restore older text.
     await app.inject({
       method: 'PUT',
       url: '/v1/drafts',
-      headers: { cookie },
-      payload: { workspaceId, body: '   ' }
+      headers: { cookie, 'idempotency-key': crypto.randomUUID() },
+      payload: { workspaceId, body: '   ', expectedRevision: 1 }
     });
     const cleared = await app.inject({ method: 'GET', url: '/v1/bootstrap', headers: { cookie } });
-    expect(cleared.json<{ drafts: unknown[] }>().drafts).toEqual([]);
+    expect(cleared.json<{ drafts: unknown[] }>().drafts).toEqual([
+      expect.objectContaining({ body: '', revision: 2 })
+    ]);
   });
 });
 

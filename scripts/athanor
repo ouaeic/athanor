@@ -698,7 +698,7 @@ doctor() {
       missing_document_tools="$missing_document_tools $document_binary"
   done
   if [ -x "$document_python" ]; then
-    for document_module in pptx docx openpyxl pandas numpy scipy statsmodels matplotlib PIL pypdf; do
+    for document_module in pptx docx openpyxl pandas pyarrow numpy scipy statsmodels matplotlib PIL pypdf; do
       "$document_python" -c "import $document_module" >/dev/null 2>&1 ||
         missing_document_tools="$missing_document_tools python:$document_module"
     done

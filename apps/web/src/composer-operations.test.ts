@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   dictationSession,
-  serialDraftWriter,
   spendCap,
   transcriptionPayload,
   uploadAttachments
@@ -62,44 +61,6 @@ describe('durable composer operations', () => {
       uploadAttachments(files, 19, new AbortController().signal, write, () => undefined)
     ).rejects.toThrow('20 files');
     expect(write).toHaveBeenCalledOnce();
-  });
-
-  it('holds draft clearing behind the complete response of an already-started save', async () => {
-    const inFlight = deferred<void>();
-    let stored = '';
-    const write = vi.fn(async (draft: string) => {
-      if (draft) await inFlight.promise;
-      stored = draft;
-    });
-    const writer = serialDraftWriter(write);
-    const original = writer.save('Important words');
-    await Promise.resolve();
-    expect(write).toHaveBeenCalledOnce();
-    const clear = writer.save('');
-    await Promise.resolve();
-    expect(write).toHaveBeenCalledOnce();
-    inFlight.resolve();
-    await Promise.all([original, clear]);
-    expect(write).toHaveBeenCalledTimes(2);
-    expect(stored).toBe('');
-  });
-
-  it('surfaces failed clearing while allowing an explicit sync retry without replaying the sent task', async () => {
-    const unavailable = new Error('Draft server unavailable');
-    const write = vi
-      .fn<
-        (draft: { body: string; attachments: DraftAttachment[] }) => Promise<{ saved: boolean }>
-      >()
-      .mockRejectedValueOnce(unavailable)
-      .mockResolvedValueOnce({ saved: true });
-    const writer = serialDraftWriter(write);
-    await expect(writer.save({ body: '', attachments: [] })).rejects.toBe(unavailable);
-    await expect(writer.save({ body: '', attachments: [] })).resolves.toEqual({ saved: true });
-    await writer.flush();
-    expect(write).toHaveBeenCalledTimes(2);
-    expect(
-      write.mock.calls.every(([draft]) => draft.body === '' && draft.attachments.length === 0)
-    ).toBe(true);
   });
 
   it('validates spending before sending even when native form validation is bypassed', () => {

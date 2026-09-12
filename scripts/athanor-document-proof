@@ -918,6 +918,182 @@ def job_letter(work: Path) -> list[tuple[str, str]]:
 # --------------------------------------------------------------------------------------------
 
 
+def require_equal(actual: object, expected: object, description: str) -> None:
+    if actual != expected:
+        raise Failure(f"{description}: expected {expected!r}, got {actual!r}")
+
+
+def rejects(check: Callable[[], object], description: str) -> None:
+    try:
+        check()
+    except (Failure, AssertionError, ValueError):
+        return
+    raise Failure(f"the check accepted {description}")
+
+
+def job_parquet(work: Path) -> list[tuple[str, str]]:
+    import pandas as pd
+
+    original = pd.DataFrame({
+        "id": pd.Series([1, None, 3], dtype="Int64"),
+        "label": pd.Series(["α", None, "third"], dtype="string"),
+        "time": pd.to_datetime(["2026-01-01", None, "2026-01-03"], utc=True),
+        "value": [0.25, -2.5, float("nan")],
+    })
+    target = work / "typed-table.parquet"
+    original.to_parquet(target, engine="pyarrow", index=False)
+    restored = pd.read_parquet(target, engine="pyarrow")
+    pd.testing.assert_frame_equal(restored, original, check_exact=True)
+    broken = restored.copy()
+    broken.loc[0, "id"] = 99
+    rejects(lambda: pd.testing.assert_frame_equal(broken, original), "a changed Parquet value")
+    return [("typed table round trip", "values, nullable types, Unicode and UTC timestamps retained"),
+            ("the check can fail", "a changed value fails the exact frame comparison")]
+
+
+def job_data(work: Path) -> list[tuple[str, str]]:
+    import pandas as pd
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    source = work / "observations.csv"
+    source.write_text("group,value\na,1\na,3\nb,8\nb,\n", encoding="utf-8")
+    table = pd.read_csv(source)
+    result = table.groupby("group")["value"].agg(["mean", "count"])
+    measured = result["mean"].to_dict()
+    require_equal(measured, {"a": 2.0, "b": 8.0}, "group means")
+    require_equal(result["count"].to_dict(), {"a": 2, "b": 1}, "missing-value counts")
+    figure, axes = plt.subplots()
+    result["mean"].plot.bar(ax=axes)
+    plot = work / "group-means.svg"
+    figure.savefig(plot)
+    plt.close(figure)
+    if "<svg" not in plot.read_text(encoding="utf-8"):
+        raise Failure("the chart is not an SVG document")
+    rejects(lambda: require_equal({"a": 3.0, "b": 8.0}, measured, "group means"), "an incorrect mean")
+    return [("CSV analysis and chart", "missing values excluded, group counts and means reconciled, SVG produced"),
+            ("the check can fail", "an incorrect mean is rejected")]
+
+
+def job_statistics(work: Path) -> list[tuple[str, str]]:
+    import numpy as np
+    from scipy import stats
+    import statsmodels.api as sm
+
+    x = np.arange(5, dtype=float)
+    y = 1 + 2 * x + np.array([0.2, -0.1, -0.2, -0.1, 0.2])
+    fitted = sm.OLS(y, sm.add_constant(x)).fit()
+    np.testing.assert_allclose(fitted.params, [1, 2], rtol=0, atol=1e-12)
+    interval = fitted.conf_int(alpha=0.05)[1]
+    if not interval[0] < 2 < interval[1]:
+        raise Failure("the slope interval does not contain the known slope")
+    test = stats.ttest_1samp(y, 5)
+    if abs(test.statistic) > 1e-12 or abs(test.pvalue - 1) > 1e-12:
+        raise Failure("the known-mean t-test is inconsistent")
+    (work / "statistics.json").write_text(json.dumps({
+        "coefficients": fitted.params.tolist(), "slope95": interval.tolist(),
+        "testP": float(test.pvalue), "observations": len(y),
+    }), encoding="utf-8")
+    rejects(lambda: np.testing.assert_allclose(fitted.params, [1, 3]), "an incorrect slope")
+    return [("regression and inference", "known coefficients, confidence interval and null mean reconciled"),
+            ("the check can fail", "an incorrect slope is rejected")]
+
+
+def job_pdf_form(work: Path) -> list[tuple[str, str]]:
+    from pypdf import PdfReader, PdfWriter
+    from pypdf.generic import (ArrayObject, BooleanObject, DictionaryObject,
+                               FloatObject, NameObject, TextStringObject)
+
+    original = work / "form-blank.pdf"
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=300, height=200)
+    field = DictionaryObject({
+        NameObject("/Type"): NameObject("/Annot"), NameObject("/Subtype"): NameObject("/Widget"),
+        NameObject("/FT"): NameObject("/Tx"), NameObject("/T"): TextStringObject("owner"),
+        NameObject("/V"): TextStringObject(""),
+        NameObject("/Rect"): ArrayObject([FloatObject(n) for n in [20, 100, 250, 140]]),
+    })
+    reference = writer._add_object(field)
+    page[NameObject("/Annots")] = ArrayObject([reference])
+    writer._root_object[NameObject("/AcroForm")] = DictionaryObject({
+        NameObject("/Fields"): ArrayObject([reference]),
+        NameObject("/NeedAppearances"): BooleanObject(True),
+    })
+    writer.write(original)
+    filled = PdfWriter(clone_from=original)
+    filled.update_page_form_field_values(filled.pages[0], {"owner": "Garden owner"}, auto_regenerate=False)
+    target = work / "form-filled.pdf"
+    filled.write(target)
+    fields = PdfReader(target).get_fields()
+    require_equal((fields or {}).get("owner", {}).get("/V"), "Garden owner", "filled form field")
+    rejects(lambda: require_equal((PdfReader(original).get_fields() or {})["owner"]["/V"],
+                                  "Garden owner", "filled form field"), "an unfilled form")
+    return [("PDF form round trip", "field enumerated, filled, saved and read back"),
+            ("the check can fail", "the unfilled twin is rejected")]
+
+
+def job_media(work: Path) -> list[tuple[str, str]]:
+    target = work / "tone.wav"
+    run([tool("ffmpeg") or "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-ar", "16000", "-ac", "1", str(target)])
+    result = run([tool("ffprobe") or "ffprobe", "-v", "error", "-show_streams", "-show_format",
+                  "-of", "json", str(target)])
+    report = json.loads(result.stdout)
+    streams = report["streams"]
+    if len(streams) != 1:
+        raise Failure("expected one audio stream")
+    measured = (streams[0]["codec_type"], streams[0]["sample_rate"], streams[0]["channels"])
+    require_equal(measured, ("audio", "16000", 1), "audio format")
+    if abs(float(report["format"]["duration"]) - 1) > 0.01:
+        raise Failure("the encoded duration changed")
+    rejects(lambda: require_equal(measured, ("audio", "48000", 2), "audio format"), "an incorrect audio format")
+    return [("audio encoding and inspection", "one-second mono PCM at the requested sample rate"),
+            ("the check can fail", "an incorrect channel and sample-rate claim is rejected")]
+
+
+def job_pdf_assembly(work: Path) -> list[tuple[str, str]]:
+    from PIL import Image
+    from pypdf import PdfReader
+
+    raster = work / "assembly-page.png"
+    Image.new("RGB", (200, 100), (20, 90, 140)).save(raster)
+    single = work / "assembly-single.pdf"
+    merged = work / "assembly-merged.pdf"
+    run([tool("img2pdf") or "img2pdf", str(raster), "-o", str(single)])
+    run([tool("qpdf") or "qpdf", "--empty", "--pages", str(single), "1", str(single), "1", "--", str(merged)])
+    run([tool("qpdf") or "qpdf", "--check", str(merged)])
+    require_equal(len(PdfReader(merged).pages), 2, "merged page count")
+    rejects(lambda: require_equal(len(PdfReader(single).pages), 2, "merged page count"), "a missing page")
+    return [("PDF assembly", "a raster page converted, duplicated into a valid PDF and counted"),
+            ("the check can fail", "a missing page is rejected")]
+
+
+def job_images(work: Path) -> list[tuple[str, str]]:
+    from PIL import Image
+    import xml.etree.ElementTree as ET
+
+    original = Image.new("RGBA", (100, 60), (255, 0, 0, 255))
+    original.paste((0, 0, 255, 255), (50, 0, 100, 60))
+    cropped = original.crop((50, 0, 100, 60)).resize((25, 30))
+    target = work / "crop.png"
+    cropped.save(target)
+    with Image.open(target) as restored:
+        require_equal(restored.size, (25, 30), "image geometry")
+        require_equal(restored.getpixel((12, 15)), (0, 0, 255, 255), "cropped pixel")
+    source = work / "flow.dot"
+    source.write_text('digraph flow { input -> result; }', encoding="utf-8")
+    diagram = work / "flow.svg"
+    run([tool("dot") or "dot", "-Tsvg", str(source), "-o", str(diagram)])
+    root = ET.parse(diagram).getroot()
+    texts = [element.text for element in root.iter() if element.tag.endswith("}text")]
+    if "input" not in texts or "result" not in texts:
+        raise Failure("the rendered graph lost a node label")
+    rejects(lambda: require_equal(original.size, (25, 30), "image geometry"), "an uncropped image")
+    return [("image and diagram output", "crop pixels and geometry read back; graph labels retained in SVG"),
+            ("the check can fail", "the original uncropped image fails the geometry check")]
+
+
 class Job(NamedTuple):
     id: str
     purpose: str
@@ -928,10 +1104,11 @@ class Job(NamedTuple):
     # --require-all, where a box missing any of it is a box that cannot finish a document job.
     rendering: tuple[str, ...]
     run: Callable[[Path], list[tuple[str, str]]]
+    capabilities: tuple[str, ...]
 
 
 JOBS: tuple[Job, ...] = (
-    Job("cv", "A one-page CV, typeset to a PDF", ("typst",), ("pypdf",), (), job_cv),
+    Job("cv", "A one-page CV, typeset to a PDF", ("typst",), ("pypdf",), (), job_cv, ("typeset-pdf", "document-fonts")),
     Job(
         "report",
         "A report whose totals are computed by the template",
@@ -939,6 +1116,7 @@ JOBS: tuple[Job, ...] = (
         ("pypdf",),
         (),
         job_report,
+        ('typeset-pdf', 'document-fonts'),
     ),
     Job(
         "tables",
@@ -947,6 +1125,7 @@ JOBS: tuple[Job, ...] = (
         ("pypdf",),
         (),
         job_tables,
+        ('pdf-extraction',),
     ),
     Job(
         "deck",
@@ -955,6 +1134,7 @@ JOBS: tuple[Job, ...] = (
         ("pptx",),
         ("athanor-office-convert", "pdftoppm", "pypdf", "PIL"),
         job_deck,
+        ('office-authoring', 'office-conversion'),
     ),
     Job(
         "workbook",
@@ -963,6 +1143,7 @@ JOBS: tuple[Job, ...] = (
         ("openpyxl",),
         ("athanor-office-convert",),
         job_workbook,
+        ('office-authoring', 'office-conversion'),
     ),
     Job(
         "letter",
@@ -971,7 +1152,15 @@ JOBS: tuple[Job, ...] = (
         ("docx",),
         ("athanor-office-convert", "pypdf"),
         job_letter,
+        ('office-authoring', 'office-conversion'),
     ),
+    Job("parquet", "A typed Parquet table saved and read back", (), ("pandas", "pyarrow"), (), job_parquet, ("parquet-data",)),
+    Job("data", "CSV aggregation and a saved chart", (), ("pandas", "matplotlib"), (), job_data, ("data-analysis",)),
+    Job("statistics", "Regression and inference against known coefficients", (), ("scipy", "statsmodels"), (), job_statistics, ("statistics",)),
+    Job("pdf-form", "A PDF form field filled and read back", (), ("pypdf",), (), job_pdf_form, ("pdf-forms",)),
+    Job("media", "Audio encoded and inspected", ("ffmpeg", "ffprobe"), (), (), job_media, ("media",)),
+    Job("pdf-assembly", "Raster conversion and PDF page assembly", ("qpdf", "img2pdf"), ("PIL", "pypdf"), (), job_pdf_assembly, ("pdf-assembly",)),
+    Job("images", "Image geometry and diagram labels read back", ("dot",), ("PIL",), (), job_images, ("image-work",)),
 )
 
 
@@ -996,8 +1185,18 @@ def main() -> int:
         action="store_true",
         help="treat a job that cannot run for want of a tool as a failure",
     )
+    parser.add_argument("--manifest", action="store_true", help="list representative workflow contracts without running them")
     parser.add_argument("--json", action="store_true", help="machine-readable report on stdout")
     arguments = parser.parse_args()
+    if arguments.manifest:
+        json.dump([{"id": job.id, "purpose": job.purpose, "capabilities": job.capabilities,
+                    "binaries": job.binaries, "modules": job.modules, "rendering": job.rendering}
+                   for job in JOBS], sys.stdout)
+        sys.stdout.write("\n")
+        return 0
+    unknown = set(arguments.only or ()) - {job.id for job in JOBS}
+    if unknown:
+        parser.error(f"unknown jobs: {', '.join(sorted(unknown))}")
 
     scratch = arguments.workdir or Path(tempfile.mkdtemp(prefix="athanor-document-proof-"))
     scratch.mkdir(parents=True, exist_ok=True)
@@ -1015,6 +1214,7 @@ def main() -> int:
                     {
                         "id": job.id,
                         "purpose": job.purpose,
+                        "capabilities": job.capabilities,
                         "status": "skipped",
                         "missing": blocking,
                         "checks": [],
@@ -1033,6 +1233,7 @@ def main() -> int:
                 {
                     "id": job.id,
                     "purpose": job.purpose,
+                    "capabilities": job.capabilities,
                     "status": status,
                     # Named on a passing job too, because "passed" without this line would read
                     # as though the render was measured when it was not.

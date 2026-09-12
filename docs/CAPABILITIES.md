@@ -159,13 +159,21 @@ These are therefore absent on purpose, and the absence is a decision rather than
   library, and the `scientific-computing` skill says so, so the failure is recognised in one step
   rather than at the end of a build log. A compiler is an ordinary approved system-package install.
 
-Two honest limits on all of the above. The table is applied by the installer, and `athanor update`
-moves code without installing operating-system packages, so a box that has only ever auto-updated
-carries the packages of the release it was installed with rather than of the release it is running.
-What tells the truth about a given machine is the runtime toolchain block, which probes that machine
-instead of reading this table. And that block does not yet cover every row: pyarrow is installed and
-not probed, so on a box that missed it the model finds out from `import pyarrow` in its own script
-rather than from the block, which is why the data-analysis skill names the package itself.
+The installer and release-carried update steps apply the host package table. An update runs those
+steps before restarting the services; failed installation is a failed update. Runtime toolchain
+reports probe the installed binaries, Python modules and fonts on the actual computer. Package
+presence and import success establish availability, while representative workflows establish that a
+particular task works. The Parquet capability probes both pandas and pyarrow independently of CSV
+analysis, so a missing Parquet reader does not hide working CSV tools.
+
+`scripts/athanor-document-proof --manifest` lists each representative workflow and the runtime
+capabilities it exercises. The runner suite checks that every capability has a workflow and that
+workflow identifiers are unique. Run the proof with the pinned Python and `--require-all --json`
+on the provisioned host; each job reports its measured checks and missing tools. This is a set of
+representative contracts, not proof of every supported operation: image geometry and graph labels,
+for example, do not establish the quality of an arbitrary design. Retain the report with the
+release revision and host identity. `scripts/test-document.mjs` separately checks extraction,
+OCR and paginated search coverage.
 
 ### One approval boundary
 

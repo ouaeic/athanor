@@ -41,21 +41,23 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
       (await store.listOwnerMessageDrafts(user.id)).flatMap((row) => {
         try {
           const key = unwrapDataKey(row.wrappedKey, masterKey, row.workspaceId);
-          const opened = decryptJson<{
-            body: string;
-            controls?: {
-              modelId: string;
-              reasoningEffort: string;
-              privacyRoute: string;
-              spendCap: string;
-            };
-            attachments?: Array<{
-              path: string;
-              name: string;
-              sizeBytes: number;
-              mimeType: string;
-            }>;
-          }>(row.bodyCiphertext, key);
+          const opened = row.bodyCiphertext
+            ? decryptJson<{
+                body: string;
+                controls?: {
+                  modelId: string;
+                  reasoningEffort: string;
+                  privacyRoute: string;
+                  spendCap: string;
+                };
+                attachments?: Array<{
+                  path: string;
+                  name: string;
+                  sizeBytes: number;
+                  mimeType: string;
+                }>;
+              }>(row.bodyCiphertext, key)
+            : { body: '', attachments: [] };
           return [
             {
               workspaceId: row.workspaceId,
@@ -63,7 +65,8 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
               body: opened.body,
               ...(opened.controls ? { controls: opened.controls } : {}),
               attachments: opened.attachments ?? [],
-              updatedAt: row.updatedAt
+              updatedAt: row.updatedAt,
+              revision: row.revision
             }
           ];
         } catch {

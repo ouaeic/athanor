@@ -559,6 +559,7 @@ export class IdentityStore {
     path: string;
     requestHash: string;
     ttlHours?: number;
+    replayOnly?: boolean;
   }): Promise<{
     state: string;
     method: string;
@@ -567,6 +568,7 @@ export class IdentityStore {
     responseStatus: number | null;
     responseCiphertext: EncryptedEnvelope | null;
   } | null> {
+    if (!input.replayOnly) {
     const inserted = await this.database.query(
       `INSERT INTO api_operations(user_id,idempotency_key,method,path,request_hash,state,expires_at)
        VALUES ($1,$2,$3,$4,$5,'running',NOW()+($6 * INTERVAL '1 hour'))
@@ -582,6 +584,7 @@ export class IdentityStore {
       ]
     );
     if (inserted.rowCount === 1) return null;
+    }
     const existing = await this.database.query(
       `SELECT state,method,path,request_hash,response_status,response_ciphertext FROM api_operations
        WHERE user_id=$1 AND idempotency_key=$2`,

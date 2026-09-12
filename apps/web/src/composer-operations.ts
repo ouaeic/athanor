@@ -11,22 +11,6 @@ export function spendCap(value: string): number | undefined {
   return cap;
 }
 
-/** A started write must settle before a later draft can reach the server. */
-export function serialDraftWriter<T>(write: (draft: T) => Promise<unknown>) {
-  let settled = Promise.resolve();
-  return {
-    save(draft: T): Promise<unknown> {
-      const next = settled.then(() => write(draft));
-      settled = next.then(
-        () => undefined,
-        () => undefined
-      );
-      return next;
-    },
-    flush: () => settled
-  };
-}
-
 export async function uploadAttachments(
   files: readonly File[],
   existingCount: number,

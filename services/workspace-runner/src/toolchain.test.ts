@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  ATHANOR_PYTHON,
   DOCUMENT_TOOLCHAIN,
   parseFontFamilies,
   parseImportableModules,
@@ -63,6 +64,19 @@ describe('document toolchain report', () => {
     expect(ready).toMatchObject({ ready: true, missingPythonModules: [] });
     // Nothing to install, so nothing is suggested.
     expect(ready?.install).toBe(undefined);
+  });
+
+  it('keeps CSV analysis available when the Parquet reader is missing', () => {
+    const reports = reportToolchain(DOCUMENT_TOOLCHAIN, {
+      ...nothing,
+      binaries: new Set([ATHANOR_PYTHON]),
+      pythonModules: new Set(['pandas', 'numpy', 'matplotlib'])
+    });
+    expect(reports.find((item) => item.id === 'data-analysis')).toMatchObject({ ready: true });
+    expect(reports.find((item) => item.id === 'parquet-data')).toMatchObject({
+      ready: false,
+      missingPythonModules: ['pyarrow']
+    });
   });
 
   it('checks fonts by family, which is how a document actually finds them', () => {

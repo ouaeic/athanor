@@ -13,11 +13,10 @@ Everything but `--terminal-bench` is offline: no key, no network, no provider, n
 path refuses to start without a key and without every bound named on the command line. Not part of
 `pnpm check`, like every other rig in `evals/`.
 
-**This is an instrument, and it has taken one reading.** The first athanor benchmark score exists:
-Terminal-Bench, 20 tasks, one model, the `shipped` arm, 0.250 (section 5). It is one run against a
-floor of three, so `parity.csv` is committed with its 44 columns and **no publishable row yet**;
-the arm ladder the instrument was built for is the next reading, and the placeholder for it is in
-section 5.
+Benchmark results are recorded in [`parity.csv`](parity.csv). Each row identifies its model,
+source revision, task set, run count and approval arm. Read those fields together: historical rows
+are evidence about the recorded revisions, and do not establish the quality of the current checkout.
+The arm ladder and its interpretation are described below.
 
 `parity-wire.csv` is the other file here with a row in it, and it is **not a score**: see section
 2.5. It is one task, solved by a scripted model, verified by a command in a real directory. Its

@@ -1,3 +1,4 @@
+import { recoverDeviceDrafts, forgetDraftKey } from './draft-storage';
 import { Component, lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import {
@@ -188,12 +189,24 @@ function WorkspaceApp() {
   const refresh = useCallback(async () => {
     try {
       const result = await get<Bootstrap>('/v1/bootstrap');
+      let draftError: unknown = null;
+      try {
+        const recovered = await recoverDeviceDrafts(result.user.id);
+        const merged = new Map(
+          result.drafts.map((draft) => [draft.taskId ?? `new:${draft.workspaceId}`, draft])
+        );
+        for (const draft of recovered)
+          merged.set(draft.taskId ?? `new:${draft.workspaceId}`, draft);
+        result.drafts = [...merged.values()];
+      } catch (cause) {
+        draftError = cause;
+      }
       void taskNotifier.current.update(result.tasks);
       setBootstrap((current) =>
         mergeTaskRefresh(current, result, activePaged.current, deletedTasks.current)
       );
       setAuthRequired(false);
-      setError(null);
+      setError(draftError);
       setWorkspaceId((current) =>
         result.workspaces.some((workspace) => workspace.id === current)
           ? current
@@ -212,6 +225,7 @@ function WorkspaceApp() {
         err instanceof ApiError &&
         ['authentication_required', 'session_expired', 'invalid_session'].includes(err.code)
       ) {
+        forgetDraftKey();
         setAuthRequired(true);
       } else setError(err);
     } finally {
@@ -233,6 +247,11 @@ function WorkspaceApp() {
       void refreshDecisions();
     }, 400);
   }, [refresh, refreshDecisions]);
+  useEffect(() => {
+    window.addEventListener('garden-draft-policy', requestRefresh);
+    return () => window.removeEventListener('garden-draft-policy', requestRefresh);
+  }, [requestRefresh]);
+
   useEffect(() => {
     let alive = true;
     void (async () => {

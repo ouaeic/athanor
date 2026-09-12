@@ -1,3 +1,4 @@
+import { DeviceDraftSettings } from './DeviceDrafts.js';
 import { useState } from 'react';
 import type { ApiToken, ApiTokenScope } from '@athanor/contracts';
 import { del, post } from '../client.js';
@@ -83,12 +84,11 @@ export function AccessSettings({ onChange }: { onChange: () => void }) {
             <h4>{account.value.user.displayName}</h4>
             <p className="muted">{account.value.user.username}</p>
             <div className="row">
-              <Button
-                disabled={action.busy}
-                onClick={() => void action.run(signOutThisDevice, 'Signed out')}
-              >
-                Sign out this device
-              </Button>
+              <ConfirmButton
+                label="Sign out this device"
+                description="End this device session and remove its unsynced drafts. Synced drafts remain on your server."
+                action={signOutThisDevice}
+              />
               <Button
                 disabled={action.busy}
                 onClick={() =>
@@ -255,6 +255,7 @@ export function AccessSettings({ onChange }: { onChange: () => void }) {
         ))}
         <ActionFeedback action={action} />
       </Section>
+      <DeviceDraftSettings />
       <Section title="Signed-in devices">
         <ResourceState resource={sessions} />
         <div className="management-list">
@@ -272,7 +273,7 @@ export function AccessSettings({ onChange }: { onChange: () => void }) {
               </div>
               <ConfirmButton
                 label="Sign out"
-                description={`End access for ${session.current ? 'this device' : session.deviceLabel || 'this session'}. It will need a passkey to sign in again.`}
+                description={`End access for ${session.current ? 'this device' : session.deviceLabel || 'this session'}. It will need a passkey to sign in again. Unsynced drafts encrypted for that session will no longer be recoverable.`}
                 action={() => revokeDeviceSession(session.id, sessions.refresh)}
               />
             </article>

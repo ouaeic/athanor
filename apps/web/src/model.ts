@@ -22,6 +22,8 @@ export interface Draft {
   body: string;
   attachments: DraftAttachment[];
   updatedAt?: string;
+  revision?: number;
+  recoveryId?: string;
   controls?: {
     modelId: string;
     modelChoices?: ProjectModelChoices;

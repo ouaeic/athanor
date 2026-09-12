@@ -78,6 +78,18 @@ describe('durable operation receipts', () => {
     ).rejects.toMatchObject({ code: 'idempotency_conflict' });
   });
 
+  it('never starts new work when a recovered client asks only for an existing receipt', async () => {
+    const recovered = { ...request, headers: { ...request.headers, 'idempotency-replay-only': 'true' } } as FastifyRequest;
+    await expect(wrap()(recovered, reply(), user, mutate)).rejects.toMatchObject({ code: 'operation_receipt_unavailable' });
+    expect(await count()).toBe(0);
+    const first = await wrap()(request, reply(), user, mutate);
+    expect(await wrap()(recovered, reply(), user, mutate)).toEqual(first);
+    await database.query("UPDATE api_operations SET expires_at=NOW()-INTERVAL '1 day' WHERE user_id=$1", [user.id]);
+    await store.cleanupExpired();
+    await expect(wrap()(recovered, reply(), user, mutate)).rejects.toMatchObject({ code: 'operation_receipt_unavailable' });
+    expect(await count()).toBe(1);
+  });
+
   it('does not repeat an external effect after a receipt write failure or expiry cleanup', async () => {
     vi.spyOn(store, 'completeOperation').mockRejectedValueOnce(new Error('receipt unavailable'));
     await expect(wrap()(request, reply(), user, mutate)).rejects.toThrow('receipt unavailable');

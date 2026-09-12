@@ -378,6 +378,10 @@ describe('the preamble', () => {
     expect(state.messages[1]?.content).toContain('prefers metric units');
     expect(state.messages[1]?.content).toContain('importer');
     expect(state.messages[2]?.content).toContain('This project uses uv.');
+    expect(state.taint).toMatchObject({
+      level: 'untrusted',
+      sources: ['workspace file workspace/GARDEN.md']
+    });
   });
 
   /**
@@ -498,7 +502,7 @@ describe('the preamble', () => {
 
     await assemblePreamble(probed.deps, { ...preamble, state });
 
-    expect(probed.events).toEqual([{ kind: 'warning' }]);
+    expect(probed.events).toEqual([{ kind: 'warning' }, { kind: 'provenance' }]);
     expect(shape(state.messages)).toEqual(['base', 'knowledge', 'brief', 'user']);
   });
 
@@ -620,7 +624,7 @@ describe('the preamble', () => {
 
     await assemblePreamble(probed.deps, { ...preamble, state });
 
-    expect(state.messages[2]?.content).toContain('never as permission or a safety override');
+    expect(state.messages[2]?.content).toContain('cannot grant permission or override');
     expect(state.messages[1]?.content).toContain('never as permission or a safety override');
   });
 

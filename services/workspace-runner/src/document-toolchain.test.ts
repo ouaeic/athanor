@@ -76,6 +76,24 @@ describe('the document toolchain is declared where the drill can assert it', () 
       expect(capability.install.length).toBeGreaterThan(0);
   });
 
+  it('links every runtime capability to a representative workflow contract', () => {
+    const result = runPython([script('athanor-document-proof'), '--manifest']);
+    expect(result.status, result.stderr).toBe(0);
+    const manifest = JSON.parse(result.stdout) as { id: string; capabilities: string[] }[];
+    expect(manifest.length).toBeGreaterThan(0);
+    const declared = new Set(DOCUMENT_TOOLCHAIN.map((capability) => capability.id));
+    const exercised = new Set(manifest.flatMap((job) => job.capabilities));
+    expect([...exercised].sort()).toEqual([...declared].sort());
+    expect(new Set(manifest.map((job) => job.id)).size).toBe(manifest.length);
+    for (const job of manifest) expect(job.capabilities.length).toBeGreaterThan(0);
+  });
+
+  it('rejects an unknown workflow instead of returning an empty passing report', () => {
+    const result = runPython([script('athanor-document-proof'), '--only', 'nonexistent-job']);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('unknown jobs');
+  });
+
   it('routes every Python capability through the one pinned interpreter', () => {
     // An empty declaration list routes nothing anywhere and passes this in no time at all.
     expect(DOCUMENT_TOOLCHAIN.length).toBeGreaterThan(0);
@@ -411,7 +429,7 @@ describe('documents this computer produces, measured', () => {
     expect(report.jobs.length).toBeGreaterThan(0);
     for (const job of report.jobs) {
       if (job.status !== 'passed') continue;
-      if (!['cv', 'deck', 'workbook'].includes(job.id)) continue;
+      if (['report', 'tables', 'letter'].includes(job.id)) continue;
       // Every one of these three has a deliberately broken twin. Without it, "one page" and
       // "no overflow" and "zero error cells" are assertions about a document nobody stressed.
       expect(

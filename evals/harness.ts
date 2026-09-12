@@ -4219,7 +4219,9 @@ export const runFixture = async (fixture: Fixture): Promise<RunOutcome> => {
     events,
     fallbackPlan,
     untrusted: events.some(
-      (entry) => entry.kind === 'warning' && entry.summary.startsWith('Untrusted content entered')
+      (entry) =>
+        ['warning', 'provenance'].includes(entry.kind) &&
+        entry.summary.startsWith('Untrusted content entered')
     ),
     replies: events.filter((entry) => entry.kind === 'assistant_message').length,
     // Read off the error event the loop writes when a call throws, rather than off the `Tool

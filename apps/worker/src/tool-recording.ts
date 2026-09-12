@@ -388,7 +388,7 @@ export const recordProvenance = async (
  * can be one clause out of step with this one and still look right.
  */
 export const raiseTaint = async (
-  deps: ToolRecordingDeps,
+  deps: Pick<ToolRecordingDeps, 'store'>,
   task: TaskRecord,
   key: Uint8Array,
   state: AgentState,
@@ -418,7 +418,7 @@ export const raiseTaint = async (
     deps.store,
     task,
     key,
-    'warning',
+    origin.startsWith('workspace file') ? 'provenance' : 'warning',
     `Untrusted content entered this turn from ${origin}`,
     { taint: state.taint, tool }
   ).catch(() => undefined);

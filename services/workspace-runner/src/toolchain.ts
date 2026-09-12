@@ -174,6 +174,15 @@ export const DOCUMENT_TOOLCHAIN: readonly ToolchainCapability[] = [
     install: "install this host's pandas and matplotlib packages, which bring numpy with them"
   },
   {
+    id: 'parquet-data',
+    purpose: 'Read and write typed Parquet tables with pandas',
+    binaries: [ATHANOR_PYTHON],
+    pythonModules: ['pandas', 'pyarrow'],
+    fonts: [],
+    packages: ['python-pandas', 'python-pyarrow'],
+    install: "install this host's pandas and pyarrow packages"
+  },
+  {
     /**
      * Separate from data-analysis on purpose. Charting a column and testing whether a difference is
      * real are different jobs, and folding them together would mean a box without the statistics

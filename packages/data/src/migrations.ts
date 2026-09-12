@@ -3717,5 +3717,13 @@ CREATE TABLE IF NOT EXISTS model_throughput_ceiling (
     version: 102,
     name: 'sealed_operation_receipts',
     sql: `ALTER TABLE api_operations ADD COLUMN IF NOT EXISTS response_ciphertext JSONB;`
+  },
+  {
+    version: 103,
+    name: 'draft_revision_tombstones',
+    sql: `
+      ALTER TABLE message_drafts ALTER COLUMN body_ciphertext DROP NOT NULL;
+      ALTER TABLE message_drafts ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;
+    `
   }
 ] as const;

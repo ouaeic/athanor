@@ -592,28 +592,56 @@ export class BillingStore {
     workspaceId: string;
     taskId?: string | null;
     bodyCiphertext: EncryptedEnvelope | null;
-  }): Promise<void> {
+    expectedRevision?: number;
+  }): Promise<{ revision: number; updatedAt: string } | null> {
     const taskId = input.taskId ?? null;
-    if (!input.bodyCiphertext) {
-      await this.database.query(
-        `DELETE FROM message_drafts WHERE workspace_id=$1 AND task_id IS NOT DISTINCT FROM $2`,
-        [input.workspaceId, taskId]
-      );
-      return;
-    }
-    // Two partial unique indexes, so two conflict targets: one insert cannot name both, and the
-    // draft with no conversation yet is the one most first sentences are typed into.
     const conflict =
       taskId === null
         ? 'ON CONFLICT (workspace_id) WHERE task_id IS NULL'
         : 'ON CONFLICT (workspace_id, task_id) WHERE task_id IS NOT NULL';
-    await this.database.query(
-      `INSERT INTO message_drafts(user_id,workspace_id,task_id,body_ciphertext,updated_at)
-       VALUES ($1,$2,$3,$4::jsonb,NOW())
-       ${conflict}
-         DO UPDATE SET body_ciphertext=EXCLUDED.body_ciphertext, updated_at=NOW()`,
-      [input.userId, input.workspaceId, taskId, JSON.stringify(input.bodyCiphertext)]
+    const values = [
+      input.userId,
+      input.workspaceId,
+      taskId,
+      input.bodyCiphertext ? JSON.stringify(input.bodyCiphertext) : null,
+      input.expectedRevision ?? null
+    ];
+    const result = await this.database.query(
+      `INSERT INTO message_drafts(user_id,workspace_id,task_id,body_ciphertext,updated_at,revision)
+       SELECT $1,$2,$3,$4::jsonb,NOW(),1 WHERE $5::integer IS NULL OR $5=0
+       ${conflict} DO NOTHING RETURNING revision,updated_at`,
+      values
     );
+    if (result.rows[0])
+      return {
+        revision: Number(result.rows[0].revision),
+        updatedAt: iso(result.rows[0].updated_at)
+      };
+    const updated = await this.database.query(
+      `UPDATE message_drafts SET body_ciphertext=$4::jsonb,updated_at=NOW(),revision=revision+1
+       WHERE user_id=$1 AND workspace_id=$2 AND task_id IS NOT DISTINCT FROM $3
+         AND ($5::integer IS NULL OR revision=$5)
+       RETURNING revision,updated_at`,
+      values
+    );
+    const row = updated.rows[0];
+    return row ? { revision: Number(row.revision), updatedAt: iso(row.updated_at) } : null;
+  }
+
+  async getMessageDraft(userId: string, workspaceId: string, taskId: string | null) {
+    const result = await this.database.query(
+      `SELECT body_ciphertext,revision,updated_at FROM message_drafts
+       WHERE user_id=$1 AND workspace_id=$2 AND task_id IS NOT DISTINCT FROM $3`,
+      [userId, workspaceId, taskId]
+    );
+    const row = result.rows[0];
+    return row
+      ? {
+          bodyCiphertext: row.body_ciphertext ? json<EncryptedEnvelope>(row.body_ciphertext) : null,
+          revision: Number(row.revision),
+          updatedAt: iso(row.updated_at)
+        }
+      : null;
   }
 
   /** Drafts retain their execution root, even when that root is hidden from the computer list. */
@@ -621,7 +649,8 @@ export class BillingStore {
     Array<{
       workspaceId: string;
       taskId: string | null;
-      bodyCiphertext: EncryptedEnvelope;
+      bodyCiphertext: EncryptedEnvelope | null;
+      revision: number;
       wrappedKey: string;
       updatedAt: string;
     }>
@@ -636,7 +665,8 @@ export class BillingStore {
     return result.rows.map((row) => ({
       workspaceId: String(row.workspace_id),
       taskId: optionalText(row.task_id) ?? null,
-      bodyCiphertext: json<EncryptedEnvelope>(row.body_ciphertext),
+      bodyCiphertext: row.body_ciphertext ? json<EncryptedEnvelope>(row.body_ciphertext) : null,
+      revision: Number(row.revision),
       wrappedKey: String(row.wrapped_key),
       updatedAt: iso(row.updated_at)
     }));
@@ -654,7 +684,7 @@ export class BillingStore {
       // ever choose "keep mine", so a device that had once seen a draft was frozen on that version
       // for good and would eventually write it back over a newer one.
       `SELECT task_id, body_ciphertext, updated_at FROM message_drafts
-       WHERE user_id=$1 AND workspace_id=$2`,
+       WHERE user_id=$1 AND workspace_id=$2 AND body_ciphertext IS NOT NULL`,
       [userId, workspaceId]
     );
     return result.rows.map((row) => ({

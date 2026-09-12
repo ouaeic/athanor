@@ -1752,3 +1752,24 @@
     display: none;
   }
 }
+
+.draft-conflict {
+  padding: 16px;
+  margin-bottom: 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  background: var(--raised);
+}
+.draft-conflict pre {
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.draft-conflict p {
+  margin: 8px 0;
+}
+.draft-conflict .row {
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
