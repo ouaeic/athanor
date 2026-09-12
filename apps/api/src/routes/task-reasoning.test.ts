@@ -51,6 +51,10 @@ describe('reasoning selection at the authenticated task boundary', () => {
     config: { TASK_MAX_STEPS: 3 },
     log: { warn() {} },
     store: {
+      effectiveSpendLimits: async () => ({
+        maxInputUsdPerMillionTokens: 1,
+        maxOutputUsdPerMillionTokens: 3
+      }),
       getTask: async () => task,
       getWorkspace: async () => ({
         id: workspaceId,
@@ -74,9 +78,15 @@ describe('reasoning selection at the authenticated task boundary', () => {
       {
         id: 'model',
         displayName: 'Model',
+        commercialUse: true,
         availability: 'available',
         privacyRoute: 'provider_zdr',
         usageClass: 'light',
+        contextTokens: 32_000,
+        modalities: ['text'],
+        capabilities: ['chat', 'tools'],
+        inputUsdPerMillionTokens: 0.1,
+        outputUsdPerMillionTokens: 0.3,
         reasoning: { supportedEfforts: ['low', 'high'], mandatory: true }
       }
     ],

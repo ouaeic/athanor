@@ -309,10 +309,7 @@ export const createServerSupport = (context: ServerBase) => {
   };
 
   const requiresZeroDataRetention = async (userId: string): Promise<boolean> => {
-    const primary = (await inferenceConnections(userId)).values().next().value;
-    if (primary) return primary.secret.enforceZeroDataRetention !== false;
-    const saved = await store.listManagedProviderCredentials(userId);
-    return saved.some((row) => row.status === 'active') ? true : config.AI_REQUIRE_ZDR;
+    return connectionRequiresZdr(await readConnections(userId));
   };
 
   /**
@@ -350,7 +347,13 @@ export const createServerSupport = (context: ServerBase) => {
 
   let ollamaReasoningRepair: Promise<void> | undefined;
   const modelsForUser = async (user: UserRecord) => {
-    const requireZdr = await requiresZeroDataRetention(user.id);
+    const [saved, initialCatalog] = await Promise.all([
+      readConnections(user.id),
+      store.listModels()
+    ]);
+    const requireZdr = connectionRequiresZdr(saved);
+    const { connections } = saved;
+    let catalog = initialCatalog;
     /*
      * Which provider the key on this box actually belongs to.
      *
@@ -363,16 +366,12 @@ export const createServerSupport = (context: ServerBase) => {
      * A connected catalogue is the picker: other providers' rows are excluded. A box with no
      * provider connected keeps the seeded rows so the first connection can still be configured.
      */
-    const connections = await inferenceConnections(user.id).catch(
-      () => new Map<string, { secret: InferenceSecret; source: string }>()
-    );
     const reachable = new Set(
       [...connections.values()].map((connection) => connection.secret.provider)
     );
     if (reachable.has('ollama-cloud')) {
       // Persist discovery so both the picker and worker validate the same effort choices.
       ollamaReasoningRepair ??= (async () => {
-        const catalog = await store.listModels();
         const missing = catalog.filter((record) => {
           const model = ModelRelease.parse(record);
           return (
@@ -438,8 +437,9 @@ export const createServerSupport = (context: ServerBase) => {
         log.warn('models.ollama_capabilities_failed', errorFields(error));
       });
       await ollamaReasoningRepair;
+      catalog = await store.listModels();
     }
-    return (await store.listModels()).flatMap((record) => {
+    return catalog.flatMap((record) => {
       const parsed = ModelRelease.parse(record);
       const connectionId = modelConnectionId(parsed, connections.keys());
       if (reachable.size && !connectionId) return [];
@@ -555,13 +555,24 @@ export const createServerSupport = (context: ServerBase) => {
     return { secret, source: 'server_environment', configured: false };
   };
 
-  const inferenceConnections = async (userId: string) =>
-    readInferenceConnections<InferenceSecret>({
-      rows: await store.listManagedProviderCredentials(userId),
+  const readConnections = async (userId: string) => {
+    const rows = await store.listManagedProviderCredentials(userId);
+    const connections = readInferenceConnections<InferenceSecret>({
+      rows,
       userId,
       masterKey,
       environment: config
     });
+    return { rows, connections };
+  };
+  const connectionRequiresZdr = (saved: Awaited<ReturnType<typeof readConnections>>): boolean => {
+    const primary = saved.connections.values().next().value;
+    return primary
+      ? primary.secret.enforceZeroDataRetention !== false
+      : saved.rows.some((row) => row.status === 'active') || config.AI_REQUIRE_ZDR;
+  };
+  const inferenceConnections = async (userId: string) =>
+    (await readConnections(userId)).connections;
 
   /**
    * Where this box's web searches are answered.
