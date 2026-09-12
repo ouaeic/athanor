@@ -3723,7 +3723,7 @@ CREATE TABLE IF NOT EXISTS model_throughput_ceiling (
     name: 'draft_revision_tombstones',
     sql: `
       ALTER TABLE message_drafts ALTER COLUMN body_ciphertext DROP NOT NULL;
-      ALTER TABLE message_drafts ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;
+      ALTER TABLE message_drafts ADD COLUMN IF NOT EXISTS revision INTEGER NOT NULL DEFAULT 1;
     `
   }
 ] as const;

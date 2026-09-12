@@ -196,9 +196,7 @@ describe('what a hostile page looks like once it is in the turn', () => {
     expect(window).toContain('already answered this turn');
   });
 
-  it('leaves a read of the owner’s own workspace exactly as it was', async () => {
-    // The strip costs a subdivision flag emoji its tag sequence, so it is applied where nobody
-    // vouches for the bytes and not to the owner's own files.
+  it('removes hidden instructions from workspace files while preserving visible content', async () => {
     const { deps, state } = recording();
     const own = {
       id: 'call-2',
@@ -206,11 +204,12 @@ describe('what a hostile page looks like once it is in the turn', () => {
       arguments: { path: 'workspace/notes.md' }
     } as unknown as ModelToolCall;
     await recordToolResult(deps, task, Buffer.from(dataKey), state, own, {
-      content: '\u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F} Scotland'
+      content: `Scotland. ${HIDDEN} Keep the visible notes.`
     });
     const window = windowEntry(state);
-    expect(window).toContain('\u{E0067}');
-    expect(window).not.toContain('UNTRUSTED DATA from');
+    expect(window).not.toContain(HIDDEN);
+    expect(window).toContain('Scotland.  Keep the visible notes.');
+    expect(window).toContain('UNTRUSTED DATA from workspace file workspace/notes.md');
   });
 });
 

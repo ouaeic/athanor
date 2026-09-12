@@ -303,7 +303,7 @@ describe('where a spilled result is parked, and why trust is the only thing that
     expect(isQuarantinedDownloadPath(writes[0]!.path)).toBe(true);
   });
 
-  it('does not quarantine the owner’s own build log', async () => {
+  it('keeps workspace file content quarantined when it spills', async () => {
     const { deps, state, writes } = recording();
     await recordToolResult(
       deps,
@@ -317,8 +317,10 @@ describe('where a spilled result is parked, and why trust is the only thing that
       } as unknown as ModelToolCall,
       { content: body(200_000, 'log') }
     );
-    expect(writes[0]!.path.startsWith(`${SPILL_DIRECTORY}/`)).toBe(true);
-    expect(isQuarantinedDownloadPath(writes[0]!.path)).toBe(false);
+    expect(writes).toHaveLength(1);
+    expect(writes[0]!.path.startsWith(`${UNTRUSTED_SPILL_DIRECTORY}/`)).toBe(true);
+    expect(isQuarantinedDownloadPath(writes[0]!.path)).toBe(true);
+    expect(windowEntry(state)).toContain('UNTRUSTED DATA from workspace file workspace/build.log');
   });
 
   it('gives the same bytes two different addresses depending on where they came from', () => {
