@@ -478,10 +478,13 @@ const transcriptionStore = (
     }
   };
   return {
-    getManagedProviderCredential: async () => ({
-      provider: 'inference',
-      secretCiphertext: encryptJson(credential, masterKey, inferenceCredentialAad(userId))
-    })
+    listManagedProviderCredentials: async () => [
+      {
+        provider: 'inference',
+        status: 'active',
+        secretCiphertext: encryptJson(credential, masterKey, inferenceCredentialAad(userId))
+      }
+    ]
   };
 };
 
