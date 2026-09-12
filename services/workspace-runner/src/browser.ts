@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 import type {
   Browser,
+  BrowserType,
   BrowserContext,
   CDPSession,
   Dialog,
@@ -1563,7 +1564,7 @@ export const BROWSER_VIEWPORT = { width: 1440, height: 900 } as const;
 
 export interface BrowserLaunchAttempt {
   headless: boolean;
-  chromiumSandbox: boolean;
+  chromiumSandbox: true;
 }
 
 /**
@@ -1578,21 +1579,76 @@ export const HEADLESS_DEVICE_ARGUMENTS = [
   '--blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4'
 ];
 
-/**
- * Launch configurations in the order they are worth trying. Running on the workspace's own X
- * server is preferred because it is the only way the page sees an ordinary desktop, and because
- * it puts the agent's browser on the screen a person can already watch and take over. The
- * renderer sandbox is preferred for the obvious reason, and cannot be had as root at all.
- */
+/** A missing display can use headless mode; the renderer sandbox is mandatory. */
 export const browserLaunchLadder = (input: {
   displayAvailable: boolean;
   runningAsRoot: boolean;
 }): BrowserLaunchAttempt[] => {
-  const modes = input.displayAvailable ? [false, true] : [true];
-  const sandboxes = input.runningAsRoot ? [false] : [true, false];
-  return modes.flatMap((headless) =>
-    sandboxes.map((chromiumSandbox) => ({ headless, chromiumSandbox }))
+  if (input.runningAsRoot)
+    throw new Error(
+      'Garden cannot start Chromium as root. Run the workspace runner under its dedicated account.'
+    );
+  return (input.displayAvailable ? [false, true] : [true]).map((headless) => ({
+    headless,
+    chromiumSandbox: true
+  }));
+};
+
+/** Browser children receive desktop and locale settings, never runner credentials. */
+export const browserLaunchEnvironment = (
+  source: NodeJS.ProcessEnv,
+  desktop: NodeJS.ProcessEnv = {}
+): Record<string, string> => {
+  const allowed = [
+    'PATH',
+    'HOME',
+    'LANG',
+    'LANGUAGE',
+    'LC_ALL',
+    'LC_CTYPE',
+    'TZ',
+    'DISPLAY',
+    'XAUTHORITY',
+    'DBUS_SESSION_BUS_ADDRESS',
+    'XDG_RUNTIME_DIR',
+    'XDG_SESSION_TYPE',
+    'PULSE_SERVER',
+    'PULSE_COOKIE',
+    'TMPDIR'
+  ];
+  const combined = { ...source, ...desktop };
+  return Object.fromEntries(
+    allowed.flatMap((name) => {
+      const value = combined[name];
+      return typeof value === 'string' ? [[name, value]] : [];
+    })
   );
+};
+
+export const launchSandboxedResearchBrowser = async (
+  driver: Pick<BrowserType, 'launch'>,
+  input: {
+    executablePath?: string | undefined;
+    runningAsRoot: boolean;
+    environment: NodeJS.ProcessEnv;
+  }
+): Promise<Browser> => {
+  browserLaunchLadder({ displayAvailable: false, runningAsRoot: input.runningAsRoot });
+  try {
+    return await driver.launch({
+      ...(input.executablePath ? { executablePath: input.executablePath } : {}),
+      headless: true,
+      chromiumSandbox: true,
+      env: browserLaunchEnvironment(input.environment),
+      ignoreDefaultArgs: HEADLESS_DEVICE_ARGUMENTS,
+      args: ['--no-first-run', '--disable-background-networking', '--disable-component-update']
+    });
+  } catch (cause) {
+    throw new Error(
+      'The research browser could not start with its renderer sandbox. Run garden doctor to inspect this host.',
+      { cause }
+    );
+  }
 };
 
 export const browserLaunchOptions = (attempt: BrowserLaunchAttempt) => ({
@@ -1958,9 +2014,10 @@ export class BrowserManager {
         context = await chromium.launchPersistentContext(profile, {
           ...(this.options.executablePath ? { executablePath: this.options.executablePath } : {}),
           ...browserLaunchOptions(attempt),
-          ...(attempt.headless || !displayEnvironment
-            ? {}
-            : { env: { ...process.env, ...displayEnvironment } }),
+          env: browserLaunchEnvironment(
+            process.env,
+            attempt.headless ? {} : (displayEnvironment ?? {})
+          ),
           acceptDownloads: true,
           // Without this Playwright stages downloads in a temp directory it deletes on close,
           // which both loses late arrivals and puts the bytes outside storage accounting.
@@ -1968,13 +2025,14 @@ export class BrowserManager {
         });
         break;
       } catch (cause) {
-        // The renderer sandbox needs kernel support the host may not offer, and a desktop can be
-        // configured and still not come up. Both are worth trying for and neither is worth
-        // losing the browser over, so each is tried once and then given up in a fixed order.
         refused = cause;
       }
     }
-    if (!context) throw refused instanceof Error ? refused : new Error('Browser did not start');
+    if (!context)
+      throw new Error(
+        'The browser could not start with its renderer sandbox. Run garden doctor to inspect this host.',
+        { cause: refused }
+      );
     /*
      * Applied as soon as there is something to apply it to, and again on the sweep below.
      *
@@ -1996,8 +2054,7 @@ export class BrowserManager {
       this.#attached.delete(active);
       if (this.#sessions.get(workspaceId) === active) this.#sessions.delete(workspaceId);
     });
-    // Worth saying out loud rather than degrading quietly: headless changes what pages serve, and
-    // an unsandboxed renderer is a weaker boundary on the process that browses arbitrary content.
+    // A display failure changes presentation, so report when only headless mode could start.
     if (settled !== ladder[0])
       runnerLogger.warn('browser.reduced_launch', {
         workspaceId,
@@ -2739,34 +2796,11 @@ export class BrowserManager {
    */
   async #launchIsolatedBrowser(): Promise<Browser> {
     if (this.options.launchIsolatedBrowser) return this.options.launchIsolatedBrowser();
-    const asRoot = typeof process.getuid === 'function' && process.getuid() === 0;
-    const options = (chromiumSandbox: boolean) => ({
-      ...(this.options.executablePath ? { executablePath: this.options.executablePath } : {}),
-      headless: true,
-      chromiumSandbox,
-      ignoreDefaultArgs: HEADLESS_DEVICE_ARGUMENTS,
-      args: ['--no-first-run', '--disable-background-networking', '--disable-component-update']
+    return launchSandboxedResearchBrowser(await chromiumDriver(), {
+      executablePath: this.options.executablePath,
+      runningAsRoot: typeof process.getuid === 'function' && process.getuid() === 0,
+      environment: process.env
     });
-    // The same fallback the session browser has had all along, and for the same reason: Ubuntu
-    // 23.10 and later refuse unprivileged user namespaces under AppArmor, so Chromium cannot build
-    // its renderer sandbox and refuses to start at all. Without this the research fan-out and the
-    // search route were the only two things on the box that simply did not work there - and they
-    // failed with a page of Chromium log rather than anything an owner could act on.
-    //
-    // Losing the renderer sandbox is a real reduction, not a free win, which is why it is a
-    // fallback and why the installer lays down an AppArmor profile so the first attempt succeeds.
-    // The command is still confined to the agent's own account either way.
-    const chromium = await chromiumDriver();
-    if (asRoot) return chromium.launch(options(false));
-    try {
-      return await chromium.launch(options(true));
-    } catch (error) {
-      runnerLogger.warn('browser.isolated_sandbox_off', {
-        sandbox: false,
-        code: failureCode(error)
-      });
-      return chromium.launch(options(false));
-    }
   }
 
   async #readResearchSource(

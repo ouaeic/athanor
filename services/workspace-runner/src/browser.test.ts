@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { Browser } from 'playwright-core';
 import type { RawSearchRow } from './search.js';
 import {
@@ -16,6 +16,8 @@ import {
   stepDestinations,
   type BotWall,
   browserLaunchLadder,
+  browserLaunchEnvironment,
+  launchSandboxedResearchBrowser,
   browserLaunchOptions,
   classifyBrowserAction,
   combineBatchPreflight,
@@ -1095,22 +1097,57 @@ describe('bot wall scope', () => {
 });
 
 describe('browser launch realism', () => {
-  it('prefers the workspace display, and falls back rather than losing the browser', () => {
+  it('falls back to headless mode without lowering renderer isolation', () => {
     expect(browserLaunchLadder({ displayAvailable: true, runningAsRoot: false })).toEqual([
       { headless: false, chromiumSandbox: true },
-      { headless: false, chromiumSandbox: false },
-      { headless: true, chromiumSandbox: true },
-      { headless: true, chromiumSandbox: false }
+      { headless: true, chromiumSandbox: true }
     ]);
     expect(browserLaunchLadder({ displayAvailable: false, runningAsRoot: false })).toEqual([
-      { headless: true, chromiumSandbox: true },
-      { headless: true, chromiumSandbox: false }
+      { headless: true, chromiumSandbox: true }
     ]);
-    // The renderer sandbox cannot be had as root, so asking for it would only cost a failed start.
-    expect(browserLaunchLadder({ displayAvailable: true, runningAsRoot: true })).toEqual([
-      { headless: false, chromiumSandbox: false },
-      { headless: true, chromiumSandbox: false }
-    ]);
+    expect(() => browserLaunchLadder({ displayAvailable: true, runningAsRoot: true })).toThrow(
+      'as root'
+    );
+  });
+
+  it('does not retry a failed research launch with reduced isolation', async () => {
+    const launch = vi.fn().mockRejectedValue(new Error('sandbox setup failed'));
+    await expect(
+      launchSandboxedResearchBrowser(
+        { launch },
+        {
+          runningAsRoot: false,
+          environment: { PATH: '/usr/bin', RUNNER_TOKEN: 'private' }
+        }
+      )
+    ).rejects.toThrow('renderer sandbox');
+    expect(launch).toHaveBeenCalledTimes(1);
+    expect(launch).toHaveBeenCalledWith(
+      expect.objectContaining({ chromiumSandbox: true, env: { PATH: '/usr/bin' } })
+    );
+  });
+
+  it('does not hand runner credentials or loader controls to the browser', () => {
+    expect(
+      browserLaunchEnvironment(
+        {
+          PATH: '/usr/bin',
+          HOME: '/home/athanor',
+          DISPLAY: ':1',
+          RUNNER_TOKEN: 'private',
+          DATA_MASTER_KEY: 'private',
+          OPENROUTER_API_KEY: 'private',
+          DATABASE_URL: 'private',
+          LD_PRELOAD: '/workspace/override.so'
+        },
+        { DISPLAY: ':9', XDG_RUNTIME_DIR: '/run/garden-display' }
+      )
+    ).toEqual({
+      PATH: '/usr/bin',
+      HOME: '/home/athanor',
+      DISPLAY: ':9',
+      XDG_RUNTIME_DIR: '/run/garden-display'
+    });
   });
 
   it('never lets a page be told the machine has no hover and a coarse pointer', () => {

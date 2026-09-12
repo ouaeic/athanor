@@ -119,29 +119,21 @@ The relevant adversaries are:
 
 ## Native host boundary
 
-The agent computer is the installed Linux host. Shell commands, background processes, Chromium,
-publisher CLIs, and user-installed software run as `athanor-agent`, an unprivileged account with no
-login shell that is separate from the `athanor` account the runner itself runs as.
+The agent computer is the installed Linux host. Shell commands, background processes,
+publisher CLIs and software started through the shell run as `athanor-agent`, an unprivileged
+account separate from the runner's `athanor` account.
 
-One exception, stated plainly because the boundary is the point: a program started through
-`desktop_launch` is spawned by the runner directly and therefore runs as `athanor`, not as
-`athanor-agent`.
+Chromium and desktop sessions currently share the runner's OS identity. Chromium requires its
+renderer sandbox, including when it falls back from a display to headless mode; a sandbox startup
+failure stops browsing. Its child environment contains desktop and locale settings rather than
+runner credentials. These controls do not isolate the browser parent or desktop applications from
+runner-owned files. Desktop D-Bus, accessibility processes, private browser profiles and session
+bookkeeping require a coherent identity boundary; changing only an application launch UID would
+break the session bus without establishing that boundary.
 
-Closing it is a real piece of work rather than a flag, and the reason is worth writing down because
-the obvious fix makes things worse. Sandboxing only the launch does not work: the session's D-Bus
-socket belongs to whoever started the session, so a program dropped to the other account reaches the
-display and not the bus, and anything wanting the session bus fails. Starting the session as
-`athanor-agent` instead was tried and refused by the box: the session keeps its state under
-`.athanor/`, which is `drwx--S--- athanor:athanor` on purpose — the agent's own files live in
-`workspace/` and the runner's bookkeeping, including artifact and checkpoint metadata, is
-deliberately out of the agent's reach. Opening it would trade this boundary for a worse one. The
-fix is to separate the session's runner-owned bookkeeping from the session's processes, so the
-directories are made by the runner and only the processes drop; until somebody does that
-carefully, the exception stands. Until it does, three things stand in
-front of it: the same command policy that refuses destructive and privilege-seeking invocations on
-the shell path, a refusal to launch anything resolving outside the workspace, and an approval card
-whenever the turn has read untrusted content. Treat `desktop_launch` as the one tool whose blast
-radius is the runner account rather than the agent account. Commands reach it through a
+The desktop uses the common approval policy and command checks. Treat browser-parent and desktop
+process compromise as compromise of the runner account until OS identity separation is verified.
+Shell commands reach their separate account through a
 root-owned helper that only ever hands back less privilege than it was called with, and that sets
 `no_new_privs` — which is inherited by every descendant and cannot be removed, so a set-user-ID
 binary confers nothing no matter which interpreter spelled the command.
