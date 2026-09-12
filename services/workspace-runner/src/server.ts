@@ -187,6 +187,7 @@ const BinaryProbeRequest = z.object({
  */
 const RenderProofRequest = z.object({
   path: WorkspaceRelativePath,
+  deadlineAt: z.number().int().positive().optional(),
   expectPages: z.number().int().min(1).max(5_000).optional(),
   marginPoints: z.number().min(0).max(200).optional()
 });
@@ -1539,21 +1540,36 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
    */
   app.post<{ Params: { workspaceId: string } }>(
     '/v1/workspaces/:workspaceId/document/render-proof',
-    async (request) => {
+    async (request, reply) => {
       requireScope(request, 'exec');
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
       await ensureWorkspace(root);
       const requested = RenderProofRequest.parse(request.body);
-      return proveRender(
-        root,
-        {
-          path: assertUserDataPath(root, requested.path),
-          expectPages: requested.expectPages,
-          marginPoints: requested.marginPoints
-        },
-        await findRenderTools(root),
-        Math.min(config.MAX_FILE_BYTES, RENDER_SOURCE_MAX_BYTES)
-      );
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      const closed = () => {
+        if (!reply.raw.writableEnded) abort();
+      };
+      request.raw.once('aborted', abort);
+      reply.raw.once('close', closed);
+      if (request.raw.aborted || reply.raw.destroyed) abort();
+      try {
+        return await proveRender(
+          root,
+          {
+            path: assertUserDataPath(root, requested.path),
+            deadlineAt: requested.deadlineAt,
+            expectPages: requested.expectPages,
+            marginPoints: requested.marginPoints
+          },
+          await findRenderTools(root),
+          Math.min(config.MAX_FILE_BYTES, RENDER_SOURCE_MAX_BYTES),
+          controller.signal
+        );
+      } finally {
+        request.raw.removeListener('aborted', abort);
+        reply.raw.removeListener('close', closed);
+      }
     }
   );
 

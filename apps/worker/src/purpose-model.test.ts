@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { afterAll, beforeAll, expect, it } from 'vitest';
+import { afterAll, beforeAll, expect, it, vi } from 'vitest';
 import type { ModelRelease } from '@athanor/contracts';
 import {
   AthanorError,
@@ -15,7 +15,11 @@ import {
   migrateDatabase,
   writeProjectModelPreferences
 } from '@athanor/data';
-import { applyProjectMainModel, resolveTaskPurposeModel } from './purpose-model.js';
+import {
+  applyProjectMainModel,
+  pinnedPurposeModel,
+  resolveTaskPurposeModel
+} from './purpose-model.js';
 import type { AgentState } from './agent-state.js';
 
 const database = createDatabase({ driver: 'pglite', pglitePath: ':memory:' });
@@ -48,7 +52,11 @@ beforeAll(async () => {
   await migrateDatabase(database);
   await store.upsertModels(models);
 });
-afterAll(async () => database.close());
+afterAll(async () => {
+  // Drain reads started alongside a rejected preference lookup before closing the embedded store.
+  await database.query('SELECT 1');
+  await database.close();
+});
 async function fixture() {
   const user = await store.createUser({ username: randomUUID(), displayName: 'Owner' });
   const workspaceId = randomUUID();
@@ -207,4 +215,30 @@ it('uses the connected provider after migration and never falls back to the task
     applyProjectMainModel(disconnected, f.task, state, catalog, key, 'worker')
   ).rejects.toMatchObject({ code: 'provider_not_connected' });
   expect((await store.getTask(f.user.id, f.task.id))?.modelId).toBe('main');
+});
+
+it('distinguishes an automatic auxiliary route from an unreadable or unavailable pin', async () => {
+  const f = await fixture();
+  expect(await pinnedPurposeModel(f.context, f.task, 'summarise', models)).toBeNull();
+  await writeProjectModelPreferences(store, masterKey, f.task, {
+    expectedRevision: 0,
+    choices: { summarise: pin('specialist') }
+  });
+  expect((await pinnedPurposeModel(f.context, f.task, 'summarise', models))?.id).toBe('specialist');
+  await expect(pinnedPurposeModel(f.context, f.task, 'summarise', [])).rejects.toMatchObject({
+    code: 'purpose_model_unavailable'
+  });
+  const unavailable = vi
+    .spyOn(store, 'getUserById')
+    .mockRejectedValueOnce(new Error('preferences unavailable'));
+  try {
+    await expect(pinnedPurposeModel(f.context, f.task, 'summarise', models)).rejects.toThrow(
+      'preferences unavailable'
+    );
+  } finally {
+    unavailable.mockRestore();
+  }
+  await expect(
+    pinnedPurposeModel({ ...f.context, masterKey: generateDataKey() }, f.task, 'summarise', models)
+  ).rejects.toThrow();
 });

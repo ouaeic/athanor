@@ -110,6 +110,9 @@ export default function TaskSurface({
     'direction' | 'history' | 'plan' | 'settings' | 'share' | 'brief' | 'models' | 'stop' | null
   >(null);
   const [busy, setBusy] = useState(false);
+  const [composerExpanded, setComposerExpanded] = useState(
+    Boolean(draft?.body || draft?.attachments.length)
+  );
   const [historyMore, setHistoryMore] = useState(false);
   const [historyPage, setHistoryPage] = useState<TaskEvent[]>([]);
   const [evidence, setEvidence] = useState<TaskEvent | null>(null);
@@ -120,6 +123,7 @@ export default function TaskSurface({
   const [briefLoading, setBriefLoading] = useState(false);
   const [branchEvent, setBranchEvent] = useState<TaskEvent | null>(null);
   const presentation = currentWork(storedPresentation, events);
+  const showComposer = !isFinished(task) || composerExpanded || Boolean(scope);
   /*
    * The run summary's elapsed figure is a live clock, not a snapshot. Re-rendering on a half
    * minute keeps it honest while a task runs; a finished task's duration is fixed and the tick
@@ -499,35 +503,41 @@ export default function TaskSurface({
             </Button>
             <Button
               className="primary"
-              onClick={() => document.getElementById(`intent-${task.id}`)?.focus()}
+              onClick={() => {
+                setComposerExpanded(true);
+                requestAnimationFrame(() => document.getElementById(`intent-${task.id}`)?.focus());
+              }}
             >
               <Plus size={17} />
               Add direction
             </Button>
           </div>
         </div>
-        <div className="work-tools garden-top-tools">
-          <Button onClick={() => onComputer('terminal')}>
-            <Terminal size={16} />
-            Terminal
-          </Button>
-          <Button onClick={() => onComputer('browser')}>Browser</Button>
-          <Button onClick={() => onComputer('desktop')}>Desktop</Button>
-          <Button onClick={() => onComputer('files')}>Files</Button>
-          <Button onClick={() => onComputer('previews')}>Previews</Button>
-          <Button onClick={() => setPanel('models')}>Models</Button>
-          <Button
-            onClick={() => {
-              setHistoryPage(events.slice(-250));
-              setHistoryMore((events.at(-250)?.sequence ?? events[0]?.sequence ?? 1) > 1);
-              setPanel('history');
-            }}
-          >
-            <History size={16} />
-            Activity
-          </Button>
-          <Button onClick={() => setPanel('plan')}>Plan</Button>
-        </div>
+        <details className="garden-project-tools">
+          <summary>Tools & activity</summary>
+          <div className="work-tools garden-top-tools">
+            <Button onClick={() => onComputer('terminal')}>
+              <Terminal size={16} />
+              Terminal
+            </Button>
+            <Button onClick={() => onComputer('browser')}>Browser</Button>
+            <Button onClick={() => onComputer('desktop')}>Desktop</Button>
+            <Button onClick={() => onComputer('files')}>Files</Button>
+            <Button onClick={() => onComputer('previews')}>Previews</Button>
+            <Button onClick={() => setPanel('models')}>Models</Button>
+            <Button
+              onClick={() => {
+                setHistoryPage(events.slice(-250));
+                setHistoryMore((events.at(-250)?.sequence ?? events[0]?.sequence ?? 1) > 1);
+                setPanel('history');
+              }}
+            >
+              <History size={16} />
+              Activity
+            </Button>
+            <Button onClick={() => setPanel('plan')}>Plan</Button>
+          </div>
+        </details>
         <div className="run-summary">
           <div className={`status-line ${isWorking(task) || pendingDelivery ? 'active' : ''}`}>
             <i />
@@ -628,25 +638,23 @@ export default function TaskSurface({
                   <SpendBlock task={task} onResumed={reload} />
                 </Suspense>
               )}
-              {/*
-               * What the owner asked for, on the page rather than behind a button.
-               *
-               * This component was written, styled and tested and then never rendered anywhere -
-               * so the answer to "where are my prompts and follow-ups" was the raw activity log.
-               * It sits above the work because it is the thing the work is answering, and it
-               * collapses every earlier direction into one line so a long project does not open
-               * with its own history.
-               */}
               {presentation?.surface && (
-                <Suspense fallback={null}>
-                  <WorkDirections
-                    surface={presentation.surface}
-                    onRevisit={(eventId) => {
-                      const event = events.find((item) => item.id === eventId);
-                      if (event) setBranchEvent(event);
-                    }}
-                  />
-                </Suspense>
+                <details
+                  className="garden-task-directions"
+                  key={`${task.id}:${isFinished(task)}`}
+                  open={!isFinished(task)}
+                >
+                  <summary>Your directions</summary>
+                  <Suspense fallback={null}>
+                    <WorkDirections
+                      surface={presentation.surface}
+                      onRevisit={(eventId) => {
+                        const event = events.find((item) => item.id === eventId);
+                        if (event) setBranchEvent(event);
+                      }}
+                    />
+                  </Suspense>
+                </details>
               )}
               <SubagentLanes events={events} />
               <Suspense fallback={null}>
@@ -920,68 +928,91 @@ export default function TaskSurface({
         </Dialog>
       )}
       <div className="garden-task-composer">
-        {attentionPanel ??
-          (task.parentMissionId ? (
-            <div className="selected-context garden-mission-context">
-              <p>This specialist uses the model and budget assigned by its parent work.</p>
-              <small className="muted">
-                {bootstrap.models.find((model) => model.id === task.modelId)?.displayName ??
-                  task.modelId}
-                {' · '}Effort {effortLabel(task.reasoningEffort ?? 'auto')}
-              </small>
-              <div className="row">
-                {question && taskDecisions.length === 0 && (
-                  <Button
-                    onClick={() => {
-                      const card = document.getElementById(`question-${task.id}`);
-                      card?.scrollIntoView({ block: 'center', behavior: 'smooth' });
-                      card?.querySelector('textarea')?.focus({ preventScroll: true });
-                    }}
-                  >
-                    Reply to the question
-                  </Button>
-                )}
-                {task.parentTaskId && (
-                  <Button onClick={() => onOpenTask(task.parentTaskId!)}>
-                    Continue in parent work
-                  </Button>
-                )}
-              </div>
-            </div>
-          ) : (
-            <>
-              {scope && (
-                <div className="selected-context">
-                  <span className="eyebrow">Selected context</span>
-                  <p>{scope}</p>
-                  <Button onClick={() => setScope('')} aria-label="Clear selected context">
-                    <X size={14} />
-                  </Button>
-                </div>
-              )}
-              <Suspense fallback={<Spinner />}>
-                <Composer
-                  workspace={workspace}
-                  task={task}
-                  bootstrap={bootstrap}
-                  toolbarExtra={
-                    <Button className="quiet-button" onClick={selectedContext}>
-                      Shape selection
-                      <ArrowUpRight size={14} />
+        {!attentionPanel && !task.parentMissionId && !showComposer && (
+          <Button
+            className="garden-compose-prompt"
+            onClick={() => {
+              setComposerExpanded(true);
+              requestAnimationFrame(() => document.getElementById(`intent-${task.id}`)?.focus());
+            }}
+          >
+            <Plus size={18} /> Add a direction…
+            <span>Continue this work</span>
+          </Button>
+        )}
+        <div hidden={!attentionPanel && !task.parentMissionId && !showComposer}>
+          {!attentionPanel && !task.parentMissionId && isFinished(task) && showComposer && (
+            <Button
+              className="garden-compose-collapse"
+              aria-label="Collapse composer"
+              onClick={() => setComposerExpanded(false)}
+            >
+              <X size={14} /> Keep draft and collapse
+            </Button>
+          )}
+          {attentionPanel ??
+            (task.parentMissionId ? (
+              <div className="selected-context garden-mission-context">
+                <p>This specialist uses the model and budget assigned by its parent work.</p>
+                <small className="muted">
+                  {bootstrap.models.find((model) => model.id === task.modelId)?.displayName ??
+                    task.modelId}
+                  {' · '}Effort {effortLabel(task.reasoningEffort ?? 'auto')}
+                </small>
+                <div className="row">
+                  {question && taskDecisions.length === 0 && (
+                    <Button
+                      onClick={() => {
+                        const card = document.getElementById(`question-${task.id}`);
+                        card?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+                        card?.querySelector('textarea')?.focus({ preventScroll: true });
+                      }}
+                    >
+                      Reply to the question
                     </Button>
-                  }
-                  {...(draft ? { initialDraft: draft } : {})}
-                  {...(scope ? { scope } : {})}
-                  onDraft={onDraft}
-                  onSent={(result) => {
-                    onTask(result);
-                    setScope('');
-                    onRefresh();
-                  }}
-                />
-              </Suspense>
-            </>
-          ))}
+                  )}
+                  {task.parentTaskId && (
+                    <Button onClick={() => onOpenTask(task.parentTaskId!)}>
+                      Continue in parent work
+                    </Button>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <>
+                {scope && (
+                  <div className="selected-context">
+                    <span className="eyebrow">Selected context</span>
+                    <p>{scope}</p>
+                    <Button onClick={() => setScope('')} aria-label="Clear selected context">
+                      <X size={14} />
+                    </Button>
+                  </div>
+                )}
+                <Suspense fallback={<Spinner />}>
+                  <Composer
+                    workspace={workspace}
+                    task={task}
+                    bootstrap={bootstrap}
+                    toolbarExtra={
+                      <Button className="quiet-button" onClick={selectedContext}>
+                        Shape selection
+                        <ArrowUpRight size={14} />
+                      </Button>
+                    }
+                    {...(draft ? { initialDraft: draft } : {})}
+                    {...(scope ? { scope } : {})}
+                    onDraft={onDraft}
+                    onSent={(result) => {
+                      onTask(result);
+                      setScope('');
+                      onRefresh();
+                    }}
+                  />
+                </Suspense>
+              </>
+            ))}
+        </div>
       </div>
       {panel === 'brief' && (
         <Dialog title="What you asked" wide onClose={() => setPanel(null)}>

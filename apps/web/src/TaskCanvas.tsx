@@ -194,19 +194,6 @@ export function TaskOutputs({
               ))}
           </div>
         )}
-      {presentation.sourceBundle && presentation.results.length > 0 && (
-        <div className="garden-source-bundle">
-          <a className="button" href={presentation.sourceBundle.downloadUrl} download>
-            <Download size={15} /> Download source bundle
-          </a>
-          <small>
-            {presentation.sourceBundle.fileCount == null
-              ? 'Project files'
-              : `${presentation.sourceBundle.fileCount} recorded output files`}{' '}
-            · ZIP
-          </small>
-        </div>
-      )}
       {featured && (
         <article className="garden-output-primary">
           <header className="garden-output-header">
@@ -254,6 +241,45 @@ export function TaskOutputs({
             </div>
             <Globe size={22} />
           </header>
+          {opened?.id === preview.id && preview.status === 'ready' ? (
+            <div className="garden-preview-live">
+              {frame}
+              {frameState !== 'loaded' && (
+                <div className="garden-preview-state" role="status">
+                  {frameState === 'failed'
+                    ? 'The embedded app could not load. Try Open app, or retry here.'
+                    : frameState === 'slow'
+                      ? 'The app is taking longer to load. You can open it separately or retry.'
+                      : 'Loading the live app…'}
+                  {(frameState === 'failed' || frameState === 'slow') && (
+                    <Button onClick={() => void open(preview)}>Retry preview</Button>
+                  )}
+                </div>
+              )}
+            </div>
+          ) : captured ? (
+            <figure className="garden-captured-result">
+              <img src={captured.src} alt={`Recorded view of ${preview.title}`} />
+              <figcaption>
+                Recorded view ·{' '}
+                {new Date(captured.createdAt).toLocaleString(undefined, {
+                  dateStyle: 'medium',
+                  timeStyle: 'short'
+                })}
+                <span>Open for the live version</span>
+              </figcaption>
+            </figure>
+          ) : (
+            <div className="garden-preview-state" role="status">
+              {preview.status !== 'ready'
+                ? (preview.detail ?? 'The live app is not available right now.')
+                : dismissed === previewKey
+                  ? 'Embedded preview closed. Open the app or view it here when you are ready.'
+                  : frameState === 'failed'
+                    ? 'The app could not be opened. Use View here to retry.'
+                    : 'Opening the live app…'}
+            </div>
+          )}
           <div className="garden-output-actions">
             {preview.status === 'ready' && (
               <>
@@ -317,46 +343,20 @@ export function TaskOutputs({
                 />
               </label>
             ))}
-          {opened?.id === preview.id && preview.status === 'ready' ? (
-            <div className="garden-preview-live">
-              {frame}
-              {frameState !== 'loaded' && (
-                <div className="garden-preview-state" role="status">
-                  {frameState === 'failed'
-                    ? 'The embedded app could not load. Try Open app, or retry here.'
-                    : frameState === 'slow'
-                      ? 'The app is taking longer to load. You can open it separately or retry.'
-                      : 'Loading the live app…'}
-                  {(frameState === 'failed' || frameState === 'slow') && (
-                    <Button onClick={() => void open(preview)}>Retry preview</Button>
-                  )}
-                </div>
-              )}
-            </div>
-          ) : captured ? (
-            <figure className="garden-captured-result">
-              <img src={captured.src} alt={`Recorded view of ${preview.title}`} />
-              <figcaption>
-                Recorded view ·{' '}
-                {new Date(captured.createdAt).toLocaleString(undefined, {
-                  dateStyle: 'medium',
-                  timeStyle: 'short'
-                })}
-                <span>Open for the live version</span>
-              </figcaption>
-            </figure>
-          ) : (
-            <div className="garden-preview-state" role="status">
-              {preview.status !== 'ready'
-                ? (preview.detail ?? 'The live app is not available right now.')
-                : dismissed === previewKey
-                  ? 'Embedded preview closed. Open the app or view it here when you are ready.'
-                  : frameState === 'failed'
-                    ? 'The app could not be opened. Use View here to retry.'
-                    : 'Opening the live app…'}
-            </div>
-          )}
         </article>
+      )}
+      {presentation.sourceBundle && presentation.results.length > 0 && (
+        <div className="garden-source-bundle">
+          <a className="button" href={presentation.sourceBundle.downloadUrl} download>
+            <Download size={15} /> Download source bundle
+          </a>
+          <small>
+            {presentation.sourceBundle.fileCount == null
+              ? 'Project files'
+              : `${presentation.sourceBundle.fileCount} recorded output files`}{' '}
+            · ZIP
+          </small>
+        </div>
       )}
       {files.length > 0 && (
         <div className="garden-delivery-list">

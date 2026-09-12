@@ -405,8 +405,8 @@
 }
 .garden-task-layout {
   display: grid;
-  grid-template-columns: minmax(230px, 0.43fr) minmax(0, 1fr);
-  grid-template-areas: 'steps outputs';
+  grid-template-columns: minmax(0, 1fr) minmax(230px, 0.43fr);
+  grid-template-areas: 'outputs steps';
   gap: clamp(22px, 3vw, 44px);
   align-items: start;
 }
@@ -423,8 +423,8 @@
   grid-area: steps;
 }
 .garden-task-aside {
-  border-right: 1px solid var(--line);
-  padding-right: 24px;
+  border-left: 1px solid var(--line);
+  padding-left: 24px;
 }
 .garden-answer {
   padding: 24px 0 6px;
@@ -974,11 +974,11 @@
     margin-left: 10px;
   }
   .garden-task-layout {
-    grid-template-columns: 235px minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr) 235px;
     gap: 22px;
   }
   .garden-task-aside {
-    padding-right: 20px;
+    padding-left: 20px;
   }
   .garden-output-header {
     padding: 17px;
@@ -987,10 +987,10 @@
 @media (max-width: 960px) {
   .garden-task-layout {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-areas: 'steps' 'outputs';
+    grid-template-areas: 'outputs' 'steps';
   }
   .garden-task-aside {
-    border-right: 0;
+    border-left: 0;
     border-top: 1px solid var(--line);
     padding: 22px 0 0;
   }
@@ -1702,4 +1702,53 @@
   border-color: transparent;
   color: var(--muted);
   font-size: 11px;
+}
+
+.garden-task-directions > summary {
+  cursor: pointer;
+  color: var(--muted);
+  padding: 8px 0;
+  font-size: 12px;
+}
+.garden-task-directions[open] > summary {
+  margin-bottom: 12px;
+}
+
+.garden-project-tools {
+  margin: 0 0 10px;
+  color: var(--muted);
+}
+.garden-project-tools > summary {
+  cursor: pointer;
+  width: fit-content;
+  padding: 8px 0;
+  font-size: 12px;
+}
+.garden-project-tools[open] .work-tools {
+  margin-bottom: 0;
+}
+
+.garden-compose-prompt {
+  width: 100%;
+  justify-content: flex-start;
+  min-height: 48px;
+  padding: 12px 16px;
+  border-radius: 14px;
+  border: 1px solid var(--line-strong);
+  color: var(--muted);
+  background: color-mix(in srgb, var(--raised) 40%, transparent);
+}
+.garden-compose-prompt span {
+  margin-left: auto;
+  font-size: 11px;
+}
+.garden-compose-collapse {
+  margin: 0 0 6px auto;
+  font-size: 11px;
+  min-height: 30px;
+}
+@media (max-width: 480px) {
+  .garden-compose-prompt span {
+    display: none;
+  }
 }

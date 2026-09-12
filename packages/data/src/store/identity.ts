@@ -1,3 +1,4 @@
+import type { EncryptedEnvelope } from '@athanor/core';
 import { randomUUID } from 'node:crypto';
 import type { Database } from '../database.js';
 import type { ApiTokenRecord, PasskeyRecord, UserRecord } from '../types.js';
@@ -564,16 +565,12 @@ export class IdentityStore {
     path: string;
     requestHash: string;
     responseStatus: number | null;
-    responseBody: unknown;
+    responseCiphertext: EncryptedEnvelope | null;
   } | null> {
     const inserted = await this.database.query(
       `INSERT INTO api_operations(user_id,idempotency_key,method,path,request_hash,state,expires_at)
        VALUES ($1,$2,$3,$4,$5,'running',NOW()+($6 * INTERVAL '1 hour'))
-       ON CONFLICT(user_id,idempotency_key) DO UPDATE SET
-         state='running',response_status=NULL,response_body=NULL,updated_at=NOW(),expires_at=EXCLUDED.expires_at
-       WHERE api_operations.state='failed'
-         AND api_operations.method=EXCLUDED.method AND api_operations.path=EXCLUDED.path
-         AND api_operations.request_hash=EXCLUDED.request_hash
+       ON CONFLICT(user_id,idempotency_key) DO NOTHING
        RETURNING state`,
       [
         input.userId,
@@ -586,7 +583,7 @@ export class IdentityStore {
     );
     if (inserted.rowCount === 1) return null;
     const existing = await this.database.query(
-      `SELECT state,method,path,request_hash,response_status,response_body FROM api_operations
+      `SELECT state,method,path,request_hash,response_status,response_ciphertext FROM api_operations
        WHERE user_id=$1 AND idempotency_key=$2`,
       [input.userId, input.idempotencyKey]
     );
@@ -598,7 +595,8 @@ export class IdentityStore {
           path: String(row.path),
           requestHash: String(row.request_hash),
           responseStatus: row.response_status === null ? null : Number(row.response_status),
-          responseBody: row.response_body === null ? null : json(row.response_body)
+          responseCiphertext:
+            row.response_ciphertext === null ? null : json(row.response_ciphertext)
         }
       : null;
   }
@@ -607,10 +605,10 @@ export class IdentityStore {
     userId: string,
     idempotencyKey: string,
     status: number,
-    body: unknown
+    body: EncryptedEnvelope
   ): Promise<void> {
     await this.database.query(
-      `UPDATE api_operations SET state='completed',response_status=$3,response_body=$4::jsonb,updated_at=NOW()
+      `UPDATE api_operations SET state='completed',response_status=$3,response_body=NULL,response_ciphertext=$4::jsonb,updated_at=NOW()
        WHERE user_id=$1 AND idempotency_key=$2`,
       [userId, idempotencyKey, status, JSON.stringify(body)]
     );
@@ -618,7 +616,7 @@ export class IdentityStore {
 
   async failOperation(userId: string, idempotencyKey: string): Promise<void> {
     await this.database.query(
-      `UPDATE api_operations SET state='failed',updated_at=NOW() WHERE user_id=$1 AND idempotency_key=$2`,
+      `UPDATE api_operations SET state='failed',updated_at=NOW() WHERE user_id=$1 AND idempotency_key=$2 AND state='running'`,
       [userId, idempotencyKey]
     );
   }

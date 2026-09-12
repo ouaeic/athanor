@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
@@ -268,6 +269,42 @@ describe('measuring a document this computer rendered', () => {
     pdftoppm: undefined,
     officeConvert: undefined
   };
+
+  it.each(['deadline', 'cancellation'] as const)(
+    'stops conversion descendants on %s without reporting a pass',
+    async (mode) => {
+      const converter = path.join(root, 'converter');
+      const marker = path.join(root, 'escaped-child');
+      await writeFile(path.join(root, 'workspace', 'deck.pptx'), 'pretend Office file');
+      await writeFile(
+        converter,
+        `#!/bin/sh\n(sleep 1; touch '${marker.replaceAll("'", "'\\''")}') &\nwait\n`,
+        { mode: 0o700 }
+      );
+      const controller = new AbortController();
+      const started = Date.now();
+      const timer = mode === 'cancellation' ? setTimeout(() => controller.abort(), 100) : undefined;
+      try {
+        await expect(
+          proveRender(
+            root,
+            {
+              path: 'workspace/deck.pptx',
+              deadlineAt: started + (mode === 'deadline' ? 100 : 30_000)
+            },
+            { ...noTools, pdftotext: '/bin/true', officeConvert: converter },
+            undefined,
+            controller.signal
+          )
+        ).rejects.toMatchObject({ status: 408 });
+        expect(Date.now() - started).toBeLessThan(2000);
+        await sleep(1100);
+        expect(existsSync(marker)).toBe(false);
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+  );
 
   it('refuses a file that has no rendered page at all', async () => {
     await expect(proveRender(root, { path: 'workspace/notes.md' }, noTools)).rejects.toThrow(

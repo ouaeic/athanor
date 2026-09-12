@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { Id, MediaJob, MediaCharacterAsset, MediaBatch } from '@athanor/contracts';
 import { AthanorError, decryptJson, encryptJson, unwrapDataKey } from '@athanor/core';
 import type { MediaJobRecord } from '@athanor/data';
-import { mediaJobErrorAad } from '@athanor/worker/media-jobs';
+import { mediaJobErrorAad } from '@athanor/worker/media-job-domain';
 import { NativeMediaLibraryClient } from '@athanor/model-gateway';
 import { requireUser } from '../http/auth-hook.js';
 import type { RouteContext } from '../http/server-context.js';

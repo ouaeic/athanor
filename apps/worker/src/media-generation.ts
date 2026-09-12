@@ -5,7 +5,7 @@ import { VideoClient } from '@athanor/model-gateway';
 import type { InferenceCredential } from './agent-state.js';
 import { VideoToolInput, mediaArguments } from './media-controls.js';
 import { mediaQuoteUsd, resolvedMediaModel } from './media.js';
-import { mediaJobAad, type StoredVideoRequest } from './media-jobs.js';
+import { mediaJobAad, type StoredVideoRequest } from './media-job-domain.js';
 import type { ToolContext } from './tool-dispatch.js';
 import { mediaAccountHash, mediaAssetAad, type StoredCharacter } from './media-library.js';
 

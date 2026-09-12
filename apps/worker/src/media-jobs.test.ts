@@ -4,7 +4,8 @@ import { decryptJson, encryptJson, sha256, wrapDataKey } from '@athanor/core';
 import { createDatabase, DataStore, migrateDatabase } from '@athanor/data';
 import { MAX_AGENT_NOTIFICATIONS_PER_TASK } from '@athanor/contracts';
 import { VideoSubmissionUncertainError } from '@athanor/model-gateway';
-import { MediaJobWorker, mediaJobAad, type StoredVideoRequest } from './media-jobs.js';
+import { MediaJobWorker } from './media-jobs.js';
+import { mediaJobAad, type StoredVideoRequest } from './media-job-domain.js';
 import type { AgentRunnerClient } from './runner-client.js';
 
 const MP4 = Buffer.from([

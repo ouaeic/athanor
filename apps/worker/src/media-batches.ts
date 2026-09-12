@@ -15,7 +15,7 @@ import type { InferenceCredential } from './agent-state.js';
 import type { ToolContext } from './tool-dispatch.js';
 import { VideoBatchControls, mediaArguments } from './media-controls.js';
 import { prepareVideoGeneration } from './media-generation.js';
-import { mediaJobAad, mediaJobErrorAad, type StoredVideoRequest } from './media-jobs.js';
+import { mediaJobAad, mediaJobErrorAad, type StoredVideoRequest } from './media-job-domain.js';
 export const mediaBatchAad = (id: string) => `provider-media-batch:${id}`;
 export const mediaBatchErrorAad = (id: string) => `provider-media-batch-error:${id}`;
 export interface StoredVideoBatch {

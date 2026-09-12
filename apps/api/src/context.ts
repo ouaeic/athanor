@@ -27,6 +27,7 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import Fastify, { type FastifyInstance } from 'fastify';
+import { sealLegacyOperationResponses } from './http/operation-receipts.js';
 import { z } from 'zod';
 import type {
   ApiToken,
@@ -610,6 +611,7 @@ export const createApiContext = async (config: ApiConfig, overrides: ApiOverride
     : await resolveDataMasterKey(config);
   const masterKey = keyRelease.key;
   await assertMasterKeyOpensDatabase(database, masterKey);
+  await sealLegacyOperationResponses(database, masterKey);
   const runnerSharedSecret =
     config.RUNNER_SHARED_SECRET ?? deriveServiceSecret(masterKey, 'runner-capabilities');
   const sessionSigningKey =

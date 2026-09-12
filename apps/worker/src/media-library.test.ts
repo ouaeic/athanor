@@ -4,7 +4,7 @@ import { decryptJson, encryptJson } from '@athanor/core';
 import { createDatabase, DataStore, migrateDatabase } from '@athanor/data';
 import { executeMediaLibrary, mediaAssetAad } from './media-library.js';
 import { queueVideoGeneration } from './media-generation.js';
-import { mediaJobAad, type StoredVideoRequest } from './media-jobs.js';
+import { mediaJobAad, type StoredVideoRequest } from './media-job-domain.js';
 import { approvalRequirement } from './approval-policy.js';
 import type { InferenceCredential } from './agent-state.js';
 import type { ToolContext } from './tool-dispatch.js';

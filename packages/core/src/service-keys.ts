@@ -29,7 +29,7 @@ export const resolveDataMasterKey = async (
 
 export const deriveServiceSecret = (
   masterKey: Uint8Array,
-  purpose: 'session-signing' | 'runner-capabilities'
+  purpose: 'session-signing' | 'runner-capabilities' | 'api-operation-receipts'
 ): string => {
   if (masterKey.byteLength !== 32) throw new Error('Service derivation requires 32 bytes');
   return Buffer.from(

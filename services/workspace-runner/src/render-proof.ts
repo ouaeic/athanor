@@ -284,8 +284,16 @@ const run = async (
   executable: string,
   args: readonly string[],
   timeoutMs: number,
-  maxBytes: number
+  maxBytes: number,
+  deadlineAt: number,
+  signal?: AbortSignal
 ): Promise<ToolResult> => {
+  const remaining = Math.min(timeoutMs, deadlineAt - Date.now());
+  if (signal?.aborted || remaining <= 0)
+    throw new WorkspaceFileError(
+      'Render verification is incomplete: cancelled or out of time.',
+      408
+    );
   const child = spawn(executable, [...args], {
     stdio: ['ignore', 'pipe', 'pipe'],
     shell: false,
@@ -308,14 +316,27 @@ const run = async (
   child.stderr?.on('data', (chunk: string) => {
     stderr = `${stderr}${chunk}`.slice(0, 4_000);
   });
-  const timer = setTimeout(() => killProcessTree(child, 'SIGKILL'), timeoutMs);
+  let stopped = false;
+  const stop = () => {
+    stopped = true;
+    killProcessTree(child, 'SIGKILL');
+  };
+  signal?.addEventListener('abort', stop, { once: true });
+  if (signal?.aborted) stop();
+  const timer = setTimeout(stop, remaining);
   timer.unref();
   let exitCode: number | null;
   try {
     ({ exitCode } = await awaitChildExit(child));
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener('abort', stop);
   }
+  if (stopped || Date.now() >= deadlineAt)
+    throw new WorkspaceFileError(
+      'Render verification is incomplete: cancelled or out of time.',
+      408
+    );
   return { stdout: Buffer.concat(chunks), stderr, exitCode, overflowed };
 };
 
@@ -347,6 +368,7 @@ export const findRenderTools = async (root: string): Promise<RenderTools> => {
 
 export interface RenderProofRequest {
   readonly path: string;
+  readonly deadlineAt?: number | undefined;
   /** The exact number of pages the job asked for, when it asked for one. */
   readonly expectPages?: number | undefined;
   readonly marginPoints?: number | undefined;
@@ -454,8 +476,27 @@ export const proveRender = async (
   root: string,
   request: RenderProofRequest,
   tools: RenderTools,
-  maxSourceBytes = RENDER_SOURCE_MAX_BYTES
+  maxSourceBytes = RENDER_SOURCE_MAX_BYTES,
+  signal?: AbortSignal
 ): Promise<RenderProofResult> => {
+  const deadlineAt = Math.min(
+    request.deadlineAt ?? Infinity,
+    Date.now() +
+      CONVERT_TIMEOUT_MS +
+      BBOX_TIMEOUT_MS +
+      MAX_BLANK_PROBE_PAGES * BLANK_PROBE_TIMEOUT_MS
+  );
+  const boundedRun = (
+    executable: string,
+    args: readonly string[],
+    timeout: number,
+    bytes: number
+  ) => run(executable, args, timeout, bytes, deadlineAt, signal);
+  if (signal?.aborted || deadlineAt <= Date.now())
+    throw new WorkspaceFileError(
+      'Render verification is incomplete: cancelled or out of time.',
+      408
+    );
   const extension = path.extname(request.path).toLowerCase();
   if (!RENDERABLE_EXTENSIONS.has(extension))
     throw new WorkspaceFileError(
@@ -477,7 +518,7 @@ export const proveRender = async (
     let pdfPath = sourcePath;
     if (converting && tools.officeConvert) {
       pdfPath = path.join(scratch, 'render.pdf');
-      const converted = await run(
+      const converted = await boundedRun(
         tools.officeConvert,
         [sourcePath, pdfPath, '--timeout', String(CONVERT_TIMEOUT_SECONDS)],
         CONVERT_TIMEOUT_MS,
@@ -491,7 +532,7 @@ export const proveRender = async (
           422
         );
     }
-    const measured = await run(
+    const measured = await boundedRun(
       tools.pdftotext,
       ['-bbox', pdfPath, '-'],
       BBOX_TIMEOUT_MS,
@@ -524,7 +565,7 @@ export const proveRender = async (
     const unreadablePages: number[] = [];
     for (const entry of empty.slice(0, MAX_BLANK_PROBE_PAGES)) {
       const ink = tools.pdftoppm
-        ? await run(
+        ? await boundedRun(
             tools.pdftoppm,
             [
               '-gray',
@@ -558,6 +599,11 @@ export const proveRender = async (
       words,
       ...(converting ? { renderedFrom: path.basename(request.path) } : {})
     });
+    if (signal?.aborted || Date.now() >= deadlineAt)
+      throw new WorkspaceFileError(
+        'Render verification is incomplete: cancelled or out of time.',
+        408
+      );
     return {
       ...described,
       pages: pages.length,

@@ -37,16 +37,9 @@ import { event } from './tool-recording.js';
  * multiply into a turn that holds the owner's computer for two hours after the model said it was
  * done.
  *
- * It is a deadline to START inside, not a wall the suite ends at, and for one branch the difference
- * is minutes rather than seconds. A command check is clamped to `remainingSeconds` below, so it both
- * starts and finishes inside this figure. The render proof is not: `/document/render-proof` takes no
- * timeout in its request schema, so nothing here can hand it one, and it is bounded instead by the
- * runner's own SIGKILL timers - 140s to convert, 60s for the bounding boxes, and 30s for each of at
- * most `MAX_BLANK_PROBE_PAGES` = 64 blank probes (services/workspace-runner/src/render-proof.ts:
- * 102-107). So a render started at 899s can hold the turn to roughly 3,000 seconds in the worst
- * case, under the client's own 65-minute ceiling and over this one. Saying that rather than clamping
- * it: the clamp needs a field the runner does not offer, and there is no measurement that a render
- * ever runs long enough for it to matter.
+ * Command checks are clamped to the remaining budget. Render checks receive the same absolute
+ * deadline, including time spent in transport, conversion and per-page probes. Cancellation
+ * reaches the runner through the request signal and kills the converter's process group.
  */
 export const ACCEPTANCE_SUITE_DEADLINE_SECONDS = 900;
 
@@ -307,6 +300,7 @@ export const acceptanceChecks = async (
                 `${root}/document/render-proof`,
                 {
                   path: check.path,
+                  deadlineAt,
                   ...(render.expectPages === undefined ? {} : { expectPages: render.expectPages }),
                   marginPoints: render.marginPoints
                 }

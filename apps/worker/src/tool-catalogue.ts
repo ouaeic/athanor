@@ -762,7 +762,7 @@ export const agentTools: ModelTool[] = [
   {
     name: 'document_search',
     description:
-      'Privately search the contents of documents already on this computer - PDFs, Word, PowerPoint, spreadsheets, OpenDocument, HTML - without uploading them or maintaining a duplicate vector database. Use code_search for source code, session_search for past conversations, and web_search for anything not already on this computer. Search again with synonyms when lexical wording may differ, then use document_read for grounded evidence.',
+      'Search local PDFs and office documents with private, source-linked BM25. Retry synonyms for wording differences; use document_read for evidence. Use code_search for code, session_search for chats, web_search for the internet.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -771,6 +771,13 @@ export const agentTools: ModelTool[] = [
         query: { type: 'string', minLength: 1, maxLength: 2_000 },
         path: { type: 'string', default: 'workspace' },
         maxFiles: { type: 'integer', minimum: 1, maximum: 2_000, default: 500 },
+        fileOffset: {
+          type: 'integer',
+          minimum: 0,
+          maximum: 1_000_000,
+          default: 0,
+          description: 'Continue with coverage.nextFileOffset, keeping query and path unchanged.'
+        },
         maxResults: { type: 'integer', minimum: 1, maximum: 50, default: 12 },
         maxPages: {
           type: 'integer',

@@ -3712,5 +3712,10 @@ CREATE TABLE IF NOT EXISTS model_throughput_ceiling (
   sampled_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 `
+  },
+  {
+    version: 102,
+    name: 'sealed_operation_receipts',
+    sql: `ALTER TABLE api_operations ADD COLUMN IF NOT EXISTS response_ciphertext JSONB;`
   }
 ] as const;

@@ -448,35 +448,41 @@ export const registerTaskRoutes = (context: RouteContext): void => {
 
   app.patch<{ Params: { taskId: string } }>('/v1/tasks/:taskId', async (request, reply) => {
     const user = requireUser(request.user);
-    return idempotent(request, reply, user, async () => {
-      const input = UpdateTaskRequest.parse(request.body ?? {});
-      const task = await store.getTask(user.id, request.params.taskId);
-      if (!task) throw new AthanorError('task_not_found', 'Task not found');
-      const workspace = await store.getWorkspace(user.id, task.workspaceId);
-      if (!workspace?.wrappedKey)
-        throw new AthanorError('workspace_not_found', 'Workspace not found');
-      let current = task;
-      if (input.pinned !== undefined || input.archived !== undefined) {
-        const filed = await store.updateTaskFiling(user.id, task.id, {
-          ...(input.pinned === undefined ? {} : { pinned: input.pinned }),
-          ...(input.archived === undefined ? {} : { archived: input.archived })
-        });
-        if (!filed) throw new AthanorError('task_not_found', 'Task not found');
-        current = filed;
-      }
-      if (input.title === undefined) return privateTaskResponse(current, workspace);
-      const key = unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id);
-      const renamed = await store.renameTask(
-        user.id,
-        task.id,
-        encryptJson({ title: input.title }, key, `task-title:${workspace.id}`),
-        // The request has not changed, but the vector holds both surfaces and a tsvector cannot be
-        // half-rewritten, so the opening is re-tokenized from the task's own ciphertext.
-        nameIndexFor(input.title, openPrompt(task, key), key)
-      );
-      if (!renamed) throw new AthanorError('task_not_found', 'Task not found');
-      return privateTaskResponse(renamed, workspace);
-    });
+    return idempotent(
+      request,
+      reply,
+      user,
+      async () => {
+        const input = UpdateTaskRequest.parse(request.body ?? {});
+        const task = await store.getTask(user.id, request.params.taskId);
+        if (!task) throw new AthanorError('task_not_found', 'Task not found');
+        const workspace = await store.getWorkspace(user.id, task.workspaceId);
+        if (!workspace?.wrappedKey)
+          throw new AthanorError('workspace_not_found', 'Workspace not found');
+        let current = task;
+        if (input.pinned !== undefined || input.archived !== undefined) {
+          const filed = await store.updateTaskFiling(user.id, task.id, {
+            ...(input.pinned === undefined ? {} : { pinned: input.pinned }),
+            ...(input.archived === undefined ? {} : { archived: input.archived })
+          });
+          if (!filed) throw new AthanorError('task_not_found', 'Task not found');
+          current = filed;
+        }
+        if (input.title === undefined) return privateTaskResponse(current, workspace);
+        const key = unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id);
+        const renamed = await store.renameTask(
+          user.id,
+          task.id,
+          encryptJson({ title: input.title }, key, `task-title:${workspace.id}`),
+          // The request has not changed, but the vector holds both surfaces and a tsvector cannot be
+          // half-rewritten, so the opening is re-tokenized from the task's own ciphertext.
+          nameIndexFor(input.title, openPrompt(task, key), key)
+        );
+        if (!renamed) throw new AthanorError('task_not_found', 'Task not found');
+        return privateTaskResponse(renamed, workspace);
+      },
+      { databaseOnly: true }
+    );
   });
 
   app.delete<{ Params: { taskId: string } }>('/v1/tasks/:taskId', async (request, reply) => {
@@ -681,13 +687,19 @@ export const registerTaskRoutes = (context: RouteContext): void => {
     '/v1/tasks/:taskId/spend-ceiling',
     async (request, reply) => {
       const user = requireUser(request.user);
-      return idempotent(request, reply, user, async () => {
-        const input = RaiseTaskSpendCeilingRequest.parse(request.body);
-        const task = await store.getTask(user.id, request.params.taskId);
-        if (!task) throw new AthanorError('task_not_found', 'Task not found');
-        await store.raiseTaskSpendCeiling(user.id, task.id, input.maxSpendUsd);
-        return privateTaskResponse((await store.getTask(user.id, task.id))!);
-      });
+      return idempotent(
+        request,
+        reply,
+        user,
+        async () => {
+          const input = RaiseTaskSpendCeilingRequest.parse(request.body);
+          const task = await store.getTask(user.id, request.params.taskId);
+          if (!task) throw new AthanorError('task_not_found', 'Task not found');
+          await store.raiseTaskSpendCeiling(user.id, task.id, input.maxSpendUsd);
+          return privateTaskResponse((await store.getTask(user.id, task.id))!);
+        },
+        { databaseOnly: true }
+      );
     }
   );
 
@@ -695,57 +707,63 @@ export const registerTaskRoutes = (context: RouteContext): void => {
     '/v1/tasks/:taskId/:action',
     async (request, reply) => {
       const user = requireUser(request.user);
-      return idempotent(request, reply, user, async () => {
-        const action = request.params.action;
-        if (!['pause', 'resume', 'cancel'].includes(action))
-          throw new AthanorError('invalid_action', 'Unsupported task action');
-        const task = await store.getTask(user.id, request.params.taskId);
-        if (!task) throw new AthanorError('task_not_found', 'Task not found');
-        if (['completed', 'failed', 'cancelled'].includes(task.status))
-          throw new AthanorError('invalid_task_state', 'A finished task cannot be changed', 409);
-        if (
-          action === 'resume' &&
-          !(resumableTaskStatuses as readonly string[]).includes(task.status)
-        )
-          throw new AthanorError(
-            'invalid_task_state',
-            'Only paused or resource-waiting tasks can be resumed',
-            409
-          );
-        const status = action === 'pause' ? 'paused' : 'queued';
-        if (action === 'cancel') {
-          await store.cancelTaskAndReleaseReservations(user.id, task.id);
-          await stopCodingMissionFamily(context, task);
-        } else {
-          if (action === 'resume') {
-            /*
-             * Resume used to re-queue a run a ceiling had stopped, straight back into the same
-             * ceiling: the worker asks the guard again before its first step, gets the same denial,
-             * and pauses. From the outside that is a Resume button that does nothing - press it,
-             * watch the status flick to queued and back to paused, with no more explanation the
-             * second time than the first.
-             *
-             * The guard is therefore asked here, before anything is re-queued. It is asked and not
-             * assumed because the answer moves on its own: a daily window rolls over at midnight, so
-             * the run that could not resume last night resumes this morning with nothing changed.
-             * Only a ceiling that would still stop it refuses, and it refuses saying which one and
-             * with what figures, so the next thing the owner does can be the thing that works.
-             */
-            const verdict = await store.spendGuard({
-              userId: user.id,
-              taskId: task.id,
-              estimateUsd: 0,
-              includeOpenCommitments: true
-            });
-            if (verdict.outcome === 'deny')
-              throw new AthanorError('spend_cap_reached', spendHalt(verdict));
-            await ensureProjectExecution(context, task);
+      return idempotent(
+        request,
+        reply,
+        user,
+        async () => {
+          const action = request.params.action;
+          if (!['pause', 'resume', 'cancel'].includes(action))
+            throw new AthanorError('invalid_action', 'Unsupported task action');
+          const task = await store.getTask(user.id, request.params.taskId);
+          if (!task) throw new AthanorError('task_not_found', 'Task not found');
+          if (['completed', 'failed', 'cancelled'].includes(task.status))
+            throw new AthanorError('invalid_task_state', 'A finished task cannot be changed', 409);
+          if (
+            action === 'resume' &&
+            !(resumableTaskStatuses as readonly string[]).includes(task.status)
+          )
+            throw new AthanorError(
+              'invalid_task_state',
+              'Only paused or resource-waiting tasks can be resumed',
+              409
+            );
+          const status = action === 'pause' ? 'paused' : 'queued';
+          if (action === 'cancel') {
+            await store.cancelTaskAndReleaseReservations(user.id, task.id);
+            await stopCodingMissionFamily(context, task);
+          } else {
+            if (action === 'resume') {
+              /*
+               * Resume used to re-queue a run a ceiling had stopped, straight back into the same
+               * ceiling: the worker asks the guard again before its first step, gets the same denial,
+               * and pauses. From the outside that is a Resume button that does nothing - press it,
+               * watch the status flick to queued and back to paused, with no more explanation the
+               * second time than the first.
+               *
+               * The guard is therefore asked here, before anything is re-queued. It is asked and not
+               * assumed because the answer moves on its own: a daily window rolls over at midnight, so
+               * the run that could not resume last night resumes this morning with nothing changed.
+               * Only a ceiling that would still stop it refuses, and it refuses saying which one and
+               * with what figures, so the next thing the owner does can be the thing that works.
+               */
+              const verdict = await store.spendGuard({
+                userId: user.id,
+                taskId: task.id,
+                estimateUsd: 0,
+                includeOpenCommitments: true
+              });
+              if (verdict.outcome === 'deny')
+                throw new AthanorError('spend_cap_reached', spendHalt(verdict));
+              await ensureProjectExecution(context, task);
+            }
+            await store.setTaskStatusForUser(user.id, task.id, status);
           }
-          await store.setTaskStatusForUser(user.id, task.id, status);
-        }
-        log.info('task.action', { taskId: task.id, userId: user.id, kind: action, status });
-        return privateTaskResponse((await store.getTask(user.id, task.id))!);
-      });
+          log.info('task.action', { taskId: task.id, userId: user.id, kind: action, status });
+          return privateTaskResponse((await store.getTask(user.id, task.id))!);
+        },
+        { databaseOnly: true }
+      );
     }
   );
 

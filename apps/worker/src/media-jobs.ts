@@ -3,17 +3,10 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { decryptJson, encryptJson, sha256, unwrapDataKey } from '@athanor/core';
 import { agentNotificationAad, type DataStore, type MediaJobRecord } from '@athanor/data';
 import { VideoClient, VideoSubmissionUncertainError } from '@athanor/model-gateway';
-import type { VideoGenerationRequest } from '@athanor/model-gateway';
 import { AgentRunnerClient, withRunnerAbort } from './runner-client.js';
 import { MediaBatchWorker } from './media-batches.js';
 
-export interface StoredVideoRequest {
-  provider: { baseUrl: string; apiKey: string; apiProtocol: 'openrouter' | 'openai' };
-  input: Omit<VideoGenerationRequest, 'signal'>;
-  quoteUsd: number | null;
-}
-export const mediaJobAad = (id: string) => `provider-media-job:${id}`;
-export const mediaJobErrorAad = (id: string) => `provider-media-error:${id}`;
+import { mediaJobAad, mediaJobErrorAad, type StoredVideoRequest } from './media-job-domain.js';
 export interface MediaJobWorkerOptions {
   store: DataStore;
   masterKey: Buffer;

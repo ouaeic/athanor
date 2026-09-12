@@ -383,9 +383,7 @@ describe('the model a compaction runs on', () => {
     expect(await summariserUsed(async () => pinned)).toBe(pinned.id);
   });
 
-  it('falls back to the automatic pick when the pin cannot be honoured', async () => {
-    // A summary must never take a long turn down: an unresolvable pin is a preference nobody can
-    // act on, not a failure, and the run carries on exactly as it did before one was expressed.
+  it('uses the automatic pick when the owner left this purpose automatic', async () => {
     expect(await summariserUsed(async () => null)).toBe(SUMMARISER.id);
   });
 

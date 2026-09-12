@@ -1420,7 +1420,14 @@ def candidate_files(root: Path, max_files: int) -> Iterable[Path]:
 
 def search_command(args: argparse.Namespace) -> dict[str, object]:
     root = safe_target(args.path, directory_ok=True)
-    files = [root] if root.is_file() else list(candidate_files(root, args.max_files))
+    from itertools import islice
+
+    candidates_walk = iter([root]) if root.is_file() else candidate_files(
+        root, args.file_offset + args.max_files + 1
+    )
+    page = list(islice(candidates_walk, args.file_offset, args.file_offset + args.max_files + 1))
+    has_more = len(page) > args.max_files
+    files = page[:args.max_files]
     query_terms = list(dict.fromkeys(term.lower() for term in TOKEN.findall(args.query)))
     if not query_terms:
         raise ValueError("Search query must contain at least one word")
@@ -1511,6 +1518,13 @@ def search_command(args: argparse.Namespace) -> dict[str, object]:
             break
     # The sentences that have to travel with these results rather than be worked out from them.
     notes: list[str] = []
+    if has_more:
+        notes.append(
+            f"This search reached its limit of {args.max_files} files and is incomplete. "
+            f"Continue with fileOffset={args.file_offset + len(files)} and the same query/path, "
+            "or narrow the folder. No matches on this page does not mean no matches in the folder. "
+            "Pages scan the current file list; restart from zero if files change during the search."
+        )
     if unread:
         notes.append(
             f"{plural(len(unread), 'document')} of {len(files)} could not be read as text, so "
@@ -1535,6 +1549,12 @@ def search_command(args: argparse.Namespace) -> dict[str, object]:
         "query": args.query,
         "path": os.path.relpath(root, Path.cwd()),
         "filesConsidered": len(files),
+        "coverage": {
+            "fileOffset": args.file_offset,
+            "fileLimit": args.max_files,
+            "hasMore": has_more,
+            "nextFileOffset": args.file_offset + len(files) if has_more else None,
+        },
         "filesSkipped": failures,
         "filesUnread": len(unread),
         # Named individually, up to a point: a folder where nothing at all could be read would
@@ -1562,6 +1582,7 @@ def parser() -> argparse.ArgumentParser:
     search.add_argument("--path", default=".")
     search.add_argument("--query", required=True)
     search.add_argument("--max-files", type=int, default=500)
+    search.add_argument("--file-offset", type=int, default=0)
     search.add_argument("--max-results", type=int, default=12)
     search.add_argument("--max-pages", type=int, default=500)
     search.add_argument("--excerpt-chars", type=int, default=2_400)
@@ -1588,6 +1609,8 @@ def main() -> int:
             payload = {"text": workbook_text(safe_target(args.path), openpyxl)}
         else:
             args.max_files = min(2_000, max(1, args.max_files))
+            if args.file_offset < 0 or args.file_offset > 1_000_000:
+                raise ValueError("File offset must be between 0 and 1000000")
             args.max_results = min(50, max(1, args.max_results))
             args.max_pages = min(10_000, max(1, args.max_pages))
             args.excerpt_chars = min(8_000, max(300, args.excerpt_chars))

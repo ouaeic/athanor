@@ -271,7 +271,10 @@ export class MaintenanceStore {
        WHERE expires_at < NOW() - INTERVAL '30 days'
           OR (revoked_at IS NOT NULL AND revoked_at < NOW() - INTERVAL '30 days')`
     );
-    await this.database.query('DELETE FROM api_operations WHERE expires_at <= NOW()');
+    // Unresolved effects need reconciliation; expiry must not authorize another attempt.
+    await this.database.query(
+      "DELETE FROM api_operations WHERE expires_at <= NOW() AND state='completed'"
+    );
     await this.database.query('DELETE FROM connector_oauth_attempts WHERE expires_at <= NOW()');
     await this.database.query(
       "DELETE FROM security_events WHERE created_at < NOW() - ($1 * INTERVAL '1 day')",

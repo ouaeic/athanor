@@ -62,30 +62,17 @@ export async function resolveTaskPurposeModel(
   return result.model;
 }
 
-/**
- * The model an owner pinned for one auxiliary job, or nothing when they left it automatic.
- *
- * Auxiliary calls already route themselves - `compactionModel` takes the cheapest capable route on
- * the task's own provider - and that is the right answer when nobody has an opinion, so the absence
- * of a pin has to mean "carry on as before" rather than "resolve something". Hence a nullable
- * answer rather than the throwing resolver above: a pin that cannot be honoured on this task's
- * provider or privacy route must not take a long turn down over a summary, so it falls back to the
- * automatic pick with the owner none the wiser until they open the settings that say so.
- */
+/** A null choice means automatic; unreadable preferences and unavailable pins fail closed. */
 export async function pinnedPurposeModel(
   context: PurposeContext,
   task: TaskRecord,
   purpose: 'summarise' | 'title',
   catalog: readonly ModelRelease[]
 ): Promise<ModelRelease | null> {
-  try {
-    const { project, global } = await preferences(context, task);
-    const { choice } = resolvePurposeChoice(purpose, project.choices, global);
-    if (choice.automatic) return null;
-    return await resolveTaskPurposeModel(context, task, purpose, catalog);
-  } catch {
-    return null;
-  }
+  const { project, global } = await preferences(context, task);
+  const { choice } = resolvePurposeChoice(purpose, project.choices, global);
+  if (choice.automatic) return null;
+  return resolveTaskPurposeModel(context, task, purpose, catalog);
 }
 
 export async function applyProjectMainModel(

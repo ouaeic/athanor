@@ -9,6 +9,11 @@
       "development": "./src/agent.ts",
       "default": "./dist/agent.js"
     },
+    "./media-job-domain": {
+      "types": "./src/media-job-domain.ts",
+      "development": "./src/media-job-domain.ts",
+      "default": "./dist/media-job-domain.js"
+    },
     "./media-jobs": {
       "types": "./src/media-jobs.ts",
       "development": "./src/media-jobs.ts",

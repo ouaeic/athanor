@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { decryptJson, encryptJson } from '@athanor/core';
 import { queueVideoGeneration } from './media-generation.js';
-import { mediaJobAad, type StoredVideoRequest } from './media-jobs.js';
+import { mediaJobAad, type StoredVideoRequest } from './media-job-domain.js';
 import type { ToolContext } from './tool-dispatch.js';
 import type { InferenceCredential } from './agent-state.js';
 const key = Buffer.alloc(32, 7);

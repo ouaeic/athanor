@@ -101,6 +101,11 @@ export async function executeDocumentTool(
       if (!query) throw new AthanorError('document_query_empty', 'Document search needs a query');
       const path = textValue(call.arguments.path, 'workspace');
       const maxFiles = clampNumber(call.arguments.maxFiles, { min: 1, max: 2_000, fallback: 500 });
+      const fileOffset = clampNumber(call.arguments.fileOffset, {
+        min: 0,
+        max: 1_000_000,
+        fallback: 0
+      });
       const maxResults = clampNumber(call.arguments.maxResults, { min: 1, max: 50, fallback: 12 });
       const maxPages = clampNumber(call.arguments.maxPages, { min: 1, max: 10_000, fallback: 500 });
       const result = await context.runner.call<ExecObservation>(
@@ -121,7 +126,8 @@ export async function executeDocumentTool(
             '--max-results',
             String(maxResults),
             '--max-pages',
-            String(maxPages)
+            String(maxPages),
+            ...(fileOffset > 0 ? ['--file-offset', String(fileOffset)] : [])
           ],
           cwd: '.',
           timeoutSeconds: 300,

@@ -465,18 +465,8 @@ describe('what the acceptance suite openly does not do', () => {
     ]);
   });
 
-  /**
-   * The suite clock reaches a command check and does not reach a render proof.
-   *
-   * `remainingSeconds` clamps the exec above, so a command both starts and finishes inside
-   * `ACCEPTANCE_SUITE_DEADLINE_SECONDS`. `/document/render-proof` takes no timeout in its request
-   * schema, so nothing here can hand it one and the render is bounded only by the runner's own
-   * SIGKILL timers - which is why the constant's comment says the deadline is one to start inside
-   * rather than a wall the suite ends at. Pinned on the request body because that is where the
-   * asymmetry lives: the day the runner grows the field and this call passes it, this row fails and
-   * that paragraph gets rewritten.
-   */
-  it('hands the render proof no timeout at all, because the runner takes none', async () => {
+  it('passes the absolute suite deadline to render verification', async () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1000);
     const probed = probe((body) =>
       'executable' in body
         ? { exitCode: 0, stdout: '', stderr: '', durationMs: 1, timedOut: false }
@@ -500,6 +490,9 @@ describe('what the acceptance suite openly does not do', () => {
     expect(results[0]?.passed).toBe(true);
     const proof = probed.calls.find((call) => call.path.endsWith('/document/render-proof'));
     expect(proof, 'the render proof was asked for at all').toBeTruthy();
-    expect(Object.keys(proof?.body ?? {}).sort()).toEqual(['expectPages', 'marginPoints', 'path']);
+    expect(proof?.body).toMatchObject({
+      deadlineAt: 1000 + ACCEPTANCE_SUITE_DEADLINE_SECONDS * 1000
+    });
+    clock.mockRestore();
   });
 });

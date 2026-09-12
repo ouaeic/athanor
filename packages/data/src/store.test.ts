@@ -2140,7 +2140,7 @@ describe('DataStore', () => {
     ).resolves.toBeNull();
   });
 
-  it('replays completed operations, rejects cross-operation keys, and retries failed work', async () => {
+  it('replays sealed operations and retains unresolved claims', async () => {
     const user = await store.createUser({ username: 'grace', displayName: 'Grace' });
     const input = {
       userId: user.id,
@@ -2150,12 +2150,13 @@ describe('DataStore', () => {
       requestHash: 'hash-a'
     };
     await expect(store.beginOperation(input)).resolves.toBeNull();
-    await store.completeOperation(user.id, input.idempotencyKey, 200, { id: 'one' });
+    const receipt = encryptJson({ id: 'one' }, generateDataKey(), 'receipt-test');
+    await store.completeOperation(user.id, input.idempotencyKey, 200, receipt);
     await expect(store.beginOperation(input)).resolves.toMatchObject({
       state: 'completed',
       method: 'POST',
       path: '/v1/workspaces',
-      responseBody: { id: 'one' }
+      responseCiphertext: receipt
     });
     await expect(store.beginOperation({ ...input, path: '/v1/tasks' })).resolves.toMatchObject({
       path: '/v1/workspaces',
@@ -2165,7 +2166,7 @@ describe('DataStore', () => {
     const retry = { ...input, idempotencyKey: 'stable-key-0002' };
     await expect(store.beginOperation(retry)).resolves.toBeNull();
     await store.failOperation(user.id, retry.idempotencyKey);
-    await expect(store.beginOperation(retry)).resolves.toBeNull();
+    await expect(store.beginOperation(retry)).resolves.toMatchObject({ state: 'failed' });
   });
 
   it('queues only undelivered generic notification references for new device subscriptions', async () => {

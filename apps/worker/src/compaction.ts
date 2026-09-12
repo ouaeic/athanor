@@ -169,18 +169,7 @@ export const compactTurnContext = async (
     input.maxOutputTokens,
     input.reservedTokens
   );
-  /*
-   * The owner's choice first, the automatic pick otherwise.
-   *
-   * `compactionModel` takes the cheapest capable route on this task's provider, which is the right
-   * answer when nobody has said anything - and it is what every run did before this. What it could
-   * not do is be overruled: an owner who wanted their summarising on one particular route had no
-   * way to say so, and this is not a small number - the context rig records around a million
-   * summariser tokens per configuration, spent on a task's longest and most expensive turns.
-   *
-   * A pin that cannot be honoured resolves to nothing rather than throwing, so a summary never
-   * takes a long turn down.
-   */
+  // Resolve preferences before changing context; an unreadable pin must not choose a different route.
   const catalogue = await deps.currentCatalog(input.catalog);
   const summariser =
     (await deps.pinnedSummariser?.(task, catalogue)) ??

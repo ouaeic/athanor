@@ -345,6 +345,44 @@ try {
   assert.equal(brokenPayload.filesConsidered, 5);
   assert.equal(brokenPayload.filesSkipped, 1);
 
+  const largeFolder = path.join(root, 'large-folder');
+  await mkdir(largeFolder);
+  await Promise.all(
+    Array.from({ length: 501 }, (_, i) =>
+      writeFile(
+        path.join(largeFolder, `${String(i).padStart(4, '0')}.txt`),
+        i === 500 ? 'Hiddenquartz only appears beyond the first page.' : 'Ordinary unrelated text.'
+      )
+    )
+  );
+  const firstPage = runIn(largeFolder, {}, 'search', '--query', 'Hiddenquartz');
+  assert.equal(firstPage.status, 0, firstPage.stderr);
+  const limited = JSON.parse(firstPage.stdout);
+  assert.equal(limited.filesConsidered, 500);
+  assert.deepEqual(limited.results, []);
+  assert.equal(limited.coverage.hasMore, true);
+  assert.equal(limited.coverage.nextFileOffset, 500);
+  assert.match(limited.note, /incomplete/);
+  const lastPage = runIn(
+    largeFolder,
+    {},
+    'search',
+    '--query',
+    'Hiddenquartz',
+    '--file-offset',
+    String(limited.coverage.nextFileOffset)
+  );
+  assert.equal(lastPage.status, 0, lastPage.stderr);
+  const continued = JSON.parse(lastPage.stdout);
+  assert.equal(continued.results.length, 1);
+  assert.equal(continued.results[0].path, '0500.txt');
+  assert.equal(continued.coverage.hasMore, false);
+  assert.equal(continued.coverage.nextFileOffset, null);
+  const exact = runIn(largeFolder, {}, 'search', '--query', 'Hiddenquartz', '--max-files', '501');
+  assert.equal(exact.status, 0, exact.stderr);
+  assert.equal(JSON.parse(exact.stdout).coverage.hasMore, false);
+  await rm(largeFolder, { recursive: true });
+
   const empty = run('search', '--path', '.', '--query', '!!!');
   assert.notEqual(empty.status, 0);
   assert.match(empty.stderr, /at least one word/);
