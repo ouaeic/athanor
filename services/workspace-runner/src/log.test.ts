@@ -111,7 +111,7 @@ describe('the journal this process writes', () => {
   it('marks the priority for journald, and only when journald is reading', () => {
     const { logger, lines } = capture();
     vi.stubEnv('JOURNAL_STREAM', '8:1234567');
-    logger.warn('browser.isolated_sandbox_off', { sandbox: false });
+    logger.warn('browser.reduced_launch', { headless: true, sandbox: true });
     expect(lines[0]!.startsWith('<4>')).toBe(true);
     expect(JSON.parse(lines[0]!.slice(3))).toMatchObject({ level: 'warn' });
     // The whole map, because it is what `scripts/check-repository.mjs` holds against the worker's.
@@ -122,7 +122,7 @@ describe('the journal this process writes', () => {
     vi.stubEnv('JOURNAL_STREAM', undefined);
     // Started in a terminal there is no journal to file anything in, so the line is JSON and
     // nothing else - a runner run by hand must not print `<4>` at the owner.
-    logger.warn('browser.isolated_sandbox_off', { sandbox: false });
+    logger.warn('browser.reduced_launch', { headless: true, sandbox: true });
     expect(lines[1]!.startsWith('{')).toBe(true);
     expect(journalLevelPrefix('warn')).toBe('');
   });
