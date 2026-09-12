@@ -1294,7 +1294,7 @@ const copiedConstants = [
   },
   {
     what: 'what each security mode stops for',
-    owner: 'apps/worker/src/approval-policy.ts',
+    owner: 'apps/worker/src/approval-common.ts',
     copy: 'apps/web/src/asking-rules.ts',
     /*
      * The one copied constant that is prose, and it earns the place the numbers above hold.
