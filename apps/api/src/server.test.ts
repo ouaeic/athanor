@@ -6412,6 +6412,7 @@ describe('a half-typed message', () => {
     expect({ ...draft, updatedAt: 'checked separately' }).toEqual({
       workspaceId,
       taskId: null,
+      revision: 1,
       body: 'a sentence begun on another device',
       controls: {
         modelId: 'test/model',

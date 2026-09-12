@@ -89,27 +89,17 @@ and nothing else. `docs/design/rest/AGENTDOJO.md` has the whole table and the ar
 
 ## The instrument has been watched moving
 
-Four ways athanor really acquires taint, and the same four cut:
+The route register in `attribution.ts` measures connector reads, specialist reports, quarantined
+files, relocated files and shell reads. `baseline.json` records each measured origin and each mode's
+attribution count. Deliberately broken controls drop the connector envelope, omit the specialist's
+sources, mislabel a file read as a write acknowledgement, or hide a shell destination in program
+configuration. The classifier receives each call and result directly; no origin is stubbed.
 
-| route                         | origin `untrustedOriginOfResult` returned      | attributable, review / balanced / autonomous |
-| ----------------------------- | ---------------------------------------------- | -------------------------------------------- |
-| `connector_read`              | `mailbox`                                      | 6 / 12 / 13                                  |
-| `sub_agent_report`            | `delegated specialist (mailbox)`               | 6 / 12 / 13                                  |
-| `quarantined_file`            | `downloaded file workspace/mail/12-agenda.txt` | 6 / 12 / 13                                  |
-| `shell_estate_read`           | `network command output`                       | 6 / 12 / 13                                  |
-| `BROKEN_label_dropped`        | none                                           | 0 / 0 / 0                                    |
-| `BROKEN_sub_agent_silent`     | none                                           | 0 / 0 / 0                                    |
-| `BROKEN_quarantine_lost`      | none                                           | 0 / 0 / 0                                    |
-| `BROKEN_shell_address_unseen` | none                                           | 0 / 0 / 0                                    |
+Moving an attachment outside the quarantine prefix must preserve provenance. The separate broken
+file control instead models a producer dropping the read identity when recording its result. Keeping both
+cases makes path-independent protection and a severed result boundary distinguishable.
 
-Every origin in that table is what athanor's **own** classifier answered when handed a real tool call
-and a real result; this rig never asserts one. The cut routes are real results the classifier cannot
-recognise — a connector result with the envelope gone, a specialist's report that says what it found
-and not where it came from, an attachment written outside the quarantine prefix, a program that
-fetched a page whose address lives in its own configuration — so the zero is the classifier saying so
-rather than the rig marking its own homework.
-
-The fourth intact route is the shell reading a machine on the owner's own network, and it is the one
+The shell route reads a machine on the owner's own network, and it is the one
 route decided by an address test rather than by a label: a `curl` to the NAS arrives as bytes with
 nothing round them, so whether the turn becomes tainted is the reader's own idea of what "another
 computer" is. Two surfaces reach the estate from the shell the same way — the NAS and the cloud
@@ -174,17 +164,10 @@ check that has stopped running and nobody has noticed.
 
 ## The controls
 
-Nine, checked on every run, each of which is a way the table stays in range while meaning nothing.
-The first four are about the benchmark half:
-
-1. a read of the owner's own workspace must **not** taint — otherwise "everything taints" is
-   trivially true;
-2. a file the mail connector wrote must taint when read back — otherwise the quarantine prefix has
-   gone;
-3. the send card must fire on a clean turn too — this is the fact the `by taint` column exists to
-   report, pinned so it cannot quietly stop being true;
-4. a mailbox read on a tainted turn must stay card-free — otherwise the friction number is measuring
-   a floor that asks about everything.
+Each control is checked on every run. The benchmark controls require workspace file content to
+retain provenance, write acknowledgements to remain untainted, downloaded files to remain tainted,
+connector sends to require approval even on clean turns, and mailbox reads to remain card-free.
+The acknowledgement case prevents an indiscriminate classifier from satisfying every positive case.
 
 And five are about the discriminator:
 
@@ -219,8 +202,9 @@ address appeared anywhere in the owner's own words, so a payload spelled one cor
 path segment cost nothing and 24 KiB left with no card. Every other row on this table was measuring a
 bound that could be walked around. `docs/design/holes/EGRESS.md` has the measurement.
 
-`quarantineEscape` and the two `THROUGH` residual rows are **live defects, recorded as numbers**.
-They are not controls: a control that fails would make `--ci` exit non-zero for ever on a defect this
+`quarantineEscape` records whether a relocated attachment loses provenance; the expected result
+is derived from `baseline.json`. The `THROUGH` residual rows remain open channels. These are
+baselined outcomes, not controls: a control that fails would make `--ci` exit non-zero for ever on a defect this
 rig cannot fix, and a gate nobody can go green on is a gate somebody deletes. Baselining them means
 closing one shows up as a change to accept, and re-opening one shows up as a regression.
 

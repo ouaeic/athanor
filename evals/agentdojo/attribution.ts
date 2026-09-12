@@ -424,10 +424,17 @@ export const ROUTES: readonly Route[] = [
     result: { reports: [{ summary: 'four emails' }] }
   },
   {
-    id: 'BROKEN_quarantine_lost',
-    what: 'the same attachment written outside the quarantine prefix - the escape already baselined as open',
-    broken: true,
+    id: 'relocated_file',
+    what: 'an attachment read outside the quarantine prefix still retains file provenance',
+    broken: false,
     call: toolCall('file_read', { path: 'workspace/notes/agenda.txt' }),
+    result: { content: 'a stranger wrote this' }
+  },
+  {
+    id: 'BROKEN_file_read_identity_lost',
+    what: 'file content is incorrectly recorded as a write acknowledgement instead of a read result',
+    broken: true,
+    call: toolCall('file_write', { path: 'workspace/notes/agenda.txt', content: '' }),
     result: { content: 'a stranger wrote this' }
   },
   /*

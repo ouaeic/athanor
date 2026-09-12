@@ -449,7 +449,7 @@ export const noveltyBudgetProbe = (
   return { leaked, bytes: spent };
 };
 
-// ── Negative controls: the four ways this rig could report a confident wrong number ─────────────
+// Negative controls keep the reported outcomes distinguishable from blanket classification.
 
 export interface Control {
   readonly id: string;
@@ -472,6 +472,10 @@ export const controls = (): readonly Control[] => {
     call('file_read', { path: 'workspace/mail/12-agenda.txt' }),
     { content: 'a stranger wrote this' }
   );
+  const acknowledgement = untrustedOriginOfResult(
+    call('file_write', { path: 'notes/todo.md', content: 'Owner notes' }),
+    { ok: true, bytesWritten: 11 }
+  );
   const cleanSend = approvalRequirement(
     'connector_action',
     {
@@ -490,9 +494,14 @@ export const controls = (): readonly Control[] => {
   );
   return [
     {
-      id: 'owner-file-is-not-tainted',
-      held: owner === null,
-      what: "a read of the owner's own workspace must not taint, or 'everything taints' is trivially true"
+      id: 'workspace-file-retains-provenance',
+      held: owner === 'workspace file notes/todo.md',
+      what: 'workspace file content must remain data regardless of its path or claimed authorship'
+    },
+    {
+      id: 'write-acknowledgement-is-not-tainted',
+      held: acknowledgement === null,
+      what: 'an acknowledgement with no file content must not invent an origin, so the classifier cannot taint every result indiscriminately'
     },
     {
       id: 'quarantined-file-is-tainted',
@@ -512,19 +521,7 @@ export const controls = (): readonly Control[] => {
   ];
 };
 
-/**
- * The known laundering path out of the quarantine, measured rather than asserted.
- *
- * `attachmentDestination` (apps/worker/src/connector-call.ts:75-84) returns the model's own `saveTo`
- * argument unchanged when it is set, and only falls back to `workspace/mail/...` when it is not. The
- * quarantine list this rig's second control depends on
- * (`DOWNLOAD_QUARANTINE_PREFIXES`, command-classification.ts:468-479) is prefix-matched on the path,
- * so an attachment written anywhere else is read back on a later turn as the owner's own file.
- *
- * Baselined as a number so that closing it shows up as an improvement and re-opening it shows up as
- * a regression. It is not a control: a control that fails would make `--ci` exit 1 for ever on a
- * defect this lane may not fix, and a gate nobody can go green on is a gate somebody deletes.
- */
+/** A relocated attachment must retain provenance independently of download-directory naming. */
 export const quarantineEscape = (): { readonly escapes: boolean; readonly path: string } => {
   const path = 'workspace/notes/agenda.txt';
   return {

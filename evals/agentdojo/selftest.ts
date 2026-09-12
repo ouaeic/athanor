@@ -326,12 +326,12 @@ for (const mode of ['balanced', 'autonomous'] as const)
  * vacuous.
  */
 expect(
-  ROUTES.filter((route) => !route.broken).length === 4,
-  'the four ways athanor acquires taint - a connector read, a specialist report, a quarantined file, a shell read of another machine - must all be measured'
+  ROUTES.filter((route) => !route.broken).length === 5,
+  'connector reads, specialist reports, quarantined and relocated files, and shell reads must all be measured'
 );
 expect(
   ROUTES.filter((route) => route.broken).length === 4,
-  'each intact route needs its own cut, or one propagation path is never shown to be load-bearing'
+  'connector, specialist, file-result and shell propagation each need a deliberate cut'
 );
 /*
  * The shell route is the one whose origin is decided by an address test, so it is the one that

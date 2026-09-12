@@ -382,9 +382,7 @@ export const render = (run: Run): string => {
   }
 
   write('── the instrument moving: taint propagation cut on purpose ────────────────────────────');
-  write(
-    '  Three ways athanor really acquires taint, and the same three broken. Every origin below'
-  );
+  write('  Intact routes and deliberately broken result boundaries. Every origin below');
   write("  is what athanor's own untrustedOriginOfResult answered when handed a real result; this");
   write('  rig never asserts one. An instrument nobody has seen move is not an instrument.');
   write();

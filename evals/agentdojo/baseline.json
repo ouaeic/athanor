@@ -1,5 +1,5 @@
 {
-  "$stamp": "0.2.0@587fca9",
+  "$stamp": "0.2.0@dcf1e70",
   "attempted": 155,
   "registered": 567,
   "modes": {
@@ -151,7 +151,13 @@
       "balanced": 0,
       "autonomous": 0
     },
-    "BROKEN_quarantine_lost": {
+    "relocated_file": {
+      "origin": "workspace file workspace/notes/agenda.txt",
+      "review": 6,
+      "balanced": 12,
+      "autonomous": 13
+    },
+    "BROKEN_file_read_identity_lost": {
       "origin": null,
       "review": 0,
       "balanced": 0,
@@ -176,5 +182,5 @@
     "leaked": 512,
     "bytes": 4096
   },
-  "quarantineEscape": true
+  "quarantineEscape": false
 }
