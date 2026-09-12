@@ -18,7 +18,8 @@ import type {
 import { AthanorError, decryptJson, encryptJson, unwrapDataKey } from '@athanor/core';
 import type { UserRecord, WorkspaceCheckpointRecord } from '@athanor/data';
 import type { z } from 'zod';
-import { checkpointResponse } from '../context.js';
+import { checkpointResponse, ownerPriceCeiling } from '../context.js';
+import { requireMainModel } from '../main-model-selection.js';
 import { requireUser } from '../http/auth-hook.js';
 import type { RouteContext } from '../http/server-context.js';
 import { errorFields } from '../log.js';
@@ -286,9 +287,15 @@ export const registerTrajectoryRoutes = (context: RouteContext): void => {
     const forkPrivacyRoute = (input.privacyRoute ?? parent.privacyRoute) as PrivacyRoute;
     const namesModel = input.modelId !== undefined || input.privacyRoute !== undefined;
     if (runsImmediately || namesModel) {
-      selected = (await modelsForUser(user)).find(
-        (model) => model.id === (input.modelId ?? parent.modelId)
-      );
+      const catalog = await modelsForUser(user);
+      selected = namesModel
+        ? requireMainModel({
+            modelId: input.modelId ?? parent.modelId,
+            catalog,
+            privacyRoute: forkPrivacyRoute,
+            ceiling: ownerPriceCeiling(await store.effectiveSpendLimits(user.id))
+          })
+        : catalog.find((model) => model.id === parent.modelId);
       if (!selected || selected.availability !== 'available')
         throw new AthanorError('model_unavailable', 'The selected model is not available');
       if (namesModel && selected.privacyRoute !== forkPrivacyRoute)

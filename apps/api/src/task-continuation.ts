@@ -15,6 +15,8 @@ import { startTurnState } from '@athanor/worker';
 import type { RouteContext } from './http/server-context.js';
 import { validateTaskReasoning } from './task-reasoning.js';
 import { replyToCodingMission } from './coding-mission-reply.js';
+import { ownerPriceCeiling } from './context.js';
+import { requireMainModel } from './main-model-selection.js';
 
 export type TaskContinuationSnapshot = Pick<
   TaskRecord,
@@ -185,7 +187,15 @@ async function performContinuation(
   const spendCeilingUsd = (await guarded)();
   const catalog = (await catalogRead)();
   const selectedModelId = retained ? task.modelId : (input.modelId ?? task.modelId);
-  const selected = catalog.find((model) => model.id === selectedModelId);
+  const selected =
+    !retained && (input.modelId !== undefined || input.privacyRoute !== undefined)
+      ? requireMainModel({
+          modelId: selectedModelId,
+          catalog,
+          privacyRoute: privacyRoute === 'provider_zdr' ? 'provider_zdr' : 'external',
+          ceiling: ownerPriceCeiling(await store.effectiveSpendLimits(user.id))
+        })
+      : catalog.find((model) => model.id === selectedModelId);
   if (!selected || selected.availability !== 'available' || selected.privacyRoute !== privacyRoute)
     throw new AthanorError(
       'model_unavailable',

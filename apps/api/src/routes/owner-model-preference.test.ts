@@ -327,6 +327,115 @@ const buildHarness = async (options: {
 };
 
 describe('model choices across settings, drafts and the first prompt', () => {
+  test('applies one eligibility and price verdict to named prompt, project, follow-up and schedule choices', async () => {
+    const harness = await buildHarness({ catalogScope: 'reviewed_open_weight' });
+    await harness.store.setSpendLimits({
+      userId: harness.userId,
+      maxInputUsdPerMillionTokens: 5,
+      maxOutputUsdPerMillionTokens: 15,
+      defaultTaskCapUsd: 2,
+      dailyCapUsd: 100,
+      monthlyCapUsd: 200
+    });
+    const beforeLimits = await harness.store.effectiveSpendLimits(harness.userId);
+    const base = catalogue[0]!;
+    const cases = [
+      { model: base, allowed: true },
+      { model: catalogue[2]!, allowed: false },
+      { model: unpricedModel, allowed: true },
+      {
+        model: { ...base, id: 'openrouter/test/no-tools', capabilities: ['chat'] },
+        allowed: false
+      },
+      {
+        model: { ...base, id: 'openrouter/test/short-context', contextTokens: 8_000 },
+        allowed: false
+      },
+      {
+        model: { ...base, id: 'openrouter/test/retired', availability: 'unavailable' },
+        allowed: false
+      },
+      {
+        model: { ...base, id: 'openrouter/test/external', privacyRoute: 'external' },
+        allowed: false
+      }
+    ];
+    expect(cases.length).toBeGreaterThan(0);
+    await harness.store.upsertModels(cases.map((item) => item.model));
+    const headers = { cookie: harness.cookie };
+    const preview = await harness.app.inject({
+      method: 'GET',
+      url: '/v1/models?purpose=main&privacyRoute=provider_zdr',
+      headers
+    });
+    expect(preview.statusCode, preview.body).toBe(200);
+    const options = preview.json<Array<{ id: string; unavailableReason: string | null }>>();
+    expect(options.length).toBeGreaterThan(0);
+    for (const item of cases) {
+      const option = options.find((model) => model.id === item.model.id);
+      if (item.model.privacyRoute === 'external') expect(option).toBeUndefined();
+      else {
+        expect(option, item.model.id).toBeDefined();
+        expect(Boolean(option!.unavailableReason), item.model.id).toBe(!item.allowed);
+      }
+    }
+    const create = (selection: Record<string, unknown>) =>
+      harness.app.inject({
+        method: 'POST',
+        url: '/v1/tasks',
+        headers: { ...headers, 'idempotency-key': crypto.randomUUID() },
+        payload: {
+          workspaceId: harness.workspaceId,
+          prompt: 'Check a model selection',
+          ...selection
+        }
+      });
+    const parent = await create({ modelId: SWIFT });
+    expect(parent.statusCode, parent.body).toBe(200);
+    const parentId = parent.json<{ id: string }>().id;
+    for (const item of [...cases, { model: { id: 'openrouter/test/missing' }, allowed: false }]) {
+      const direct = await create({ modelId: item.model.id });
+      const project = await create({
+        modelChoices: {
+          main: { automatic: false, preference: 'balanced', modelId: item.model.id }
+        }
+      });
+      expect(direct.statusCode, `${item.model.id}: ${direct.body}`).toBe(item.allowed ? 200 : 400);
+      expect(project.statusCode, `${item.model.id}: ${project.body}`).toBe(direct.statusCode);
+      if (item.allowed) {
+        expect(direct.json<{ modelId: string }>().modelId).toBe(item.model.id);
+        expect(project.json<{ modelId: string }>().modelId).toBe(item.model.id);
+      } else {
+        expect(direct.json()).toMatchObject({ error: { code: 'model_unavailable' } });
+        expect(project.json()).toMatchObject({
+          error: {
+            code: 'model_unavailable',
+            message: direct.json<{ error: { message: string } }>().error.message
+          }
+        });
+        const followup = await harness.app.inject({
+          method: 'POST',
+          url: `/v1/tasks/${parentId}/messages`,
+          headers: { ...headers, 'idempotency-key': crypto.randomUUID() },
+          payload: { prompt: 'Use this model', modelId: item.model.id }
+        });
+        expect(followup.statusCode, followup.body).toBe(400);
+        expect(followup.json()).toMatchObject({
+          error: {
+            code: 'model_unavailable',
+            message: direct.json<{ error: { message: string } }>().error.message
+          }
+        });
+      }
+      const schedule = await harness.scheduledModel({ modelId: item.model.id });
+      expect(schedule.statusCode, `${item.model.id}: ${JSON.stringify(schedule)}`).toBe(
+        item.allowed ? 201 : 400
+      );
+    }
+    expect(await harness.store.effectiveSpendLimits(harness.userId)).toEqual(beforeLimits);
+    expect(await harness.store.getNextQueuedTaskMessage(parentId)).toBeNull();
+  });
+
   test('round-trips auxiliary defaults and controls without prompt text, then creates the project with its choices', async () => {
     const harness = await buildHarness({ catalogScope: 'reviewed_open_weight' });
     const headers = { cookie: harness.cookie };

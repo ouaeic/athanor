@@ -708,6 +708,7 @@ export default function Composer({
             <ModelPicker
               label="Model for this direction"
               loadDetails
+              privacyRoute={privacyRoute}
               value={!task && modelChoices.main?.automatic ? '__automatic' : modelId}
               models={models}
               shortcuts={[

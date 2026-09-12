@@ -7,7 +7,7 @@
  * own single-model provider.
  */
 
-import { modelTaskKinds, priceCeilingFields, rankModels } from '@athanor/core';
+import { modelTaskKinds, priceCeilingFields, rankModels, selectPurposeModel } from '@athanor/core';
 import type { ModelTaskKind } from '@athanor/core';
 import { refreshOpenRouterCatalog, seedModels } from '@athanor/model-gateway';
 import { ownerPriceCeiling } from '../context.js';
@@ -73,7 +73,30 @@ export const seedModelCatalog = async (context: ServerBase): Promise<void> => {
 
 export const registerModelRoutes = (context: RouteContext): void => {
   const { app, store, modelsForUser } = context;
-  app.get('/v1/models', async (request) => modelsForUser(requireUser(request.user)));
+  app.get<{ Querystring: { purpose?: string; privacyRoute?: string } }>(
+    '/v1/models',
+    async (request) => {
+      const user = requireUser(request.user);
+      if (request.query.purpose !== 'main') return modelsForUser(user);
+      const [catalog, limits] = await Promise.all([
+        modelsForUser(user),
+        store.effectiveSpendLimits(user.id)
+      ]);
+      const privacyRoute = request.query.privacyRoute === 'external' ? 'external' : 'provider_zdr';
+      return catalog
+        .filter((model) => model.privacyRoute === privacyRoute)
+        .map((model) => ({
+          ...model,
+          unavailableReason: selectPurposeModel({
+            purpose: 'main',
+            choice: { automatic: false, preference: 'balanced', modelId: model.id },
+            catalog: [model],
+            privacyRoute,
+            ceiling: ownerPriceCeiling(limits)
+          }).reason
+        }));
+    }
+  );
   app.get<{
     Querystring: {
       privacyRoute?: 'provider_zdr' | 'external';
@@ -101,10 +124,7 @@ export const registerModelRoutes = (context: RouteContext): void => {
       requiredModalities: ['text'],
       minContextTokens: 16_000,
       preference: request.query.preference ?? 'balanced',
-      // Recommending a route the owner's own ceiling would refuse is how a limit becomes a
-      // suggestion: the picker offers it, the composer sends it as an explicit `modelId`, and the
-      // exemption for an explicit pick - which exists so the owner is never overruled - carries it
-      // straight past the ceiling they set.
+      // Recommendations obey the same rate limits as a named selection.
       ...priceCeilingFields(ownerPriceCeiling(await store.effectiveSpendLimits(user.id))),
       // A kind this server does not know is a client from another version, not a bad request: rank
       // it as general work rather than refusing to answer with the whole catalogue.

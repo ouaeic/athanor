@@ -199,10 +199,11 @@ export function SpendingSettings({ onChange }: { onChange: () => void }) {
               </Field>
             </div>
             <details>
-              <summary>Automatic model price ceiling</summary>
+              <summary>Model price ceiling</summary>
               <p className="muted">
-                These rates guide automatic selection before work begins. A model you choose
-                explicitly can exceed them.
+                These rates constrain automatic and named model selections. Existing work keeps its
+                model until you change it. Unpublished prices cannot be checked against these rates;
+                task and account spending caps still apply.
               </p>
               <div className="management-grid">
                 <Field label="Maximum input price · USD per million tokens">

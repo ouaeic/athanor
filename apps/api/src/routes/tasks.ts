@@ -211,10 +211,10 @@ export const registerTaskRoutes = (context: RouteContext): void => {
       const routed = started(
         modelsForUser(user).then(async (catalog) => {
           const main = input.modelChoices?.main;
-          if (main) {
+          if (main || input.modelId) {
             const resolved = selectPurposeModel({
               purpose: 'main',
-              choice: main,
+              choice: main ?? { automatic: false, preference: 'balanced', modelId: input.modelId! },
               catalog,
               privacyRoute: input.privacyRoute,
               taskKind: inferModelTask(input.prompt),
@@ -234,12 +234,10 @@ export const registerTaskRoutes = (context: RouteContext): void => {
           }
           return {
             catalog,
-            chosen: input.modelId
-              ? null
-              : await pickModelUnderPriceCeiling(user.id, catalog, {
-                  privacyRoute: input.privacyRoute,
-                  taskKind: inferModelTask(input.prompt)
-                })
+            chosen: await pickModelUnderPriceCeiling(user.id, catalog, {
+              privacyRoute: input.privacyRoute,
+              taskKind: inferModelTask(input.prompt)
+            })
           };
         })
       );
@@ -250,9 +248,7 @@ export const registerTaskRoutes = (context: RouteContext): void => {
         throw new AthanorError('workspace_unavailable', 'Workspace is not running');
       const spendCeilingUsd = (await guarded)();
       const { catalog, chosen } = (await routed)();
-      const selected = input.modelId
-        ? catalog.find((model) => model.id === input.modelId)
-        : chosen?.model;
+      const selected = chosen?.model;
       if (
         !selected ||
         selected.availability !== 'available' ||

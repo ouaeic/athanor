@@ -212,9 +212,8 @@ export const createServerSupport = (context: ServerBase) => {
    * with the cheapest route that could have done the work and what it costs, in the same 402 family
    * as the running cap, because both are "this would cost more than you allowed".
    *
-   * An explicit `modelId` on the request never reaches here: the ceiling governs what athanor
-   * chooses for the owner, never what the owner chooses for themselves - `rankModels` is
-   * deliberately built that way and this does not change it.
+   * Named selections use the purpose resolver. This path ranks automatic choices and validates
+   * standing defaults, falling back to the ranking when a default exceeds the rate ceiling.
    *
    * What it now also reads is the dial the owner already set. `OwnerPreferences.model` was
    * validated, persisted and read back by exactly one consumer - the browser - so every pick this

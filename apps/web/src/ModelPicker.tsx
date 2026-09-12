@@ -1,6 +1,6 @@
 import { lazy, Suspense, useState } from 'react';
 import { ChevronDown } from 'lucide-react';
-import type { ModelRelease, MediaModelOption } from '@athanor/contracts';
+import type { ModelRelease, MediaModelOption, PrivacyRoute } from '@athanor/contracts';
 const ModelBrowser = lazy(() => import('./ModelBrowser.js'));
 
 export type PickerModel = Pick<ModelRelease, 'id' | 'displayName' | 'provider'> &
@@ -30,6 +30,7 @@ export interface ModelPickerProps {
   shortcuts?: { value: string; label: string; detail?: string }[];
   disabled?: boolean | undefined;
   loadDetails?: boolean;
+  privacyRoute?: PrivacyRoute;
   onChange: (value: string) => void;
 }
 

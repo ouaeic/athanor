@@ -1,6 +1,6 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Check, Search } from 'lucide-react';
-import { Dialog } from './ui.js';
+import { Dialog, ErrorNotice } from './ui.js';
 import type { ModelPickerProps, PickerModel } from './ModelPicker.js';
 import { mediaRouteIsRetired } from './media-state.js';
 import { get } from './client.js';
@@ -37,6 +37,7 @@ export default function ModelBrowser({
   value,
   models: providedModels,
   loadDetails = false,
+  privacyRoute,
   shortcuts = [],
   onChange,
   onClose
@@ -45,20 +46,33 @@ export default function ModelBrowser({
   const [provider, setProvider] = useState('');
   const [active, setActive] = useState(0);
   const [catalogue, setCatalogue] = useState<PickerModel[]>([]);
+  const [loading, setLoading] = useState(loadDetails);
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const [attempt, setAttempt] = useState(0);
   useEffect(() => {
     if (!loadDetails) return;
     const controller = new AbortController();
-    void get<PickerModel[]>('/v1/models', { signal: controller.signal })
+    setLoading(true);
+    setLoadError(null);
+    const url = privacyRoute
+      ? `/v1/models?purpose=main&privacyRoute=${privacyRoute}`
+      : '/v1/models';
+    void get<PickerModel[]>(url, { signal: controller.signal })
       .then((models) => {
         if (!controller.signal.aborted) setCatalogue(models);
       })
-      .catch(() => undefined);
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) setLoadError(error);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false);
+      });
     return () => controller.abort();
-  }, [loadDetails]);
+  }, [loadDetails, privacyRoute, attempt]);
   const models = useMemo(() => {
-    const byId = new Map(catalogue.map((model) => [model.id, model]));
-    return providedModels.map((model) => ({ ...byId.get(model.id), ...model }));
-  }, [providedModels, catalogue]);
+    if (loadDetails && !loading && !loadError) return catalogue;
+    return providedModels;
+  }, [providedModels, catalogue, loadDetails, loading, loadError]);
   const search = useRef<HTMLInputElement>(null);
   const list = useRef<HTMLDivElement>(null);
   const id = useId();
@@ -86,6 +100,11 @@ export default function ModelBrowser({
         group: providerName(model),
         detail: details(model),
         reason:
+          (loading
+            ? 'Checking availability and limits…'
+            : loadError
+              ? 'Availability could not be checked'
+              : '') ||
           (mediaRouteIsRetired(model)
             ? 'This generation route has retired'
             : model.unavailableReason) ||
@@ -115,7 +134,7 @@ export default function ModelBrowser({
         : []),
       ...concrete
     ];
-  }, [models, shortcuts, query, provider, value]);
+  }, [models, shortcuts, query, provider, value, loading, loadError]);
   useEffect(() => {
     search.current?.focus();
   }, []);
@@ -135,6 +154,7 @@ export default function ModelBrowser({
   return (
     <Dialog title={`Choose ${label.toLowerCase()}`} onClose={onClose} wide>
       <div className="model-browser">
+        <ErrorNotice error={loadError} onRetry={() => setAttempt((value) => value + 1)} />
         <div className="model-browser-search">
           <Search size={18} aria-hidden="true" />
           <input
