@@ -132,10 +132,16 @@ export class BillingStore {
   ): Promise<{ upserted: number; removed: number; retired: number }> {
     if (models.length === 0) return { upserted: 0, removed: 0, retired: 0 };
     const ids = models.map((model) => String(model.id));
-    const providers = [...new Set(models.map((model) => String(model.provider)))];
+    const connections = [
+      ...new Set(models.map((model) => String(model.connectionId ?? model.provider)))
+    ];
     return this.database.transaction(async (transaction) => {
       for (const model of models) await this.#upsertModel(transaction, model);
-      const withdrawn = `provider = ANY($1::text[]) AND NOT (id = ANY($2::text[]))`;
+      const withdrawn = `(CASE
+        WHEN connection_id = 'custom' AND recommendation_tags ? 'Ollama Cloud' THEN 'ollama-cloud'
+        WHEN connection_id = 'custom' AND recommendation_tags ? 'Configured endpoint' THEN 'openai-compatible'
+        ELSE COALESCE(connection_id, provider) END) = ANY($1::text[])
+        AND NOT (id = ANY($2::text[]))`;
       const pinned = `id IN (
            SELECT model_id FROM task_schedules WHERE enabled
            UNION SELECT model_id FROM tasks
@@ -144,11 +150,11 @@ export class BillingStore {
       const retired = await transaction.query(
         `UPDATE model_releases SET availability='unavailable', updated_at=NOW()
          WHERE ${withdrawn} AND ${pinned} AND availability <> 'unavailable'`,
-        [providers, ids]
+        [connections, ids]
       );
       const removed = await transaction.query(
         `DELETE FROM model_releases WHERE ${withdrawn} AND NOT (${pinned})`,
-        [providers, ids]
+        [connections, ids]
       );
       return { upserted: models.length, removed: removed.rowCount, retired: retired.rowCount };
     });
@@ -291,6 +297,9 @@ export class BillingStore {
         providerModelId: String(row.provider_model_id),
         displayName: String(row.display_name),
         provider: String(row.provider),
+        ...(typeof row.connection_id === 'string' && row.connection_id !== 'custom'
+          ? { connectionId: row.connection_id }
+          : {}),
         revision: String(row.revision),
         availability: String(row.availability),
         openness: String(row.openness),

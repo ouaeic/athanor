@@ -65,6 +65,9 @@
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 18px;
 }
+.model-connection-tabs {
+  margin-bottom: 16px;
+}
 .management-grid .span-all {
   grid-column: 1/-1;
 }

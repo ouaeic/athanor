@@ -39,7 +39,13 @@ export const NativeReadOptions = z
   .strict();
 const digest = (bytes: Uint8Array | string) => createHash('sha256').update(bytes).digest('hex');
 const modelBinding = (model: ModelRelease) =>
-  digest(JSON.stringify({ provider: model.provider, model: model.providerModelId }));
+  digest(
+    JSON.stringify({
+      provider: model.provider,
+      connectionId: model.connectionId,
+      model: model.providerModelId
+    })
+  );
 export const nativeCredentialBinding = (secret: InferenceCredential, privacyRoute?: string) => {
   if (
     privacyRoute === 'provider_zdr' &&

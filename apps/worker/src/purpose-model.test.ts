@@ -95,7 +95,8 @@ async function fixture() {
     context: {
       store,
       masterKey,
-      inferenceCredential: async () => ({ provider: 'openai-compatible' as const })
+      connectedModels: async (_task: unknown, catalog: readonly ModelRelease[]) =>
+        catalog.filter((model) => model.provider === 'custom')
     }
   };
 }
@@ -204,7 +205,7 @@ it('uses the connected provider after migration and never falls back to the task
   ).rejects.toMatchObject({ code: 'purpose_model_unavailable' });
   const disconnected = {
     ...f.context,
-    inferenceCredential: async () => {
+    connectedModels: async () => {
       throw new AthanorError('provider_not_connected', 'Disconnected');
     }
   };

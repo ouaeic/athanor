@@ -28,17 +28,19 @@ const catalogue = (
     upserted,
     store: {
       soleUser: async () => ({ id: OWNER }),
-      getManagedProviderCredential: async (userId: string, provider: string) => {
-        if (!savedKey || provider !== 'inference' || userId !== OWNER) return null;
-        return {
-          provider: 'inference',
-          status: 'active',
-          secretCiphertext: encryptJson(
-            { provider: savedProvider, apiKey: savedKey, baseUrl: 'https://endpoint.test/v1' },
-            masterKey,
-            inferenceCredentialAad(OWNER)
-          )
-        };
+      listManagedProviderCredentials: async (userId: string) => {
+        if (!savedKey || userId !== OWNER) return [];
+        return [
+          {
+            provider: 'inference',
+            status: 'active',
+            secretCiphertext: encryptJson(
+              { provider: savedProvider, apiKey: savedKey, baseUrl: 'https://endpoint.test/v1' },
+              masterKey,
+              inferenceCredentialAad(OWNER)
+            )
+          }
+        ];
       },
       listModels: async () => rows,
       replaceModelCatalog: async (models) => {
@@ -100,7 +102,10 @@ describe('refreshOnce', () => {
   });
 
   it('replaces the whole catalogue from the key the owner saved, and hands the refresh what the catalogue said before it', async () => {
-    const fake = catalogue([{ id: 'openrouter/withdrawn-last-quarter' }], 'sk-owner');
+    const fake = catalogue(
+      [{ id: 'openrouter/withdrawn-last-quarter', provider: 'openrouter' }],
+      'sk-owner'
+    );
     let sawKey = '';
     let sawPrevious = -1;
     const outcome = await pass(fake.store, {
@@ -108,14 +113,20 @@ describe('refreshOnce', () => {
       refreshCatalog: async (_allowlist, options) => {
         sawKey = options.apiKey;
         sawPrevious = options.previous.length;
-        return [{ id: 'openrouter/live-today' }, { id: 'openrouter/released-yesterday' }];
+        return [
+          { id: 'openrouter/live-today', provider: 'openrouter' },
+          { id: 'openrouter/released-yesterday', provider: 'openrouter' }
+        ];
       }
     });
     expect(outcome).toEqual({ state: 'refreshed', models: 2, reason: null });
     expect(sawKey).toBe('sk-owner');
     expect(sawPrevious).toBe(0);
     expect(fake.replaced).toEqual([
-      [{ id: 'openrouter/live-today' }, { id: 'openrouter/released-yesterday' }]
+      [
+        { id: 'openrouter/live-today', provider: 'openrouter', connectionId: 'openrouter' },
+        { id: 'openrouter/released-yesterday', provider: 'openrouter', connectionId: 'openrouter' }
+      ]
     ]);
     expect(fake.upserted).toEqual([]);
   });
@@ -148,6 +159,7 @@ describe('refreshOnce', () => {
   it('refuses to replace a good catalogue with an answer that stopped describing models, and says which fact went', async () => {
     const described = Array.from({ length: 40 }, (_unused, index) => ({
       id: `openrouter/m-${index}`,
+      provider: 'openrouter',
       capabilities: ['chat', 'tools'],
       inputUsdPerMillionTokens: 3,
       measuredQuality: 0.8
@@ -182,7 +194,13 @@ describe('refreshOnce', () => {
  */
 describe('a provider that is not OpenRouter', () => {
   const configured = [
-    { id: 'custom/served', providerModelId: 'served', provider: 'custom', capabilities: ['chat'] }
+    {
+      id: 'custom/served',
+      providerModelId: 'served',
+      provider: 'custom',
+      recommendationTags: ['Ollama Cloud'],
+      capabilities: ['chat']
+    }
   ];
   const alsoOnTheBox = [{ id: 'openrouter/seed', provider: 'openrouter', capabilities: ['chat'] }];
 

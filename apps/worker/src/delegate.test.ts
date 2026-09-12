@@ -218,7 +218,8 @@ const runMission = async (
     consequentialApproved: false,
     webPlan: options.webPlan ?? { mode: 'in_house' },
     state,
-    inferenceCredential: async () => ({ provider: 'openai-compatible' }),
+    connectedModels: async (_task: unknown, catalog: readonly ModelRelease[]) =>
+      catalog.filter((model) => model.provider === 'custom'),
     providerWebSearch: async () => ({}),
     missingBinaries: async () => [],
     // The real dispatcher, which is what this harness's own header says it drives. It arrives on

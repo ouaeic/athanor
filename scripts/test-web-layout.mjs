@@ -221,6 +221,52 @@ let projectChoices = {},
 let failModelSave = false,
   createdModelRequest;
 let generationChoices = {};
+const providerConnections = new Map([
+  [
+    'openrouter',
+    {
+      provider: 'openrouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      modelId: null,
+      hasApiKey: true,
+      enforceZeroDataRetention: true
+    }
+  ],
+  [
+    'ollama-cloud',
+    {
+      provider: 'ollama-cloud',
+      baseUrl: 'https://ollama.com/v1',
+      modelId: null,
+      hasApiKey: true,
+      enforceZeroDataRetention: true
+    }
+  ],
+  [
+    'openai-compatible',
+    {
+      provider: 'openai-compatible',
+      baseUrl: 'https://compatible.example/v1',
+      modelId: 'shared/model',
+      hasApiKey: true,
+      enforceZeroDataRetention: true,
+      contextTokens: 98304,
+      capabilities: ['chat', 'tools'],
+      modalities: ['text']
+    }
+  ]
+]);
+let primaryProvider = 'openrouter';
+const providerWrites = [];
+const providerResponse = () => {
+  const connections = [...providerConnections.values()].map((entry) => ({
+    ...entry,
+    connectionId: entry.provider,
+    configured: true,
+    source: 'encrypted_database'
+  }));
+  return { ...connections.find((entry) => entry.provider === primaryProvider), connections };
+};
 const generationModel = {
   id: 'fixture/image-studio',
   provider: 'fixture',
@@ -515,14 +561,26 @@ try {
       return json(modelSurface(true));
     }
     if (path === '/v1/models') return json(modelCatalog);
-    if (path === '/v1/providers')
-      return json({
-        configured: true,
-        source: 'server_environment',
-        provider: 'openrouter',
-        hasApiKey: true,
-        enforceZeroDataRetention: true
-      });
+    if (path === '/v1/providers') {
+      if (route.request().method() === 'PUT') {
+        const input = route.request().postDataJSON();
+        providerWrites.push(input);
+        providerConnections.set(input.provider, {
+          ...providerConnections.get(input.provider),
+          ...input,
+          modelId: input.modelId ?? null
+        });
+        primaryProvider = input.provider;
+      }
+      if (route.request().method() === 'DELETE') {
+        const selected = url.searchParams.get('connectionId');
+        assert(selected, 'The settings interface must remove only the chosen connection');
+        providerConnections.delete(selected);
+        primaryProvider = providerConnections.keys().next().value;
+        return json({ deleted: true });
+      }
+      return json(providerResponse());
+    }
     if (path === '/v1/media/models') {
       if (route.request().method() === 'PUT') generationChoices = route.request().postDataJSON();
       return json(generationSurface());
@@ -1750,6 +1808,33 @@ try {
 
     await modelsPage.getByRole('button', { name: 'Settings', exact: true }).click();
     await modelsPage.getByRole('heading', { name: 'Model defaults', exact: true }).waitFor();
+    await modelsPage.getByRole('button', { name: 'Compatible endpoint', exact: true }).click();
+    assert.equal(
+      await modelsPage.getByLabel('Endpoint URL', { exact: true }).inputValue(),
+      'https://compatible.example/v1'
+    );
+    assert.equal(await modelsPage.getByLabel(/^Restrict to model ID/).inputValue(), 'shared/model');
+    assert.equal(
+      await modelsPage.getByLabel('Context window in tokens', { exact: true }).inputValue(),
+      '98304'
+    );
+    assert.equal(await modelsPage.getByLabel(/^API key/).inputValue(), '');
+    await modelsPage.getByRole('button', { name: 'Ollama Cloud', exact: true }).click();
+    await modelsPage
+      .getByRole('combobox', { name: 'Provider', exact: true })
+      .selectOption('openai-compatible');
+    await modelsPage.getByLabel(/^Restrict to model ID/).fill('');
+    await modelsPage.getByLabel('Context window in tokens', { exact: true }).fill('65536');
+    await modelsPage.getByRole('button', { name: 'Verify and save', exact: true }).click();
+    await modelsPage
+      .getByText('Connection and routing verified and saved', { exact: true })
+      .waitFor();
+    assert.equal(providerWrites.length, 1);
+    assert.equal(providerWrites[0].provider, 'openai-compatible');
+    assert.equal(providerWrites[0].contextTokens, 65536);
+    assert.equal(providerWrites[0].apiKey, undefined);
+    assert.equal(providerWrites[0].modelId, undefined);
+
     await pick(modelsPage, 'Condensing long work', 'openrouter/alpha/model-78');
     await pick(modelsPage, 'Naming a conversation', 'openrouter/beta/model-79');
     failModelSave = true;
@@ -1780,6 +1865,15 @@ try {
     await modelsPage
       .getByRole('button', { name: 'image model: Image Studio', exact: true })
       .waitFor();
+    assert.equal(
+      await modelsPage.getByLabel('Endpoint URL', { exact: true }).inputValue(),
+      'https://compatible.example/v1'
+    );
+    assert.equal(
+      await modelsPage.getByLabel('Context window in tokens', { exact: true }).inputValue(),
+      '65536'
+    );
+    assert.equal(await modelsPage.getByLabel(/^Restrict to model ID/).inputValue(), '');
     await modelsPage.screenshot({ path: resolve(report, 'model-defaults-desktop.png') });
     await modelsPage.setViewportSize({ width: 390, height: 844 });
     await modelsPage
@@ -1797,6 +1891,23 @@ try {
     await modelsPage.screenshot({ path: resolve(report, 'model-browser-phone.png') });
     assert.equal(await modelsPage.evaluate(() => document.documentElement.scrollWidth), 390);
     await modelsPage.getByRole('combobox', { name: 'Search models', exact: true }).press('Escape');
+    await modelsPage
+      .getByRole('dialog', { name: 'Choose naming a conversation', exact: true })
+      .waitFor({ state: 'detached' });
+    await modelsPage.getByLabel('Endpoint URL', { exact: true }).scrollIntoViewIfNeeded();
+    await modelsPage.screenshot({ path: resolve(report, 'model-connections-phone.png') });
+    assert.equal(await modelsPage.evaluate(() => document.documentElement.scrollWidth), 390);
+    await modelsPage.getByRole('button', { name: 'Remove saved connection', exact: true }).click();
+    const removeConnection = modelsPage.getByRole('dialog', {
+      name: 'Remove saved connection',
+      exact: true
+    });
+    await removeConnection
+      .getByRole('button', { name: 'Remove saved connection', exact: true })
+      .click();
+    await removeConnection.waitFor({ state: 'detached' });
+    assert.deepEqual([...providerConnections.keys()], ['openrouter', 'ollama-cloud']);
+
     await modelsPage.close();
   }
 

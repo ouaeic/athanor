@@ -1,0 +1,224 @@
+import Fastify from 'fastify';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { ModelRelease } from '@athanor/contracts';
+import { decryptJson, encryptJson, inferenceCredentialAad, modelConnectionId } from '@athanor/core';
+import { createDatabase, DataStore, migrateDatabase } from '@athanor/data';
+import type { RouteContext, ServerBase } from '../http/server-context.js';
+import type { InferenceSecret } from '../context.js';
+import { createServerSupport } from './support.js';
+import { registerProviderRoutes } from './providers.js';
+
+describe('saved provider connection lifecycle', () => {
+  const database = createDatabase({ driver: 'pglite', pglitePath: ':memory:' });
+  const store = new DataStore(database),
+    app = Fastify(),
+    masterKey = Buffer.alloc(32, 24);
+  let userId = '',
+    rejectMedia = false;
+  const calls: Array<{ url: string; authorization: string | null }> = [];
+  const catalogFetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+    const address = url instanceof Request ? url.url : String(url);
+    calls.push({ url: address, authorization: new Headers(init?.headers).get('authorization') });
+    return new Response(
+      JSON.stringify({
+        data: [
+          { id: 'shared/model', name: 'Shared model', context_length: 128000 },
+          { id: 'another-model', name: 'Another model', context_length: 64000 }
+        ]
+      })
+    );
+  });
+  let support: ReturnType<typeof createServerSupport>;
+  beforeAll(async () => {
+    await migrateDatabase(database);
+    const user = await store.createUser({ username: 'connection-owner', displayName: 'Owner' });
+    userId = user.id;
+    const base = {
+      app,
+      database,
+      store,
+      masterKey,
+      config: {
+        AI_PROVIDER: 'openrouter',
+        AI_BASE_URL: 'https://openrouter.ai/api/v1',
+        OPENROUTER_BASE_URL: 'https://openrouter.ai/api/v1',
+        AI_REQUIRE_ZDR: true,
+        PUBLIC_APP_URL: 'https://garden.example',
+        ALLOW_INSECURE_PROVIDER_URLS: false,
+        MODEL_CATALOG_SCOPE: 'provider_catalog'
+      },
+      overrides: { modelCatalogFetch: catalogFetch },
+      log: { warn: vi.fn(), info: vi.fn() }
+    } as unknown as ServerBase;
+    support = createServerSupport(base);
+    app.decorateRequest('user', null);
+    app.addHook('onRequest', async (request) => {
+      request.user = user;
+    });
+    registerProviderRoutes({
+      ...base,
+      ...support,
+      requireRecentStepUp: async () => undefined,
+      idempotent: async (
+        _request: unknown,
+        _reply: unknown,
+        _user: unknown,
+        execute: () => Promise<unknown>
+      ) => execute(),
+      mediaRoutesFor: async () => {
+        if (rejectMedia) throw new Error('Media verification failed');
+        return {};
+      },
+      resumeTasksWaitingOnAProvider: async () => 0
+    } as unknown as RouteContext);
+    await app.ready();
+  });
+  beforeEach(async () => {
+    await database.query('DELETE FROM model_releases');
+    await database.query('DELETE FROM managed_provider_credentials');
+    calls.length = 0;
+    rejectMedia = false;
+  });
+  afterAll(async () => {
+    await app.close();
+    await database.close();
+  });
+  const connect = (provider: string, extra: Record<string, unknown> = {}) =>
+    app.inject({
+      method: 'PUT',
+      url: '/v1/providers',
+      payload: {
+        provider,
+        enforceZeroDataRetention: true,
+        ...(provider === 'openai-compatible' ? { baseUrl: 'https://compatible.example/v1' } : {}),
+        ...extra
+      }
+    });
+
+  it('discovers both catalogs, preserves exact model identity and removes only the selected connection', async () => {
+    for (const provider of ['ollama-cloud', 'openai-compatible']) {
+      const response = await connect(provider, { apiKey: `${provider}-key` });
+      expect(response.statusCode, response.body).toBe(200);
+    }
+    const models = (await store.listModels()).map((record) => ModelRelease.parse(record));
+    expect(models).toHaveLength(4);
+    const shared = models.filter((model) => model.providerModelId === 'shared/model');
+    expect(shared).toHaveLength(2);
+    expect(new Set(shared.map((model) => model.id)).size).toBe(2);
+    expect(
+      shared.map((model) => modelConnectionId(model, ['ollama-cloud', 'openai-compatible'])).sort()
+    ).toEqual(['ollama-cloud', 'openai-compatible']);
+    const settings = (await app.inject({ method: 'GET', url: '/v1/providers' })).json<{
+      connections: unknown[];
+    }>();
+    expect(settings.connections).toHaveLength(2);
+    expect(JSON.stringify(settings)).not.toContain('-key');
+    const removed = await app.inject({
+      method: 'DELETE',
+      url: '/v1/providers?connectionId=ollama-cloud'
+    });
+    expect(removed.json()).toEqual({ deleted: true });
+    const remaining = await support.inferenceConnections(userId);
+    expect([...remaining.keys()]).toEqual(['openai-compatible']);
+    const user = (await store.getUserById(userId))!;
+    const reachable = await support.modelsForUser(user);
+    expect(reachable).toHaveLength(2);
+    expect(reachable.every((model) => model.connectionId === 'openai-compatible')).toBe(true);
+  });
+
+  it('keeps the chosen vendor key when a different vendor was edited most recently', async () => {
+    expect((await connect('ollama-cloud', { apiKey: 'ollama-key' })).statusCode).toBe(200);
+    expect((await connect('openai-compatible', { apiKey: 'compatible-key' })).statusCode).toBe(200);
+    calls.length = 0;
+    const saved = await connect('ollama-cloud');
+    expect(saved.statusCode, saved.body).toBe(200);
+    const requests = calls.filter((call) => call.url.startsWith('https://ollama.com/'));
+    expect(requests.length).toBeGreaterThan(0);
+    expect(requests.every((call) => call.authorization === 'Bearer ollama-key')).toBe(true);
+  });
+
+  it('refuses to send a saved key to a changed endpoint and leaves the saved connection intact', async () => {
+    expect((await connect('openai-compatible', { apiKey: 'private-key' })).statusCode).toBe(200);
+    calls.length = 0;
+    const changed = await connect('openai-compatible', { baseUrl: 'https://different.example/v1' });
+    expect(changed.statusCode).toBe(422);
+    expect(calls).toHaveLength(0);
+    expect(
+      (await support.inferenceConnections(userId)).get('openai-compatible')?.secret
+    ).toMatchObject({ baseUrl: 'https://compatible.example/v1', apiKey: 'private-key' });
+  });
+
+  it('persists fallback metadata and an optional restriction without changing other connections', async () => {
+    const response = await connect('openai-compatible', {
+      apiKey: 'key',
+      modelId: 'shared/model',
+      contextTokens: 98304,
+      capabilities: ['chat', 'tools'],
+      modalities: ['text']
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    expect(response.json()).toMatchObject({
+      modelId: 'shared/model',
+      contextTokens: 98304,
+      capabilities: ['chat', 'tools']
+    });
+    expect(await store.listModels()).toHaveLength(1);
+    const credential = (await store.getManagedProviderCredential(
+      userId,
+      'inference:openai-compatible'
+    ))!;
+    expect(
+      decryptJson<InferenceSecret>(
+        credential.secretCiphertext,
+        masterKey,
+        inferenceCredentialAad(userId)
+      ).catalogDefaults
+    ).toMatchObject({ contextTokens: 98304, capabilities: ['chat', 'tools'] });
+  });
+
+  it('does not write a catalog or credential if explicit media verification fails', async () => {
+    rejectMedia = true;
+    const failed = await connect('openai-compatible', {
+      apiKey: 'key',
+      mediaModels: { image: { automatic: true, preference: 'balanced' } }
+    });
+    expect(failed.statusCode).toBe(500);
+    expect(await store.listModels()).toHaveLength(0);
+    expect(await store.listManagedProviderCredentials(userId)).toHaveLength(0);
+  });
+
+  it('preserves an existing legacy model id when its source identifies the same vendor', async () => {
+    const first = await connect('ollama-cloud', { apiKey: 'key' });
+    expect(first.statusCode).toBe(200);
+    const model = (await store.listModels()).find(
+      (entry) => entry.providerModelId === 'shared/model'
+    )!;
+    await database.query('DELETE FROM model_releases');
+    await store.upsertModels([{ ...model, id: 'custom/shared/model', connectionId: undefined }]);
+    await store.upsertManagedProviderCredential({
+      userId,
+      provider: 'inference',
+      monthlyLimitUsd: 0,
+      externalRef: 'legacy',
+      secretCiphertext: encryptJson(
+        {
+          provider: 'ollama-cloud',
+          baseUrl: 'https://ollama.com/v1',
+          apiKey: 'legacy-key',
+          enforceZeroDataRetention: true
+        },
+        masterKey,
+        inferenceCredentialAad(userId)
+      )
+    });
+    expect((await connect('ollama-cloud', { apiKey: 'new-key' })).statusCode).toBe(200);
+    const preserved = (await store.listModels()).filter(
+      (entry) => entry.providerModelId === 'shared/model'
+    );
+    expect(preserved).toHaveLength(1);
+    expect(preserved[0]).toMatchObject({ id: 'custom/shared/model', connectionId: 'ollama-cloud' });
+    expect((await support.inferenceConnections(userId)).get('ollama-cloud')?.secret.apiKey).toBe(
+      'new-key'
+    );
+  });
+});

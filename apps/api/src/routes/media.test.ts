@@ -35,6 +35,7 @@ describe('selected media route through the authenticated settings API', () => {
     masterKey = Buffer.alloc(32, 43);
   let ownerId = '',
     fail = false;
+  let duringResolve: (() => Promise<void>) | undefined;
   const fetch = vi.fn(async (url: string | URL | Request) => {
     if (fail) throw new Error('offline fixture outage');
     const path = url instanceof Request ? url.url : String(url);
@@ -89,6 +90,12 @@ describe('selected media route through the authenticated settings API', () => {
       store,
       masterKey,
       ...support,
+      mediaRoutesFor: async (...args: Parameters<typeof support.mediaRoutesFor>) => {
+        const hook = duringResolve;
+        duringResolve = undefined;
+        await hook?.();
+        return support.mediaRoutesFor(...args);
+      },
       idempotent: async (
         _request: unknown,
         _reply: unknown,
@@ -188,5 +195,32 @@ describe('selected media route through the authenticated settings API', () => {
     expect(catalog.every((model) => Boolean(model.unavailableReason))).toBe(true);
     expect(catalog.some((model) => model.providerModelId === image.id)).toBe(false);
     expect(await support.mediaCatalogFor({ ...secret, provider: 'openai-compatible' })).toEqual([]);
+  });
+  it('cannot overwrite a credential rotated while its media models were being verified', async () => {
+    fail = false;
+    duringResolve = async () => {
+      const current = (await store.primaryInferenceCredential(ownerId))!;
+      await store.upsertManagedProviderCredential({
+        userId: ownerId,
+        provider: current.provider,
+        externalRef: 'self-hosted',
+        monthlyLimitUsd: 0,
+        secretCiphertext: encryptJson(
+          { ...secret, apiKey: 'rotated-key' },
+          masterKey,
+          inferenceCredentialAad(ownerId)
+        )
+      });
+    };
+    const response = await app.inject({ method: 'PUT', url: '/v1/media/models', payload: {} });
+    expect(response.statusCode, response.body).toBe(409);
+    const latest = (await store.primaryInferenceCredential(ownerId))!;
+    expect(
+      decryptJson<InferenceSecret>(
+        latest.secretCiphertext,
+        masterKey,
+        inferenceCredentialAad(ownerId)
+      ).apiKey
+    ).toBe('rotated-key');
   });
 });

@@ -149,6 +149,8 @@ export const configuredModelCatalog = (
     modalities: ModelRelease['modalities'];
     /** The badge on every row, naming where these came from. */
     tag: string;
+    connectionId?: string;
+    previous?: ReadonlyArray<Record<string, unknown>>;
     now?: Date;
   }
 ): RoutableModel[] => {
@@ -156,7 +158,15 @@ export const configuredModelCatalog = (
   return described
     .filter((model) => model.id.trim().length > 0)
     .map((model) => ({
-      id: `custom/${model.id}`,
+      id: String(
+        (options.previous?.find(
+          (row) => row.providerModelId === model.id && typeof row.id === 'string'
+        )?.id as string | undefined) ??
+          (options.connectionId
+            ? `custom/${options.connectionId}/${encodeURIComponent(model.id)}`
+            : `custom/${model.id}`)
+      ),
+      ...(options.connectionId ? { connectionId: options.connectionId } : {}),
       providerModelId: model.id,
       displayName: model.displayName,
       provider: 'custom',

@@ -23,6 +23,8 @@ import type { ModelRelease, PrivacyRoute } from '@athanor/contracts';
  */
 export interface ConfiguredCatalogInput {
   provider: string;
+  connectionId?: string;
+  defaults?: Pick<ModelRelease, 'contextTokens' | 'capabilities' | 'modalities'>;
   baseUrl: string;
   apiKey?: string | undefined;
   /** The single model the owner named, when the save wrote a single row rather than a catalogue. */
@@ -128,8 +130,9 @@ export const refreshConfiguredCatalog = async (
       typeof row.providerModelId === 'string' ? [row.providerModelId] : []
     )
   ]);
-  const catalogue =
-    input.provider === 'ollama-cloud'
+  const catalogue = input.modelId
+    ? described.filter((model) => model.id === input.modelId)
+    : input.connectionId || input.provider === 'ollama-cloud'
       ? described
       : described.filter((model) => pinned.has(model.id));
   /*
@@ -143,6 +146,7 @@ export const refreshConfiguredCatalog = async (
   return configuredModelCatalog(catalogue, {
     privacyRoute,
     tag: tagFor(input.provider),
-    ...declaredBy(input.previous)
+    ...(input.connectionId ? { connectionId: input.connectionId, previous: input.previous } : {}),
+    ...(input.defaults ?? declaredBy(input.previous))
   });
 };

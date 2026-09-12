@@ -564,6 +564,7 @@ const makeTask = (agentState?: unknown): TaskRecord => ({
 interface FetchLog {
   readonly calls: string[];
   readonly modelRequests: Array<Record<string, unknown>>;
+  readonly modelAuthorizations?: Array<string | null>;
   /** Bodies sent to the workspace runner, for the tests that care what a tool actually asked for. */
   readonly runnerRequests?: Array<{ url: string; body: unknown }>;
   /** Generation requests, which reach the same host as inference but a different route. */
@@ -653,8 +654,10 @@ const installFetch = (
                 ))
         )();
       }
-      if (typeof init?.body === 'string')
+      if (typeof init?.body === 'string') {
         log.modelRequests.push(JSON.parse(init.body) as Record<string, unknown>);
+        log.modelAuthorizations?.push(new Headers(init.headers).get('authorization'));
+      }
       const next = providerBodies[Math.min(served, providerBodies.length - 1)];
       served += 1;
       return new Response(typeof next === 'function' ? next(init) : (next ?? ''), {
@@ -1943,6 +1946,7 @@ describe('opening the stored inference credential', () => {
   const credentialRow = (aad: string | undefined) =>
     ({
       provider: 'inference',
+      status: 'active',
       secretCiphertext: encryptJson(
         {
           provider: 'openai-compatible',
@@ -1960,8 +1964,7 @@ describe('opening the stored inference credential', () => {
     const probe = probeStore(() => task);
     const store = {
       ...probe.store,
-      getManagedProviderCredential: async (_userId: string, provider: string) =>
-        provider === 'inference' ? credentialRow(aad) : null
+      listManagedProviderCredentials: async () => [credentialRow(aad)]
     } as unknown as DataStore;
     const log: FetchLog = { calls: [], modelRequests: [] };
     installFetch([textFrame('thinking')], log);
@@ -3483,27 +3486,27 @@ describe('spending the owner’s money on generated media', () => {
     Object.assign(probe.store, {
       ...(options.imageRoute || options.audioRoute || options.videoRoute
         ? {
-            getManagedProviderCredential: async (_userId: string, provider: string) =>
-              provider === 'inference'
-                ? ({
-                    provider: 'inference',
-                    secretCiphertext: encryptJson(
-                      {
-                        provider: 'openai-compatible',
-                        baseUrl: PROVIDER_URL,
-                        apiKey: 'stored-key',
-                        enforceZeroDataRetention: false,
-                        mediaRoutes: {
-                          ...(options.imageRoute ? { image: options.imageRoute } : {}),
-                          ...(options.audioRoute ? { audio: options.audioRoute } : {}),
-                          ...(options.videoRoute ? { video: options.videoRoute } : {})
-                        }
-                      },
-                      masterKey,
-                      `inference-provider:${userId}`
-                    )
-                  } as unknown as Awaited<ReturnType<DataStore['getManagedProviderCredential']>>)
-                : null
+            listManagedProviderCredentials: async () => [
+              {
+                provider: 'inference',
+                status: 'active',
+                secretCiphertext: encryptJson(
+                  {
+                    provider: 'openai-compatible',
+                    baseUrl: PROVIDER_URL,
+                    apiKey: 'stored-key',
+                    enforceZeroDataRetention: false,
+                    mediaRoutes: {
+                      ...(options.imageRoute ? { image: options.imageRoute } : {}),
+                      ...(options.audioRoute ? { audio: options.audioRoute } : {}),
+                      ...(options.videoRoute ? { video: options.videoRoute } : {})
+                    }
+                  },
+                  masterKey,
+                  `inference-provider:${userId}`
+                )
+              }
+            ]
           }
         : {}),
       parkTaskForApproval: async () => true,
@@ -9156,7 +9159,7 @@ describe('an account holding more than one provider connection', () => {
       modelThroughputCeiling: async () => null,
       getManagedProviderCredential: async () => null
     } as unknown as DataStore;
-    const log: FetchLog = { calls: [], modelRequests: [] };
+    const log: FetchLog = { calls: [], modelRequests: [], modelAuthorizations: [] };
     installFetch([textFrame('thinking')], log);
     await new AgentWorker(store, config({ TASK_MAX_STEPS: 1 }), masterKey, runnerSecret)
       .run(task)
@@ -9178,6 +9181,33 @@ describe('an account holding more than one provider connection', () => {
       { ...model, id: 'openrouter/vendor/model-1', provider: 'openrouter' }
     );
     expect(log.modelRequests.length).toBeGreaterThan(0);
+  });
+
+  it.each([
+    ['Ollama Cloud', 'ollama-key'],
+    ['Configured endpoint', 'compatible-key']
+  ])('uses the exact custom connection identified by %s', async (tag, expected) => {
+    const log = await runAgainst(
+      [
+        connection('openrouter', 'openrouter-key'),
+        connection('ollama-cloud', 'ollama-key'),
+        connection('openai-compatible', 'compatible-key')
+      ],
+      { ...model, recommendationTags: [tag] }
+    );
+    expect(log.modelAuthorizations?.length).toBeGreaterThan(0);
+    expect(log.modelAuthorizations?.every((header) => header === `Bearer ${expected}`)).toBe(true);
+  });
+
+  it('refuses an ambiguous legacy model and a removed explicit connection', async () => {
+    const connections = [
+      connection('ollama-cloud', 'ollama-key'),
+      connection('openai-compatible', 'compatible-key')
+    ];
+    expect((await runAgainst(connections, model)).modelRequests).toHaveLength(0);
+    expect(
+      (await runAgainst(connections, { ...model, connectionId: 'removed-account' })).modelRequests
+    ).toHaveLength(0);
   });
 
   it('refuses a model no connection reaches rather than spending another provider`s key', async () => {

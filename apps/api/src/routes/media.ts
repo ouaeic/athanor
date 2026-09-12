@@ -4,14 +4,14 @@
 
 import { MediaModelSelection } from '@athanor/contracts';
 import { registerProjectModelRoutes } from './project-models.js';
-import { AthanorError, decryptJson, encryptJson, inferenceCredentialAad } from '@athanor/core';
-import type { InferenceSecret } from '../context.js';
+import { AthanorError, encryptJson, inferenceCredentialAad } from '@athanor/core';
 import { requireUser } from '../http/auth-hook.js';
 import type { RouteContext } from '../http/server-context.js';
 
 export const registerMediaRoutes = (context: RouteContext): void => {
   registerProjectModelRoutes(context);
-  const { app, store, masterKey, mediaSettings, mediaRoutesFor, idempotent } = context;
+  const { app, store, masterKey, mediaSettings, mediaRoutesFor, inferenceConnections, idempotent } =
+    context;
   app.get('/v1/media/models', async (request) => mediaSettings(requireUser(request.user).id));
 
   /**
@@ -28,33 +28,31 @@ export const registerMediaRoutes = (context: RouteContext): void => {
     const user = requireUser(request.user);
     return idempotent(request, reply, user, async () => {
       const input = MediaModelSelection.parse(request.body);
-      // Whatever key this account's credential lives under, and written back to that same key: a
-      // media choice belongs in the row it was read from.
-      const credential = await store.primaryInferenceCredential(user.id);
-      if (credential?.status !== 'active')
+      const connection = (await inferenceConnections(user.id)).values().next().value;
+      if (!connection?.record)
         throw new AthanorError(
           'provider_setup_required',
           'Connect a model provider before choosing what it generates with',
           409
         );
-      const secret = decryptJson<InferenceSecret>(
-        credential.secretCiphertext,
-        masterKey,
-        inferenceCredentialAad(user.id)
-      );
+      const { secret, record: credential } = connection;
       const routes = await mediaRoutesFor(secret, input);
-      await store.upsertManagedProviderCredential({
+      const saved = await store.replaceManagedProviderCredentialSecret({
         userId: user.id,
         provider: credential.provider,
-        secretCiphertext: encryptJson(
+        expected: credential.secretCiphertext,
+        replacement: encryptJson(
           { ...secret, mediaModels: input, ...(routes ? { mediaRoutes: routes } : {}) },
           masterKey,
           inferenceCredentialAad(user.id)
-        ),
-        externalRef: credential.externalRef ?? 'self-hosted',
-        monthlyLimitUsd: 0,
-        status: 'active'
+        )
       });
+      if (!saved)
+        throw new AthanorError(
+          'provider_changed',
+          'This connection changed while its models were being verified. Reload and try again.',
+          409
+        );
       return mediaSettings(user.id);
     });
   });

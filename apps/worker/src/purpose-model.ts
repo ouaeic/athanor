@@ -6,18 +6,13 @@ import {
   type DataStore,
   type TaskRecord
 } from '@athanor/data';
-import type { AgentState, InferenceCredential } from './agent-state.js';
+import type { AgentState } from './agent-state.js';
 
 type PurposeContext = {
   store: DataStore;
   masterKey: Buffer;
-  inferenceCredential(task: TaskRecord): Promise<Pick<InferenceCredential, 'provider'>>;
+  connectedModels(task: TaskRecord, catalog: readonly ModelRelease[]): Promise<ModelRelease[]>;
 };
-
-async function connectedProvider(context: PurposeContext, task: TaskRecord) {
-  const credential = await context.inferenceCredential(task);
-  return credential.provider === 'openrouter' ? 'openrouter' : 'custom';
-}
 
 async function preferences(
   context: PurposeContext,
@@ -49,13 +44,12 @@ export async function resolveTaskPurposeModel(
 ): Promise<ModelRelease> {
   const { project, global, limits } = await preferences(context, task);
   const { choice } = resolvePurposeChoice(purpose, project.choices, global);
-  const provider = await connectedProvider(context, task);
+  const connected = await context.connectedModels(task, catalog);
   const result = selectPurposeModel({
     purpose,
     choice,
-    catalog,
+    catalog: connected,
     privacyRoute: task.privacyRoute === 'provider_zdr' ? 'provider_zdr' : 'external',
-    provider,
     ceiling: limits
   });
   if (!result.model) throw new AthanorError('purpose_model_unavailable', result.reason!, 409);
@@ -91,13 +85,12 @@ export async function applyProjectMainModel(
   if (state.mainModelPreference === fingerprint) return;
   const { global, limits } = await preferences(context, task, project);
   const { choice } = resolvePurposeChoice('main', project.choices, global);
-  const provider = await connectedProvider(context, task);
+  const connected = await context.connectedModels(task, catalog);
   const result = selectPurposeModel({
     purpose: 'main',
     choice,
-    catalog,
+    catalog: connected,
     privacyRoute: task.privacyRoute === 'provider_zdr' ? 'provider_zdr' : 'external',
-    provider,
     ceiling: limits
   });
   if (!result.model) throw new AthanorError('purpose_model_unavailable', result.reason!, 409);

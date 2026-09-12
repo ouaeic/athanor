@@ -67,6 +67,10 @@ export interface ToolContext {
    * closes over per-worker state (the master key, the gateway, the binary cache) that has no
    * business being copied per call, so they arrive as bound functions rather than as data.
    */
+  readonly connectedModels: (
+    task: TaskRecord,
+    catalog: readonly ModelRelease[]
+  ) => Promise<ModelRelease[]>;
   readonly inferenceCredential: (
     task: TaskRecord,
     resolveMedia?: boolean

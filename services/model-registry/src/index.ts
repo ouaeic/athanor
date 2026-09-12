@@ -57,6 +57,9 @@ const Config = z.object({
    * `configured-catalog.ts` still treats it as a subscription rather than a single pinned model.
    */
   AI_PROVIDER: sharedEnv.AI_PROVIDER,
+  AI_API_KEY: sharedEnv.AI_API_KEY,
+  OPENROUTER_API_KEY: sharedEnv.OPENROUTER_API_KEY,
+  AI_REQUIRE_ZDR: sharedEnv.AI_REQUIRE_ZDR,
   AI_BASE_URL: sharedEnv.AI_BASE_URL,
   AI_DEFAULT_MODEL: sharedEnv.AI_DEFAULT_MODEL,
   /**
@@ -114,7 +117,11 @@ while (running) {
     environmentProvider: {
       provider: config.AI_PROVIDER,
       baseUrl: config.AI_BASE_URL,
-      modelId: config.AI_DEFAULT_MODEL
+      modelId: config.AI_DEFAULT_MODEL,
+      apiKey:
+        config.AI_API_KEY ??
+        (config.AI_PROVIDER === 'openrouter' ? config.OPENROUTER_API_KEY : undefined),
+      enforceZeroDataRetention: config.AI_REQUIRE_ZDR
     },
     baseUrl: config.OPENROUTER_BASE_URL,
     scope: config.MODEL_CATALOG_SCOPE

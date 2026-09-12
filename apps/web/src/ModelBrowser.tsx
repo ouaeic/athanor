@@ -153,6 +153,12 @@ export default function ModelBrowser({
               setActive(0);
             }}
             onKeyDown={(event) => {
+              if (event.key === 'Escape') {
+                event.preventDefault();
+                event.stopPropagation();
+                onClose();
+                return;
+              }
               if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
                 event.preventDefault();
                 move(event.key === 'ArrowDown' ? 1 : -1);

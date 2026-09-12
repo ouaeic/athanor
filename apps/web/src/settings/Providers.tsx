@@ -20,6 +20,8 @@ import ModelPicker from '../ModelPicker.js';
 
 interface Provider {
   configured: boolean;
+  connectionId?: string;
+  connections?: Provider[];
   source: string;
   provider: string;
   baseUrl: string;
@@ -47,18 +49,39 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
   const [mediaSelections, setMediaSelections] = useState<Record<string, string>>({});
   const mediaAction = useAction(() => onChange());
   const selected = choice || provider.value?.provider || 'openrouter';
+  const saved =
+    provider.value?.connections?.find((entry) => entry.provider === selected) ??
+    (provider.value?.provider === selected ? provider.value : undefined);
   return (
     <>
       <AudioReceipts />
       <Section
-        title="Model connection"
+        title="Model connections"
         description="Bring your own provider. Your computer uses your credentials directly."
       >
         <ResourceState resource={provider} />
+        {Boolean(provider.value?.connections?.length) && (
+          <div className="row model-connection-tabs" aria-label="Saved model connections">
+            {provider.value?.connections?.map((entry) => (
+              <Button
+                key={entry.provider}
+                type="button"
+                aria-pressed={selected === entry.provider}
+                onClick={() => setChoice(entry.provider)}
+              >
+                {entry.provider === 'openrouter'
+                  ? 'OpenRouter'
+                  : entry.provider === 'ollama-cloud'
+                    ? 'Ollama Cloud'
+                    : 'Compatible endpoint'}
+              </Button>
+            ))}
+          </div>
+        )}
         {provider.value && preferences.value && (
           <form
             className="stack"
-            key={provider.value.source + provider.value.provider}
+            key={selected + (saved?.baseUrl ?? '') + (saved?.modelId ?? '')}
             onSubmit={(event) => {
               event.preventDefault();
               const form = new FormData(event.currentTarget);
@@ -71,7 +94,9 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
                     ...(selected === 'openai-compatible'
                       ? {
                           baseUrl: fieldValue(form, 'baseUrl'),
-                          modelId: fieldValue(form, 'modelId'),
+                          ...(fieldValue(form, 'modelId')
+                            ? { modelId: fieldValue(form, 'modelId') }
+                            : {}),
                           contextTokens: Number(form.get('contextTokens')),
                           capabilities: [
                             'chat',
@@ -108,9 +133,9 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
             }}
           >
             <div className="management-note">
-              {provider.value.configured
-                ? `Connected through ${provider.value.source === 'server_environment' ? 'server configuration' : 'your saved settings'}. ${provider.value.hasApiKey ? 'A key is securely stored.' : 'This endpoint uses no saved key.'}`
-                : 'Connect a provider to begin work.'}
+              {saved && saved.configured !== false
+                ? `Connected through ${saved?.source === 'server_environment' ? 'server configuration' : 'your saved settings'}. ${saved?.hasApiKey ? 'A key is securely stored.' : 'This endpoint uses no saved key.'}`
+                : 'Add this provider alongside your other connections.'}
             </div>
             <div className="management-grid">
               <Field label="Provider">
@@ -120,12 +145,15 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
                   <option value="openai-compatible">Compatible endpoint</option>
                 </select>
               </Field>
-              <Field label="API key" hint="Leave empty to keep an existing key for this provider.">
+              <Field
+                label="API key"
+                hint="Leave empty to keep this connection’s key. Changing its endpoint requires a new key."
+              >
                 <input
                   name="apiKey"
                   type="password"
                   autoComplete="new-password"
-                  placeholder={provider.value.hasApiKey ? 'Stored securely' : 'Paste your key'}
+                  placeholder={saved?.hasApiKey ? 'Stored securely' : 'Paste your key'}
                 />
               </Field>
               {selected === 'openai-compatible' && (
@@ -135,12 +163,15 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
                       required
                       name="baseUrl"
                       type="url"
-                      defaultValue={provider.value.baseUrl}
+                      defaultValue={saved?.baseUrl ?? ''}
                       placeholder="https://provider.example/v1"
                     />
                   </Field>
-                  <Field label="Model ID">
-                    <input required name="modelId" defaultValue={provider.value.modelId ?? ''} />
+                  <Field
+                    label="Restrict to model ID"
+                    hint="Optional. Leave empty to discover every model this endpoint offers."
+                  >
+                    <input name="modelId" defaultValue={saved?.modelId ?? ''} />
                   </Field>
                   <Field label="Context window in tokens">
                     <input
@@ -148,7 +179,7 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
                       type="number"
                       min={4096}
                       max={10000000}
-                      defaultValue={provider.value.contextTokens ?? 128000}
+                      defaultValue={saved?.contextTokens ?? 128000}
                       required
                     />
                   </Field>
@@ -157,7 +188,7 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
                       <input
                         name="vision"
                         type="checkbox"
-                        defaultChecked={provider.value.capabilities?.includes('vision')}
+                        defaultChecked={saved?.capabilities?.includes('vision')}
                       />
                       Accepts images
                     </label>
@@ -165,7 +196,7 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
                       <input
                         name="reasoning"
                         type="checkbox"
-                        defaultChecked={provider.value.capabilities?.includes('reasoning') ?? true}
+                        defaultChecked={saved?.capabilities?.includes('reasoning') ?? true}
                       />
                       Supports reasoning
                     </label>
@@ -241,7 +272,7 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
               <input
                 name="zdr"
                 type="checkbox"
-                defaultChecked={provider.value.enforceZeroDataRetention}
+                defaultChecked={saved?.enforceZeroDataRetention ?? true}
               />
               <span>
                 Require zero data retention
@@ -254,12 +285,14 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
               <Button type="submit" className="primary" busy={action.busy}>
                 Verify and save
               </Button>
-              {provider.value.source === 'encrypted_database' && (
+              {saved?.source === 'encrypted_database' && (
                 <ConfirmButton
                   label="Remove saved connection"
-                  description="Remove the saved provider credential. Tasks that need it will wait until a provider is configured again. Server environment settings, if present, still apply."
+                  description="Remove this saved connection. Tasks that need it will wait until it is connected again. Other saved providers remain available."
                   action={async () => {
-                    await sensitive(() => del('/v1/providers'));
+                    await sensitive(() =>
+                      del(`/v1/providers?connectionId=${encodeURIComponent(selected)}`)
+                    );
                     provider.refresh();
                     models.refresh();
                     onChange();

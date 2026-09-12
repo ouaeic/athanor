@@ -11,6 +11,7 @@ export * from './errors.js';
 export * from './model-policy.js';
 export * from './endpoint-routing.js';
 export * from './purpose-model.js';
+export * from './inference-connections.js';
 export * from './network-scope.js';
 export * from './preview-ports.js';
 export * from './memory.js';

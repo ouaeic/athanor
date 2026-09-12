@@ -1,3 +1,4 @@
+import type { ModelRelease } from '@athanor/contracts';
 /**
  * The API server's context: everything a route needs that is not the route.
  *
@@ -315,6 +316,11 @@ export interface ConnectionManifest {
  * `modelId` is only meaningful for an endpoint that serves a single model.
  */
 export interface InferenceSecret {
+  catalogDefaults?: {
+    contextTokens: number;
+    capabilities: ModelRelease['capabilities'];
+    modalities: ModelRelease['modalities'];
+  };
   provider: 'openrouter' | 'ollama-cloud' | 'openai-compatible';
   baseUrl: string;
   apiKey?: string;

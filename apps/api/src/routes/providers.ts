@@ -13,7 +13,8 @@ import {
   assertTimeZone,
   decryptJson,
   encryptJson,
-  inferenceCredentialAad
+  inferenceCredentialAad,
+  environmentInferenceSecret
 } from '@athanor/core';
 import {
   OpenAICompatibleAdapter,
@@ -23,6 +24,7 @@ import {
   verifyOpenRouterKey
 } from '@athanor/model-gateway';
 import { z } from 'zod';
+import { DataStore } from '@athanor/data';
 import type { InferenceSecret } from '../context.js';
 import { requireUser } from '../http/auth-hook.js';
 import type { RouteContext } from '../http/server-context.js';
@@ -57,9 +59,11 @@ const seededSpendCaps = (
 export const registerProviderRoutes = (context: RouteContext): void => {
   const {
     app,
+    database,
     store,
     masterKey,
     providerSettings,
+    inferenceConnections,
     mediaRoutesFor,
     config,
     overrides,
@@ -73,15 +77,6 @@ export const registerProviderRoutes = (context: RouteContext): void => {
     const user = requireUser(request.user);
     await requireRecentStepUp(request, user);
     return idempotent(request, reply, user, async () => {
-      const existingCredential = await store.primaryInferenceCredential(user.id);
-      const existingSecret =
-        existingCredential?.status === 'active'
-          ? decryptJson<InferenceSecret>(
-              existingCredential.secretCiphertext,
-              masterKey,
-              inferenceCredentialAad(user.id)
-            )
-          : undefined;
       const input = z
         .object({
           provider: z.enum(['openrouter', 'ollama-cloud', 'openai-compatible']),
@@ -122,15 +117,6 @@ export const registerProviderRoutes = (context: RouteContext): void => {
           // Ollama Cloud is exempt because it no longer needs one: the catalogue below lists every
           // model that account can reach, the same way OpenRouter's does, so naming a single model
           // by hand went from a requirement to an optional pin.
-          if (value.provider === 'openai-compatible' && !value.modelId)
-            context.addIssue({
-              code: 'custom',
-              path: ['modelId'],
-              message: 'Choose the model ID exposed by this endpoint'
-            });
-          // Checked here rather than where the caps are written, which is after the credential has
-          // been stored: a zone this server cannot resolve should cost the owner a corrected form,
-          // not a saved key reported as a failure.
           if (value.spendCeiling?.timeZone !== undefined) {
             try {
               assertTimeZone(value.spendCeiling.timeZone);
@@ -144,24 +130,33 @@ export const registerProviderRoutes = (context: RouteContext): void => {
           }
         })
         .parse(request.body);
-      const apiKey =
-        input.apiKey?.trim() ||
-        (existingSecret?.provider === input.provider ? existingSecret.apiKey : undefined) ||
-        (config.AI_PROVIDER === input.provider
-          ? (config.AI_API_KEY ?? config.OPENROUTER_API_KEY)
-          : undefined);
-      if (['openrouter', 'ollama-cloud'].includes(input.provider) && !apiKey)
-        throw new AthanorError(
-          'provider_key_required',
-          `${input.provider === 'openrouter' ? 'OpenRouter' : 'Ollama Cloud'} requires an API key`,
-          422
-        );
       const baseUrl =
         input.provider === 'openrouter'
           ? 'https://openrouter.ai/api/v1'
           : input.provider === 'ollama-cloud'
             ? 'https://ollama.com/v1'
             : (input.baseUrl ?? config.AI_BASE_URL);
+      const existingSecret = (await inferenceConnections(user.id)).get(input.provider)?.secret;
+      const sameEndpoint = (secret: InferenceSecret | undefined) =>
+        secret?.provider === input.provider &&
+        secret.baseUrl.replace(/\/+$/, '') === baseUrl.replace(/\/+$/, '');
+      const environment = environmentInferenceSecret(config);
+      const apiKey =
+        input.apiKey?.trim() ||
+        (sameEndpoint(existingSecret) ? existingSecret?.apiKey : undefined) ||
+        (!existingSecret && sameEndpoint(environment) ? environment.apiKey : undefined);
+      if (!input.apiKey?.trim() && existingSecret?.apiKey && !sameEndpoint(existingSecret))
+        throw new AthanorError(
+          'provider_key_required',
+          'Enter the key issued for this endpoint. A saved key cannot be sent to a different endpoint.',
+          422
+        );
+      if (['openrouter', 'ollama-cloud'].includes(input.provider) && !apiKey)
+        throw new AthanorError(
+          'provider_key_required',
+          `${input.provider === 'openrouter' ? 'OpenRouter' : 'Ollama Cloud'} requires an API key`,
+          422
+        );
       const url = new URL(baseUrl);
       if (url.username || url.password || url.search || url.hash)
         throw new AthanorError(
@@ -204,8 +199,10 @@ export const registerProviderRoutes = (context: RouteContext): void => {
         privacyRoute: input.enforceZeroDataRetention ? 'provider_zdr' : 'external',
         appUrl: config.PUBLIC_APP_URL,
         appTitle: 'garden',
+        ...(overrides.modelCatalogFetch ? { fetch: overrides.modelCatalogFetch } : {}),
         enforceZeroDataRetention: input.provider === 'openrouter' && input.enforceZeroDataRetention
       });
+      let pendingModels: Array<Record<string, unknown>>;
       if (input.provider === 'openrouter') {
         // The `adapter.list()` that used to run here for every provider is gone from this arm: its
         // answer was only ever read by the branch below, so an OpenRouter save spent a whole extra
@@ -216,7 +213,7 @@ export const registerProviderRoutes = (context: RouteContext): void => {
           scope: config.MODEL_CATALOG_SCOPE,
           ...(overrides.modelCatalogFetch ? { fetch: overrides.modelCatalogFetch } : {})
         });
-        await store.upsertModels(liveModels);
+        pendingModels = liveModels.map((model) => ({ ...model, connectionId: input.provider }));
       } else {
         /*
          * One request, read twice as hard.
@@ -245,34 +242,32 @@ export const registerProviderRoutes = (context: RouteContext): void => {
             `The endpoint did not list model ${input.modelId}`,
             422
           );
-        /*
-         * A subscription is a catalogue, not a model.
-         *
-         * An Ollama Cloud account reaches every cloud model on the plan, so all of them are written
-         * and the owner picks in the composer like any other provider. A directly configured
-         * endpoint keeps the single named row: those are usually one served model, the owner has
-         * told this screen its context window and capabilities, and writing that description across
-         * every id a gateway happens to front would attach one model's facts to all of them.
-         */
-        const catalogue =
-          input.provider === 'ollama-cloud'
-            ? described
-            : described.filter((model) => model.id === input.modelId);
+        const catalogue = input.modelId
+          ? described.filter((model) => model.id === input.modelId)
+          : described;
         if (!catalogue.length)
           throw new AthanorError(
             'provider_model_not_found',
             'The endpoint listed no models for this key',
             422
           );
-        await store.upsertModels(
-          configuredModelCatalog(catalogue, {
-            privacyRoute: input.enforceZeroDataRetention ? 'provider_zdr' : 'external',
-            contextTokens: input.contextTokens,
-            capabilities: input.capabilities,
-            modalities: input.modalities,
-            tag: input.provider === 'ollama-cloud' ? 'Ollama Cloud' : 'Configured endpoint'
-          })
-        );
+        pendingModels = configuredModelCatalog(catalogue, {
+          privacyRoute: input.enforceZeroDataRetention ? 'provider_zdr' : 'external',
+          contextTokens: input.contextTokens,
+          capabilities: input.capabilities,
+          modalities: input.modalities,
+          tag: input.provider === 'ollama-cloud' ? 'Ollama Cloud' : 'Configured endpoint',
+          connectionId: input.provider,
+          previous: (await store.listModels()).filter(
+            (record) =>
+              record.connectionId === input.provider ||
+              (!record.connectionId &&
+                Array.isArray(record.recommendationTags) &&
+                record.recommendationTags.includes(
+                  input.provider === 'ollama-cloud' ? 'Ollama Cloud' : 'Configured endpoint'
+                ))
+          )
+        });
       }
       /*
        * Carried forward when this save did not mention it, and dropped when the provider changes.
@@ -286,6 +281,11 @@ export const registerProviderRoutes = (context: RouteContext): void => {
         (existingSecret?.provider === input.provider ? existingSecret.mediaModels : undefined);
       const saved: InferenceSecret = {
         provider: input.provider,
+        catalogDefaults: {
+          contextTokens: input.contextTokens,
+          capabilities: input.capabilities,
+          modalities: input.modalities
+        },
         baseUrl,
         ...(apiKey ? { apiKey } : {}),
         ...(input.modelId ? { modelId: input.modelId } : {}),
@@ -296,52 +296,22 @@ export const registerProviderRoutes = (context: RouteContext): void => {
       const mediaRoutes = mediaModels
         ? await mediaRoutesFor(saved, mediaModels)
         : await mediaRoutesFor(saved, undefined).catch(() => ({}));
-      /*
-       * Keyed by vendor, so a second connection joins the first instead of overwriting it.
-       *
-       * The key used to be the role - one row called `inference` - which is the whole reason
-       * connecting Ollama Cloud took OpenRouter away. The legacy row is removed in the same breath
-       * as the vendor-keyed one is written, so an account that had a single connection ends up
-       * holding exactly the same connection under its new name rather than two copies of it that
-       * can drift apart.
-       */
-      await store.upsertManagedProviderCredential({
-        userId: user.id,
-        provider: `inference:${input.provider}`,
-        secretCiphertext: encryptJson(
-          { ...saved, ...(mediaRoutes ? { mediaRoutes } : {}) },
-          masterKey,
-          inferenceCredentialAad(user.id)
-        ),
-        externalRef: 'self-hosted',
-        monthlyLimitUsd: 0,
-        status: 'active'
+      await database.transaction(async (transaction) => {
+        const target = new DataStore(transaction);
+        await target.replaceModelCatalog(pendingModels);
+        await target.upsertManagedProviderCredential({
+          userId: user.id,
+          provider: `inference:${input.provider}`,
+          secretCiphertext: encryptJson(
+            { ...saved, ...(mediaRoutes ? { mediaRoutes } : {}) },
+            masterKey,
+            inferenceCredentialAad(user.id)
+          ),
+          externalRef: 'self-hosted',
+          monthlyLimitUsd: 0,
+          status: 'active'
+        });
       });
-      const legacy = await store.getManagedProviderCredential(user.id, 'inference');
-      if (legacy) {
-        const previous = decryptJson<InferenceSecret>(
-          legacy.secretCiphertext,
-          masterKey,
-          inferenceCredentialAad(user.id)
-        );
-        /*
-         * Never over the row this request just wrote. A legacy credential for the *same* vendor is
-         * the older copy of what was just saved, and copying it forward would put the previous key
-         * back a line after the new one was stored. A legacy credential for a *different* vendor is
-         * a connection this account already had, and moving it to its own key is what keeps it
-         * rather than stranding it under a name nothing reads any more.
-         */
-        if (previous.provider !== input.provider)
-          await store.upsertManagedProviderCredential({
-            userId: user.id,
-            provider: `inference:${previous.provider}`,
-            secretCiphertext: legacy.secretCiphertext,
-            externalRef: legacy.externalRef,
-            monthlyLimitUsd: legacy.monthlyLimitUsd,
-            status: 'active'
-          });
-        await store.removeManagedProviderCredential(user.id, 'inference');
-      }
       await recordSecurityEvent(store, {
         userId: user.id,
         kind: 'inference_provider_configured',
@@ -386,11 +356,31 @@ export const registerProviderRoutes = (context: RouteContext): void => {
        * a box reporting no provider while the worker still held a usable one - which is worse than
        * either state on its own.
        */
+      const query = z
+        .object({
+          connectionId: z.enum(['openrouter', 'ollama-cloud', 'openai-compatible']).optional()
+        })
+        .parse(request.query);
       const connections = await store.listManagedProviderCredentials(user.id);
+      const selected = query.connectionId;
       let deleted = false;
-      for (const connection of connections)
+      for (const connection of connections) {
+        if (selected) {
+          const vendor =
+            connection.provider === 'openrouter'
+              ? 'openrouter'
+              : connection.provider === 'inference'
+                ? decryptJson<InferenceSecret>(
+                    connection.secretCiphertext,
+                    masterKey,
+                    inferenceCredentialAad(user.id)
+                  ).provider
+                : connection.provider.slice('inference:'.length);
+          if (vendor !== selected) continue;
+        }
         deleted =
           (await store.removeManagedProviderCredential(user.id, connection.provider)) || deleted;
+      }
       return { deleted };
     });
   });

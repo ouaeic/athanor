@@ -30,9 +30,10 @@ import type {
 import {
   AthanorError,
   assertSpendAllowed,
-  decryptJson,
   generateDataKey,
-  inferenceCredentialAad,
+  readInferenceConnections,
+  environmentInferenceSecret,
+  modelConnectionId,
   priceCeilingFields,
   readRoutingMetadata,
   selectModel,
@@ -309,29 +310,10 @@ export const createServerSupport = (context: ServerBase) => {
   };
 
   const requiresZeroDataRetention = async (userId: string): Promise<boolean> => {
-    /*
-     * The primary connection's answer, which is a narrower claim than it used to be.
-     *
-     * With one credential per account this was the box's retention setting. An account can now hold
-     * several, and each model already carries the privacy route of the connection that listed it -
-     * so the per-task match, which is what actually keeps a conversation on the route it was
-     * started on, is unaffected. What this still answers is the account-level default a settings
-     * screen shows and a new conversation inherits.
-     */
-    const saved = await store.primaryInferenceCredential(userId);
-    if (saved?.status !== 'active') return config.AI_REQUIRE_ZDR;
-    try {
-      return (
-        decryptJson<{ enforceZeroDataRetention?: boolean }>(
-          saved.secretCiphertext,
-          masterKey,
-          inferenceCredentialAad(userId)
-        ).enforceZeroDataRetention !== false
-      );
-    } catch {
-      // An unreadable credential must never weaken the configured privacy floor.
-      return true;
-    }
+    const primary = (await inferenceConnections(userId)).values().next().value;
+    if (primary) return primary.secret.enforceZeroDataRetention !== false;
+    const saved = await store.listManagedProviderCredentials(userId);
+    return saved.some((row) => row.status === 'active') ? true : config.AI_REQUIRE_ZDR;
   };
 
   /**
@@ -352,14 +334,8 @@ export const createServerSupport = (context: ServerBase) => {
     if (!catalog.length || catalog.some((model) => String(model.availability) !== 'review')) return;
     const owner = await store.soleUser();
     if (!owner) return;
-    const saved = await store.primaryInferenceCredential(owner.id);
-    if (saved?.status !== 'active') return;
-    const secret = decryptJson<{ provider?: string; baseUrl?: string; apiKey?: string }>(
-      saved.secretCiphertext,
-      masterKey,
-      inferenceCredentialAad(owner.id)
-    );
-    if (secret.provider !== 'openrouter' || !secret.apiKey) return;
+    const secret = (await inferenceConnections(owner.id)).get('openrouter')?.secret;
+    if (!secret?.apiKey) return;
     const live = await refreshOpenRouterCatalog(seedModels(), {
       baseUrl: secret.baseUrl ?? config.OPENROUTER_BASE_URL,
       apiKey: secret.apiKey,
@@ -412,8 +388,8 @@ export const createServerSupport = (context: ServerBase) => {
           );
         });
         if (!missing.length) return;
-        const { secret } = await inferenceCredential(user.id);
-        if (secret.provider !== 'ollama-cloud') return;
+        const secret = connections.get('ollama-cloud')?.secret;
+        if (!secret) return;
         const adapter = new OpenAICompatibleAdapter({
           provider: 'custom',
           privacyRoute: 'external',
@@ -464,43 +440,19 @@ export const createServerSupport = (context: ServerBase) => {
       });
       await ollamaReasoningRepair;
     }
-    /*
-     * Every connected provider's rows, in one list, each carrying which connection reaches it.
-     *
-     * This filtered down to a single provider, because an account could only hold one credential
-     * and a row whose key had been replaced was a row the worker would refuse mid-conversation. An
-     * account can now hold several, so the question is no longer "which provider is configured"
-     * but "is there a key for this row" - and a row with no key behind it is still excluded, for
-     * exactly the reason the single-provider filter existed.
-     *
-     * A box with nothing connected keeps the seeded rows, so a first connection can be configured
-     * from the picker it is about to fill.
-     */
-    const namespaces = new Set([...reachable].map(catalogueNamespace));
-    const tags = new Set(
-      [...reachable]
-        .filter((vendor) => vendor !== 'openrouter')
-        .map((vendor) => (vendor === 'ollama-cloud' ? 'Ollama Cloud' : 'Configured endpoint'))
-    );
-    return (await store.listModels())
-      .filter((record) => {
-        if (reachable.size === 0) return true;
-        const model = ModelRelease.parse(record);
-        if (!namespaces.has(model.provider)) return false;
-        // Inside `custom` two vendors share one namespace, so the tag is what tells an Ollama Cloud
-        // row from a configured endpoint's. OpenRouter has a namespace to itself and needs no tag.
-        if (model.provider === 'openrouter') return true;
-        return [...tags].some((tag) => model.recommendationTags.includes(tag));
-      })
-      .map((record) => {
-        // The contract's parse strips what it does not declare, and the fields the router reads -
-        // where the numbers came from, when the route retires, how it bills a cached prefix - are
-        // deliberately not part of the owner-facing model shape. Carried alongside rather than
-        // widened into it, so the API keeps answering with exactly what it promises.
-        const parsed = ModelRelease.parse(record);
-        const model = applyOpenRouterPrivacyPolicy(parsed, requireZdr);
-        return { ...model, ...readRoutingMetadata(record) };
-      });
+    return (await store.listModels()).flatMap((record) => {
+      const parsed = ModelRelease.parse(record);
+      const connectionId = modelConnectionId(parsed, connections.keys());
+      if (reachable.size && !connectionId) return [];
+      const connection = connectionId ? connections.get(connectionId) : undefined;
+      const model = applyOpenRouterPrivacyPolicy(
+        parsed,
+        connection?.secret.enforceZeroDataRetention ?? requireZdr
+      );
+      return [
+        { ...model, ...(connectionId ? { connectionId } : {}), ...readRoutingMetadata(record) }
+      ];
+    });
   };
 
   const provisionWorkspace = async (
@@ -598,128 +550,19 @@ export const createServerSupport = (context: ServerBase) => {
     source: 'encrypted_database' | 'server_environment';
     configured: boolean;
   }> => {
-    /*
-     * The account's primary connection, which is no longer the same thing as its only one.
-     *
-     * Media, voice and transcription are account-level choices rather than per-model ones, and the
-     * `configured` flag every settings screen reads is a question about the account. Both are
-     * answered from the connection map so that they keep working now that a credential is keyed by
-     * vendor - reading the literal `'inference'` row, as this did, stopped finding anything the
-     * moment a save started writing `inference:openrouter` instead.
-     *
-     * Primary means most recently saved: `listManagedProviderCredentials` orders by `updated_at`
-     * descending and the map keeps insertion order, so the first entry is the connection the owner
-     * touched last. That is the one a media picker was filled from.
-     */
-    const connections = await inferenceConnections(userId);
-    const primary = [...connections.values()][0];
-    if (primary?.source === 'encrypted_database')
-      return { secret: primary.secret, source: 'encrypted_database', configured: true };
-    const apiKey = config.AI_API_KEY ?? config.OPENROUTER_API_KEY;
-    return {
-      secret: {
-        provider: config.AI_PROVIDER,
-        baseUrl: config.AI_BASE_URL,
-        ...(apiKey ? { apiKey } : {}),
-        ...(config.AI_DEFAULT_MODEL ? { modelId: config.AI_DEFAULT_MODEL } : {}),
-        enforceZeroDataRetention: config.AI_REQUIRE_ZDR
-      },
-      source: 'server_environment',
-      configured: Boolean(
-        apiKey || (config.AI_PROVIDER === 'openai-compatible' && config.AI_DEFAULT_MODEL)
-      )
-    };
+    const primary = (await inferenceConnections(userId)).values().next().value;
+    if (primary) return { ...primary, configured: true };
+    const { apiKey: _unavailableKey, ...secret } = environmentInferenceSecret(config);
+    return { secret, source: 'server_environment', configured: false };
   };
 
-  /**
-   * The connection id a vendor's credential is stored under, and the one it was stored under before
-   * an account could hold more than one.
-   *
-   * `'inference'` was the key when there was exactly one connection, and `'openrouter'` before that.
-   * Both are still read, because an install that has not saved a provider since is holding its only
-   * credential in one of them; new saves go to the vendor-keyed form so a second connection has
-   * somewhere to live.
-   */
-  const connectionKey = (vendor: InferenceSecret['provider']): string => `inference:${vendor}`;
-
-  /**
-   * Every inference connection this account holds, by connection id.
-   *
-   * A connection id is what a catalogue row's `connectionId` names, so this is the map that turns
-   * "which model did the owner pick" into "which key can call it". The environment fallback appears
-   * here too and under its own vendor, because a development checkout and a first start have a
-   * provider without ever having saved one.
-   */
-  const inferenceConnections = async (
-    userId: string
-  ): Promise<
-    Map<string, { secret: InferenceSecret; source: 'encrypted_database' | 'server_environment' }>
-  > => {
-    const connections = new Map<
-      string,
-      { secret: InferenceSecret; source: 'encrypted_database' | 'server_environment' }
-    >();
-    for (const row of await store.listManagedProviderCredentials(userId)) {
-      if (row.status !== 'active') continue;
-      try {
-        /*
-         * The oldest key, `'openrouter'`, sealed a bare `{apiKey}` rather than a whole secret, and
-         * is opened without the account's AAD because that is how it was written. It is read here
-         * rather than migrated so that an account which has not touched Settings in months still
-         * reaches its provider on the next turn.
-         */
-        const secret: InferenceSecret =
-          row.provider === 'openrouter'
-            ? {
-                provider: 'openrouter',
-                baseUrl: config.OPENROUTER_BASE_URL,
-                apiKey: decryptJson<{ apiKey: string }>(row.secretCiphertext, masterKey).apiKey,
-                enforceZeroDataRetention: true
-              }
-            : decryptJson<InferenceSecret>(
-                row.secretCiphertext,
-                masterKey,
-                inferenceCredentialAad(userId)
-              );
-        connections.set(connectionKey(secret.provider).slice('inference:'.length), {
-          secret,
-          source: 'encrypted_database'
-        });
-      } catch {
-        // A credential this box can no longer open is a connection it does not have. Skipped rather
-        // than thrown: one unreadable row must not take away the others.
-      }
-    }
-    if (connections.size === 0) {
-      const apiKey = config.AI_API_KEY ?? config.OPENROUTER_API_KEY;
-      const configured =
-        apiKey || (config.AI_PROVIDER === 'openai-compatible' && config.AI_DEFAULT_MODEL);
-      if (configured)
-        connections.set(config.AI_PROVIDER, {
-          secret: {
-            provider: config.AI_PROVIDER,
-            baseUrl: config.AI_BASE_URL,
-            ...(apiKey ? { apiKey } : {}),
-            ...(config.AI_DEFAULT_MODEL ? { modelId: config.AI_DEFAULT_MODEL } : {}),
-            enforceZeroDataRetention: config.AI_REQUIRE_ZDR
-          },
-          source: 'server_environment'
-        });
-    }
-    return connections;
-  };
-
-  /**
-   * Which id namespace a vendor's catalogue rows are written under.
-   *
-   * Not the same thing as the connection id, and deliberately so: every model id in the database is
-   * `<namespace>/<model>`, ids are what finished tasks and pinned schedules name their model by,
-   * and a namespace that moved would strand every one of them. OpenRouter has always had its own;
-   * everything else shares `custom`, and now says which connection serves it in its own column
-   * instead of being told apart by a prefix that cannot carry the answer.
-   */
-  const catalogueNamespace = (vendor: InferenceSecret['provider']): string =>
-    vendor === 'openrouter' ? 'openrouter' : 'custom';
+  const inferenceConnections = async (userId: string) =>
+    readInferenceConnections<InferenceSecret>({
+      rows: await store.listManagedProviderCredentials(userId),
+      userId,
+      masterKey,
+      environment: config
+    });
 
   /**
    * Where this box's web searches are answered.
@@ -785,7 +628,8 @@ export const createServerSupport = (context: ServerBase) => {
    * Null when there is no configured row to read: an OpenRouter box has a catalogue nobody typed.
    */
   const configuredModelFacts = async (
-    modelId: string | undefined
+    modelId: string | undefined,
+    connectionId?: string
   ): Promise<{
     contextTokens: number | null;
     capabilities: string[] | null;
@@ -794,7 +638,9 @@ export const createServerSupport = (context: ServerBase) => {
     const absent = { contextTokens: null, capabilities: null, modalities: null };
     if (!modelId) return absent;
     const record = (await store.listModels()).find(
-      (row) => row.id === `custom/${modelId}` || row.providerModelId === modelId
+      (row) =>
+        (row.id === `custom/${modelId}` || row.providerModelId === modelId) &&
+        (!connectionId || modelConnectionId(ModelRelease.parse(row), [connectionId]) !== null)
     );
     if (!record) return absent;
     const parsed = ModelRelease.safeParse(record);
@@ -807,32 +653,28 @@ export const createServerSupport = (context: ServerBase) => {
   };
 
   const providerSettings = async (userId: string) => {
-    const { secret, source, configured } = await inferenceCredential(userId);
-    if (source === 'encrypted_database') {
-      return {
-        configured: true,
-        source,
-        provider: secret.provider,
-        baseUrl: secret.baseUrl,
-        modelId: secret.modelId ?? null,
-        hasApiKey: Boolean(secret.apiKey),
-        enforceZeroDataRetention: secret.enforceZeroDataRetention,
-        mediaModels: secret.mediaModels ?? null,
-        webSearch: webSearchRoute(secret),
-        ...(await configuredModelFacts(secret.modelId))
-      };
-    }
+    const connections = await inferenceConnections(userId);
+    const describe = async (connectionId: string, secret: InferenceSecret, source: string) => ({
+      connectionId,
+      source,
+      provider: secret.provider,
+      baseUrl: secret.baseUrl,
+      modelId: secret.modelId ?? null,
+      hasApiKey: Boolean(secret.apiKey),
+      enforceZeroDataRetention: secret.enforceZeroDataRetention,
+      mediaModels: secret.mediaModels ?? null,
+      webSearch: webSearchRoute(secret),
+      ...(secret.catalogDefaults ?? (await configuredModelFacts(secret.modelId, connectionId)))
+    });
+    const listed = await Promise.all(
+      [...connections].map(([id, entry]) => describe(id, entry.secret, entry.source))
+    );
+    const primary = listed[0];
+    const { apiKey: _unavailableKey, ...unconfigured } = environmentInferenceSecret(config);
     return {
-      configured,
-      source: 'server_environment' as const,
-      provider: config.AI_PROVIDER,
-      baseUrl: config.AI_BASE_URL,
-      modelId: config.AI_DEFAULT_MODEL ?? null,
-      hasApiKey: Boolean(config.AI_API_KEY ?? config.OPENROUTER_API_KEY),
-      enforceZeroDataRetention: config.AI_REQUIRE_ZDR,
-      mediaModels: null,
-      webSearch: webSearchRoute({ provider: config.AI_PROVIDER }),
-      ...(await configuredModelFacts(config.AI_DEFAULT_MODEL))
+      ...(primary ?? (await describe(config.AI_PROVIDER, unconfigured, 'server_environment'))),
+      configured: Boolean(primary),
+      connections: listed
     };
   };
 
@@ -932,10 +774,12 @@ export const createServerSupport = (context: ServerBase) => {
     if (privacy !== 'provider_zdr' && privacy !== 'external') return { skipped: true };
     if (privacy === 'provider_zdr' && !secret.enforceZeroDataRetention) return { skipped: true };
     const route = selectTitleRoute(
-      (await store.listModels()).map((record) => ({
-        ...ModelRelease.parse(record),
-        ...readRoutingMetadata(record)
-      })),
+      (await store.listModels())
+        .map((record) => ({
+          ...ModelRelease.parse(record),
+          ...readRoutingMetadata(record)
+        }))
+        .filter((model) => modelConnectionId(model, [secret.provider]) !== null),
       {
         provider: secret.provider === 'openrouter' ? 'openrouter' : 'custom',
         privacyRoute: privacy,
@@ -1080,6 +924,7 @@ export const createServerSupport = (context: ServerBase) => {
     provisionWorkspace,
     ensurePrimaryWorkspace,
     inferenceCredential,
+    inferenceConnections,
     webSearchRoute,
     webSearchRouteFor,
     configuredModelFacts,

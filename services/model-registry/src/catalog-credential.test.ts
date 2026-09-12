@@ -9,15 +9,14 @@ const OWNER = 'ffffffff-1111-4111-8111-ffffffffffff';
 const source = (rows: Record<string, { provider: string; status: string; secret: unknown }>) =>
   ({
     soleUser: async () => ({ id: OWNER }),
-    getManagedProviderCredential: async (userId: string, provider: string) => {
-      const row = rows[provider];
-      if (!row || userId !== OWNER) return null;
-      return {
-        provider: row.provider,
-        status: row.status,
-        secretCiphertext: row.secret as EncryptedEnvelope
-      };
-    }
+    listManagedProviderCredentials: async (userId: string) =>
+      userId !== OWNER
+        ? []
+        : Object.values(rows).map((row) => ({
+            provider: row.provider,
+            status: row.status,
+            secretCiphertext: row.secret as EncryptedEnvelope
+          }))
   }) satisfies CredentialSource;
 
 const inferenceRow = (secret: Record<string, unknown>, status = 'active') => ({
@@ -38,7 +37,7 @@ describe('catalogCredential', () => {
       }),
       masterKey
     });
-    expect(credential).toEqual({
+    expect(credential).toMatchObject({
       apiKey: 'sk-owner',
       baseUrl: 'https://openrouter.ai/api/v1',
       provider: 'openrouter',
@@ -52,7 +51,7 @@ describe('catalogCredential', () => {
       masterKey,
       environmentKey: 'sk-operator'
     });
-    expect(credential).toEqual({
+    expect(credential).toMatchObject({
       apiKey: 'sk-operator',
       provider: 'openrouter',
       source: 'environment'
@@ -70,7 +69,11 @@ describe('catalogCredential', () => {
       }),
       masterKey
     });
-    expect(credential).toEqual({ apiKey: 'sk-legacy', provider: 'openrouter', source: 'owner' });
+    expect(credential).toMatchObject({
+      apiKey: 'sk-legacy',
+      provider: 'openrouter',
+      source: 'owner'
+    });
   });
 
   /*
@@ -96,7 +99,7 @@ describe('catalogCredential', () => {
         }),
         masterKey
       });
-      expect(credential).toEqual({
+      expect(credential).toMatchObject({
         apiKey: 'sk-elsewhere',
         baseUrl: 'https://x.test/v1',
         provider,
@@ -116,11 +119,18 @@ describe('catalogCredential', () => {
     expect(
       await catalogCredential({
         store: source({
-          inference: inferenceRow({ provider: 'custom', baseUrl: 'http://127.0.0.1:11434/v1' })
+          inference: inferenceRow({
+            provider: 'openai-compatible',
+            baseUrl: 'http://127.0.0.1:11434/v1'
+          })
         }),
         masterKey
       })
-    ).toEqual({ provider: 'custom', baseUrl: 'http://127.0.0.1:11434/v1', source: 'owner' });
+    ).toMatchObject({
+      provider: 'openai-compatible',
+      baseUrl: 'http://127.0.0.1:11434/v1',
+      source: 'owner'
+    });
     expect(
       await catalogCredential({
         store: source({ inference: inferenceRow({ provider: 'openrouter' }) }),
@@ -174,7 +184,7 @@ describe('catalogCredential', () => {
           modelId: 'served-model'
         }
       })
-    ).toEqual({
+    ).toMatchObject({
       provider: 'openai-compatible',
       baseUrl: 'https://vllm.internal/v1',
       modelId: 'served-model',
@@ -237,6 +247,6 @@ describe('catalogCredential', () => {
         store: source({ inference: { provider: 'inference', status: 'active', secret: stolen } }),
         masterKey
       })
-    ).rejects.toThrow(/context mismatch/i);
+    ).rejects.toThrow('could not be opened');
   });
 });

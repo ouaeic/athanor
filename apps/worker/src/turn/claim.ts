@@ -25,7 +25,7 @@ import {
 } from '@athanor/contracts';
 import type { DataStore, TaskRecord, WorkspaceRecord } from '@athanor/data';
 import type { ModelGateway, ModelTool } from '@athanor/model-gateway';
-import type { AgentState, AgentWorkerConfig, InferenceCredential } from '../agent-state.js';
+import type { AgentState, AgentWorkerConfig } from '../agent-state.js';
 import { BASE_SYSTEM_PROMPT, COMPACT_CONTEXT_TOOL } from '../context.js';
 import { agentToolsFor } from '../tools.js';
 import { applyProjectMainModel } from '../purpose-model.js';
@@ -37,7 +37,7 @@ export interface TurnClaimDeps {
   readonly store: DataStore;
   readonly config: AgentWorkerConfig;
   readonly masterKey: Buffer;
-  inferenceCredential(task: TaskRecord): Promise<Pick<InferenceCredential, 'provider'>>;
+  connectedModels(task: TaskRecord, catalog: readonly ModelRelease[]): Promise<ModelRelease[]>;
   gateway(
     task: TaskRecord,
     model: ModelRelease

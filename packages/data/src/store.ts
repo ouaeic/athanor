@@ -1281,6 +1281,12 @@ export class DataStore {
     return this.#connectors.removeManagedProviderCredential(...args);
   }
 
+  replaceManagedProviderCredentialSecret(
+    ...args: Parameters<ConnectorStore['replaceManagedProviderCredentialSecret']>
+  ) {
+    return this.#connectors.replaceManagedProviderCredentialSecret(...args);
+  }
+
   upsertManagedProviderCredential(
     ...args: Parameters<ConnectorStore['upsertManagedProviderCredential']>
   ) {

@@ -1073,6 +1073,8 @@ export const ModelOpenness = z.enum([
 
 export const ModelRelease = z.object({
   id: z.string(),
+  /** The saved connection that serves this exact model route. */
+  connectionId: z.string().min(1).optional(),
   providerModelId: z.string(),
   displayName: z.string(),
   provider: z.string(),

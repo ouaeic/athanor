@@ -374,6 +374,27 @@ export class ConnectorStore {
     return result.rows.length > 0;
   }
 
+  /** A settings save cannot restore a key rotated or removed while discovery was in flight. */
+  async replaceManagedProviderCredentialSecret(input: {
+    userId: string;
+    provider: string;
+    expected: EncryptedEnvelope;
+    replacement: EncryptedEnvelope;
+  }): Promise<boolean> {
+    const result = await this.database.query(
+      `UPDATE managed_provider_credentials SET secret_ciphertext=$4::jsonb, updated_at=NOW()
+       WHERE user_id=$1 AND provider=$2 AND status='active' AND secret_ciphertext=$3::jsonb
+       RETURNING provider`,
+      [
+        input.userId,
+        input.provider,
+        JSON.stringify(input.expected),
+        JSON.stringify(input.replacement)
+      ]
+    );
+    return result.rows.length === 1;
+  }
+
   async upsertManagedProviderCredential(input: {
     userId: string;
     provider: string;

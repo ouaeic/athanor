@@ -14,7 +14,8 @@ import {
 import {
   decryptJson,
   encryptJson,
-  inferenceCredentialAad,
+  readInferenceConnections,
+  modelConnectionId,
   AthanorError,
   selectModel,
   sha256,
@@ -309,7 +310,7 @@ export class AgentWorker {
       config,
       masterKey: this.#masterKey,
       gateway: (task, model) => this.#gateway(task, model),
-      inferenceCredential: (task) => this.#inferenceCredential(task),
+      connectedModels: (task, catalog) => this.#connectedModels(task, catalog),
       startedBySchedule: (task, key) => this.#startedBySchedule(task, key),
       toolchainSummary: (task) => this.#toolchainSummary(task),
       machineSummary: (task) => this.#machineSummary(task),
@@ -379,7 +380,7 @@ export class AgentWorker {
           {
             store,
             masterKey: this.#masterKey,
-            inferenceCredential: (forTask) => this.#inferenceCredential(forTask)
+            connectedModels: (forTask, catalog) => this.#connectedModels(forTask, catalog)
           },
           task,
           'summarise',
@@ -472,104 +473,48 @@ export class AgentWorker {
     };
   }
 
-  /**
-   * The credential facts the web route is decided from, handed back with the gateway rather than
-   * read a second time.
-   *
-   * The owner can edit both from the settings page while a task runs, and two reads a step apart
-   * can disagree - which on this decision is the difference between sending the provider's search
-   * tools and withdrawing the in-house ones, the one pair the tool catalogue cannot survive.
-   */
-  /**
-   * The provider this owner has configured, as a base URL and a key.
-   *
-   * Media generation needs the same account as inference and nothing else about a model release,
-   * so the lookup lives here rather than being written twice with two chances to disagree about
-   * which credential wins.
-   */
-  /**
-   * The account's connections, by vendor.
-   *
-   * An account holds one credential per provider it has connected, keyed `inference:<vendor>`, and
-   * two older shapes exist beside them: `'inference'` from when a box could hold exactly one, and
-   * `'openrouter'` from before that, which sealed a bare `{apiKey}` without the account's AAD. All
-   * three are read, because an install that has not opened Settings since is still reaching its
-   * provider through one of the old ones.
-   */
   async #inferenceConnections(task: TaskRecord): Promise<Map<string, InferenceCredential>> {
-    const connections = new Map<string, InferenceCredential>();
-    for (const row of await this.store.listManagedProviderCredentials(task.userId)) {
-      if (row.status !== 'active') continue;
-      try {
-        const secret: InferenceCredential =
-          row.provider === 'openrouter'
-            ? {
-                provider: 'openrouter',
-                baseUrl: this.config.OPENROUTER_BASE_URL,
-                apiKey: decryptJson<{ apiKey: string }>(row.secretCiphertext, this.#masterKey)
-                  .apiKey,
-                enforceZeroDataRetention: true
-              }
-            : decryptJson<InferenceCredential>(
-                row.secretCiphertext,
-                this.#masterKey,
-                inferenceCredentialAad(task.userId)
-              );
-        // Newest wins on a tie: `listManagedProviderCredentials` orders by `updated_at` descending,
-        // so a vendor-keyed row written today takes precedence over the legacy row it replaced.
-        if (!connections.has(secret.provider)) connections.set(secret.provider, secret);
-      } catch {
-        // A credential this worker cannot open is one it does not have. One unreadable row must not
-        // take the others down with it, which is what a throw here would do.
-      }
-    }
-    /*
-     * A box whose provider comes from its environment has no rows at all, and that is the
-     * documented self-hosted install: `AI_API_KEY` or `OPENROUTER_API_KEY` in `control.env`, never
-     * a visit to Settings. `#inferenceCredential` is the one place that fallback is written down,
-     * so it answers here too rather than being restated - restating it is how the two would come to
-     * disagree about what a box with no saved credential can reach.
-     */
-    if (connections.size === 0) {
-      const only = await this.#inferenceCredential(task).catch(() => undefined);
-      if (only) connections.set(only.provider, only);
-    }
-    return connections;
+    const connections = readInferenceConnections<InferenceCredential>({
+      rows: await this.store.listManagedProviderCredentials(task.userId),
+      userId: task.userId,
+      masterKey: this.#masterKey,
+      environment: this.config
+    });
+    return new Map([...connections].map(([id, connection]) => [id, connection.secret]));
+  }
+
+  async #connectedModels(
+    task: TaskRecord,
+    catalog: readonly ModelRelease[]
+  ): Promise<ModelRelease[]> {
+    const connections = await this.#inferenceConnections(task);
+    return catalog.filter((model) => modelConnectionId(model, connections.keys()) !== null);
+  }
+
+  async #credentialForModel(task: TaskRecord, model: ModelRelease): Promise<InferenceCredential> {
+    const connections = await this.#inferenceConnections(task);
+    const id = modelConnectionId(model, connections.keys());
+    const secret = id ? connections.get(id) : undefined;
+    if (!secret)
+      throw new AthanorError(
+        'provider_model_mismatch',
+        'The selected model has no available connection. Check its provider in Settings.',
+        409
+      );
+    return secret;
   }
 
   async #inferenceCredential(task: TaskRecord, resolveMedia = false): Promise<InferenceCredential> {
-    const credential =
-      (await this.store.getManagedProviderCredential(task.userId, 'inference')) ??
-      (await this.store.getManagedProviderCredential(task.userId, 'openrouter'));
-    const environmentApiKey = this.config.AI_API_KEY ?? this.config.OPENROUTER_API_KEY;
-    const secret: InferenceCredential | undefined = credential?.secretCiphertext
-      ? credential.provider === 'inference'
-        ? decryptJson<InferenceCredential>(
-            credential.secretCiphertext,
-            this.#masterKey,
-            inferenceCredentialAad(task.userId)
-          )
-        : {
-            provider: 'openrouter',
-            baseUrl: this.config.OPENROUTER_BASE_URL,
-            apiKey: decryptJson<{ apiKey: string }>(credential.secretCiphertext, this.#masterKey)
-              .apiKey,
-            enforceZeroDataRetention: true
-          }
-      : environmentApiKey
-        ? {
-            provider: this.config.AI_PROVIDER,
-            baseUrl: this.config.AI_BASE_URL,
-            apiKey: environmentApiKey,
-            enforceZeroDataRetention: this.config.AI_REQUIRE_ZDR
-          }
-        : this.config.AI_PROVIDER === 'openai-compatible' && this.config.AI_DEFAULT_MODEL
-          ? {
-              provider: 'openai-compatible',
-              baseUrl: this.config.AI_BASE_URL,
-              enforceZeroDataRetention: this.config.AI_REQUIRE_ZDR
-            }
-          : undefined;
+    const connections = await this.#inferenceConnections(task);
+    const model = resolveMedia
+      ? undefined
+      : ((await this.store.listModels()).find((entry) => entry.id === task.modelId) as
+          | ModelRelease
+          | undefined);
+    const id = model
+      ? modelConnectionId(model, connections.keys())
+      : connections.keys().next().value;
+    const secret = id ? connections.get(id) : undefined;
     if (!secret)
       throw new AthanorError(
         // The name three things already listen for. `provider_setup_required` was thrown here and
@@ -600,34 +545,7 @@ export class AgentWorker {
     credential: { provider: string; enforceZeroDataRetention: boolean };
   }> {
     const gateway = new ModelGateway();
-    /*
-     * The credential is chosen by the model, not by the account.
-     *
-     * This used to read the one credential an account had and refuse any model whose namespace did
-     * not match it - which is what made a box single-provider: connecting Ollama Cloud took
-     * OpenRouter's models away, and a conversation pinned to one of them failed here, after it had
-     * started. An account now holds a connection per provider, so the question is whether *this*
-     * model has a key behind it.
-     *
-     * `custom` is one namespace shared by every non-OpenRouter vendor, so a row in it is served by
-     * whichever such connection exists; the tag on the row says which vendor listed it. The failure
-     * is still a refusal rather than a silent fallback to another provider's key: sending an
-     * account's OpenRouter credential to an endpoint it was not issued for is the one outcome worse
-     * than stopping.
-     */
-    const connections = await this.#inferenceConnections(task);
-    const vendor =
-      model.provider === 'openrouter'
-        ? 'openrouter'
-        : ([...connections.keys()].find((name) => name !== 'openrouter') ?? null);
-    const secret = vendor ? connections.get(vendor) : undefined;
-    if (!secret)
-      throw new AthanorError(
-        'provider_model_mismatch',
-        connections.size === 0
-          ? 'Add a model provider in Settings before starting agent work'
-          : `The selected model belongs to ${model.provider}, and this account has no connection that reaches it`
-      );
+    const secret = await this.#credentialForModel(task, model);
     gateway.register(
       model.provider,
       nativeInputAdapter(
@@ -652,7 +570,7 @@ export class AgentWorker {
         model,
         nativeCredentialBinding(secret),
         async () =>
-          nativeCredentialBinding(await this.#inferenceCredential(task), task.privacyRoute),
+          nativeCredentialBinding(await this.#credentialForModel(task, model), task.privacyRoute),
         this.config.WORKER_ID
       )
     );
@@ -1662,6 +1580,7 @@ export class AgentWorker {
         state,
         inferenceCredential: (forTask, resolveMedia) =>
           this.#inferenceCredential(forTask, resolveMedia),
+        connectedModels: (forTask, catalog) => this.#connectedModels(forTask, catalog),
         providerWebSearch: (forTask, forCall, plan, forState) =>
           this.#providerWebSearch(forTask, forCall, plan, forState),
         missingBinaries: (forTask, binaries) => this.#missingBinaries(forTask, binaries),
@@ -2005,7 +1924,7 @@ export class AgentWorker {
       {
         store: this.store,
         masterKey: this.#masterKey,
-        inferenceCredential: (forTask) => this.#inferenceCredential(forTask)
+        connectedModels: (forTask, catalog) => this.#connectedModels(forTask, catalog)
       },
       task,
       catalog,
@@ -2337,12 +2256,10 @@ export class AgentWorker {
        * on `provider_model_mismatch` - a worse failure than the wall, because it does not lift.
        */
       const connections = await this.#inferenceConnections(task);
-      const namespaces = new Set<string>(
-        [...connections.keys()].map((vendor) => (vendor === 'openrouter' ? 'openrouter' : 'custom'))
-      );
-      const reachable = catalog.filter(
-        (entry) => namespaces.has(entry.provider) && !walled.includes(entry.provider)
-      );
+      const reachable = catalog.filter((entry) => {
+        const id = modelConnectionId(entry, connections.keys());
+        return id !== null && !walled.includes(entry.provider);
+      });
       if (reachable.length === 0) return false;
       const chosen = selectModel(reachable, {
         privacyRoute: task.privacyRoute === 'provider_zdr' ? 'provider_zdr' : 'external',
@@ -2392,7 +2309,7 @@ export class AgentWorker {
     generationId: string
   ): Promise<void> {
     try {
-      const credential = await this.#inferenceCredential(task);
+      const credential = await this.#credentialForModel(task, model);
       if (credential.provider !== 'openrouter' || !credential.apiKey) return;
       const measured = await fetchGenerationThroughput({
         baseUrl: this.config.OPENROUTER_BASE_URL,

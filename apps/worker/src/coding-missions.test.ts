@@ -1,3 +1,4 @@
+import type { ModelRelease } from '@athanor/contracts';
 import { reconcileCodingMission } from './coding-mission-loop.js';
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -119,7 +120,8 @@ describe('native coding tool and durable parent wait', () => {
       runner,
       state,
       config: { WORKER_ID: 'worker' },
-      inferenceCredential: async () => ({ provider: 'openai-compatible' })
+      connectedModels: async (_task: unknown, catalog: readonly ModelRelease[]) =>
+        catalog.filter((model) => model.provider === 'custom')
     } as unknown as ToolContext;
     return { context, runner, state, task, user, workspace };
   };
