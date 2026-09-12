@@ -3,10 +3,9 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { MediaModelOption } from '@athanor/contracts';
 import { createDatabase, DataStore, migrateDatabase } from '@athanor/data';
-import { sha256 } from '@athanor/core';
 import type * as AudioPreparation from '../audio-preparation.js';
 import type { InferenceSecret } from '../context.js';
-import type { RouteContext, ServerBase } from '../http/server-context.js';
+import type { RouteContext } from '../http/server-context.js';
 import { createIdempotentOperation } from '../http/idempotency.js';
 import { registerTranscriptionRoutes } from './transcriptions.js';
 import { prepareDictationAudio } from '../audio-preparation.js';
@@ -50,6 +49,7 @@ const route = (): MediaModelOption => ({
 });
 
 describe('dictation provider authority, atomic accounting and sealed retries', () => {
+  const masterKey = Buffer.alloc(32, 19);
   const database = createDatabase({ driver: 'pglite', pglitePath: ':memory:' }),
     store = new DataStore(database);
   const apps: FastifyInstance[] = [];
@@ -88,10 +88,10 @@ describe('dictation provider authority, atomic accounting and sealed retries', (
       app,
       store,
       config: { PUBLIC_APP_URL: 'https://garden.example' },
-      masterKey: Buffer.alloc(32, 19),
+      masterKey,
       inferenceCredential: async () => ({ secret }),
       mediaSettings,
-      idempotent: createIdempotentOperation({ store } as ServerBase)
+      idempotent: createIdempotentOperation({ store, database, masterKey })
     } as unknown as RouteContext);
     const fetch = vi.fn<typeof globalThis.fetch>(
       async () =>
@@ -298,14 +298,15 @@ describe('dictation provider authority, atomic accounting and sealed retries', (
     expect(second.headers['idempotency-replayed']).toBe('true');
     expect(f.fetch).toHaveBeenCalledTimes(1);
     const stored = await database.query(
-      'SELECT response_body FROM api_operations WHERE user_id=$1',
+      'SELECT response_body,response_ciphertext FROM api_operations WHERE user_id=$1',
       [f.owner.id]
     );
     expect(stored.rows).toHaveLength(1);
     expect(JSON.stringify(stored.rows)).not.toContain('A private transcript');
-    expect(stored.rows[0]!.response_body).toMatchObject({
+    expect(stored.rows[0]!.response_body).toBeNull();
+    expect(stored.rows[0]!.response_ciphertext).toMatchObject({
       v: 1,
-      aad: `dictation-response:${f.owner.id}:${sha256(key)}`
+      ciphertext: expect.any(String)
     });
   });
   it('uses the reviewed external OpenRouter model and prepared audio', async () => {

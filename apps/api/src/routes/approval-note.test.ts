@@ -7,7 +7,7 @@ import { APPROVAL_NOTE_MAX_CHARS } from '@athanor/contracts';
 import { ZodError } from 'zod';
 import { registerApprovalRoutes } from './approvals.js';
 import { createIdempotentOperation } from '../http/idempotency.js';
-import type { RouteContext, ServerBase } from '../http/server-context.js';
+import type { RouteContext } from '../http/server-context.js';
 
 const database = createDatabase({ driver: 'pglite', pglitePath: ':memory:' });
 const store = new DataStore(database);
@@ -78,7 +78,7 @@ async function fixture() {
     app,
     store,
     masterKey,
-    idempotent: createIdempotentOperation({ store } as ServerBase)
+    idempotent: createIdempotentOperation({ store, database, masterKey })
   } as RouteContext);
   const send = (
     body: unknown = {},

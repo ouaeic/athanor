@@ -9,7 +9,7 @@ import { registerUsageRoutes } from './usage.js';
 import { registerPrivacyRoutes } from './privacy.js';
 import { registerScheduleRoutes } from './schedules.js';
 import { registerAccountRoutes } from './account.js';
-import type { RouteContext, ServerBase } from '../http/server-context.js';
+import type { RouteContext } from '../http/server-context.js';
 import { createIdempotentOperation } from '../http/idempotency.js';
 
 const database = createDatabase({ driver: 'pglite', pglitePath: ':memory:' });
@@ -125,7 +125,7 @@ async function fixture() {
     runner: { request: runnerRequest },
     providerSpend: async () => null,
     requireRecentStepUp: vi.fn(async () => undefined),
-    idempotent: createIdempotentOperation({ store } as ServerBase),
+    idempotent: createIdempotentOperation({ store, database, masterKey }),
     taskTitle: async (task: typeof parent.task, record: WorkspaceRecord) =>
       decryptJson<{ title: string }>(
         task.titleCiphertext!,
