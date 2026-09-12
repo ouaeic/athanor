@@ -56,7 +56,10 @@ export const createIdempotentOperation = (
     const execute = async (): Promise<T> => {
       const replayHeader = request.headers['idempotency-replay-only'];
       if (replayHeader !== undefined && replayHeader !== 'true')
-        throw new AthanorError('invalid_operation_replay', 'Idempotency-Replay-Only accepts true or must be omitted.');
+        throw new AthanorError(
+          'invalid_operation_replay',
+          'Idempotency-Replay-Only accepts true or must be omitted.'
+        );
       const replayOnly = replayHeader === 'true';
       const existing = await store.beginOperation({ ...identity, replayOnly });
       if (existing) {
@@ -86,8 +89,12 @@ export const createIdempotentOperation = (
           409
         );
       }
-      if (replayOnly) throw new AthanorError('operation_receipt_unavailable',
-        'The previous send has no saved receipt. Check your work before starting a new request.', 409);
+      if (replayOnly)
+        throw new AthanorError(
+          'operation_receipt_unavailable',
+          'The previous send has no saved receipt. Check your work before starting a new request.',
+          409
+        );
       try {
         const result = await operation();
         await store.completeOperation(
