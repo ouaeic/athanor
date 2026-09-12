@@ -4515,24 +4515,23 @@ describe('spending caps', () => {
     expect(catalogue.get(chosen)).not.toBeNull();
     expect(catalogue.get(chosen)!).toBeLessThanOrEqual(1);
 
-    // Naming the dear route by hand still works. The ceiling governs what athanor chooses for the
-    // owner, never what the owner chooses for themselves.
-    expect(
-      (
-        await app.inject({
-          method: 'POST',
-          url: '/v1/tasks',
-          headers: { cookie, 'idempotency-key': 'ceiling-task-named' },
-          payload: {
-            workspaceId,
-            prompt: 'Use the expensive one, I know what it costs',
-            modelId: 'openrouter/z-ai/glm-5.2',
-            privacyRoute: 'provider_zdr',
-            maxComputeCredits: 5
-          }
-        })
-      ).statusCode
-    ).toBe(200);
+    // A named selection has the same rate constraint as the automatic and project paths.
+    const named = await app.inject({
+      method: 'POST',
+      url: '/v1/tasks',
+      headers: { cookie, 'idempotency-key': 'ceiling-task-named' },
+      payload: {
+        workspaceId,
+        prompt: 'Use the named model',
+        modelId: 'openrouter/z-ai/glm-5.2',
+        privacyRoute: 'provider_zdr',
+        maxComputeCredits: 5
+      }
+    });
+    expect(named.statusCode, named.body).toBe(400);
+    const namedError = named.json<{ error: { code: string; message: string } }>().error;
+    expect(namedError.code).toBe('model_unavailable');
+    expect(namedError.message).toContain('above your price ceiling');
 
     // Direction decides the passkey, exactly as it does for the caps: a ceiling that was $1 and is
     // now $50 admits routes that were refused a second ago, and clearing it admits everything.
