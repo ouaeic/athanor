@@ -345,7 +345,7 @@ canvas {
   font-size: 13px;
   flex: 1;
 }
-.field > span {
+.field > label {
   color: var(--muted);
 }
 .field input:not([type='checkbox']),

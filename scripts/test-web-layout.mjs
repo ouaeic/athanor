@@ -1809,6 +1809,31 @@ try {
     await modelsPage.getByRole('button', { name: 'Settings', exact: true }).click();
     await modelsPage.getByRole('heading', { name: 'Model defaults', exact: true }).waitFor();
     await modelsPage.getByRole('button', { name: 'Compatible endpoint', exact: true }).click();
+    await modelsPage.getByRole('combobox', { name: 'Provider', exact: true }).waitFor();
+    const accessibility = await context.newCDPSession(modelsPage);
+    const tree = await accessibility.send('Accessibility.getFullAXTree');
+    assert(tree.nodes.length > 0, 'The browser must expose an accessibility tree');
+    const restriction = tree.nodes.filter(
+      (node) => node.role?.value === 'textbox' && node.name?.value === 'Restrict to model ID'
+    );
+    assert.equal(
+      restriction.length,
+      1,
+      'A field must have its concise visible label as its accessible name'
+    );
+    assert.equal(
+      restriction[0].description?.value,
+      'Optional. Leave empty to discover every model this endpoint offers.',
+      'Supporting text must be exposed as a description separately from the field name'
+    );
+    await accessibility.detach();
+    await modelsPage.locator('.field > label', { hasText: 'Restrict to model ID' }).click();
+    assert(
+      await modelsPage
+        .getByRole('textbox', { name: 'Restrict to model ID', exact: true })
+        .evaluate((element) => element === document.activeElement),
+      'Activating a visible field label must focus its control'
+    );
     assert.equal(
       await modelsPage.getByLabel('Endpoint URL', { exact: true }).inputValue(),
       'https://compatible.example/v1'

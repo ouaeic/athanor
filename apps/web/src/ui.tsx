@@ -1,5 +1,5 @@
-import { useEffect, useId, useRef } from 'react';
-import type { ButtonHTMLAttributes, ReactNode } from 'react';
+import { cloneElement, useEffect, useId, useRef } from 'react';
+import type { ButtonHTMLAttributes, ReactElement, ReactNode } from 'react';
 import { X, LoaderCircle } from 'lucide-react';
 
 export function Button({
@@ -49,15 +49,25 @@ export function Field({
   hint
 }: {
   label: string;
-  children: ReactNode;
+  children: ReactElement<{ id?: string | undefined; 'aria-describedby'?: string | undefined }>;
   hint?: string;
 }) {
+  const generatedId = useId();
+  const controlId = children.props.id ?? generatedId;
+  const hintId = `${generatedId}-hint`;
+  const describedBy = [children.props['aria-describedby'], hint ? hintId : null]
+    .filter(Boolean)
+    .join(' ');
   return (
-    <label className="field">
-      <span>{label}</span>
-      {children}
-      {hint && <small className="muted">{hint}</small>}
-    </label>
+    <div className="field">
+      <label htmlFor={controlId}>{label}</label>
+      {cloneElement(children, { id: controlId, 'aria-describedby': describedBy || undefined })}
+      {hint && (
+        <small id={hintId} className="muted">
+          {hint}
+        </small>
+      )}
+    </div>
   );
 }
 export function Dialog({
