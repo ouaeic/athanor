@@ -967,6 +967,30 @@ printf '%s\n' "$restore_browser_warning" | grep -q 'Restore complete.'
 test "$(cat "$database_file")" = "row-worth-recovering"
 test "$(cat "$home/persistent.txt")" = "files-worth-recovering"
 printf 'ok  a failed browser fetch leaves recovered data serving with an explicit warning\n'
+
+# An offline rehearsal must recover the data without waking copied tasks or taking the network.
+printf 'row-written-since\n' >"$database_file"
+printf 'files-written-since\n' >"$home/persistent.txt"
+: >"$command_log"
+offline_restore=$(run_athanor restore "$database_backup" --yes --keep-stopped 2>&1)
+printf '%s\n' "$offline_restore" | grep -q 'Restore complete. Garden remains stopped'
+test "$(cat "$database_file")" = "row-worth-recovering"
+test "$(cat "$home/persistent.txt")" = "files-worth-recovering"
+test -s "$command_log"
+grep -q '^systemctl stop athanor.target$' "$command_log"
+if grep -Eq '^systemctl (start|restart|reload)|^managed browser fetch$|^network-refresh|^system-packages' "$command_log"; then
+  printf 'offline restore started a service or attempted runtime/network repair\n' >&2; exit 1
+fi
+printf 'ok  offline restore recovers database and files without starting services or repairs\n'
+
+for offline_origin in --new-host --hostname=ai.example.com; do
+  : >"$command_log"
+  if run_athanor restore "$database_backup" --yes --keep-stopped "$offline_origin" >/dev/null 2>&1; then
+    printf 'offline restore accepted an option that restarts services\n' >&2; exit 1
+  fi
+  test ! -s "$command_log"
+done
+printf 'ok  offline restore refuses online origin changes before touching data\n'
 rm -rf "$restore_playwright"
 
 # Moving to a new computer, which was not merely undrilled but mechanically broken.

@@ -295,6 +295,20 @@ reinstalls the recorded approved packages, replaces the current database, home, 
 configuration, fixes ownership, restarts services, waits for API health, and refreshes the connection
 manifest and certificate names. It is destructive by design: make a separate backup first.
 
+For a recovery rehearsal on an isolated machine, use:
+
+```bash
+sudo athanor restore /path/to/backup --yes --keep-stopped
+```
+
+This restores the database, files and keys while leaving Garden stopped. It skips runtime repair,
+package downloads and connection refresh, so copied tasks and schedules do not resume during the
+restore. Verify the recovered data before bringing it online; this mode does not establish service
+readiness. It cannot be combined with `--new-host` or `--hostname`, which restart services. It does
+not disable service activation on a later reboot. For a rehearsal, isolate the machine from external
+networks, stop its maintenance timers and discard the restored copy after verification. Use the
+ordinary restore command when recovering a server that should resume work.
+
 To restore an off-host copy, decrypt it first with the private half of the key it was encrypted to,
 then restore the decrypted directory:
 

@@ -1966,6 +1966,7 @@ restore_athanor() {
   source_directory=""
   confirmation=""
   restore_new_host=""
+  restore_keep_stopped=""
   restore_hostname=""
   restore_expect_hostname=""
   for restore_argument in "$@"; do
@@ -1977,6 +1978,7 @@ restore_athanor() {
     case "$restore_argument" in
       --yes) confirmation=--yes ;;
       --new-host) restore_new_host=yes ;;
+      --keep-stopped) restore_keep_stopped=yes ;;
       --hostname)
         restore_expect_hostname=yes
         restore_new_host=yes
@@ -1996,11 +1998,13 @@ restore_athanor() {
   done
   [ -z "$restore_expect_hostname" ] ||
     fail "athanor restore --hostname needs a name, such as --hostname ai.example.com"
+  [ -z "$restore_keep_stopped" ] || [ -z "$restore_new_host" ] ||
+    fail "athanor restore --keep-stopped cannot be combined with --new-host or --hostname, which restart services"
   [ -f "$source_directory/database.dump" ] &&
     [ -f "$source_directory/workspaces.tar.gz" ] &&
     [ -f "$source_directory/configuration.tar.gz" ] &&
     [ -f "$source_directory/SHA256SUMS" ] ||
-    fail "usage: sudo athanor restore /path/to/backup --yes [--new-host [--hostname NAME]]"
+    fail "usage: sudo athanor restore /path/to/backup --yes [--keep-stopped | --new-host [--hostname NAME]]"
   [ "$confirmation" = "--yes" ] ||
     fail "restore replaces the database, workspace files, and server keys; re-run with --yes"
   need_root restore "$@"
@@ -2064,6 +2068,13 @@ SQL
   runuser -u postgres -- psql -v ON_ERROR_STOP=1 -v password="$restored_password" <<'SQL'
 SELECT format('ALTER ROLE athanor WITH LOGIN PASSWORD %L', :'password')\gexec
 SQL
+  if [ -n "$restore_keep_stopped" ]; then
+    # Rehearsals must be able to inspect recovered data before copied tasks can resume.
+    trap - EXIT INT TERM
+    printf 'Restore complete. Garden remains stopped for offline verification.\n'
+    printf 'Runtime repair and connection refresh were skipped. Starting Garden may resume restored work.\n'
+    return 0
+  fi
   if [ -f "$athanor_root/scripts/athanor-native-runtime" ] &&
     grep -q '^  preview-origin)' "$athanor_root/scripts/athanor-native-runtime"; then
     /bin/sh "$athanor_root/scripts/athanor-native-runtime" preview-origin
@@ -4465,7 +4476,7 @@ task_command() {
 
 usage() {
   printf '%s\n' \
-    'Usage: garden {install|start|stop|restart|status|logs [api|worker|runner|registry|notifications|nginx]|doctor|connect|pairing-code|set-hostname HOST|price-ceiling [show|set INPUT OUTPUT|clear]|spend-cap [show|set DAILY MONTHLY|clear]|backup [dir]|backup auto on|off|status|backup destination [show|PATH --recipient FILE|off]|restore DIR --yes [--new-host [--hostname NAME]]|update|rollback [dir]|auto-update on|off|status|relay status|on|off|uninstall|certificate ...|ddns ...|task ...|tool-opens [DAYS] [--json]|acp --workspace ID [--approvals park|relay]}' \
+    'Usage: garden {install|start|stop|restart|status|logs [api|worker|runner|registry|notifications|nginx]|doctor|connect|pairing-code|set-hostname HOST|price-ceiling [show|set INPUT OUTPUT|clear]|spend-cap [show|set DAILY MONTHLY|clear]|backup [dir]|backup auto on|off|status|backup destination [show|PATH --recipient FILE|off]|restore DIR --yes [--keep-stopped | --new-host [--hostname NAME]]|update|rollback [dir]|auto-update on|off|status|relay status|on|off|uninstall|certificate ...|ddns ...|task ...|tool-opens [DAYS] [--json]|acp --workspace ID [--approvals park|relay]}' \
     '' \
     'Browser sign-in needs a hostname: a passkey is bound to a domain name and the WebAuthn' \
     'standard does not allow an IP address. If this server has no name, run:' \
