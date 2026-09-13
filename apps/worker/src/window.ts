@@ -836,6 +836,8 @@ export const refreshActivePlan = async (
     plan.stepsCiphertext,
     key
   );
+  // An owner revision is an explicit commitment, even when it replaces generic scaffolding.
+  if (plan.createdBy === 'user') state.planIsFallback = false;
   const planMessage: ModelMessage = {
     role: 'system',
     content: `ACTIVE USER-VISIBLE PLAN v${plan.version} (${content.branchName ?? plan.branchName}). Follow this newest version and do not execute stale work. The user watches these statuses live, so call set_plan again whenever one changes: send every step with its status (pending, in_progress, completed or skipped) and keep the step you are working on marked in_progress.\n${content.steps

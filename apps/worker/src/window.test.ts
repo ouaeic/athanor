@@ -816,9 +816,10 @@ describe('the active plan', () => {
    * Pushed at the tail rather than written in place, and the file argues the measurement: a
    * republish diverges at the tail as it stood a few steps ago instead of just behind the goal.
    */
-  it('goes to the tail and takes any older copy with it', async () => {
+  it('replaces a persisted generic scaffold with the owner plan at the tail', async () => {
     const probed = probe();
     const state = freshState();
+    state.planIsFallback = true;
     state.messages.push({ role: 'system', content: `${PLAN_MARKER} v1 (Main).\n1. [pending] old` });
     state.messages.push({ role: 'assistant', content: 'working' });
     probed.plan = {
@@ -842,6 +843,7 @@ describe('the active plan', () => {
     expect(shape(state.messages)).toEqual(['base', 'user', 'assistant', 'plan']);
     expect(state.messages.at(-1)?.content).toContain('Rewrite the importer');
     expect(state.planVersion).toBe(2);
+    expect(state.planIsFallback).toBe(false);
   });
 
   it('writes nothing when the window already holds this version', async () => {
