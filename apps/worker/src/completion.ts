@@ -149,6 +149,7 @@ export const startTurnState = <T extends Record<string, unknown>>(
     finishRejections: 0,
     deliveryNagged: false,
     completionNags: 0,
+    truncatedReplies: 0,
     // Both per turn, like every counter around them: what the last turn started is not evidence
     // that this one has, and a turn that opens by thinking must not inherit a stalled count.
     toolsStarted: 0,

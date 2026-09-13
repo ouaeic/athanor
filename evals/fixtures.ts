@@ -1759,53 +1759,19 @@ export const fixtures: readonly Fixture[] = [
     id: 'verify-output-limit-forever-still-ends',
     shape: 'verify',
     request: 'Explain, at length, how the importer handles malformed rows.',
-    why: 'The cap on continuations used to change only the wording: both arms continued, so a model that hit the output ceiling on every reply was told to stop expanding the answer and then asked again until the step budget ran out - 41 calls against a ceiling of 40. Past the cap the step now falls to the completion nag, which ends the turn by completing, so the answer the owner has already read stands.',
+    why: 'Repeatedly truncated replies stop at the continuation ceiling. The partial answer remains available with an interruption notice, and completion reminders cannot start another sequence of calls.',
     model: sequence({ text: 'The importer first checks the header, and then it', truncated: true }),
     expect: {
-      // Three continuations to the cap, then four nags, then the turn completes. Well inside the
-      // ceiling is the whole claim, and it is pinned exactly because the number moving is how a
-      // future change to either bound announces itself.
-      modelCalls: 8,
+      modelCalls: 4,
       tools: [],
       status: 'completed',
       verification: 'not_applicable',
-      /*
-       * Three continuations, and then the cap itself - once per remaining step, each followed by
-       * the nag that ends the turn.
-       *
-       * The four `output_limit_capped` rows are new to this list and nothing about the loop
-       * changed to put them there. The harness kept its own copy of the loop's wording, that copy
-       * had eleven of the sixteen pushbacks in it, and `OUTPUT LIMIT REACHED` was one of the five
-       * it had never heard of - so the cap fired four times on this fixture, on every run, and was
-       * counted as no hold at all. The comment that used to sit here said `holds` could not show
-       * this group; it can, and this is what it shows.
-       */
-      holds: [
-        'output_limit_continued',
-        'output_limit_continued',
-        'output_limit_continued',
-        'output_limit_capped',
-        'completion_nag',
-        'output_limit_capped',
-        'completion_nag',
-        'output_limit_capped',
-        'completion_nag',
-        'output_limit_capped',
-        'completion_nag'
-      ],
-      // The owner-visible half of the same count, and the half that says the cap held: three
-      // continuations, then five replies that reached the ceiling and were deliberately not
-      // continued.
+      holds: ['output_limit_continued', 'output_limit_continued', 'output_limit_continued'],
       warnings: [
         OUTPUT_LIMIT_CONTINUED,
         OUTPUT_LIMIT_CONTINUED,
         OUTPUT_LIMIT_CONTINUED,
-        OUTPUT_LIMIT_CAPPED,
-        OUTPUT_LIMIT_CAPPED,
-        OUTPUT_LIMIT_CAPPED,
-        OUTPUT_LIMIT_CAPPED,
-        OUTPUT_LIMIT_CAPPED,
-        'Answered without calling finish'
+        OUTPUT_LIMIT_CAPPED
       ]
     }
   },

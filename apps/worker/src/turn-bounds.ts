@@ -1045,13 +1045,8 @@ export const MAX_NOTICES_PER_TURN = 3;
 export const MAX_QUESTIONS_PER_TURN = 2;
 
 /**
- * How many times a reply cut off at the output limit is continued before the answer has to change
- * shape instead.
- *
- * A long answer legitimately needs a second or third pass - the limit is a per-response ceiling,
- * not a judgement about the work. But a model that hits it four times running is producing prose
- * the chat window was never the right container for, and every further continuation is another
- * billed call against a full window. At that point the remainder belongs in a file.
+ * Automatic continuations allowed after a provider-limited reply. This allowance ends separately
+ * from completion reminders, so a spent continuation budget cannot start another repair loop.
  */
 export const MAX_TRUNCATED_CONTINUATIONS = 3;
 
@@ -1159,7 +1154,6 @@ export type PushbackName =
   | 'baseline_refused'
   | 'repetition_stopped'
   | 'output_limit_continued'
-  | 'output_limit_capped'
   | 'reply_cut_off'
   | 'step_budget'
   | 'compute_budget'
@@ -1196,10 +1190,9 @@ export const PUSHBACK_MARKERS: ReadonlyArray<readonly [PushbackName, string]> = 
   ['acceptance_failed', 'Finish refused (acceptance '],
   ['baseline_refused', 'every one of them already passes'],
   ['completion_nag', 'COMPLETION CHECK ('],
-  // The two generation watches: repetition abort, and the output-limit continuation and its cap.
+  // Generation repairs that send another request: repetition abort and output-limit continuation.
   ['repetition_stopped', 'began repeating'],
   ['output_limit_continued', 'CONTINUE THE ANSWER ('],
-  ['output_limit_capped', 'OUTPUT LIMIT REACHED'],
   ['reply_cut_off', 'YOUR REPLY WAS CUT OFF'],
   // The two ceilings, from the same template in `#runHandoffCall`, and `stepLimitCarryOver`.
   ['step_budget', 'STEP BUDGET EXHAUSTED'],

@@ -19,6 +19,7 @@ import {
   ACCEPTANCE_EARLIER_TURN_CAVEAT,
   DELEGATE_MAX_STEPS,
   MAX_NOTICES_PER_TURN,
+  MAX_TRUNCATED_CONTINUATIONS,
   WORKSPACE_BRIEF_MARKER
 } from './turn-bounds.js';
 import {
@@ -9395,5 +9396,77 @@ describe('a task walled on one provider while another is connected', () => {
       new AthanorError('provider_quota_exhausted', 'The provider is out of quota')
     );
     expect(probe.checkpoints).toMatchObject([{ status: 'awaiting_resource' }]);
+  });
+});
+
+describe('the output-limit continuation ceiling', () => {
+  const limited = (text: string) =>
+    `data: ${JSON.stringify({ choices: [{ finish_reason: 'length', delta: { content: text } }] })}\n\ndata: [DONE]\n\n`;
+  it.each(['', 'The partial answer'])(
+    'ends after the permitted continuations without adding completion retries: %j',
+    async (text) => {
+      const task = makeTask();
+      const probe = probeStore(() => task);
+      const log: FetchLog = { calls: [], modelRequests: [] };
+      installFetch([limited(text)], log);
+      await new AgentWorker(
+        probe.store,
+        config({ TASK_MAX_STEPS: 40 }),
+        masterKey,
+        runnerSecret
+      ).run(task);
+      expect(log.modelRequests).toHaveLength(MAX_TRUNCATED_CONTINUATIONS + 1);
+      const capped = probe.events.filter(
+        (event) =>
+          event.kind === 'warning' &&
+          (event.payload as { continued?: boolean })?.continued === false
+      );
+      expect(capped).toHaveLength(1);
+      expect(capped[0]?.payload).toMatchObject({
+        owner: true,
+        continuation: MAX_TRUNCATED_CONTINUATIONS + 1
+      });
+      expect(
+        probe.events.some((event) => event.summary === 'Answered without calling finish')
+      ).toBe(false);
+      const completion = probe.events.find((event) => event.kind === 'completed');
+      expect(completion?.payload).toMatchObject({
+        interrupted: true,
+        verification: { remainingRisks: [expect.stringContaining('output limit')] }
+      });
+      if (!text) {
+        expect((completion?.payload as { summary?: string })?.summary).toContain(
+          'without a complete answer'
+        );
+        expect(JSON.stringify(log.modelRequests[1]?.messages)).toContain(
+          'without returning an answer'
+        );
+        expect(JSON.stringify(log.modelRequests[1]?.messages)).not.toContain('mid-sentence');
+      }
+    }
+  );
+
+  it('continues an incomplete reply when the next response can finish', async () => {
+    const task = makeTask();
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch(
+      [
+        limited('The answer begins here.'),
+        toolFrame('done', 'finish', {
+          summary: 'The complete explanation.',
+          verification: { status: 'not_applicable', reason: 'A conversational explanation.' }
+        })
+      ],
+      log
+    );
+    await new AgentWorker(probe.store, config({ TASK_MAX_STEPS: 10 }), masterKey, runnerSecret).run(
+      task
+    );
+    expect(log.modelRequests).toHaveLength(2);
+    expect(JSON.stringify(log.modelRequests[1]?.messages)).toContain('The answer begins here.');
+    expect(probe.events.find((event) => event.kind === 'completed')?.payload).not.toMatchObject({
+      interrupted: true
+    });
   });
 });

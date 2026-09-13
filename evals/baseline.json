@@ -1,9 +1,9 @@
 {
   "$stamp": {
-    "acceptedAt": "2026-09-13T02:05:18.073Z",
+    "acceptedAt": "2026-09-13T10:29:05.379Z",
     "version": "0.2.0",
-    "commit": "b2572d0",
-    "harness": "0575e7ec472c"
+    "commit": "3802356",
+    "harness": "5c51b13ceedd"
   },
   "ambiguous-a-question-before-looking-is-refused": {
     "modelCalls": 3,
@@ -517,9 +517,9 @@
     "displayedLines": 0
   },
   "verify-output-limit-forever-still-ends": {
-    "modelCalls": 8,
-    "promptTokens": 131934,
-    "catalogueTokens": 101784,
+    "modelCalls": 4,
+    "promptTokens": 64752,
+    "catalogueTokens": 50892,
     "cachePrefix": 96,
     "displayedLines": 0
   },

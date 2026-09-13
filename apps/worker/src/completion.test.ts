@@ -39,6 +39,7 @@ describe('what a new turn keeps and what it drops', () => {
     turnToolResults: { 'call-a': { name: 'shell', success: true, mutating: true } },
     finishRejections: 2,
     completionNags: 4,
+    truncatedReplies: 4,
     notices: 3,
     turnNoveltyBytes: 900,
     mutated: true,
@@ -72,6 +73,7 @@ describe('what a new turn keeps and what it drops', () => {
     expect(next.turnToolResults).toEqual({});
     expect(next.finishRejections).toBe(0);
     expect(next.completionNags).toBe(0);
+    expect(next.truncatedReplies).toBe(0);
     // A monitor that spoke three times last turn was told it had used its whole allowance.
     expect(next.notices).toBe(0);
     // A fresh turn believing it had already changed something reorders its own evidence rules.
