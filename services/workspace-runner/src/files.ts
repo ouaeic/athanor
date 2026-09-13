@@ -439,15 +439,46 @@ export const readWorkspaceFile = async (
   /** Whether one further line is included, cut short - the first line longer than the whole budget. */
   partialLine?: boolean;
 }> => {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0)
+    throw new Error('File read limit must be a nonnegative safe integer');
   const target = resolveInside(root, requested);
   await rejectSymlinkComponents(root, target);
-  const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const handle = await open(
+    target,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK
+  );
   try {
     await assertOpenedInPlace(root, target, handle);
     const details = await handle.stat();
     if (!details.isFile()) throw new Error('Requested path is not a regular file');
     if (details.size > maxBytes) throw new Error(`File exceeds ${maxBytes} byte read limit`);
-    const content = await handle.readFile();
+    // Bound the reads themselves: a writable file can grow after its size was checked.
+    const buffer = Buffer.alloc(Math.min(64 * 1024, details.size + 1));
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    while (true) {
+      const { bytesRead } = await handle.read(
+        buffer,
+        0,
+        Math.min(buffer.length, details.size - bytes + 1),
+        bytes
+      );
+      if (!bytesRead) break;
+      bytes += bytesRead;
+      if (bytes > details.size)
+        throw new Error('The file changed while it was being read; read it again');
+      chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
+    }
+    const after = await handle.stat();
+    await assertOpenedInPlace(root, target, handle);
+    if (
+      details.size !== after.size ||
+      details.mtimeMs !== after.mtimeMs ||
+      details.ctimeMs !== after.ctimeMs ||
+      bytes !== after.size
+    )
+      throw new Error('The file changed while it was being read; read it again');
+    const content = Buffer.concat(chunks, bytes);
     // The hash is of the FILE, not of what is returned: it is the caller's claim about what it is
     // replacing on a later write, and a digest of a prefix would be a claim about nothing.
     const sha256 = createHash('sha256').update(content).digest('hex');
