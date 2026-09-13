@@ -499,7 +499,7 @@ function PhaseList({
 function Outcome({ outcome }: { outcome: NonNullable<TaskPresentation['outcome']> }) {
   const verification =
     outcome.verification === 'verified'
-      ? `Checked — ${outcome.evidence} ${outcome.evidence === 1 ? 'piece' : 'pieces'} of evidence`
+      ? `Evidence recorded · ${outcome.evidence} ${outcome.evidence === 1 ? 'item' : 'items'}`
       : outcome.verification === 'not_applicable'
         ? 'An answer, with nothing external to check'
         : 'Finished without a verification';

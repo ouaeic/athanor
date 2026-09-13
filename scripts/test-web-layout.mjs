@@ -1376,6 +1376,10 @@ try {
     await page.reload();
     await page.locator('.garden-answer').getByText('harbor-cobalt-46', { exact: true }).waitFor();
     await page
+      .locator('.completion-record .badge')
+      .getByText('Completion recorded', { exact: true })
+      .waitFor();
+    await page
       .locator('.completion-record')
       .getByText(event.payload.summary, { exact: true })
       .waitFor();
@@ -1387,6 +1391,35 @@ try {
       0,
       'A timeline receipt must not replace the actual answer'
     );
+    const previousVerification = event.payload.verification;
+    event.payload.verification = {
+      status: 'verified',
+      evidence: [
+        { claim: 'The output source was read', source: 'tool_result' },
+        { claim: 'The verifier passed: python3 verify.py — exit 0', source: 'acceptance_check' }
+      ]
+    };
+    event.payload.acceptance = ['The verifier passed: python3 verify.py — exit 0'];
+    await page.reload();
+    const completionRecord = page.locator('.completion-record');
+    await completionRecord.getByText('1 check passed', { exact: true }).waitFor();
+    await completionRecord.getByText('Evidence and checks', { exact: true }).click();
+    await completionRecord.getByText('Executed check', { exact: true }).waitFor();
+    await completionRecord.getByText('Cited tool result', { exact: true }).waitFor();
+    assert.equal(
+      await completionRecord.locator('.completion-acceptance li').textContent(),
+      event.payload.acceptance[0]
+    );
+    assert.equal(await completionRecord.locator('pre').count(), 0);
+    await page.setViewportSize({ width: 390, height: 844 });
+    assert.equal(
+      await completionRecord.evaluate((node) => node.scrollWidth > node.clientWidth + 1),
+      false
+    );
+    await page.screenshot({ path: resolve(report, 'completion-checks-phone.png') });
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    event.payload.verification = previousVerification;
+    delete event.payload.acceptance;
     recordedReply = null;
     presentation.results = [];
     await page.reload();

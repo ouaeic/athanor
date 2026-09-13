@@ -52,6 +52,7 @@ import { createQuestionAnswerSender } from './task-actions';
 import { TaskOutputs, TaskProgress } from './TaskCanvas';
 import WorkTrace from './WorkTrace';
 import { currentWork } from './current-work';
+import { completionChecks, evidenceSource } from './completion-checks';
 import './presentation.css';
 import { effortLabel } from './reasoning-options';
 const Markdown = lazy(() => import('./MarkdownBody'));
@@ -187,6 +188,8 @@ export default function TaskSurface({
   const completionEvent = lastEvent(currentEvents, 'completed');
   const completion = data(completionEvent?.payload);
   const verification = data(completion.verification);
+  const checks = completionChecks(verification);
+  const acceptance = strings(completion.acceptance);
   const pendingDelivery = (presentation?.delivery?.status ?? task.deliveryStatus) === 'pending';
   const deliveryFailed = (presentation?.delivery?.status ?? task.deliveryStatus) === 'incomplete';
   /*
@@ -715,7 +718,7 @@ export default function TaskSurface({
                           : verification.status === 'delivery_incomplete'
                             ? 'Delivery needs attention'
                             : verification.status === 'verified'
-                              ? 'Verified'
+                              ? checks.label
                               : verification.status === 'not_applicable'
                                 ? 'No executable checks needed'
                                 : verification.status === 'checks_failed'
@@ -739,12 +742,11 @@ export default function TaskSurface({
                       </ul>
                     </div>
                   )}
-                  {Array.isArray(verification.evidence) && verification.evidence.length > 0 && (
+                  {(checks.evidence.length > 0 || acceptance.length > 0) && (
                     <details>
                       <summary>Evidence and checks</summary>
                       <ul className="evidence-list">
-                        {verification.evidence.map((item, index) => {
-                          const record = data(item);
+                        {checks.evidence.map((record, index) => {
                           const call = text(record.toolCallId);
                           const source = events.find(
                             (event) =>
@@ -754,7 +756,7 @@ export default function TaskSurface({
                           return (
                             <li key={index}>
                               <span>{text(record.claim)}</span>
-                              <small>{text(record.source).replaceAll('_', ' ')}</small>
+                              <small>{evidenceSource(record.source)}</small>
                               {source && (
                                 <Button onClick={() => setEvidence(source)}>
                                   Inspect evidence
@@ -764,8 +766,15 @@ export default function TaskSurface({
                           );
                         })}
                       </ul>
-                      {completion.acceptance !== undefined && (
-                        <pre>{JSON.stringify(completion.acceptance, null, 2)}</pre>
+                      {acceptance.length > 0 && (
+                        <div className="completion-acceptance">
+                          <strong>Check results</strong>
+                          <ul>
+                            {acceptance.map((result, index) => (
+                              <li key={index}>{result}</li>
+                            ))}
+                          </ul>
+                        </div>
                       )}
                     </details>
                   )}
