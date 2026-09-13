@@ -391,15 +391,9 @@ managed_chromium_absent() {
   done
 }
 
-# Fetch it, as the account that will run it, into the cache that account reads.
-#
-# Called from `update_athanor` after the build and before the restart, which is the only window in
-# which the checkout's Playwright and the machine's browser can be brought back into agreement
-# without an outage of its own. It warns rather than failing: a box whose browser is a release
-# behind still answers every question that does not need one, and rolling a whole release back over
-# a browser download - on an unattended box, at three in the morning, taking the database with it -
-# is a worse outcome than the fault it is repairing. `doctor` is what says so afterwards, and it can
-# now see it.
+# Fetch as the account that runs the browser, into its own cache. Updates and restores both need
+# this runtime. A failed download must leave recovered data serving; doctor reports the missing
+# browser independently of database readiness.
 fetch_managed_chromium() {
   chromium_wanted=$(managed_chromium_absent)
   [ -n "$chromium_wanted" ] || return 0
@@ -2078,6 +2072,10 @@ SQL
   systemctl reload-or-restart nginx
   wait_until_serving
   trap - EXIT INT TERM
+
+  # Browser binaries are excluded from the archive and the workspace restore clears their cache.
+  # Repair only after data is serving, so a download failure cannot undo a successful recovery.
+  fetch_managed_chromium
 
   # Last, and never fatal.
   #

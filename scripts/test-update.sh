@@ -150,6 +150,12 @@ exec /usr/bin/shasum -a 256 "$@"'
 # a real cluster, which is a separate rig and not this one.
 make_fake runuser '
 case "$*" in
+  *"playwright-core/cli.js install chromium"*)
+    printf "managed browser fetch\n" >>"$ATHANOR_TEST_COMMAND_LOG"
+    [ "${ATHANOR_TEST_BROWSER_FETCH_FAIL:-0}" != 1 ] || exit 44
+    mkdir -p "$ATHANOR_HOME/.cache/ms-playwright/chromium-1234" \
+      "$ATHANOR_HOME/.cache/ms-playwright/chromium_headless_shell-1234"
+    ;;
   *"pg_dump"*) cat "$ATHANOR_TEST_DATABASE" ;;
   *"pg_restore"*)
     [ "${ATHANOR_TEST_RESTORE_FAIL:-0}" != 1 ] || exit 43
@@ -936,6 +942,32 @@ run_athanor restore "$database_backup" --yes >/dev/null 2>&1
 test "$(cat "$database_file")" = "row-worth-recovering"
 test "$(cat "$home/persistent.txt")" = "files-worth-recovering"
 printf 'ok  a restore puts the database back, not only the files\n'
+
+# Managed browsers are excluded from backups, so restoring the home tree must repair that runtime.
+restore_playwright="$checkout/services/workspace-runner/node_modules/playwright-core"
+mkdir -p "$restore_playwright"
+printf '{"browsers":[{"name":"chromium","revision":"1234"}]}\n' >"$restore_playwright/browsers.json"
+: >"$restore_playwright/cli.js"
+mkdir -p "$home/.cache/ms-playwright/chromium-1234" \
+  "$home/.cache/ms-playwright/chromium_headless_shell-1234"
+: >"$command_log"
+run_athanor restore "$database_backup" --yes >/dev/null 2>&1
+grep -q '^managed browser fetch$' "$command_log" || {
+  printf 'restore removed the managed browser without fetching its pinned replacement\n' >&2; exit 1;
+}
+test -d "$home/.cache/ms-playwright/chromium-1234"
+test -d "$home/.cache/ms-playwright/chromium_headless_shell-1234"
+test "$(cat "$database_file")" = "row-worth-recovering"
+test "$(cat "$home/persistent.txt")" = "files-worth-recovering"
+printf 'ok  restore repairs the excluded managed browser after recovering data\n'
+
+restore_browser_warning=$(ATHANOR_TEST_BROWSER_FETCH_FAIL=1 run_athanor restore "$database_backup" --yes 2>&1)
+printf '%s\n' "$restore_browser_warning" | grep -q 'could not be fetched; browser jobs will fail'
+printf '%s\n' "$restore_browser_warning" | grep -q 'Restore complete.'
+test "$(cat "$database_file")" = "row-worth-recovering"
+test "$(cat "$home/persistent.txt")" = "files-worth-recovering"
+printf 'ok  a failed browser fetch leaves recovered data serving with an explicit warning\n'
+rm -rf "$restore_playwright"
 
 # Moving to a new computer, which was not merely undrilled but mechanically broken.
 #

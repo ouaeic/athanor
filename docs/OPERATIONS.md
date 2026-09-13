@@ -347,6 +347,10 @@ The whole move, on a machine that has just been built:
    those again from a client that still signs in.
 6. `sudo athanor doctor`.
 
+Restore also reinstalls the managed browser revision excluded from the backup. If that download
+fails, the restored data remains available and the command reports that browser work cannot run.
+`sudo athanor update` retries the download; `sudo athanor doctor` checks the installed revision.
+
 Nothing in step 3 is fatal after the data is back: a name that does not resolve yet from a machine
 plugged in ten minutes ago prints what to run and leaves the restored server serving.
 
