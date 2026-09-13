@@ -120,20 +120,20 @@ class PostgresDatabase implements Database {
       listen: (channel, handler) => this.listen(channel, handler),
       close: async () => undefined
     };
-    await client.query('BEGIN');
+    let discard = false;
     try {
+      await client.query('BEGIN');
       const result = await this.#transaction.run(scoped, () => callback(scoped));
       await client.query('COMMIT');
       return result;
     } catch (error) {
-      // A connection that died mid-transaction fails the ROLLBACK too, and letting that failure
-      // propagate replaced the real cause with "Connection terminated" - so the one line in the log
-      // that says why the write was abandoned described the cleanup instead. The rollback still has
-      // to be attempted: the server may be alive and holding the transaction open.
-      await client.query('ROLLBACK').catch(() => undefined);
+      // Preserve the original failure, but reuse the session only after rollback confirms it is idle.
+      await client.query('ROLLBACK').catch(() => {
+        discard = true;
+      });
       throw error;
     } finally {
-      client.release();
+      client.release(discard);
     }
   }
 
