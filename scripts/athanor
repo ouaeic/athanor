@@ -103,7 +103,16 @@ PYTHON
   fi
   chown root:root "$maintenance_lock_file"
   chmod 0600 "$maintenance_lock_file"
-  flock -n 9 || fail 'another backup, update or rollback holds the maintenance lock; retry when it finishes'
+  if [ -n "${1:-}" ]; then
+    case "$1" in *[!0-9]*) fail 'maintenance lock wait must be a whole number of seconds' ;; esac
+    [ "$1" -le 1800 ] || fail 'maintenance lock wait exceeds its bounded window'
+    if ! flock -w "$1" 9; then
+      printf 'garden: another maintenance operation is still running\n' >&2
+      return 75
+    fi
+  else
+    flock -n 9 || fail 'another backup, update or rollback holds the maintenance lock; retry when it finishes'
+  fi
   maintenance_lock_acquired=1
 }
 
@@ -2876,6 +2885,36 @@ auto_backup_run() {
     # once is the design; standing down for a month is the owner's to know about.
     record_backup_status skipped 'a task was still running when the window came round'
     printf 'garden: a task is running; the next window will take the backup.\n'
+    return 0
+  fi
+  # The idle check can race with an update; wait on the same kernel lock before inspecting again.
+  if acquire_maintenance_lock "$athanor_backup_idle_wait_seconds"; then
+    :
+  else
+    lock_result=$?
+    [ "$lock_result" -eq 75 ] || return "$lock_result"
+    record_backup_status skipped 'another maintenance operation was still running'
+    printf 'garden: maintenance is busy; the next window will take the backup.\n'
+    return 0
+  fi
+  if ! worker_is_idle; then
+    record_backup_status skipped 'a task started while waiting for maintenance'
+    printf 'garden: a task started; the next window will take the backup.\n'
+    return 0
+  fi
+  backup_runner_health=$(curl -fsS --max-time 5 http://127.0.0.1:4300/healthz 2>/dev/null) || backup_runner_health=''
+  if ! printf '%s' "$backup_runner_health" | python3 -c '
+import json, sys
+try:
+    health = json.load(sys.stdin)
+    count = health.get("backgroundCommands")
+    idle = health.get("ok") is True and type(count) is int and count == 0
+except (ValueError, AttributeError):
+    idle = False
+sys.exit(0 if idle else 1)
+'; then
+    record_backup_status skipped 'background computation is active or the runner could not confirm it is idle'
+    printf 'garden: background work is not confirmed idle; the next window will take the backup.\n'
     return 0
   fi
   # Pessimistic first and corrected on the way out, because a run killed by its own start timeout

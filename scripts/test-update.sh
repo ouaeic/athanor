@@ -40,7 +40,20 @@ make_fake() {
 
 # fcntl exercises the same inherited-descriptor kernel lock on this non-Linux test host.
 make_fake flock '
-exec python3 -c "import fcntl,sys; fcntl.flock(int(sys.argv[-1]), fcntl.LOCK_EX | fcntl.LOCK_NB)" "$@"'
+exec python3 -c "
+import fcntl, os, pathlib, sys, time
+wait = float(sys.argv[2]) if sys.argv[1] == \"-w\" else 0
+end = time.monotonic() + wait
+while True:
+    try:
+        fcntl.flock(int(sys.argv[-1]), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except BlockingIOError:
+        marker = os.environ.get(\"ATHANOR_TEST_LOCK_BLOCKED\")
+        if marker and wait: pathlib.Path(marker).touch()
+        if time.monotonic() >= end: sys.exit(1)
+        time.sleep(0.02)
+" "$@"'
 
 make_fake id '
 if [ "${1:-}" = "-u" ]; then printf "0\n"; else printf "root\n"; fi'
@@ -76,10 +89,13 @@ case "$requested" in
     ;;
   */v1/legal) printf "{\"applicationLicense\":\"AGPL-3.0-only\",\"accepted\":false}\n" ;;
   # The runner health document, which is where `doctor` reads the rung the sandbox is actually on
-  # rather than the one runner.env asked for. Silent unless a fixture is in place, because every
-  # case above this one only needs the endpoint to answer at all.
+  # rather than the one runner.env asked for. Other cases receive an idle, healthy runner.
   *4300/healthz)
-    if [ -f "$ATHANOR_TEST_RUNNER_HEALTH" ]; then cat "$ATHANOR_TEST_RUNNER_HEALTH"; fi
+    if [ -f "$ATHANOR_TEST_RUNNER_HEALTH" ]; then
+      cat "$ATHANOR_TEST_RUNNER_HEALTH"
+    else
+      printf "{\"ok\":true,\"backgroundCommands\":0}\n"
+    fi
     ;;
 esac
 exit 0'
@@ -797,6 +813,26 @@ test "$(status_field reason)" = "a task was still running when the window came r
 test -n "$(status_field copy_at)"
 printf 'ok  a run that stands down for a busy worker says so and says why\n'
 rm -f "$worker_busy"
+
+# Active or uncertain background work must not be interrupted by an unattended archive.
+commands_before_background=$(wc -l <"$command_log" | tr -d ' ')
+for health in '{"ok":true,"backgroundCommands":1}' '{"ok":true}' 'not json' '{"ok":true,"backgroundCommands":false}'; do
+  printf '%s\n' "$health" >"$test_root/runner-health"
+  run_athanor backup auto run >/dev/null 2>&1
+  test "$(status_field outcome)" = skipped
+  test "$(status_field reason)" = 'background computation is active or the runner could not confirm it is idle'
+done
+rm -f "$test_root/runner-health"
+tail -n +"$((commands_before_background + 1))" "$command_log" >"$test_root/background-skipped-commands"
+if grep -q 'systemctl stop' "$test_root/background-skipped-commands"; then
+  printf 'unattended backup interrupted active or uncertain work\n' >&2
+  exit 1
+fi
+printf '0\n' >"$test_root/worker-busy-late"
+run_athanor backup auto run >/dev/null 2>&1
+rm -f "$test_root/worker-busy-late"
+test "$(status_field reason)" = 'a task started while waiting for maintenance'
+printf 'ok  automatic backups recheck active work and preserve background computations\n'
 
 # The second. A full disk is the ordinary way a backup fails, and it is exactly when every retained
 # copy is already there - so nothing new is written, nothing is left behind, and the box carries on
@@ -2015,7 +2051,7 @@ set -eu
 set -- help
 . "$ATHANOR_ROOT/scripts/athanor" >/dev/null
 need_root backup
-acquire_maintenance_lock
+acquire_maintenance_lock "${ATHANOR_TEST_LOCK_WAIT:-}"
 printf '%s\n' "$$" >"$ATHANOR_TEST_LOCK_PID"
 case "$ATHANOR_TEST_LOCK_MODE" in
   hold) exec sleep 30 ;;
@@ -2028,6 +2064,8 @@ run_lock_holder() {
   PATH="$fake_bin:$PATH" ATHANOR_ROOT="$checkout" ATHANOR_STATE="$state" \
     ATHANOR_CONFIG="$config" ATHANOR_RUNTIME_PREFIX="$runtime" \
     ATHANOR_TEST_COMMAND_LOG="$command_log" ATHANOR_TEST_LOCK_MODE="$1" \
+    ATHANOR_TEST_LOCK_WAIT="${ATHANOR_TEST_LOCK_WAIT:-}" \
+    ATHANOR_TEST_LOCK_BLOCKED="${ATHANOR_TEST_LOCK_BLOCKED:-}" \
     ATHANOR_TEST_LOCK_PID="$test_root/lock-holder-pid" \
     /bin/sh "$lock_holder"
 }
@@ -2057,8 +2095,23 @@ for operation in backup update rollback restore; do
   printf '%s\n' "$lock_refusal" | grep -q 'holds the maintenance lock'
 done
 test "$(wc -l <"$command_log" | tr -d ' ')" = "$commands_before_lock"
-kill -TERM "$(cat "$test_root/lock-holder-pid")"
+lock_skip=$(run_athanor backup auto run 2>&1)
+test "$(status_field outcome)" = skipped
+test "$(status_field reason)" = 'another maintenance operation was still running'
+printf '%s\n' "$lock_skip" | grep -q 'maintenance is busy'
+held_pid=$(cat "$test_root/lock-holder-pid")
+ATHANOR_TEST_LOCK_WAIT=3 ATHANOR_TEST_LOCK_BLOCKED="$test_root/lock-blocked" run_lock_holder probe >"$test_root/lock-waiter.log" 2>&1 &
+lock_waiter_job=$!
+lock_wait=0
+while [ ! -e "$test_root/lock-blocked" ] && [ "$lock_wait" -lt 100 ]; do
+  sleep 0.02
+  lock_wait=$((lock_wait + 1))
+done
+test -e "$test_root/lock-blocked"
+kill -0 "$lock_waiter_job"
+kill -TERM "$held_pid"
 wait "$lock_holder_job" || true
+wait "$lock_waiter_job"
 run_lock_holder probe
 if run_lock_holder fail; then fail_case 'failure fixture succeeded'; fi
 run_lock_holder probe
