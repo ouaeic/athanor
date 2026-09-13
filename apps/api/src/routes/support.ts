@@ -449,7 +449,12 @@ export const createServerSupport = (context: ServerBase) => {
         connection?.secret.enforceZeroDataRetention ?? requireZdr
       );
       return [
-        { ...model, ...(connectionId ? { connectionId } : {}), ...readRoutingMetadata(record) }
+        {
+          ...model,
+          ...(connectionId ? { connectionId } : {}),
+          ...(connection?.secret.label ? { connectionLabel: connection.secret.label } : {}),
+          ...readRoutingMetadata(record)
+        }
       ];
     });
   };
@@ -666,6 +671,7 @@ export const createServerSupport = (context: ServerBase) => {
     const connections = await inferenceConnections(userId);
     const describe = async (connectionId: string, secret: InferenceSecret, source: string) => ({
       connectionId,
+      label: secret.label ?? null,
       source,
       provider: secret.provider,
       baseUrl: secret.baseUrl,

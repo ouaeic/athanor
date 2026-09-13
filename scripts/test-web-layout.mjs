@@ -260,13 +260,13 @@ const providerConnections = new Map([
 let primaryProvider = 'openrouter';
 const providerWrites = [];
 const providerResponse = () => {
-  const connections = [...providerConnections.values()].map((entry) => ({
+  const connections = [...providerConnections].map(([connectionId, entry]) => ({
     ...entry,
-    connectionId: entry.provider,
+    connectionId,
     configured: true,
     source: 'encrypted_database'
   }));
-  return { ...connections.find((entry) => entry.provider === primaryProvider), connections };
+  return { ...connections.find((entry) => entry.connectionId === primaryProvider), connections };
 };
 const generationModel = {
   id: 'fixture/image-studio',
@@ -636,12 +636,16 @@ try {
       if (route.request().method() === 'PUT') {
         const input = route.request().postDataJSON();
         providerWrites.push(input);
-        providerConnections.set(input.provider, {
-          ...providerConnections.get(input.provider),
+        const connectionId = input.connectionId ?? input.provider;
+        providerConnections.set(connectionId, {
+          ...providerConnections.get(connectionId),
           ...input,
+          apiKey: undefined,
+          hasApiKey:
+            Boolean(input.apiKey) || providerConnections.get(connectionId)?.hasApiKey || false,
           modelId: input.modelId ?? null
         });
-        primaryProvider = input.provider;
+        primaryProvider = connectionId;
       }
       if (route.request().method() === 'DELETE') {
         const selected = url.searchParams.get('connectionId');
@@ -2292,6 +2296,79 @@ try {
       .getByRole('button', { name: 'Remove saved connection', exact: true })
       .click();
     await removeConnection.waitFor({ state: 'detached' });
+    assert.deepEqual([...providerConnections.keys()], ['openrouter', 'ollama-cloud']);
+
+    const namedConnections = [];
+    for (const [label, host] of [
+      ['Work models', 'work-models.example'],
+      ['Research models', 'research-models.example']
+    ]) {
+      await modelsPage.getByRole('button', { name: 'Add custom endpoint', exact: true }).click();
+      await modelsPage.getByLabel('Connection name', { exact: true }).fill(label);
+      await modelsPage.getByLabel('Endpoint URL', { exact: true }).fill(`https://${host}/v1`);
+      await modelsPage.getByLabel('API key', { exact: true }).fill('synthetic-account-key');
+      await modelsPage.getByRole('button', { name: 'Verify and save', exact: true }).click();
+      await modelsPage.getByRole('button', { name: label, exact: true }).waitFor();
+      const saved = providerWrites.at(-1);
+      assert.match(saved.connectionId, /^openai-compatible:[0-9a-f-]{36}$/);
+      assert.equal(saved.provider, 'openai-compatible');
+      assert.equal(saved.label, label);
+      const model = {
+        ...modelCatalog[0],
+        id: `custom/${saved.connectionId}/shared-model`,
+        providerModelId: 'shared-model',
+        provider: 'custom',
+        connectionId: saved.connectionId,
+        connectionLabel: label,
+        displayName: 'Shared endpoint model'
+      };
+      modelCatalog.push(model);
+      namedConnections.push({ connectionId: saved.connectionId, label, host, model });
+    }
+    assert.notEqual(namedConnections[0].connectionId, namedConnections[1].connectionId);
+    await modelsPage.reload();
+    await modelsPage.getByRole('button', { name: 'Settings', exact: true }).click();
+    await modelsPage.getByRole('button', { name: 'Work models', exact: true }).click();
+    assert.equal(
+      await modelsPage.getByLabel('Endpoint URL', { exact: true }).inputValue(),
+      'https://work-models.example/v1'
+    );
+    assert.equal(await modelsPage.getByLabel('API key', { exact: true }).inputValue(), '');
+    await pick(modelsPage, 'Condensing long work', namedConnections[0].model.id);
+    await modelsPage.getByRole('button', { name: 'Save model defaults', exact: true }).click();
+    await modelsPage.getByText('Model defaults saved', { exact: true }).waitFor();
+    await modelsPage.reload();
+    await modelsPage.getByRole('button', { name: 'Settings', exact: true }).click();
+    await modelsPage
+      .getByRole('button', {
+        name: 'Condensing long work: Shared endpoint model · Work models',
+        exact: true
+      })
+      .waitFor();
+    assert.equal(defaultChoices.summarise.modelId, namedConnections[0].model.id);
+    await modelsPage.getByRole('button', { name: 'Work models', exact: true }).click();
+    await modelsPage.getByLabel('Endpoint URL', { exact: true }).scrollIntoViewIfNeeded();
+    await modelsPage.screenshot({ path: resolve(report, 'named-connections-phone.png') });
+    assert.equal(await modelsPage.evaluate(() => document.documentElement.scrollWidth), 390);
+    await pick(modelsPage, 'Condensing long work', 'openrouter/alpha/model-78');
+    await modelsPage.getByRole('button', { name: 'Save model defaults', exact: true }).click();
+    await modelsPage.getByText('Model defaults saved', { exact: true }).waitFor();
+    for (const connection of namedConnections) {
+      await modelsPage.getByRole('button', { name: connection.label, exact: true }).click();
+      await modelsPage
+        .getByRole('button', { name: 'Remove saved connection', exact: true })
+        .click();
+      const dialog = modelsPage.getByRole('dialog', {
+        name: 'Remove saved connection',
+        exact: true
+      });
+      await dialog.getByRole('button', { name: 'Remove saved connection', exact: true }).click();
+      await dialog.waitFor({ state: 'detached' });
+      assert.equal(providerConnections.has(connection.connectionId), false);
+      const index = modelCatalog.findIndex((model) => model.id === connection.model.id);
+      assert(index >= 0);
+      modelCatalog.splice(index, 1);
+    }
     assert.deepEqual([...providerConnections.keys()], ['openrouter', 'ollama-cloud']);
 
     await modelsPage.close();

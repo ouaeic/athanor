@@ -2,11 +2,23 @@ import type { ModelRelease } from '@athanor/contracts';
 import { decryptJson, inferenceCredentialAad, type EncryptedEnvelope } from './crypto.js';
 
 export interface InferenceConnectionSecret {
+  connectionId?: string;
+  label?: string;
   provider: 'openrouter' | 'ollama-cloud' | 'openai-compatible';
   baseUrl: string;
   apiKey?: string;
   modelId?: string;
   enforceZeroDataRetention: boolean;
+}
+
+/** Named compatible endpoints retain the vendor protocol while owning an independent credential. */
+export function inferenceConnectionProvider(
+  id: string
+): InferenceConnectionSecret['provider'] | null {
+  if (id === 'openrouter' || id === 'ollama-cloud' || id === 'openai-compatible') return id;
+  return /^openai-compatible:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)
+    ? 'openai-compatible'
+    : null;
 }
 
 export interface InferenceConnectionRow {
@@ -60,11 +72,11 @@ export function readInferenceConnections<T extends InferenceConnectionSecret>(in
   const claimed = new Set<string>();
   const active = input.rows.filter((row) => row.status === 'active');
   for (const row of active) {
-    const keyedVendor = row.provider.startsWith('inference:')
+    const keyedId = row.provider.startsWith('inference:')
       ? row.provider.slice('inference:'.length)
       : undefined;
-    if (keyedVendor && claimed.has(keyedVendor)) continue;
-    if (keyedVendor) claimed.add(keyedVendor);
+    if (keyedId && claimed.has(keyedId)) continue;
+    if (keyedId) claimed.add(keyedId);
     try {
       const opened =
         row.provider === 'openrouter'
@@ -100,14 +112,17 @@ export function readInferenceConnections<T extends InferenceConnectionSecret>(in
         !['openrouter', 'ollama-cloud', 'openai-compatible'].includes(secret.provider) ||
         typeof secret.baseUrl !== 'string' ||
         !secret.baseUrl ||
-        (keyedVendor && keyedVendor !== secret.provider)
+        (keyedId && inferenceConnectionProvider(keyedId) !== secret.provider)
       )
         continue;
+      const connectionId = keyedId ?? secret.provider;
+      if (secret.connectionId && secret.connectionId !== connectionId) continue;
+      if (connectionId !== secret.provider && secret.connectionId !== connectionId) continue;
       if (secret.provider !== 'openai-compatible' && !secret.apiKey) continue;
-      if (!keyedVendor && claimed.has(secret.provider)) continue;
-      claimed.add(secret.provider);
-      if (!connections.has(secret.provider))
-        connections.set(secret.provider, { secret, source: 'encrypted_database', record: row });
+      if (!keyedId && claimed.has(connectionId)) continue;
+      claimed.add(connectionId);
+      if (!connections.has(connectionId))
+        connections.set(connectionId, { secret, source: 'encrypted_database', record: row });
     } catch {
       input.onUnreadable?.(row.provider);
     }

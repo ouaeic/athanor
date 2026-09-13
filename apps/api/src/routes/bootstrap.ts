@@ -135,21 +135,13 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
           privateScheduleResponse(schedule, metadata.get(schedule.workspaceId))
         )
       ),
-      /*
-       * The catalogue as the picker needs it, not as the router needs it.
-       *
-       * This is the request that gates first paint: nothing renders until it returns. It was 426 kB
-       * on a box with a provider connected, and 424.5 kB of that was the model catalogue - 341
-       * models with forty-three fields each, including benchmark populations, cache pricing, price
-       * tiers, uptime percentages and knowledge cutoffs. Everything else in the payload together
-       * came to 1.7 kB. The web client reads five of those fields; the rest went to every device on
-       * every launch and was never looked at. The full record is still one request away for anyone
-       * who needs it - `GET /v1/models` - and the router reads it server-side where it lives.
-       */
+      // Bootstrap gates initial rendering, so it carries only picker identity and capabilities.
+      // Full model metadata remains available from /v1/models and to the server-side router.
       models: models.map((model) => ({
         id: model.id,
         providerModelId: model.providerModelId,
         displayName: model.displayName,
+        ...(model.connectionLabel ? { connectionLabel: model.connectionLabel } : {}),
         // Kept although no screen reads it: it is how "this box exposes only hosted routes" is
         // checked at the surface the client actually receives, and a boundary that can only be
         // asserted server-side is one nobody notices breaking.

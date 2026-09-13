@@ -14,6 +14,7 @@ import {
   decryptJson,
   encryptJson,
   inferenceCredentialAad,
+  inferenceConnectionProvider,
   environmentInferenceSecret
 } from '@athanor/core';
 import {
@@ -80,6 +81,8 @@ export const registerProviderRoutes = (context: RouteContext): void => {
       const input = z
         .object({
           provider: z.enum(['openrouter', 'ollama-cloud', 'openai-compatible']),
+          connectionId: z.string().max(100).optional(),
+          label: z.string().trim().max(80).optional(),
           baseUrl: z.string().url().optional(),
           apiKey: z.string().max(2_000).optional(),
           modelId: z.string().trim().min(1).max(300).optional(),
@@ -130,13 +133,20 @@ export const registerProviderRoutes = (context: RouteContext): void => {
           }
         })
         .parse(request.body);
+      const connectionId = input.connectionId ?? input.provider;
+      if (inferenceConnectionProvider(connectionId) !== input.provider)
+        throw new AthanorError(
+          'provider_connection_invalid',
+          'Choose a connection for this provider',
+          422
+        );
       const baseUrl =
         input.provider === 'openrouter'
           ? 'https://openrouter.ai/api/v1'
           : input.provider === 'ollama-cloud'
             ? 'https://ollama.com/v1'
             : (input.baseUrl ?? config.AI_BASE_URL);
-      const existingSecret = (await inferenceConnections(user.id)).get(input.provider)?.secret;
+      const existingSecret = (await inferenceConnections(user.id)).get(connectionId)?.secret;
       const sameEndpoint = (secret: InferenceSecret | undefined) =>
         secret?.provider === input.provider &&
         secret.baseUrl.replace(/\/+$/, '') === baseUrl.replace(/\/+$/, '');
@@ -144,7 +154,9 @@ export const registerProviderRoutes = (context: RouteContext): void => {
       const apiKey =
         input.apiKey?.trim() ||
         (sameEndpoint(existingSecret) ? existingSecret?.apiKey : undefined) ||
-        (!existingSecret && sameEndpoint(environment) ? environment.apiKey : undefined);
+        (!existingSecret && connectionId === input.provider && sameEndpoint(environment)
+          ? environment.apiKey
+          : undefined);
       if (!input.apiKey?.trim() && existingSecret?.apiKey && !sameEndpoint(existingSecret))
         throw new AthanorError(
           'provider_key_required',
@@ -213,7 +225,7 @@ export const registerProviderRoutes = (context: RouteContext): void => {
           scope: config.MODEL_CATALOG_SCOPE,
           ...(overrides.modelCatalogFetch ? { fetch: overrides.modelCatalogFetch } : {})
         });
-        pendingModels = liveModels.map((model) => ({ ...model, connectionId: input.provider }));
+        pendingModels = liveModels.map((model) => ({ ...model, connectionId }));
       } else {
         /*
          * One request, read twice as hard.
@@ -257,11 +269,12 @@ export const registerProviderRoutes = (context: RouteContext): void => {
           capabilities: input.capabilities,
           modalities: input.modalities,
           tag: input.provider === 'ollama-cloud' ? 'Ollama Cloud' : 'Configured endpoint',
-          connectionId: input.provider,
+          connectionId,
           previous: (await store.listModels()).filter(
             (record) =>
-              record.connectionId === input.provider ||
-              (!record.connectionId &&
+              record.connectionId === connectionId ||
+              (connectionId === input.provider &&
+                !record.connectionId &&
                 Array.isArray(record.recommendationTags) &&
                 record.recommendationTags.includes(
                   input.provider === 'ollama-cloud' ? 'Ollama Cloud' : 'Configured endpoint'
@@ -279,7 +292,12 @@ export const registerProviderRoutes = (context: RouteContext): void => {
       const mediaModels =
         input.mediaModels ??
         (existingSecret?.provider === input.provider ? existingSecret.mediaModels : undefined);
+      const connectionLabel =
+        (input.label === undefined ? existingSecret?.label : input.label) ||
+        (connectionId !== input.provider ? new URL(baseUrl).hostname : undefined);
       const saved: InferenceSecret = {
+        connectionId,
+        ...(connectionLabel ? { label: connectionLabel } : {}),
         provider: input.provider,
         catalogDefaults: {
           contextTokens: input.contextTokens,
@@ -301,7 +319,7 @@ export const registerProviderRoutes = (context: RouteContext): void => {
         await target.replaceModelCatalog(pendingModels);
         await target.upsertManagedProviderCredential({
           userId: user.id,
-          provider: `inference:${input.provider}`,
+          provider: `inference:${connectionId}`,
           secretCiphertext: encryptJson(
             { ...saved, ...(mediaRoutes ? { mediaRoutes } : {}) },
             masterKey,
@@ -358,7 +376,11 @@ export const registerProviderRoutes = (context: RouteContext): void => {
        */
       const query = z
         .object({
-          connectionId: z.enum(['openrouter', 'ollama-cloud', 'openai-compatible']).optional()
+          connectionId: z
+            .string()
+            .max(100)
+            .refine((id) => inferenceConnectionProvider(id) !== null)
+            .optional()
         })
         .parse(request.query);
       const connections = await store.listManagedProviderCredentials(user.id);

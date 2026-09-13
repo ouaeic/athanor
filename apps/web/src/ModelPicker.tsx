@@ -13,6 +13,7 @@ export type PickerModel = Pick<ModelRelease, 'id' | 'displayName' | 'provider'> 
       | 'inputUsdPerMillionTokens'
       | 'outputUsdPerMillionTokens'
       | 'reasoning'
+      | 'connectionLabel'
     >
   > & {
     capabilities?: ModelRelease['capabilities'] | MediaModelOption['capabilities'] | undefined;
@@ -36,9 +37,12 @@ export interface ModelPickerProps {
 
 export default function ModelPicker(props: ModelPickerProps) {
   const [open, setOpen] = useState(false);
+  const selectedModel = props.models.find((model) => model.id === props.value);
   const selected =
     props.shortcuts?.find((item) => item.value === props.value)?.label ??
-    props.models.find((model) => model.id === props.value)?.displayName ??
+    (selectedModel
+      ? [selectedModel.displayName, selectedModel.connectionLabel].filter(Boolean).join(' · ')
+      : undefined) ??
     (props.value ? `${props.value} · unavailable` : 'Choose a model');
   return (
     <>

@@ -7,6 +7,7 @@ import { get } from './client.js';
 import './model-choices.css';
 
 const providerName = (model: PickerModel) => {
+  if (model.connectionLabel) return model.connectionLabel;
   const parts = model.id.split('/');
   return model.provider === 'openrouter' && parts.length > 2 ? parts[1]! : model.provider;
 };
@@ -85,7 +86,7 @@ export default function ModelBrowser({
         (model) =>
           (!provider || providerName(model) === provider) &&
           matches(
-            `${model.displayName} ${model.id} ${model.provider} ${Array.isArray(model.capabilities) ? model.capabilities.join(' ') : ''}`
+            `${model.displayName} ${model.id} ${model.provider} ${model.connectionLabel ?? ''} ${Array.isArray(model.capabilities) ? model.capabilities.join(' ') : ''}`
           )
       )
       .sort(

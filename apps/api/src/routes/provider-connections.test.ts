@@ -126,6 +126,86 @@ describe('saved provider connection lifecycle', () => {
     expect(reachable.every((model) => model.connectionId === 'openai-compatible')).toBe(true);
   });
 
+  it('saves named endpoints independently, binds duplicate model names and removes only one account', async () => {
+    const first = 'openai-compatible:10000000-0000-4000-8000-000000000001';
+    const second = 'openai-compatible:10000000-0000-4000-8000-000000000002';
+    for (const [connectionId, label, baseUrl, apiKey] of [
+      [first, 'Work', 'https://work.example/v1', 'work-account-key'],
+      [second, 'Research', 'https://research.example/v1', 'research-account-key']
+    ]) {
+      const response = await connect('openai-compatible', { connectionId, label, baseUrl, apiKey });
+      expect(response.statusCode, response.body).toBe(200);
+    }
+    const user = (await store.getUserById(userId))!;
+    const models = await support.modelsForUser(user);
+    const shared = models.filter((model) => model.providerModelId === 'shared/model');
+    expect(shared).toHaveLength(2);
+    expect(new Set(shared.map((model) => model.id)).size).toBe(2);
+    expect(shared.map((model) => model.connectionLabel).sort()).toEqual(['Research', 'Work']);
+    const settings = (await app.inject({ method: 'GET', url: '/v1/providers' })).json<{
+      connections: Array<{ connectionId: string; label: string }>;
+    }>();
+    expect(settings.connections).toHaveLength(2);
+    expect(JSON.stringify(settings)).not.toContain('-account-key');
+    calls.length = 0;
+    const edited = await connect('openai-compatible', {
+      connectionId: first,
+      label: 'Work renamed',
+      baseUrl: 'https://work.example/v1'
+    });
+    expect(edited.statusCode, edited.body).toBe(200);
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.every((call) => call.authorization === 'Bearer work-account-key')).toBe(true);
+    expect((await support.inferenceConnections(userId)).get(second)?.secret.apiKey).toBe(
+      'research-account-key'
+    );
+    const cleared = await connect('openai-compatible', {
+      connectionId: first,
+      label: '',
+      baseUrl: 'https://work.example/v1'
+    });
+    expect(cleared.statusCode, cleared.body).toBe(200);
+    expect((await support.inferenceConnections(userId)).get(first)?.secret.label).toBe(
+      'work.example'
+    );
+    expect((await support.inferenceConnections(userId)).get(second)?.secret.label).toBe('Research');
+    const removed = await app.inject({
+      method: 'DELETE',
+      url: `/v1/providers?connectionId=${encodeURIComponent(first)}`
+    });
+    expect(removed.statusCode).toBe(200);
+    expect([...(await support.inferenceConnections(userId)).keys()]).toEqual([second]);
+    const remaining = await support.modelsForUser(user);
+    expect(remaining).toHaveLength(2);
+    expect(remaining.every((model) => model.connectionId === second)).toBe(true);
+  });
+
+  it('does not borrow a saved key for a newly named account at the same endpoint', async () => {
+    expect((await connect('openai-compatible', { apiKey: 'default-key' })).statusCode).toBe(200);
+    calls.length = 0;
+    const response = await connect('openai-compatible', {
+      connectionId: 'openai-compatible:10000000-0000-4000-8000-000000000003'
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.every((call) => call.authorization === null)).toBe(true);
+  });
+
+  it('rejects malformed identities or a connection belonging to a different protocol before discovery', async () => {
+    for (const connectionId of [
+      'openai-compatible:../escape',
+      'ollama-cloud',
+      'openrouter:10000000-0000-4000-8000-000000000003'
+    ]) {
+      const response = await connect('openai-compatible', {
+        connectionId,
+        apiKey: 'must-not-be-sent'
+      });
+      expect(response.statusCode).toBe(422);
+    }
+    expect(calls).toHaveLength(0);
+  });
+
   it('keeps the chosen vendor key when a different vendor was edited most recently', async () => {
     expect((await connect('ollama-cloud', { apiKey: 'ollama-key' })).statusCode).toBe(200);
     expect((await connect('openai-compatible', { apiKey: 'compatible-key' })).statusCode).toBe(200);

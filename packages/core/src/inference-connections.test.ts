@@ -35,6 +35,34 @@ const read = (rows: ReturnType<typeof row>[]) =>
   readInferenceConnections({ rows, userId, masterKey, environment });
 
 describe('inference connection identity', () => {
+  it('keeps independent named endpoints and rejects a credential swapped between their rows', () => {
+    const first = 'openai-compatible:10000000-0000-4000-8000-000000000001';
+    const second = 'openai-compatible:10000000-0000-4000-8000-000000000002';
+    const firstSecret = {
+      ...secret('openai-compatible', 'first-key'),
+      connectionId: first,
+      label: 'Work'
+    };
+    const secondSecret = {
+      ...secret('openai-compatible', 'second-key'),
+      connectionId: second,
+      label: 'Research'
+    };
+    const rows = [row(`inference:${first}`, firstSecret), row(`inference:${second}`, secondSecret)];
+    const connections = read(rows);
+    expect([...connections.keys()]).toEqual([first, second]);
+    expect(connections.get(first)?.secret.apiKey).toBe('first-key');
+    expect(connections.get(second)?.secret.apiKey).toBe('second-key');
+    const swapped = read([{ ...rows[0]!, secretCiphertext: rows[1]!.secretCiphertext }, rows[1]!]);
+    expect([...swapped.keys()]).toEqual([second]);
+    expect(
+      modelConnectionId(
+        { provider: 'custom', connectionId: first, recommendationTags: [] },
+        swapped.keys()
+      )
+    ).toBeNull();
+  });
+
   it('keeps the newest vendor credential and independent vendors', () => {
     const connections = read([
       row('inference:openrouter', secret('openrouter', 'new-key')),

@@ -21,6 +21,7 @@ import ModelPicker from '../ModelPicker.js';
 interface Provider {
   configured: boolean;
   connectionId?: string;
+  label?: string | null;
   connections?: Provider[];
   source: string;
   provider: string;
@@ -48,10 +49,17 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
   const [query, setQuery] = useState('');
   const [mediaSelections, setMediaSelections] = useState<Record<string, string>>({});
   const mediaAction = useAction(() => onChange());
-  const selected = choice || provider.value?.provider || 'openrouter';
+  const selected =
+    choice || provider.value?.connectionId || provider.value?.provider || 'openrouter';
   const saved =
-    provider.value?.connections?.find((entry) => entry.provider === selected) ??
-    (provider.value?.provider === selected ? provider.value : undefined);
+    provider.value?.connections?.find(
+      (entry) => (entry.connectionId ?? entry.provider) === selected
+    ) ??
+    ((provider.value?.connectionId ?? provider.value?.provider) === selected
+      ? provider.value
+      : undefined);
+  const selectedProvider =
+    saved?.provider ?? (selected.startsWith('openai-compatible:') ? 'openai-compatible' : selected);
   return (
     <>
       <AudioReceipts />
@@ -64,20 +72,24 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
           <div className="row model-connection-tabs" aria-label="Saved model connections">
             {provider.value?.connections?.map((entry) => (
               <Button
-                key={entry.provider}
+                key={entry.connectionId ?? entry.provider}
                 type="button"
-                aria-pressed={selected === entry.provider}
-                onClick={() => setChoice(entry.provider)}
+                aria-pressed={selected === (entry.connectionId ?? entry.provider)}
+                onClick={() => setChoice(entry.connectionId ?? entry.provider)}
               >
-                {entry.provider === 'openrouter'
-                  ? 'OpenRouter'
-                  : entry.provider === 'ollama-cloud'
-                    ? 'Ollama Cloud'
-                    : 'Compatible endpoint'}
+                {entry.label ??
+                  (entry.provider === 'openrouter'
+                    ? 'OpenRouter'
+                    : entry.provider === 'ollama-cloud'
+                      ? 'Ollama Cloud'
+                      : 'Compatible endpoint')}
               </Button>
             ))}
           </div>
         )}
+        <Button type="button" onClick={() => setChoice(`openai-compatible:${crypto.randomUUID()}`)}>
+          Add custom endpoint
+        </Button>
         {provider.value && preferences.value && (
           <form
             className="stack"
@@ -89,9 +101,13 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
               void action.run(async () => {
                 await sensitive(() =>
                   put('/v1/providers', {
-                    provider: selected,
+                    provider: selectedProvider,
+                    connectionId: selected,
+                    ...(selectedProvider === 'openai-compatible'
+                      ? { label: fieldValue(form, 'label') }
+                      : {}),
                     ...(apiKey ? { apiKey } : {}),
-                    ...(selected === 'openai-compatible'
+                    ...(selectedProvider === 'openai-compatible'
                       ? {
                           baseUrl: fieldValue(form, 'baseUrl'),
                           ...(fieldValue(form, 'modelId')
@@ -110,7 +126,7 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
                     enforceZeroDataRetention: form.has('zdr')
                   })
                 );
-                if (selected === 'openrouter') {
+                if (selectedProvider === 'openrouter') {
                   try {
                     await put('/v1/account/preferences', {
                       providerRouting: {
@@ -139,7 +155,11 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
             </div>
             <div className="management-grid">
               <Field label="Provider">
-                <select value={selected} onChange={(event) => setChoice(event.target.value)}>
+                <select
+                  value={selectedProvider}
+                  disabled={selected !== selectedProvider}
+                  onChange={(event) => setChoice(event.target.value)}
+                >
                   <option value="openrouter">OpenRouter</option>
                   <option value="ollama-cloud">Ollama Cloud</option>
                   <option value="openai-compatible">Compatible endpoint</option>
@@ -156,8 +176,19 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
                   placeholder={saved?.hasApiKey ? 'Stored securely' : 'Paste your key'}
                 />
               </Field>
-              {selected === 'openai-compatible' && (
+              {selectedProvider === 'openai-compatible' && (
                 <>
+                  <Field
+                    label="Connection name"
+                    hint="Optional. A named connection uses its endpoint hostname by default."
+                  >
+                    <input
+                      name="label"
+                      maxLength={80}
+                      defaultValue={saved?.label ?? ''}
+                      placeholder="Work models"
+                    />
+                  </Field>
                   <Field label="Endpoint URL">
                     <input
                       required
@@ -204,7 +235,7 @@ export function ProviderSettings({ onChange }: { onChange: () => void }) {
                 </>
               )}
             </div>
-            {selected === 'openrouter' && (
+            {selectedProvider === 'openrouter' && (
               /*
                * Which operator serves a model, when several do.
                *
