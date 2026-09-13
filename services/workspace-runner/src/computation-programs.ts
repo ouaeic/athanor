@@ -1,6 +1,6 @@
 /** Protocol packets remain untrusted cell output; they never authorize tools or arbitrary paths. */
 export const PYTHON_COMPUTATION = String.raw`
-import sys, json, ast, asyncio, inspect, traceback, builtins, io, base64
+import sys, json, ast, asyncio, inspect, traceback, builtins, io, base64, platform
 _token = sys.argv[1]
 _wire = sys.stdout
 _json = json.dumps
@@ -31,7 +31,7 @@ def _json_value(value, depth=0):
     if type(value) in (list, tuple): return [_json_value(v,depth+1) for v in value]
     if type(value) is dict and all(type(k) is str for k in value): return {k:_json_value(v,depth+1) for k,v in value.items()}
     raise ValueError('Checkpoints accept JSON values only')
-_send({'kind':'ready'})
+_send({'kind':'ready','runtime':{'version':sys.version.split()[0],'platform':sys.platform,'architecture':platform.machine()}})
 for _line in sys.stdin:
     try:
         _request = json.loads(_line)
@@ -170,5 +170,5 @@ readline.createInterface({input:process.stdin}).on('line',line=>{ tail=tail.then
  send({kind:'done',cellId:active,result,error,variables:cached,artifacts:plots.map(plot=>({mimeType:'application/vnd.garden.plot+json',plot}))});active=null;
  }).catch(()=>send({kind:'fatal',message:'Computation protocol failed'}));});
 process.stdin.on('end',()=>{server.close();process.exit(0);});
-initialized.then(()=>send({kind:'ready'}),()=>send({kind:'fatal',message:'Native context initialization failed'}));
+initialized.then(()=>send({kind:'ready',runtime:{version:process.version,platform:process.platform,architecture:process.arch}}),()=>send({kind:'fatal',message:'Native context initialization failed'}));
 `;

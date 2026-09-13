@@ -450,6 +450,19 @@ const historyStart = (sequence, cellId, code) =>
       options: { action: 'cell', cellId, code }
     }
   });
+const computationManifest = {
+  format: 'garden-computation-manifest-1',
+  capturedAt: time,
+  requestSha256: 'a'.repeat(64),
+  sourceSha256: 'b'.repeat(64),
+  predecessorCellId: 'cell-earlier',
+  runtime: { version: '3.14.2', platform: 'linux', architecture: 'x86_64' },
+  inputs: [
+    { path: 'workspace/input.csv', status: 'hashed', bytes: 128, sha256: 'c'.repeat(64) },
+    { path: 'workspace/large-input.csv', status: 'unavailable', reason: 'too_large' }
+  ],
+  coverage: 'declared_inputs_before_execution'
+};
 const historyReceipt = (sequence, cellId, state, stdout) =>
   historyEvent(sequence, 'tool_result', {
     toolCallId: cellId,
@@ -462,7 +475,9 @@ const historyReceipt = (sequence, cellId, state, stdout) =>
         stdout,
         stderr: '',
         artifacts: [],
-        ...(state === 'failed' ? { error: 'Fixture cell failure' } : {})
+        ...(state === 'failed'
+          ? { error: 'Fixture cell failure', manifest: computationManifest }
+          : {})
       }
     }
   });
@@ -1602,12 +1617,25 @@ try {
     await history.getByText('cell-latest', { exact: true }).click();
     await history.getByText('raise ValueError("fixture")', { exact: true }).waitFor();
     await history.getByText('Fixture cell failure', { exact: true }).waitFor();
+    await history.getByText('Source and input record', { exact: true }).click();
+    await history.getByText('workspace/input.csv', { exact: true }).waitFor();
+    await history.getByText('Hash unavailable: too large.', { exact: true }).waitFor();
+    await page.setViewportSize({ width: 390, height: 844 });
+    await history.getByText('Source and input record', { exact: true }).scrollIntoViewIfNeeded();
+    assert.equal(
+      await page.evaluate(() => document.documentElement.scrollWidth > innerWidth),
+      false,
+      'Input hashes must wrap on a phone'
+    );
+    await page.screenshot({ path: resolve(report, 'computation-manifest-phone.png') });
+    await page.setViewportSize({ width: 1440, height: 1000 });
     const historyDownloadPromise = page.waitForEvent('download');
     await history.getByRole('button', { name: 'Export this history page', exact: true }).click();
     const historyDownload = await historyDownloadPromise;
     const exportedHistory = JSON.parse(await readFile(await historyDownload.path(), 'utf8'));
     assert.equal(exportedHistory.entries.length, 1);
     assert.equal(exportedHistory.entries[0].receipt.state, 'failed');
+    assert.deepEqual(exportedHistory.entries[0].receipt.manifest, computationManifest);
     assert.deepEqual(exportedHistory.coverage, {
       olderEventsAvailable: true,
       newerEventsAvailable: false,

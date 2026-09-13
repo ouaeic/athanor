@@ -1,7 +1,7 @@
 import { mkdtemp, realpath, readFile, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as ExecutionModule from './execution.js';
 import type * as HostStorageModule from './host-storage.js';
@@ -97,6 +97,53 @@ describe('persistent native computation', () => {
       });
     }
   );
+  it.each(['python', 'javascript'] as const)(
+    'records the launched %s interpreter and exact declared input snapshots',
+    async (language) => {
+      const session = await start(language);
+      expect(session.runtime?.version).toMatch(/\d/);
+      expect(session.runtime?.platform).toBe(process.platform);
+      expect(session.runtime?.architecture.length).toBeGreaterThan(0);
+      const bytes = Buffer.from('group,value\nA,3\n');
+      await writeFile(path.join(directory, workspaceId, 'workspace/input.csv'), bytes);
+      const code = language === 'python' ? 'value = 7\nvalue' : 'const value = 7; value';
+      const id = randomUUID();
+      const request = {
+        action: 'cell',
+        sessionId: session.sessionId,
+        cellId: id,
+        code,
+        inputs: ['workspace/input.csv']
+      };
+      await manager.act(workspaceId, owner, request);
+      await vi.waitFor(() =>
+        expect(manager.status(workspaceId, owner, session.sessionId).state).toBe('idle')
+      );
+      const completed = manager.status(workspaceId, owner, session.sessionId);
+      expect(completed.latestCell?.manifest).toMatchObject({
+        format: 'garden-computation-manifest-1',
+        sourceSha256: createHash('sha256').update(code).digest('hex'),
+        runtime: session.runtime,
+        coverage: 'declared_inputs_before_execution',
+        inputs: [
+          {
+            path: 'workspace/input.csv',
+            status: 'hashed',
+            bytes: bytes.length,
+            sha256: createHash('sha256').update(bytes).digest('hex')
+          }
+        ]
+      });
+      expect(completed.latestCell?.manifest?.predecessorCellId).toBeUndefined();
+      await writeFile(path.join(directory, workspaceId, 'workspace/input.csv'), 'changed');
+      const replay = (await manager.act(workspaceId, owner, request)) as ComputationSession;
+      expect(replay.latestCell?.manifest).toEqual(completed.latestCell?.manifest);
+      const next = await cell(session, 'value');
+      expect(next.latestCell?.manifest?.predecessorCellId).toBe(id);
+      expect(next.latestCell?.manifest?.inputs).toEqual([]);
+      expect(next.latestCell?.result).toMatchObject({ value: 7 });
+    }
+  );
   it('keeps stable cell IDs exactly once, rejects conflicting reuse and does not execute status reads', async () => {
     const session = await start('python');
     const id = randomUUID();
@@ -189,6 +236,19 @@ describe('persistent native computation', () => {
       cellId: 'restore',
       path: 'workspace/values.json'
     });
+    const checkpointBytes = await readFile(
+      path.join(directory, workspaceId, 'workspace/values.json')
+    );
+    expect(
+      manager.status(workspaceId, owner, another.sessionId).latestCell?.manifest?.inputs
+    ).toEqual([
+      {
+        path: 'workspace/values.json',
+        status: 'hashed',
+        bytes: checkpointBytes.length,
+        sha256: createHash('sha256').update(checkpointBytes).digest('hex')
+      }
+    ]);
     expect((await cell(another, 'sum(values)')).latestCell?.result).toMatchObject({ value: 10 });
     await expect(
       manager.act(workspaceId, owner, {

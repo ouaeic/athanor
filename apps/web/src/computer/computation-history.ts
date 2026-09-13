@@ -16,6 +16,40 @@ const record = (value: unknown): Record<string, unknown> =>
     : {};
 const string = (value: unknown): string | undefined =>
   typeof value === 'string' ? value : undefined;
+const hash = (value: unknown) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+const bounded = (value: unknown, limit: number) =>
+  typeof value === 'string' && value.length <= limit;
+const validManifest = (value: unknown): boolean => {
+  const manifest = record(value),
+    runtime = record(manifest.runtime);
+  return (
+    manifest.format === 'garden-computation-manifest-1' &&
+    bounded(manifest.capturedAt, 100) &&
+    Number.isFinite(Date.parse(String(manifest.capturedAt))) &&
+    manifest.coverage === 'declared_inputs_before_execution' &&
+    hash(manifest.requestSha256) &&
+    (manifest.sourceSha256 === undefined || hash(manifest.sourceSha256)) &&
+    (manifest.predecessorCellId === undefined || bounded(manifest.predecessorCellId, 120)) &&
+    (manifest.runtime === undefined ||
+      (bounded(runtime.version, 200) &&
+        bounded(runtime.platform, 100) &&
+        bounded(runtime.architecture, 100))) &&
+    Array.isArray(manifest.inputs) &&
+    manifest.inputs.length <= 32 &&
+    manifest.inputs.every((value) => {
+      const input = record(value);
+      return (
+        bounded(input.path, 4096) &&
+        (input.status === 'hashed'
+          ? hash(input.sha256) && Number.isSafeInteger(input.bytes) && Number(input.bytes) >= 0
+          : input.status === 'unavailable' &&
+            ['not_readable', 'too_large', 'budget_exhausted', 'changed_during_read'].includes(
+              String(input.reason)
+            ))
+      );
+    })
+  );
+};
 const cellReceipt = (value: unknown): ComputationCell | undefined => {
   const cell = record(value);
   if (
@@ -34,7 +68,8 @@ const cellReceipt = (value: unknown): ComputationCell | undefined => {
       );
     }) ||
     (cell.error !== undefined && typeof cell.error !== 'string') ||
-    (cell.finishedAt !== undefined && typeof cell.finishedAt !== 'string')
+    (cell.finishedAt !== undefined && typeof cell.finishedAt !== 'string') ||
+    (cell.manifest !== undefined && !validManifest(cell.manifest))
   )
     return undefined;
   return cell as unknown as ComputationCell;

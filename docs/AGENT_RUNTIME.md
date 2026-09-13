@@ -355,6 +355,14 @@ A computation session's in-memory interpreter state is also distinct from a fini
 checkpointable stages when an analysis must recover after maintenance or a crash. Garden does not
 infer a checkpoint or reconstruct arbitrary program memory.
 
+Computation receipts also carry the launched interpreter's version, platform and architecture,
+the submitted source and request hashes, and the preceding cell's identity. Declare `inputs` on a
+code cell to capture bounded file hashes before execution; dependency lockfiles can be included.
+Unreadable, changing or oversized inputs remain explicit unavailable records. These are snapshots,
+not locks: unlisted dependencies, exact file reads during execution and in-memory values are not
+captured. Execution history displays and exports these records when present. They do not authorize
+an automatic rerun or claim a complete environment lock.
+
 The updater still checks unfinished background work before maintenance, including checkpointable
 jobs. Declaring recovery is a safeguard against interruption, not permission to interrupt active
 work. [Operations](OPERATIONS.md#what-an-update-stops-and-what-comes-back) describes the update gate

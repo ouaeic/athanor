@@ -62,7 +62,7 @@ export default function ComputationHistory({ session }: { session: ComputationSe
         newestSequence: page?.newestSequence,
         eventCount: page?.eventCount
       },
-      note: 'Execution evidence from the saved transcript. Runtime dependencies and input hashes were not recorded; this is not an environment lock or an automatic replay recipe.',
+      note: 'Execution evidence from the saved transcript. Manifests, when present, identify the interpreter and declared input snapshots taken before execution. Files were not locked; undeclared dependencies and in-memory state are not captured. This is not an environment lock or an automatic replay recipe.',
       entries
     };
     const url = URL.createObjectURL(
@@ -127,6 +127,54 @@ export default function ComputationHistory({ session }: { session: ComputationSe
                 ? `Checkpoint path: ${entry.path ?? 'not recorded'}`
                 : 'Source is outside the loaded event window or was not recorded.'}
             </p>
+          )}
+          {entry.receipt?.manifest && (
+            <details>
+              <summary>Source and input record</summary>
+              {entry.receipt.manifest.runtime && (
+                <p className="muted">
+                  {session.language} {entry.receipt.manifest.runtime.version} ·{' '}
+                  {entry.receipt.manifest.runtime.platform} ·{' '}
+                  {entry.receipt.manifest.runtime.architecture}
+                </p>
+              )}
+              {entry.receipt.manifest.sourceSha256 && (
+                <p className="computer-path">
+                  Source SHA-256: <code>{entry.receipt.manifest.sourceSha256}</code>
+                </p>
+              )}
+              {entry.receipt.manifest.predecessorCellId && (
+                <p className="muted">
+                  Continues session state after{' '}
+                  <code>{entry.receipt.manifest.predecessorCellId}</code>.
+                </p>
+              )}
+              <p className="muted">
+                Pre-execution snapshots cover the declared files below. They do not lock files or
+                capture unlisted dependencies and session values.
+              </p>
+              {entry.receipt.manifest.inputs.length ? (
+                <ul className="computer-manifest-inputs">
+                  {entry.receipt.manifest.inputs.map((input, index) => (
+                    <li key={`${input.path}:${index}`} className="stack">
+                      <code className="computer-path">{input.path}</code>
+                      {input.status === 'hashed' ? (
+                        <>
+                          <span className="muted">{bytes(input.bytes)}</span>
+                          <code className="computer-path">{input.sha256}</code>
+                        </>
+                      ) : (
+                        <span className="muted">
+                          Hash unavailable: {input.reason.replaceAll('_', ' ')}.
+                        </span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="muted">No input files were declared.</p>
+              )}
+            </details>
           )}
           {entry.receipt?.stdout && <pre className="computer-log">{entry.receipt.stdout}</pre>}
           {entry.receipt?.stderr && <pre className="computer-log">{entry.receipt.stderr}</pre>}

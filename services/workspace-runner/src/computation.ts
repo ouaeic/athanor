@@ -7,7 +7,9 @@ import { z } from 'zod';
 import {
   ComputationRequest,
   ComputationSessionSchema,
+  ComputationRuntimeSchema,
   type ComputationCell,
+  type ComputationInput,
   type ComputationSession
 } from '@athanor/contracts';
 import {
@@ -26,12 +28,13 @@ import { killProcessTree } from './subprocess.js';
 import { belowHostStorageFloor, hostStorage } from './host-storage.js';
 import { PYTHON_COMPUTATION, JAVASCRIPT_COMPUTATION } from './computation-programs.js';
 import { saveComputationArtifacts } from './computation-artifacts.js';
+import { computationInputs } from './computation-inputs.js';
 
 export const COMPUTATION_LIMIT = 8;
 export const COMPUTATION_CELL_LIMIT = 256;
 export const COMPUTATION_OUTPUT_BYTES = 16_384;
 const Packet = z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('ready') }),
+  z.object({ kind: z.literal('ready'), runtime: ComputationRuntimeSchema }),
   z.object({ kind: z.literal('fatal'), message: z.string().max(8000) }),
   z.object({
     kind: z.literal('output'),
@@ -192,6 +195,8 @@ export class ComputationManager {
   }
   async act(workspaceId: string, owner: string | null, value: unknown): Promise<unknown> {
     const request = ComputationRequest.parse(value);
+    if (request.inputs && request.action !== 'cell')
+      throw Error('Declared inputs apply to code cells only');
     if (request.action === 'list') return { sessions: this.list(workspaceId, owner) };
     if (request.action === 'start') {
       if (!owner) throw Error('Computation start requires a task');
@@ -450,7 +455,9 @@ export class ComputationManager {
     refuseUnreachableTimeout({ timeoutSeconds: seconds }, this.maximumSeconds, true);
     if (seconds * 1000 > Date.parse(record.view.deadlineAt) - this.now())
       throw Error('Cell timeout exceeds remaining session lifetime');
+    const capturedAt = new Date(this.now()).toISOString();
     let values: unknown;
+    let restoredInput: ComputationInput | undefined;
     if (request.action === 'restore') {
       if (!request.path) throw Error('Restore requires a JSON checkpoint path');
       const content = await readWorkspaceFile(
@@ -467,12 +474,21 @@ export class ComputationManager {
         .strict()
         .parse(JSON.parse(content.content.toString('utf8')));
       values = checkpoint.values;
+      restoredInput = {
+        path: assertUserDataPath(live.root, request.path),
+        status: 'hashed',
+        sha256: content.sha256,
+        bytes: content.content.length
+      };
     }
     if (request.action === 'checkpoint') {
       if (!request.path || !request.variables?.length)
         throw Error('Checkpoint requires a new path and selected variables');
       assertUserDataPath(live.root, request.path);
     }
+    const inputs = restoredInput
+      ? [restoredInput]
+      : await computationInputs(live.root, request.inputs ?? []);
     if (this.#live.get(record.view.sessionId) !== live || record.view.state !== 'idle')
       throw Error('Computation session changed while preparing the cell');
     record.view.latestCell = {
@@ -481,7 +497,19 @@ export class ComputationManager {
       startedAt: new Date(this.now()).toISOString(),
       stdout: '',
       stderr: '',
-      artifacts: []
+      artifacts: [],
+      manifest: {
+        format: 'garden-computation-manifest-1',
+        capturedAt,
+        requestSha256: hash,
+        ...(request.code !== undefined
+          ? { sourceSha256: createHash('sha256').update(request.code).digest('hex') }
+          : {}),
+        ...(record.receipts.at(-1) ? { predecessorCellId: record.receipts.at(-1)!.cellId } : {}),
+        ...(record.view.runtime ? { runtime: record.view.runtime } : {}),
+        inputs,
+        coverage: 'declared_inputs_before_execution'
+      }
     };
     record.receipts.push({ cellId: id, hash, state: 'running' });
     record.view.state = 'busy';
@@ -536,6 +564,8 @@ export class ComputationManager {
       try {
         const packet = Packet.parse(JSON.parse(line.slice(marker + live.token.length)));
         if (packet.kind === 'ready') {
+          if (live.record.view.state !== 'starting') continue;
+          live.record.view.runtime = packet.runtime;
           live.ready();
           continue;
         }

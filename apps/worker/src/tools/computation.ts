@@ -21,7 +21,7 @@ export async function executeComputationTool(
       actions: {
         start:
           'Start an approved task-scoped Python or JavaScript interpreter with explicit lifetimeSeconds. Filesystem confined, network disabled; use governed tools for downloads/installations. Requires the native sandbox.',
-        cell: 'Execute code in the retained session. Use a unique stable cellId; retries never replay an accepted cell. Values remain server-side. Results return quickly or as a running handle; status reads cached outputs without executing code.',
+        cell: 'Execute code in the retained session. Use a unique stable cellId; retries never replay an accepted cell. Values remain server-side. Results return quickly or as a running handle; status reads cached outputs without executing code. Declare inputs as workspace file paths to capture bounded pre-execution hashes (include dependency lockfiles). Receipts include source/request hashes, interpreter identity and the previous cell; they do not capture all dependencies or freeze files.',
         list: 'List this task’s sessions.',
         status: 'Read cached session state, variables and latest cell receipt.',
         interrupt:

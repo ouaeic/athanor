@@ -21,6 +21,7 @@ export const ComputationRequest = z
     code: z.string().max(100_000).optional(),
     timeoutSeconds: z.number().int().positive().optional(),
     variables: z.array(z.string().min(1).max(200)).max(100).optional(),
+    inputs: z.array(z.string().min(1).max(4096)).max(32).optional(),
     path: z.string().max(4096).optional()
   })
   .strict();
@@ -37,6 +38,49 @@ export const ComputationState = z.enum([
 ]);
 export type ComputationState = z.infer<typeof ComputationState>;
 
+export const ComputationRuntimeSchema = z
+  .object({
+    version: z.string().min(1).max(200),
+    platform: z.string().min(1).max(100),
+    architecture: z.string().min(1).max(100)
+  })
+  .strict();
+
+export const ComputationInputSchema = z.discriminatedUnion('status', [
+  z
+    .object({
+      path: z.string().max(4096),
+      status: z.literal('hashed'),
+      bytes: z.number().int().nonnegative(),
+      sha256: z.string().regex(/^[a-f0-9]{64}$/)
+    })
+    .strict(),
+  z
+    .object({
+      path: z.string().max(4096),
+      status: z.literal('unavailable'),
+      reason: z.enum(['not_readable', 'too_large', 'budget_exhausted', 'changed_during_read'])
+    })
+    .strict()
+]);
+export type ComputationInput = z.infer<typeof ComputationInputSchema>;
+
+export const ComputationManifestSchema = z
+  .object({
+    format: z.literal('garden-computation-manifest-1'),
+    capturedAt: z.string().datetime(),
+    requestSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    sourceSha256: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
+    predecessorCellId: z.string().max(120).optional(),
+    runtime: ComputationRuntimeSchema.optional(),
+    inputs: z.array(ComputationInputSchema).max(32),
+    coverage: z.literal('declared_inputs_before_execution')
+  })
+  .strict();
+
 export const ComputationCellSchema = z
   .object({
     cellId: z.string().min(1).max(120),
@@ -47,6 +91,7 @@ export const ComputationCellSchema = z
     stderr: z.string().max(40_000),
     result: z.unknown().optional(),
     error: z.string().max(8000).optional(),
+    manifest: ComputationManifestSchema.optional(),
     artifacts: z
       .array(
         z.object({
@@ -66,6 +111,7 @@ export const ComputationSessionSchema = z
     workspaceId: z.string().uuid(),
     name: z.string().max(120),
     language: z.enum(['python', 'javascript']),
+    runtime: ComputationRuntimeSchema.optional(),
     cwd: z.string().max(4096),
     state: ComputationState,
     createdAt: z.string().datetime(),

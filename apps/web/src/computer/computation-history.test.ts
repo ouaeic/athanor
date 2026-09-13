@@ -37,6 +37,34 @@ describe('computation execution history from encrypted transcript events', () =>
     expect(entries).toHaveLength(1);
     expect(entries[0]).toMatchObject({ source: '1+1', receipt: cell, sequence: 1 });
   });
+  it('preserves valid input records while refusing malformed untrusted manifests', () => {
+    const manifest: NonNullable<ComputationCell['manifest']> = {
+      format: 'garden-computation-manifest-1',
+      capturedAt: '2026-09-13T00:00:00Z',
+      requestSha256: 'a'.repeat(64),
+      sourceSha256: 'b'.repeat(64),
+      runtime: { version: '3.14.2', platform: 'linux', architecture: 'x86_64' },
+      inputs: [
+        { path: 'workspace/input.csv', status: 'hashed', bytes: 20, sha256: 'c'.repeat(64) }
+      ],
+      coverage: 'declared_inputs_before_execution'
+    };
+    expect(
+      computationHistory([result(2, { ...cell, manifest })], sessionId)[0]?.receipt?.manifest
+    ).toEqual(manifest);
+    for (const invalid of [
+      { ...manifest, inputs: null },
+      { ...manifest, runtime: { version: { html: 'bad' } } },
+      { ...manifest, inputs: [{ path: 'x', status: 'unavailable', reason: { html: 'bad' } }] },
+      { ...manifest, inputs: [{ path: 'x', status: 'hashed', bytes: -1, sha256: 'wrong' }] }
+    ]) {
+      const malformed = event(2, 'tool_result', {
+        toolCallId: 'x',
+        result: { sessionId, latestCell: { ...cell, manifest: invalid } }
+      });
+      expect(computationHistory([malformed], sessionId)).toEqual([]);
+    }
+  });
   it('a status read updates the receipt without inventing source', () => {
     const entries = computationHistory([result(3, cell, 'poll')], sessionId);
     expect(entries).toHaveLength(1);
