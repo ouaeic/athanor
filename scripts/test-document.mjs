@@ -383,6 +383,70 @@ try {
   assert.equal(JSON.parse(exact.stdout).coverage.hasMore, false);
   await rm(largeFolder, { recursive: true });
 
+  const variantsFolder = path.join(root, 'terminology');
+  await mkdir(variantsFolder);
+  await writeFile(
+    path.join(variantsFolder, 'clinical.txt'),
+    'Myocardial infarction was confirmed in the discharge note.'
+  );
+  await writeFile(
+    path.join(variantsFolder, 'abbreviation.txt'),
+    'The ECG recording is attached to the clinical archive.'
+  );
+  await writeFile(
+    path.join(variantsFolder, 'unrelated.txt'),
+    'The storage warranty expires next year.'
+  );
+  const plain = runIn(variantsFolder, {}, 'search', '--query', 'heart attack');
+  assert.equal(plain.status, 0, plain.stderr);
+  assert.deepEqual(JSON.parse(plain.stdout).results, []);
+  const expanded = runIn(
+    variantsFolder,
+    {},
+    'search',
+    '--query',
+    'heart attack',
+    '--alternative=myocardial infarction',
+    '--alternative=ECG'
+  );
+  assert.equal(expanded.status, 0, expanded.stderr);
+  const expandedPayload = JSON.parse(expanded.stdout);
+  assert.equal(expandedPayload.filesConsidered, 3);
+  assert.equal(expandedPayload.coverage.hasMore, false);
+  assert.deepEqual(expandedPayload.queries, ['heart attack', 'myocardial infarction', 'ECG']);
+  assert.equal(expandedPayload.results.length, 2);
+  assert.deepEqual(
+    expandedPayload.results.find((hit) => hit.path === 'clinical.txt').matchedQueries,
+    ['myocardial infarction']
+  );
+  assert.deepEqual(
+    expandedPayload.results.find((hit) => hit.path === 'abbreviation.txt').matchedQueries,
+    ['ECG']
+  );
+  const repeated = runIn(
+    variantsFolder,
+    {},
+    'search',
+    '--query',
+    'heart attack',
+    '--alternative=myocardial infarction',
+    '--alternative=ECG',
+    '--alternative=ECG'
+  );
+  assert.equal(repeated.status, 0, repeated.stderr);
+  assert.deepEqual(JSON.parse(repeated.stdout).results, expandedPayload.results);
+  for (const invalid of [
+    Array(5).fill('--alternative=ECG'),
+    ['--alternative=!!!'],
+    ['--alternative=' + 'x'.repeat(501)]
+  ]) {
+    assert.notEqual(
+      runIn(variantsFolder, {}, 'search', '--query', 'heart attack', ...invalid).status,
+      0
+    );
+  }
+  await rm(variantsFolder, { recursive: true });
+
   const empty = run('search', '--path', '.', '--query', '!!!');
   assert.notEqual(empty.status, 0);
   assert.match(empty.stderr, /at least one word/);

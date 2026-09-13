@@ -104,18 +104,18 @@ the whole block on every `pnpm check`. Accept a new baseline and this page fails
 is re-derived, naming the value it should now carry. The instruction is no longer advice.
 
 ```baseline
-fixtures                                                                             75
+fixtures                                                                             77
 long-a-finished-phase-is-never-declared.modelCalls                                   38
-long-a-finished-phase-is-never-declared.promptTokens                          1,462,301
-long-a-finished-phase-is-never-declared.catalogueTokens                         477,204
+long-a-finished-phase-is-never-declared.promptTokens                          1,468,199
+long-a-finished-phase-is-never-declared.catalogueTokens                         483,474
 long-a-finished-phase-is-never-declared.cachePrefix                                  95
 long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.modelCalls           40
-long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.promptTokens  1,408,856
-long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.catalogueTokens    489,763
+long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.promptTokens  1,414,908
+long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.catalogueTokens    496,198
 long-a-finished-phase-is-condensed-and-nothing-is-taken-quietly.cachePrefix          94
 long-finished-phases-condense-rather-than-shred.cachePrefix                          66
 compaction.extraModelCalls                                                            2
-compaction.tokensSaved                                                           53,445
+compaction.tokensSaved                                                           53,291
 compaction.cachePointsGivenUp                                                         1
 floorWalk.cachePointsLost                                                            28
 ```

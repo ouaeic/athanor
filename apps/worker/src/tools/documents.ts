@@ -99,6 +99,22 @@ export async function executeDocumentTool(
     case 'document_search': {
       const query = textValue(call.arguments.query).trim();
       if (!query) throw new AthanorError('document_query_empty', 'Document search needs a query');
+      const rawAlternatives =
+        call.arguments.alternatives === undefined ? [] : call.arguments.alternatives;
+      if (
+        !Array.isArray(rawAlternatives) ||
+        rawAlternatives.length > 4 ||
+        rawAlternatives.some(
+          (value) => typeof value !== 'string' || !value.trim() || value.length > 500
+        )
+      )
+        throw new AthanorError(
+          'document_alternatives_invalid',
+          'Document search accepts up to four nonempty alternatives of 500 characters each'
+        );
+      const alternatives = [
+        ...new Set(rawAlternatives.map((value: string) => value.trim()))
+      ].filter((value) => value !== query);
       const path = textValue(call.arguments.path, 'workspace');
       const maxFiles = clampNumber(call.arguments.maxFiles, { min: 1, max: 2_000, fallback: 500 });
       const fileOffset = clampNumber(call.arguments.fileOffset, {
@@ -127,6 +143,7 @@ export async function executeDocumentTool(
             String(maxResults),
             '--max-pages',
             String(maxPages),
+            ...alternatives.map((value) => `--alternative=${value}`),
             ...(fileOffset > 0 ? ['--file-offset', String(fileOffset)] : [])
           ],
           cwd: '.',

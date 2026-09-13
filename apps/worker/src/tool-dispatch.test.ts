@@ -1322,6 +1322,60 @@ describe('the document arms', () => {
     ]);
   });
 
+  it('passes deduplicated terminology variants as literal arguments in one document scan', async () => {
+    const executed = await dispatch(
+      {
+        name: 'document_search',
+        arguments: {
+          query: 'heart attack',
+          alternatives: ['myocardial infarction', 'myocardial infarction', '-ECG', 'heart attack'],
+          fileOffset: 10
+        }
+      },
+      {
+        route: (url) =>
+          url.endsWith(`${root}/exec`) ? observation({ stdout: '{"results":[]}' }) : undefined
+      }
+    );
+    expect(executed.failure).toBeUndefined();
+    expect(executed.calls).toHaveLength(1);
+    expect((executed.calls[0]?.body as { args: string[] }).args).toEqual([
+      'search',
+      '--path',
+      'workspace',
+      '--query',
+      'heart attack',
+      '--max-files',
+      '500',
+      '--max-results',
+      '12',
+      '--max-pages',
+      '500',
+      '--alternative=myocardial infarction',
+      '--alternative=-ECG',
+      '--file-offset',
+      '10'
+    ]);
+  });
+  it.each([
+    { alternatives: ['', 'valid'] },
+    { alternatives: ['x'.repeat(501)] },
+    { alternatives: Array(5).fill('valid') },
+    { alternatives: 'not-an-array' },
+    { alternatives: [42] },
+    { alternatives: null }
+  ])(
+    'refuses invalid search alternatives before invoking a reader: $alternatives',
+    async ({ alternatives }) => {
+      const executed = await dispatch({
+        name: 'document_search',
+        arguments: { query: 'heart attack', alternatives }
+      });
+      expect(executed.calls).toEqual([]);
+      expect(executed.failure?.code).toBe('document_alternatives_invalid');
+    }
+  );
+
   it('refuses a document search with nothing to look for', async () => {
     const executed = await dispatch({ name: 'document_search', arguments: { query: '  ' } });
 

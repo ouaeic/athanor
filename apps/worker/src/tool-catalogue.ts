@@ -762,13 +762,18 @@ export const agentTools: ModelTool[] = [
   {
     name: 'document_search',
     description:
-      'Search local PDFs and office documents with private, source-linked BM25. Retry synonyms for wording differences; use document_read for evidence. Use code_search for code, session_search for chats, web_search for the internet.',
+      'Search documents with private BM25; alternatives add synonyms. Use document_read for evidence, code_search for code, session_search for chats, web_search for the web.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       required: ['query'],
       properties: {
         query: { type: 'string', minLength: 1, maxLength: 2_000 },
+        alternatives: {
+          type: 'array',
+          maxItems: 4,
+          items: { type: 'string', minLength: 1, maxLength: 500 }
+        },
         path: { type: 'string', default: 'workspace' },
         maxFiles: { type: 'integer', minimum: 1, maximum: 2_000, default: 500 },
         fileOffset: {
@@ -776,7 +781,8 @@ export const agentTools: ModelTool[] = [
           minimum: 0,
           maximum: 1_000_000,
           default: 0,
-          description: 'Continue with coverage.nextFileOffset, keeping query and path unchanged.'
+          description:
+            'Continue with coverage.nextFileOffset, keeping all queries and path unchanged.'
         },
         maxResults: { type: 'integer', minimum: 1, maximum: 50, default: 12 },
         maxPages: {

@@ -1419,6 +1419,18 @@ def candidate_files(root: Path, max_files: int) -> Iterable[Path]:
 
 
 def search_command(args: argparse.Namespace) -> dict[str, object]:
+    if len(args.alternative) > 4 or any(
+        not value.strip() or len(value) > 500 for value in args.alternative
+    ):
+        raise ValueError("Search accepts up to four nonempty alternatives of 500 characters each")
+    queries = list(
+        dict.fromkeys([args.query.strip(), *(value.strip() for value in args.alternative)])
+    )
+    if any(not TOKEN.findall(value) for value in queries):
+        raise ValueError("Each search query must contain at least one word")
+    query_terms = list(
+        dict.fromkeys(term.lower() for value in queries for term in TOKEN.findall(value))
+    )
     root = safe_target(args.path, directory_ok=True)
     from itertools import islice
 
@@ -1428,9 +1440,6 @@ def search_command(args: argparse.Namespace) -> dict[str, object]:
     page = list(islice(candidates_walk, args.file_offset, args.file_offset + args.max_files + 1))
     has_more = len(page) > args.max_files
     files = page[:args.max_files]
-    query_terms = list(dict.fromkeys(term.lower() for term in TOKEN.findall(args.query)))
-    if not query_terms:
-        raise ValueError("Search query must contain at least one word")
     candidates: list[tuple[Path, str, int | None, Counter[str], int]] = []
     document_frequency: Counter[str] = Counter()
     corpus_size = 0
@@ -1478,28 +1487,25 @@ def search_command(args: argparse.Namespace) -> dict[str, object]:
             if present or any(term in target.name.lower() for term in query_terms):
                 candidates.append((target, chunk, page, counts, token_count))
     average_length = corpus_tokens / max(1, corpus_size)
-    ranked = [
-        (
-            bm25_score(
-                args.query,
-                chunk,
-                target.name,
-                counts,
-                token_count,
-                document_frequency,
-                corpus_size,
-                average_length,
-            ),
-            target,
-            chunk,
-            page,
-        )
-        for target, chunk, page, counts, token_count in candidates
-    ]
+    ranked = []
+    for target, chunk, page, counts, token_count in candidates:
+        scores = [
+            (
+                query,
+                bm25_score(
+                    query, chunk, target.name, counts, token_count,
+                    document_frequency, corpus_size, average_length,
+                ),
+            )
+            for query in queries
+        ]
+        # A passage earns its strongest individual match; repeating variants buys no extra rank.
+        matched = [query for query, score in scores if score > 0]
+        ranked.append((max(score for _, score in scores), target, chunk, page, matched))
     ranked.sort(key=lambda item: (-item[0], str(item[1]), item[3] or 0))
     results: list[dict[str, object]] = []
     per_file: Counter[str] = Counter()
-    for score, target, excerpt, page in ranked:
+    for score, target, excerpt, page, matched in ranked:
         relative = os.path.relpath(target, Path.cwd())
         if per_file[relative] >= 3:
             continue
@@ -1508,6 +1514,8 @@ def search_command(args: argparse.Namespace) -> dict[str, object]:
             "score": round(score, 3),
             "excerpt": excerpt[: args.excerpt_chars],
         }
+        if len(queries) > 1:
+            result["matchedQueries"] = matched
         if page is not None:
             result["page"] = page
         if target in readers:
@@ -1521,7 +1529,7 @@ def search_command(args: argparse.Namespace) -> dict[str, object]:
     if has_more:
         notes.append(
             f"This search reached its limit of {args.max_files} files and is incomplete. "
-            f"Continue with fileOffset={args.file_offset + len(files)} and the same query/path, "
+            f"Continue with fileOffset={args.file_offset + len(files)} and the same queries/path, "
             "or narrow the folder. No matches on this page does not mean no matches in the folder. "
             "Pages scan the current file list; restart from zero if files change during the search."
         )
@@ -1547,6 +1555,7 @@ def search_command(args: argparse.Namespace) -> dict[str, object]:
         )
     return {
         "query": args.query,
+        **({"queries": queries} if len(queries) > 1 else {}),
         "path": os.path.relpath(root, Path.cwd()),
         "filesConsidered": len(files),
         "coverage": {
@@ -1581,6 +1590,7 @@ def parser() -> argparse.ArgumentParser:
     search = subparsers.add_parser("search")
     search.add_argument("--path", default=".")
     search.add_argument("--query", required=True)
+    search.add_argument("--alternative", action="append", default=[])
     search.add_argument("--max-files", type=int, default=500)
     search.add_argument("--file-offset", type=int, default=0)
     search.add_argument("--max-results", type=int, default=12)
