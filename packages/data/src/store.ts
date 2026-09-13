@@ -645,6 +645,9 @@ export class DataStore {
   listTasks(...args: Parameters<TaskStore['listTasks']>) {
     return this.#tasks.listTasks(...args);
   }
+  projectExecutionMembers(...args: Parameters<TaskStore['projectExecutionMembers']>) {
+    return this.#tasks.projectExecutionMembers(...args);
+  }
 
   listTaskPage(...args: Parameters<TaskStore['listTaskPage']>) {
     return this.#tasks.listTaskPage(...args);

@@ -211,7 +211,8 @@ const requiredApiTokenScope = (method: string, route: string): ApiTokenScope | u
    * every reason to know.
    */
   if (route === '/v1/tasks/:taskId/security-mode') return writing ? undefined : 'tasks:read';
-  if (route === '/v1/tasks/:taskId/bundle') return 'files:read';
+  if (route === '/v1/tasks/:taskId/bundle' || route === '/v1/tasks/:taskId/directories')
+    return 'files:read';
   if (route === '/v1/coding-missions/:missionId/review') return 'files:read';
   if (route === '/v1/coding-missions/:missionId/integrate') return 'files:write';
   if (route === '/v1/coding-missions/:missionId/cancel') return 'tasks:write';
@@ -243,7 +244,14 @@ const requiredApiTokenScope = (method: string, route: string): ApiTokenScope | u
      */
     if (route === '/v1/workspaces/:workspaceId/security-mode')
       return writing ? undefined : 'workspaces:read';
-    if (route === '/v1/workspaces/:workspaceId/download') return 'files:read';
+    if (
+      [
+        '/v1/workspaces/:workspaceId/download',
+        '/v1/workspaces/:workspaceId/directory',
+        '/v1/workspaces/:workspaceId/directory.zip'
+      ].includes(route)
+    )
+      return 'files:read';
     if (
       route === '/v1/workspaces/:workspaceId/computation' ||
       route === '/v1/workspaces/:workspaceId/debugger' ||

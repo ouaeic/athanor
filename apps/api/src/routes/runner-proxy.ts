@@ -17,8 +17,10 @@ import { AthanorError, MAX_CAPABILITY_TTL_SECONDS } from '@athanor/core';
 import { z } from 'zod';
 import { requireUser } from '../http/auth-hook.js';
 import type { RouteContext } from '../http/server-context.js';
+import { registerProjectProcessRoutes } from './project-processes.js';
 
 export const registerRunnerProxyRoutes = (context: RouteContext): void => {
+  registerProjectProcessRoutes(context);
   const { app, store, runner, config, idempotent } = context;
   app.post<{ Params: { workspaceId: string; tab: string } }>(
     '/v1/workspaces/:workspaceId/browser/tabs/:tab/retention',

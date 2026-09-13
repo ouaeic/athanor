@@ -1,6 +1,8 @@
 import { discardMissionInvocation, trackMissionInvocation } from './mission-processes.js';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { scheduleDeadline } from './deadline.js';
+import { ProcessResources, processScanner, PROCESS_SAMPLE_MS } from './process-resources.js';
 import path from 'node:path';
 import { z } from 'zod';
 import {
@@ -47,26 +49,7 @@ const BackgroundRequest = z
     args: z.array(z.string().max(100_000)).max(8_192).default([]),
     cwd: z.string().default('workspace'),
     env: z.record(z.string(), z.string()).default({}),
-    /*
-     * An hour by default, and NO maximum here. The DEFAULT stays an hour on purpose: it is what a
-     * caller that names nothing gets, and a job with no stated deadline should not be able to hold a
-     * slot for a day by omission. A long job says how long it is.
-     *
-     * The `.max(86_400)` this line used to carry was the same defect as the hour it replaced,
-     * arriving from the other side. `MAX_BACKGROUND_SECONDS` is documented as the ceiling and an
-     * owner can raise it, and until this was removed raising it above a day did nothing at all:
-     * measured on this branch with the ceiling set to 172,800 and 129,600s asked for, the answer was
-     * `runner_invalid_request - timeoutSeconds: too big: expected number to be <=86400`. A zod
-     * sentence, naming a number that was no longer this box's limit, for a run the box was configured
-     * to allow. So the owner with a forty-hour assembly - the work this computer exists for - could
-     * not ask for it by any configuration, and the message told them the wrong reason.
-     *
-     * There is exactly one authority on how long a background command may run now, and it is
-     * `refuseUnreachableTimeout` against the configured ceiling, a few lines into `start`. It names
-     * the real number of the box it is running on. What would change this line: nothing, because the
-     * number it used to hold has moved to where it can be configured.
-     */
-    timeoutSeconds: z.number().int().positive().default(3_600),
+    timeoutSeconds: z.number().int().positive().optional(),
     stdin: z.string().max(10_000_000).optional(),
     network: z.boolean().default(false),
     maxOutputBytes: z
@@ -115,7 +98,7 @@ interface Session {
   finishedAt?: string;
   exitCode?: number | null;
   signal?: string | null;
-  timeout?: NodeJS.Timeout;
+  timeout?: ReturnType<typeof scheduleDeadline>;
   /** The host-disk floor watch, cleared the moment the process is no longer writing to it. */
   diskFloor?: NodeJS.Timeout;
   settled?: Promise<void>;
@@ -224,6 +207,8 @@ export class ProcessManager {
   readonly #jobs = new Map<string, Supervised>();
   readonly #recoveries = new Map<string, Promise<boolean>>();
   #jobCheckpoint: NodeJS.Timeout | undefined;
+  #resources = new ProcessResources();
+  #resourceSweep: NodeJS.Timeout | undefined;
   readonly #registries = new Map<string, ServiceRegistry>();
   readonly #declarations = new Map<string, Promise<unknown>>();
   #declarationTail: Promise<unknown> = Promise.resolve();
@@ -287,18 +272,11 @@ export class ProcessManager {
           guards
         })
       );
-    // Below the service branch because a service has no deadline at all, so the ceiling is not its
-    // business. Everything else is answered before it starts rather than killed part-way through:
-    // see `refuseUnreachableTimeout`, which is where the argument for refusing over clamping is.
-    refuseUnreachableTimeout(value, maximumSeconds, true);
     if (request.job)
       return this.#declareInOrder(workspaceId, () =>
-        this.#declareJob(workspaceRoot, workspaceId, owner, request, {
-          maximumSeconds,
-          isolateNetwork,
-          guards
-        })
+        this.#declareJob(workspaceRoot, workspaceId, owner, request, { isolateNetwork, guards })
       );
+    refuseUnreachableTimeout(value, maximumSeconds, true);
     const session = await this.#launch(workspaceRoot, workspaceId, owner, request, {
       maximumSeconds,
       isolateNetwork,
@@ -348,6 +326,23 @@ export class ProcessManager {
       deadlineAt?: string;
     }
   ): Promise<Session> {
+    const supervised = options.onSettled !== undefined;
+    const requestedSeconds = options.finite
+      ? request.timeoutSeconds
+      : (request.timeoutSeconds ?? 3_600);
+    const allowedSeconds =
+      supervised && !options.finite
+        ? undefined
+        : requestedSeconds === undefined
+          ? undefined
+          : Math.min(requestedSeconds, options.maximumSeconds ?? requestedSeconds);
+    const deadlineAt =
+      options.deadlineAt ??
+      (allowedSeconds === undefined
+        ? undefined
+        : new Date(Date.now() + allowedSeconds * 1_000).toISOString());
+    if (deadlineAt && !Number.isFinite(Date.parse(deadlineAt)))
+      throw new Error('The requested deadline is outside the supported date range');
     const guards = options.guards;
     // The refusals, the sandbox and the resource limiter, shared with the foreground path so a
     // service is subject to the same rules as a command an agent runs in front of you. The one
@@ -376,35 +371,19 @@ export class ProcessManager {
     });
     trackMissionInvocation(workspaceRoot, prepared, child);
     const id = options.id ?? `proc_${randomUUID()}`;
-    const supervised = options.onSettled !== undefined;
-    // A service has no deadline. That is the whole point of it: the hour was what made a link the
-    // agent handed the owner stop answering by dinner.
-    const allowedSeconds = Math.min(
-      request.timeoutSeconds,
-      options.maximumSeconds ?? request.timeoutSeconds
-    );
     const timeout =
-      supervised && !options.finite
+      deadlineAt === undefined
         ? undefined
-        : setTimeout(
-            () => {
-              const session = this.#sessions.get(id);
-              if (!session || session.status !== 'running') return;
-              session.status = 'timed_out';
-              // The deadline states itself in the log, exactly as the disk floor and the owner's stop
-              // do. This was the one stop on this path that left `status: "timed_out"` beside an empty
-              // stderr, which reads to a model like a job that died for no reason it can name.
-              noteOnStderr(
-                session,
-                timedOutNote(allowedSeconds, options.maximumSeconds ?? allowedSeconds, true)
-              );
-              stopProcessTree(child);
-            },
-            options.deadlineAt
-              ? Math.max(1, Date.parse(options.deadlineAt) - Date.now())
-              : allowedSeconds * 1_000
-          );
-    timeout?.unref();
+        : scheduleDeadline(Date.parse(deadlineAt), () => {
+            const session = this.#sessions.get(id);
+            if (!session || session.status !== 'running') return;
+            session.status = 'timed_out';
+            noteOnStderr(
+              session,
+              timedOutNote(allowedSeconds ?? 0, options.maximumSeconds ?? allowedSeconds ?? 0, true)
+            );
+            stopProcessTree(child);
+          });
     const session: Session = {
       id,
       workspaceId,
@@ -415,15 +394,17 @@ export class ProcessManager {
       stdout: boundedCollector(request.maxOutputBytes),
       stderr: boundedCollector(request.maxOutputBytes),
       startedAt: new Date().toISOString(),
-      ...(timeout
-        ? {
-            timeout,
-            deadlineAt:
-              options.deadlineAt ?? new Date(Date.now() + allowedSeconds * 1_000).toISOString()
-          }
-        : {})
+      ...(timeout && deadlineAt ? { timeout, deadlineAt } : {})
     };
     this.#sessions.set(id, session);
+    if (!this.#resourceSweep) {
+      this.#resources = new ProcessResources(processScanner('/proc', guards.sandbox));
+      this.#resourceSweep = setInterval(() => {
+        void this.refreshResources();
+      }, PROCESS_SAMPLE_MS);
+      this.#resourceSweep.unref();
+    }
+    void this.refreshResources();
     /*
      * The floor, watched for as long as this process can write to the disk.
      *
@@ -461,7 +442,7 @@ export class ProcessManager {
     // the flush hands the agent a truncated log and calls it the whole thing. The foreground path
     // has always waited for the drain; this is the same rule for a background session.
     const settle = (status: Status, exitCode: number | null, signal: NodeJS.Signals | null) => {
-      if (timeout) clearTimeout(timeout);
+      timeout?.cancel();
       clearInterval(diskFloor);
       // The two endings this class does not perform - the kernel's kill and the ruleset's refusal -
       // asked of the same function the foreground path asks, so the two paths cannot drift again.
@@ -572,7 +553,7 @@ export class ProcessManager {
     workspaceId: string,
     owner: string,
     request: z.infer<typeof BackgroundRequest>,
-    options: { maximumSeconds: number; isolateNetwork: boolean; guards: Guards }
+    options: { isolateNetwork: boolean; guards: Guards }
   ) {
     const registry = this.#registry(root, workspaceId);
     if (registry.list().length === 0) await registry.load();
@@ -587,7 +568,11 @@ export class ProcessManager {
       kind: 'job',
       launch: ServiceLaunchSchema.parse(request),
       ...(request.checkpointResume ? { checkpointResume: request.checkpointResume } : {}),
-      deadlineAt: new Date(Date.now() + request.timeoutSeconds * 1_000).toISOString()
+      ...(request.timeoutSeconds === undefined
+        ? {}
+        : {
+            deadlineAt: new Date(Date.now() + request.timeoutSeconds * 1_000).toISOString()
+          })
     });
     // Journal before executing: an uncertain launch may require attention, but may never become
     // an unrecorded command that a restart blindly executes again.
@@ -725,8 +710,8 @@ export class ProcessManager {
     if (!record.checkpointResume) return false;
     const remaining = record.deadlineAt
       ? Math.ceil((Date.parse(record.deadlineAt) - Date.now()) / 1_000)
-      : 0;
-    if (remaining <= 0) {
+      : undefined;
+    if (remaining !== undefined && remaining <= 0) {
       record.state = 'timed_out';
       record.lastExit.reason = 'The declared job deadline has passed';
       await job.registry.put(record);
@@ -737,7 +722,10 @@ export class ProcessManager {
         job.root,
         record.workspaceId,
         record.owner,
-        { ...record.checkpointResume, timeoutSeconds: remaining },
+        {
+          ...record.checkpointResume,
+          ...(remaining === undefined ? {} : { timeoutSeconds: remaining })
+        },
         {
           isolateNetwork: job.isolateNetwork,
           guards: job.guards,
@@ -818,6 +806,8 @@ export class ProcessManager {
     const finished = record.state !== 'running';
     return {
       sessionId: record.id,
+      ownerTaskId: record.owner,
+      workspaceId: record.workspaceId,
       status: record.state,
       command: [record.launch.executable, ...record.launch.args],
       startedAt: record.startedAt,
@@ -1292,6 +1282,28 @@ export class ProcessManager {
     return writers;
   }
 
+  async refreshResources(): Promise<void> {
+    await this.#resources.refresh(
+      [...this.#sessions.values()]
+        .filter(
+          (session) =>
+            session.status === 'running' &&
+            session.child.pid !== undefined &&
+            session.child.exitCode === null &&
+            session.child.signalCode === null
+        )
+        .map((session) => ({
+          id: session.id,
+          pid: session.child.pid!,
+          generation: session.startedAt
+        }))
+    );
+  }
+
+  resourcesAvailable(): boolean {
+    return this.#resources.available;
+  }
+
   list(workspaceId: string, owner: string) {
     return [
       ...[...this.#sessions.values()]
@@ -1413,6 +1425,8 @@ export class ProcessManager {
    * that is what brings the services back.
    */
   close() {
+    clearInterval(this.#resourceSweep);
+    this.#resourceSweep = undefined;
     const endings: Promise<void>[] = [];
     if (this.#jobCheckpoint) clearInterval(this.#jobCheckpoint);
     this.#jobCheckpoint = undefined;
@@ -1432,7 +1446,7 @@ export class ProcessManager {
     this.#stopListenerSweepIfIdle();
     for (const session of this.#sessions.values()) {
       if (session.settled) endings.push(session.settled);
-      if (session.timeout) clearTimeout(session.timeout);
+      session.timeout?.cancel();
       if (session.diskFloor) clearInterval(session.diskFloor);
       if (session.status === 'running') this.#stop(session);
     }
@@ -1512,7 +1526,7 @@ export class ProcessManager {
     if (options.forget) this.#registries.delete(workspaceId);
     for (const [id, session] of this.#sessions) {
       if (session.workspaceId !== workspaceId) continue;
-      if (session.timeout) clearTimeout(session.timeout);
+      session.timeout?.cancel();
       if (session.diskFloor) clearInterval(session.diskFloor);
       if (session.status === 'running') this.#stop(session);
       this.#sessions.delete(id);
@@ -1583,7 +1597,7 @@ export class ProcessManager {
       if (session.workspaceId !== workspaceId || session.owner !== owner) continue;
       if (this.#supervised.has(id)) continue;
       if (session.status !== 'running') continue;
-      if (session.timeout) clearTimeout(session.timeout);
+      session.timeout?.cancel();
       if (session.diskFloor) clearInterval(session.diskFloor);
       session.status = 'stopped';
       noteOnStderr(session, OWNER_STOPPED_NOTE);
@@ -1640,6 +1654,12 @@ export class ProcessManager {
     const ranToMs = session.finishedAt ? Date.parse(session.finishedAt) : Date.now();
     return {
       sessionId: session.id,
+      ownerTaskId: session.owner,
+      resourceState: this.#resources.state(session.id),
+      workspaceId: session.workspaceId,
+      ...(this.#resources.sample(session.id)
+        ? { resources: this.#resources.sample(session.id)! }
+        : {}),
       status: session.status,
       command: session.command,
       startedAt: session.startedAt,

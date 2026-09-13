@@ -47,6 +47,8 @@ import { completionChecks, evidenceSource } from './completion-checks';
 import MessageAttachmentList from './MessageAttachmentList';
 import './presentation.css';
 import { effortLabel } from './reasoning-options';
+const ProcessPanel = lazy(() => import('./ProcessPanel'));
+const DirectoryPanel = lazy(() => import('./DirectoryPanel'));
 const PlanEditor = lazy(() => import('./PlanEditor'));
 const TaskOptions = lazy(() => import('./TaskOptions'));
 const Trajectory = lazy(() => import('./Trajectory'));
@@ -120,6 +122,7 @@ export default function TaskSurface({
     Boolean(draft?.body || draft?.attachments.length)
   );
   const [historyMore, setHistoryMore] = useState(false);
+  const [fileRequest, setFileRequest] = useState(0);
   const [historyPage, setHistoryPage] = useState<TaskEvent[]>([]);
   useEffect(() => {
     if (!initialPage) return;
@@ -430,8 +433,24 @@ export default function TaskSurface({
             </Button>
             <Button onClick={() => onComputer('browser')}>Browser</Button>
             <Button onClick={() => onComputer('desktop')}>Desktop</Button>
-            <Button onClick={() => onComputer('files')}>Files</Button>
+            <Button
+              onClick={() => {
+                setFileRequest((value) => value + 1);
+                document
+                  .getElementById(`directories-${task.id}`)
+                  ?.scrollIntoView({ block: 'start' });
+              }}
+            >
+              Files
+            </Button>
             <Button onClick={() => onComputer('previews')}>Previews</Button>
+            <Button
+              onClick={() =>
+                document.getElementById(`processes-${task.id}`)?.scrollIntoView({ block: 'start' })
+              }
+            >
+              Processes
+            </Button>
             <Button onClick={() => setPanel('models')}>Models</Button>
             <Button
               onClick={() => {
@@ -691,6 +710,16 @@ export default function TaskSurface({
                   </Button>
                 </article>
               )}
+              <div id={`processes-${task.id}`}>
+                <Suspense fallback={null}>
+                  <ProcessPanel key={task.id} workspaceId={workspace.id} taskId={task.id} />
+                </Suspense>
+              </div>
+              <div id={`directories-${task.id}`}>
+                <Suspense fallback={null}>
+                  <DirectoryPanel key={task.id} taskId={task.id} openRequest={fileRequest} />
+                </Suspense>
+              </div>
               {completionEvent && (
                 <section
                   className={`completion-record ${completion.interrupted || verification.status === 'checks_failed' || verification.status === 'checks_did_not_run' || verification.status === 'delivery_incomplete' ? 'needs-review' : ''}`}

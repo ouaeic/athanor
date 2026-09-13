@@ -11,36 +11,8 @@ import { previewIsolated, previewUrl } from '../preview-url';
 import { stepUp } from '../auth.js';
 import { bytes, message } from './format.js';
 import Computation from './Computation';
+import ProcessPanel from '../ProcessPanel';
 import DebugSessions from './DebugSessions';
-
-interface Process {
-  sessionId: string;
-  status: string;
-  command: string;
-  startedAt: string;
-  ranForMs: number;
-  outputBytes: number;
-  deadlineAt?: string;
-  exitCode?: number;
-  service?: { name?: string; listening?: string[] };
-  lifetime?: 'task' | 'service' | 'job';
-  job?: {
-    jobId: string;
-    name: string;
-    state: string;
-    checkpointResumable: boolean;
-    createdAt: string;
-    startedAt: string;
-    restarts: number;
-    lastExit?: { code?: number; reason?: string };
-  };
-}
-interface ProcessList {
-  processes: Process[];
-  agentListeners?: string[];
-  reachableFromOutsideThisComputer?: string[];
-  note?: string;
-}
 
 export function Operations({
   workspace,
@@ -55,7 +27,6 @@ export function Operations({
 }) {
   const base = `/v1/workspaces/${workspace.id}`;
   const [previews, setPreviews] = useState<WorkspacePreview[]>([]);
-  const [processes, setProcesses] = useState<ProcessList>({ processes: [] });
   const [snapshots, setSnapshots] = useState<WorkspaceSnapshot[]>([]);
   const [rewind, setRewind] = useState<TaskRewindPreview | null>(null);
   const [rewindError, setRewindError] = useState('');
@@ -64,32 +35,28 @@ export function Operations({
   const [path, setPath] = useState('/');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const [logs, setLogs] = useState<Record<string, string>>({});
   const [confirm, setConfirm] = useState<{
     id: string;
-    action: 'restore' | 'delete' | 'publish' | 'stop' | 'rotate';
+    action: 'restore' | 'delete' | 'publish' | 'rotate';
   } | null>(null);
   const [confirmName, setConfirmName] = useState('');
   const [opened, setOpened] = useState<WorkspacePreview | null>(null);
   const load = useCallback(async () => {
     if (tool === 'previews') setPreviews(await get<WorkspacePreview[]>(`${base}/previews`));
-    if (tool === 'processes') setProcesses(await get<ProcessList>(`${base}/processes`));
     if (tool === 'checkpoints') setSnapshots(await get<WorkspaceSnapshot[]>(`${base}/snapshots`));
   }, [base, tool]);
   useEffect(() => {
+    if (tool === 'processes') return;
     let active = true;
     void load().catch((e) => {
       if (active) setError(message(e));
     });
-    const interval = setInterval(
-      () => {
-        if (document.visibilityState === 'visible')
-          void load().catch((e) => {
-            if (active) setError(message(e));
-          });
-      },
-      tool === 'processes' ? 5000 : 20_000
-    );
+    const interval = setInterval(() => {
+      if (document.visibilityState === 'visible')
+        void load().catch((e) => {
+          if (active) setError(message(e));
+        });
+    }, 20_000);
     return () => {
       active = false;
       clearInterval(interval);
@@ -119,8 +86,6 @@ export function Operations({
   };
   const executeConfirmation = async () => {
     if (!confirm) return;
-    if (confirm.action === 'stop')
-      await post(`${base}/processes/${encodeURIComponent(confirm.id)}`, { action: 'kill' });
     if (confirm.action === 'rotate')
       setOpened(await post<WorkspacePreview>(`/v1/previews/${confirm.id}/rotate-access`, {}));
     if (confirm.action === 'publish') {
@@ -177,11 +142,9 @@ export function Operations({
               ? 'Publish this preview? Anyone with its address will be able to open it.'
               : confirm.action === 'restore'
                 ? 'Restore this recovery point? Current computer files will be replaced. Enter the computer name to continue.'
-                : confirm.action === 'stop'
-                  ? 'Stop this process? A stopped service will not restart automatically.'
-                  : confirm.action === 'rotate'
-                    ? 'Reset private links? Existing links to this preview will stop working. A new private link will open here.'
-                    : 'Delete this saved item?'}
+                : confirm.action === 'rotate'
+                  ? 'Reset private links? Existing links to this preview will stop working. A new private link will open here.'
+                  : 'Delete this saved item?'}
           </p>
           {confirm.action === 'restore' && (
             <label>
@@ -207,11 +170,9 @@ export function Operations({
                 ? 'Publish'
                 : confirm.action === 'restore'
                   ? 'Restore computer'
-                  : confirm.action === 'stop'
-                    ? 'Stop process'
-                    : confirm.action === 'rotate'
-                      ? 'Reset private links'
-                      : 'Delete'}
+                  : confirm.action === 'rotate'
+                    ? 'Reset private links'
+                    : 'Delete'}
             </button>
           </div>
         </div>
@@ -377,115 +338,7 @@ export function Operations({
       )}
       {tool === 'processes' && (
         <>
-          {processes.note && <p className="muted">{processes.note}</p>}
-          {processes.reachableFromOutsideThisComputer?.length ? (
-            <p>
-              Reachable from outside this computer:{' '}
-              {processes.reachableFromOutsideThisComputer.join(', ')}
-            </p>
-          ) : null}
-          {processes.processes.length ? (
-            processes.processes.map((process) => (
-              <article className="computer-item stack" key={process.sessionId}>
-                <div className="row">
-                  <strong>{process.job?.name || process.service?.name || process.sessionId}</strong>
-                  <span className="badge">
-                    {process.lifetime === 'job'
-                      ? 'Long-running job'
-                      : process.lifetime === 'service' || process.service
-                        ? 'Persistent service'
-                        : 'Task process'}
-                  </span>
-                  <span className="muted">
-                    {process.job?.state ?? process.status}
-                    {process.exitCode !== undefined ? ` · exit ${process.exitCode}` : ''} ·{' '}
-                    {Math.floor(process.ranForMs / 1000)}s
-                  </span>
-                </div>
-                <code className="computer-command">{process.command}</code>
-                <p className="muted">
-                  Output {bytes(process.outputBytes)}
-                  {process.deadlineAt
-                    ? ` · stops ${new Date(process.deadlineAt).toLocaleString()}`
-                    : process.service
-                      ? ' · persistent service'
-                      : ''}
-                </p>
-                {process.job && (
-                  <p className="muted">
-                    {process.job.state === 'completed'
-                      ? 'Finished. This job will not be started again automatically.'
-                      : process.job.checkpointResumable
-                        ? 'Continues beyond the agent turn. An interrupted run can recover using its declared checkpoint command.'
-                        : 'Continues beyond the agent turn. An interrupted run is kept for inspection and will not be restarted blindly.'}
-                  </p>
-                )}
-                {process.service?.listening && (
-                  <p className="muted">
-                    Listening: {process.service.listening.join(', ') || 'No listening ports'}
-                  </p>
-                )}
-                <div className="row">
-                  <button
-                    className="button"
-                    disabled={busy}
-                    onClick={() =>
-                      void run(async () => {
-                        const result = await post<{ stdout?: string; stderr?: string }>(
-                          `${base}/processes/${encodeURIComponent(process.sessionId)}`,
-                          { action: 'log' }
-                        );
-                        setLogs((previous) => ({
-                          ...previous,
-                          [process.sessionId]:
-                            `${previous[process.sessionId] ?? ''}${result.stdout ?? ''}${result.stderr ?? ''}`.slice(
-                              -100_000
-                            )
-                        }));
-                      })
-                    }
-                  >
-                    Read output
-                  </button>
-                  {process.job?.state === 'interrupted' && process.job.checkpointResumable && (
-                    <button
-                      className="button"
-                      disabled={busy}
-                      onClick={() =>
-                        void run(async () => {
-                          await post(
-                            `${base}/processes/${encodeURIComponent(process.sessionId)}/resume`,
-                            {}
-                          );
-                        })
-                      }
-                    >
-                      Resume checkpoint
-                    </button>
-                  )}
-                  <button
-                    className="button"
-                    disabled={
-                      busy ||
-                      ['completed', 'killed', 'failed', 'timed_out', 'stopped'].includes(
-                        process.job?.state ?? process.status
-                      )
-                    }
-                    onClick={() => setConfirm({ id: process.sessionId, action: 'stop' })}
-                  >
-                    Stop
-                  </button>
-                </div>
-                {logs[process.sessionId] !== undefined && (
-                  <pre className="computer-log">
-                    {logs[process.sessionId] || 'No output since the last read.'}
-                  </pre>
-                )}
-              </article>
-            ))
-          ) : (
-            <p className="empty">No background processes are reported by this computer.</p>
-          )}
+          <ProcessPanel key={workspace.id} workspaceId={workspace.id} />
           <Computation key={workspace.id} workspaceId={workspace.id} />
           <DebugSessions key={`debug-${workspace.id}`} workspaceId={workspace.id} />
         </>

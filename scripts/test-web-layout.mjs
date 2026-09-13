@@ -7,6 +7,8 @@ import { readFile, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { resolve, extname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { processFixture, checkProjectProcesses } from './browser-processes.mjs';
+import { directoryFixture, checkProjectDirectories } from './browser-directories.mjs';
 
 // Local fixtures exercise browser interactions; API and runner suites own authorization and delivery.
 const requireRunner = createRequire(
@@ -597,6 +599,8 @@ let currentPlan = {
   steps: [{ id: 'first-step', title: 'Original plan step', status: 'pending' }]
 };
 const planWrites = [];
+const processUi = processFixture(workspace.id, task.id);
+const directoryUi = directoryFixture(workspace.id);
 try {
   const context = await browser.newContext({
     viewport: { width: 1440, height: 1000 },
@@ -878,7 +882,8 @@ try {
       return json(mediaAssets[0]);
     }
     if (path.endsWith('/files')) return json({ entries: [] });
-    if (path.endsWith('/processes')) return json({ processes: [] });
+    if (await processUi.handle(route, path)) return;
+    if (await directoryUi.handle(route, path)) return;
     if (path.endsWith('/computation')) return json({ sessions: [computation] });
     if (path.endsWith('/debugger'))
       return json({ sessions: [debugSession], available: { python: true, javascript: true } });
@@ -1033,6 +1038,23 @@ try {
     return route.fulfill({ status: 501, json: { error: { message: 'Unspecified UI fixture' } } });
   });
   if (process.env.GARDEN_UI_FOCUS !== 'drafts') {
+    await checkProjectDirectories({
+      context,
+      origin,
+      taskId: task.id,
+      workspaceId: workspace.id,
+      fixture: directoryUi,
+      report,
+      errors
+    });
+    await checkProjectProcesses({
+      context,
+      origin,
+      taskId: task.id,
+      fixture: processUi,
+      report,
+      errors
+    });
     const page = await context.newPage();
     page.on('pageerror', (error) => errors.push(error.message));
     await page.goto(`${origin}/?task=${task.id}`);

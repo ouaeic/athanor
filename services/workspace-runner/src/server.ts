@@ -12,6 +12,7 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 import { totalmem } from 'node:os';
+import { PROCESS_SAMPLE_MS } from './process-resources.js';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import type { ReadableStream as NodeReadableStream } from 'node:stream/web';
@@ -334,6 +335,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     maxFileBytes: config.MAX_FILE_BYTES
   });
   const processes = new ProcessManager();
+  let processCapacity: { at: number; value: ReturnType<typeof machineReport> } | undefined;
   const checkpoints = new WorkspaceCheckpoints({
     workspaceRoot: config.WORKSPACE_ROOT,
     btrfsExecutable: config.CHECKPOINT_BTRFS_EXECUTABLE,
@@ -970,11 +972,30 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
        * agent-owned process holds the port and not which one. Omitted entirely when nothing could
        * be read, because an empty list would claim the machine has nothing open.
        */
+      await processes.refreshResources();
+      if (!processCapacity || Date.now() - processCapacity.at >= PROCESS_SAMPLE_MS)
+        processCapacity = {
+          at: Date.now(),
+          value: machineReport({
+            root: config.WORKSPACE_ROOT,
+            commandMemoryBytes: limits.memoryBytes,
+            readCgroupLimits: options.cgroup
+          })
+        };
+      const capacity = await processCapacity.value;
       const listeners = processes.observedAgentListeners();
       const reachable = (listeners ?? []).filter(
         (socket) => reachOfBindAddress(socket.address) !== 'self'
       );
       return {
+        observedAt: new Date().toISOString(),
+        refreshAfterMs: PROCESS_SAMPLE_MS,
+        resourcesAvailable: processes.resourcesAvailable(),
+        host: {
+          logicalCpus: capacity.cores,
+          memoryBytes: totalmem(),
+          commandMemoryLimitBytes: limiter ? capacity.memoryBytes : null
+        },
         processes:
           request.capability.role === 'agent'
             ? processes.list(request.params.workspaceId, request.capability.sub)

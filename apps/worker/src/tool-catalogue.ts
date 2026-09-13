@@ -643,7 +643,7 @@ export const agentTools: ModelTool[] = [
           type: 'integer',
           minimum: 1,
           description:
-            'Deadline: foreground defaults to 5 minutes, at most 1 hour; background defaults to 1 hour, capped by this computer’s configured limit. Services have no deadline.'
+            'Optional for named jobs: omit to run until finished or stopped. Foreground/unnamed sessions use the computer’s timeout limits. Services have no deadline.'
         },
         background: {
           type: 'boolean',

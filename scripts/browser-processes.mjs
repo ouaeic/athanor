@@ -1,0 +1,250 @@
+import assert from 'node:assert/strict';
+import { resolve } from 'node:path';
+
+export function processFixture(workspaceId, taskId) {
+  const fixture = { rows: [], failRead: false, failStop: false, reads: 0, actions: [] };
+  fixture.handle = async (route, pathname) => {
+    if (!/\/processes(?:\/[^/]+(?:\/resume)?)?$/.test(pathname)) return false;
+    const json = (body, status = 200) => route.fulfill({ status, json: body });
+    if (pathname.endsWith('/processes')) {
+      fixture.reads++;
+      await json(
+        fixture.failRead
+          ? {
+              error: {
+                code: 'runner_unavailable',
+                message: 'Process service is temporarily unavailable.'
+              }
+            }
+          : {
+              processes: fixture.rows,
+              observedAt: new Date().toISOString(),
+              refreshAfterMs: 120_000,
+              resourcesAvailable: true,
+              host: {
+                logicalCpus: 16,
+                memoryBytes: 32 * 1024 ** 3,
+                commandMemoryLimitBytes: 22 * 1024 ** 3
+              }
+            },
+        fixture.failRead ? 503 : 200
+      );
+      return true;
+    }
+    const body = route.request().postDataJSON();
+    const row = fixture.rows.find((item) => pathname.includes('/' + item.sessionId));
+    assert(row, 'A process action must refer to a listed managed process');
+    assert(
+      pathname.startsWith(`/v1/workspaces/${row.workspaceId}/processes/`),
+      'A branch process must use its own execution root'
+    );
+    fixture.actions.push({ path: pathname, body });
+    if (body.action === 'log') await json({ stdout: 'contig-42 complete\n', stderr: '' });
+    else if (body.action === 'kill' && fixture.failStop)
+      await json(
+        { error: { code: 'stop_failed', message: 'The process could not be stopped.' } },
+        500
+      );
+    else {
+      row.status = pathname.endsWith('/resume') ? 'running' : 'stopped';
+      if (row.job) row.job.state = row.status;
+      await json(row);
+    }
+    return true;
+  };
+  fixture.seed = () => {
+    const now = Date.now(),
+      startedAt = new Date(now - (3 * 86400_000 + 5 * 3600_000)).toISOString();
+    const row = {
+      sessionId: 'job_genome',
+      ownerTaskId: taskId,
+      workspaceId: '10000000-0000-4000-8000-000000000088',
+      status: 'running',
+      lifetime: 'job',
+      startedAt,
+      ranForMs: 3 * 86400_000 + 5 * 3600_000,
+      outputBytes: 8192,
+      command: [
+        'python3',
+        'analyses/whole_genome_analysis.py',
+        '--input',
+        'patient cohort with a long descriptive filename '.repeat(6) + '.fastq.gz'
+      ],
+      job: {
+        jobId: 'job_genome',
+        name: 'Whole-genome analysis',
+        state: 'running',
+        createdAt: startedAt,
+        startedAt,
+        restarts: 0,
+        checkpointResumable: true
+      },
+      resources: {
+        sampledAt: new Date(now - 30_000).toISOString(),
+        intervalMs: 120_000,
+        cpuPercent: 825,
+        residentBytes: 18 * 1024 ** 3,
+        processCount: 2,
+        threadCount: 17,
+        children: [
+          {
+            pid: 812,
+            name: 'python3',
+            state: 'S',
+            residentBytes: 2 * 1024 ** 3,
+            threads: 1,
+            ranForMs: 3 * 86400_000
+          },
+          {
+            pid: 813,
+            name: 'aligner',
+            state: 'R',
+            residentBytes: 16 * 1024 ** 3,
+            threads: 16,
+            ranForMs: 2 * 86400_000
+          }
+        ]
+      }
+    };
+    fixture.rows = [
+      row,
+      {
+        ...row,
+        sessionId: 'job_finished',
+        status: 'completed',
+        workspaceId,
+        job: {
+          ...row.job,
+          jobId: 'job_finished',
+          name: 'Completed quality control',
+          state: 'completed'
+        },
+        resources: undefined
+      },
+      {
+        ...row,
+        sessionId: 'job_interrupted',
+        status: 'interrupted',
+        workspaceId,
+        job: {
+          ...row.job,
+          jobId: 'job_interrupted',
+          name: 'Checkpointed assembly',
+          state: 'interrupted'
+        },
+        resources: undefined
+      }
+    ];
+  };
+  return fixture;
+}
+
+export async function checkProjectProcesses({ context, origin, taskId, fixture, report, errors }) {
+  fixture.seed();
+  const page = await context.newPage();
+  page.on('pageerror', (error) => errors.push(error.message));
+  await page.clock.install({ time: new Date() });
+  try {
+    await page.goto(`${origin}/?task=${taskId}`);
+    const panel = page.getByRole('region', { name: 'Project processes', exact: true });
+    const card = panel.getByRole('article', { name: 'Whole-genome analysis', exact: true });
+    await card.waitFor();
+    assert((await card.innerText()).includes('3d 5h'));
+    assert((await card.innerText()).includes('825%'));
+    assert((await card.innerText()).includes('18.0 GiB'));
+    assert((await card.innerText()).includes('No time limit'));
+    assert.equal(await panel.getByRole('article').count(), 1);
+    const before = fixture.reads;
+    await page.clock.runFor(119_000);
+    assert.equal(fixture.reads, before, 'No fast polling while a long job runs');
+    const next = page.waitForResponse((response) =>
+      response.url().endsWith(`/tasks/${taskId}/processes`)
+    );
+    await page.clock.runFor(2_000);
+    await next;
+    assert.equal(fixture.reads, before + 1, 'Refresh process status on the relaxed interval');
+    await card.getByText('Command & details', { exact: true }).click();
+    assert((await card.innerText()).includes('aligner · R · 2d'));
+    await card.getByRole('button', { name: 'Read output', exact: true }).click();
+    const output = card.getByRole('textbox', { name: 'Output from Whole-genome analysis' });
+    await output.waitFor();
+    const outputRead = page.waitForResponse(
+      (response) =>
+        response.url().endsWith('/job_genome') && response.request().postDataJSON().action === 'log'
+    );
+    await card.getByRole('button', { name: 'Read output', exact: true }).click();
+    await outputRead;
+    assert.equal(
+      (await output.inputValue()).trim(),
+      'contig-42 complete',
+      'Repeated log reads must not duplicate captured output'
+    );
+    for (const width of [1440, 768, 320]) {
+      if (width === 768) await card.getByText('Command & details', { exact: true }).click();
+      await page.setViewportSize({ width, height: 1000 });
+      await panel.scrollIntoViewIfNeeded();
+      assert(
+        await card.evaluate((element) => element.scrollWidth <= element.clientWidth),
+        `The process card must fit at ${width}px`
+      );
+      const bounds = await card.boundingBox();
+      assert(bounds && bounds.x >= 0 && bounds.x + bounds.width <= width + 1);
+      const buttons = await card.locator('.process-actions button').evaluateAll((elements) =>
+        elements.map((element) => {
+          const r = element.getBoundingClientRect();
+          return { x: r.x, y: r.y, right: r.right, bottom: r.bottom };
+        })
+      );
+      assert(buttons.length > 0);
+      for (let i = 0; i < buttons.length; i++)
+        for (let j = i + 1; j < buttons.length; j++) {
+          const a = buttons[i],
+            b = buttons[j];
+          assert(
+            a.right <= b.x || b.right <= a.x || a.bottom <= b.y || b.bottom <= a.y,
+            'Process actions must not overlap'
+          );
+        }
+      await panel.screenshot({ path: resolve(report, `project-processes-${width}.png`) });
+    }
+    await panel.getByRole('button', { name: 'Show finished processes (2)', exact: true }).click();
+    const finished = panel.getByRole('article', { name: 'Completed quality control' });
+    assert.equal(await finished.getByRole('button', { name: 'Stop', exact: true }).count(), 0);
+    const interrupted = panel.getByRole('article', { name: 'Checkpointed assembly' });
+    await interrupted.getByRole('button', { name: 'Resume checkpoint', exact: true }).click();
+    assert(fixture.actions.some((action) => action.path.endsWith('/job_interrupted/resume')));
+    fixture.failRead = true;
+    await panel.getByRole('button', { name: 'Refresh processes' }).click();
+    await page.clock.runFor(5_000);
+    await panel
+      .getByText('Showing the last received status; the computer may have changed.')
+      .waitFor();
+    assert(await card.isVisible(), 'A failed refresh retains the known process list');
+    fixture.failRead = false;
+    await panel.getByRole('button', { name: 'Try again', exact: true }).click();
+    await panel
+      .getByText('Showing the last received status; the computer may have changed.')
+      .waitFor({ state: 'detached' });
+    fixture.failStop = true;
+    await card.getByRole('button', { name: 'Stop', exact: true }).click();
+    const dialog = page.getByRole('dialog', { name: 'Stop Whole-genome analysis?' });
+    await dialog.getByRole('button', { name: 'Stop process', exact: true }).click();
+    await dialog.getByText('The process could not be stopped.', { exact: true }).waitFor();
+    assert.equal(fixture.rows[0].status, 'running');
+    await dialog.getByRole('button', { name: 'Keep running', exact: true }).click();
+    fixture.failStop = false;
+    await card.getByRole('button', { name: 'Stop', exact: true }).click();
+    await dialog.getByRole('button', { name: 'Stop process', exact: true }).click();
+    await dialog.waitFor({ state: 'detached' });
+    assert.equal(fixture.rows[0].status, 'stopped');
+    assert.equal(await card.getByRole('button', { name: 'Stop', exact: true }).count(), 0);
+    console.log(
+      'Project process browser checks passed: multi-day clocks, child resources, relaxed polling, responsive controls, checkpoint resume, log replacement, stale/error status and exact-root stop.'
+    );
+  } finally {
+    await page.close();
+    fixture.rows = [];
+    fixture.failRead = false;
+    fixture.failStop = false;
+  }
+}

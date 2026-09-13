@@ -330,12 +330,14 @@ or redirect unless the model explicitly runs an interpreter and passes the scrip
 
 A **foreground** command holds the turn open and is bounded by `MAX_EXECUTION_SECONDS`.
 A **background session** returns a process id immediately and is bounded by
-`MAX_BACKGROUND_SECONDS`. A **finite job** uses that same background deadline and adds a durable
-record. A **declared service** has no deadline and restarts after every exit, including a successful
+`MAX_BACKGROUND_SECONDS`. A named **finite job** has a durable record and an optional deadline;
+omitting `timeoutSeconds` lets it run until completion or an explicit stop. A **declared service** has no deadline and restarts after every exit, including a successful
 exit; use a finite job for work that is meant to finish.
 
-The runner refuses a requested timeout above its configured limit before starting. Background
-responses and polls include `deadlineAt` and `remainingMs`. A service has no deadline.
+Foreground and unnamed sessions refuse a requested timeout above their configured limit. Named
+jobs accept long explicit deadlines without the timer-overflow limit of a single Node timer.
+Responses include `deadlineAt` and `remainingMs` only when a deadline was requested. A service
+has no deadline. See [Project processes](PROJECT_PROCESSES.md) for visibility and resource readings.
 
 Declare finite work with `shell(background=true, job=...)`. Garden retains its identity, bounded
 logs, terminal result and original deadline across runner restarts. A completed job never runs again.

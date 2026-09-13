@@ -460,7 +460,7 @@ commands. Recovery depends on how the work was declared:
 
 - A **declared service** is relaunched from its saved record.
 - A **foreground command** belongs to a task; active tasks hold the update off.
-- A **finite job** retains its identity, bounded logs, result and original deadline. An interrupted
+- A **finite job** retains its identity, bounded logs, result and any explicitly requested deadline. An interrupted
   job resumes only through its declared checkpoint recovery command. Without one it remains
   interrupted and preserves partial files. Completed, cancelled and expired jobs do not restart.
 - An **ordinary background session** has no durable record and does not come back. Polling its old

@@ -18,8 +18,10 @@ import { requireUser } from '../http/auth-hook.js';
 import type { RouteContext } from '../http/server-context.js';
 import { recordSecurityEvent } from '../security-events.js';
 import type { ReadableStream as NodeReadableStream } from 'node:stream/web';
+import { registerProjectDirectoryRoutes } from './project-directories.js';
 
 export const registerWorkspaceFileRoutes = (context: RouteContext): void => {
+  registerProjectDirectoryRoutes(context);
   const { app, store, masterKey, runner, hostStorageCache, requireRecentStepUp, idempotent } =
     context;
   app.get<{ Params: { workspaceId: string }; Querystring: { path?: string } }>(
@@ -79,7 +81,7 @@ export const registerWorkspaceFileRoutes = (context: RouteContext): void => {
     const user = requireUser(request.user);
     const workspace = await store.getWorkspace(user.id, request.params.workspaceId);
     if (!workspace) throw new AthanorError('workspace_not_found', 'Workspace not found');
-    const path = z.string().min(1).max(1_024).parse(request.query.path);
+    const path = z.string().min(1).max(4096).parse(request.query.path);
     const headers: Record<string, string> = {};
     for (const name of ['range', 'if-range'] as const) {
       const value = request.headers[name];

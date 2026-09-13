@@ -40,41 +40,9 @@ const Config = z.object({
   // change it: moving that number too, in the same commit. A run that wants longer than this does
   // not want to be in the foreground at all, and `execute` says so by name rather than clamping.
   MAX_EXECUTION_SECONDS: z.coerce.number().int().positive().default(3600),
-  /*
-   * The BACKGROUND ceiling. Nothing holds a request open on that path - the start call returns a
-   * session id - so the hour it used to share with the foreground was never about a resource, and
-   * it was the number that made a six-hour alignment or a variant-calling run impossible to ask
-   * for. CHOSEN as a day, to agree exactly with the 86,400 the request schemas on both paths have
-   * always accepted and no caller could ever reach: a ceiling the declaration allows and the
-   * enforcement refuses is the worst of both, and this is the half that was wrong.
-   *
-   * A day rather than none at all because a background session with no deadline is a service, and
-   * a service is a different thing with its own record, its own restart policy and its own way for
-   * the owner to see it.
-   *
-   * THIS IS THE ONLY NUMBER, and until this comment was written it was not. The background request
-   * schema in processes.ts carried its own `.max(86_400)`, so an owner who set this to 172,800 for
-   * a forty-hour assembly got `timeoutSeconds: too big: expected number to be <=86400` - a refusal
-   * naming a limit that was no longer this box's, for a run this box was configured to allow. That
-   * cap is gone and `refuseUnreachableTimeout` answers against this value, so raising this raises
-   * what the box will actually run.
-   *
-   * What would change the DEFAULT: nothing yet. A day is not a safety bound - memory, the process
-   * table, open files and the host disk are each bounded by something that is not a clock, and the
-   * disk floor stops a runaway while it runs and says why. What a day bounds is a job nobody will
-   * ever come back for, holding a process group and a session row. So a legitimate forty-hour run
-   * is a reason to raise this on that box, and it is NOT a reason to declare a service: a service
-   * is restarted whenever it exits, including successfully, so a batch job declared as one runs
-   * itself again for ever.
-   *
-   * 2,147,483 at the top - twenty-four days - and it is a property of the mechanism rather than a
-   * policy. The deadline is a `setTimeout`, whose delay is a signed 32-bit millisecond count, and
-   * past 2^31-1 ms Node does not extend it: it warns and fires IMMEDIATELY. So a ceiling above this
-   * would kill every background job the instant it started, which is the quietest possible failure
-   * and the exact shape this repository keeps finding. Refused at startup rather than clamped,
-   * because a runner that will not start says so in the journal in seconds while a clamp says
-   * nothing at all - and the typo that reaches this is an extra digit, not a considered choice.
-   */
+  // Unnamed task sessions have a fallback deadline. Named finite jobs have only an explicitly
+  // requested deadline, and services are supervised without one. This setting also supplies the
+  // upper bound for task-scoped interpreter sessions.
   MAX_BACKGROUND_SECONDS: z.coerce.number().int().positive().max(2_147_483).default(86_400),
   // prlimit is part of util-linux, an essential package, so it is present on every stock
   // Debian and Ubuntu host without anything being installed for athanor's benefit.

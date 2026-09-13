@@ -157,6 +157,16 @@ const buildHarness = async (): Promise<Harness> => {
     handlerRuns++;
     return 'zip';
   });
+  for (const route of [
+    '/v1/tasks/:taskId/directories',
+    '/v1/workspaces/:workspaceId/directory',
+    '/v1/workspaces/:workspaceId/directory.zip'
+  ]) {
+    app.get(route, async () => {
+      handlerRuns++;
+      return 'directory';
+    });
+  }
   for (const kind of ['computation', 'debugger']) {
     app.get(`/v1/workspaces/:workspaceId/${kind}`, async () => {
       handlerRuns++;
@@ -254,6 +264,9 @@ describe('workspace pre-handler', () => {
     for (const url of [
       `/v1/workspaces/${owner.workspaceId}/download`,
       `/v1/tasks/${randomUUID()}/bundle`,
+      `/v1/tasks/${randomUUID()}/directories`,
+      `/v1/workspaces/${owner.workspaceId}/directory`,
+      `/v1/workspaces/${owner.workspaceId}/directory.zip`,
       `/v1/workspaces/${owner.workspaceId}/computation`,
       `/v1/workspaces/${owner.workspaceId}/debugger`
     ]) {

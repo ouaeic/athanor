@@ -7,6 +7,8 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { signCapabilityToken, capabilityAudience } from '@athanor/core';
 import { authenticateRunnerRequest } from './auth.js';
+import { directoryArchive } from './directory-archive.js';
+import { listDirectory } from './directories.js';
 import {
   byteRange,
   openDownloadFile,
@@ -62,6 +64,136 @@ describe('streaming source delivery', () => {
   };
   const auth = (url: string, scopes = ['files.read']) => ({
     authorization: `Bearer ${signCapabilityToken({ sub: 'owner', workspaceId, role: 'user', scopes, nonce: randomUUID(), aud: capabilityAudience('GET', url) }, secret, 60)}`
+  });
+
+  it('downloads the entire directory, preserving empty directories, hidden files, environments and symbolic links', async () => {
+    await mkdir(path.join(workspace, 'workspace/project/empty'));
+    await mkdir(path.join(workspace, 'workspace/project/node_modules'));
+    await writeFile(path.join(workspace, 'workspace/project/.hidden'), 'hidden');
+    await writeFile(path.join(workspace, 'workspace/project/node_modules/module.js'), 'module');
+    await writeFile(path.join(workspace, 'workspace/project/zero'), '');
+    await writeFile(path.join(workspace, 'private.txt'), 'must not be read');
+    await symlink('../../private.txt', path.join(workspace, 'workspace/project/link'));
+    const app = appFor();
+    const url = `/v1/workspaces/${workspaceId}/directory.zip?path=workspace%2Fproject`;
+    const response = await app.inject({ url, headers: auth(url) });
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['content-type']).toBe('application/zip');
+    expect(response.headers['content-disposition']).toContain('project.zip');
+    const files = unzip(response.rawPayload);
+    expect([...files.keys()].sort()).toEqual([
+      'project/',
+      'project/.hidden',
+      'project/empty/',
+      'project/link',
+      'project/node_modules/',
+      'project/node_modules/module.js',
+      'project/zero'
+    ]);
+    expect(files.get('project/link')?.toString()).toBe('../../private.txt');
+    expect(files.get('project/.hidden')?.toString()).toBe('hidden');
+    expect(files.get('project/zero')?.length).toBe(0);
+    expect(response.rawPayload.includes(Buffer.from('must not be read'))).toBe(false);
+    const denied = await app.inject({ url, headers: auth(url, ['exec']) });
+    expect(denied.statusCode).not.toBe(200);
+    expect(denied.body).toContain('files.read');
+    await expect(directoryArchive(workspace, '../')).rejects.toThrow();
+    await expect(directoryArchive(workspace, '.home')).rejects.toThrow();
+    await symlink(
+      path.join(workspace, 'workspace/project'),
+      path.join(workspace, 'workspace/alias')
+    );
+    await expect(directoryArchive(workspace, 'alias')).rejects.toThrow();
+  });
+
+  it('paginates large directories and archives more files than a source bundle', async () => {
+    for (let offset = 0; offset < 1100; offset += 100)
+      await Promise.all(
+        Array.from({ length: 100 }, (_, index) =>
+          writeFile(
+            path.join(workspace, `workspace/project/file-${offset + index}.txt`),
+            String(offset + index)
+          )
+        )
+      );
+    let cursor: string | undefined;
+    const names = new Set<string>();
+    let pages = 0;
+    do {
+      const page = await listDirectory(workspace, 'project', cursor);
+      expect(page.entries.length).toBeGreaterThan(0);
+      expect(page.entries.length).toBeLessThanOrEqual(100);
+      for (const entry of page.entries) {
+        expect(names.has(entry.name)).toBe(false);
+        names.add(entry.name);
+      }
+      cursor = page.nextCursor ?? undefined;
+      pages++;
+    } while (cursor);
+    expect(pages).toBe(11);
+    expect(names.size).toBe(1100);
+    const chunks: Buffer[] = [];
+    for await (const chunk of (await directoryArchive(
+      workspace,
+      'workspace'
+    )) as AsyncIterable<Buffer>)
+      chunks.push(chunk);
+    const files = unzip(Buffer.concat(chunks));
+    expect(files.size).toBe(1102);
+    expect(files.get('workspace/project/file-1099.txt')?.toString()).toBe('1099');
+  });
+
+  it('rejects stale or mismatched directory cursors instead of losing entries', async () => {
+    await writeFile(path.join(workspace, 'workspace/project/a'), 'a');
+    await writeFile(path.join(workspace, 'workspace/project/b'), 'b');
+    const first = await listDirectory(workspace, 'project', undefined, 1);
+    expect(first.nextCursor).toBeTypeOf('string');
+    await expect(listDirectory(workspace, 'workspace', first.nextCursor!)).rejects.toThrow(
+      'changed'
+    );
+    await writeFile(path.join(workspace, 'workspace/project/c'), 'c');
+    await expect(listDirectory(workspace, 'project', first.nextCursor!)).rejects.toThrow('changed');
+  });
+
+  it('streams a large archive and aborts if its file changes during delivery', async () => {
+    const target = path.join(workspace, 'workspace/project/reads.gz');
+    const handle = await open(target, 'w');
+    await handle.truncate(16 * 1024 ** 2);
+    await handle.close();
+    let total = 0,
+      largest = 0;
+    for await (const chunk of (await directoryArchive(
+      workspace,
+      'project'
+    )) as AsyncIterable<Buffer>) {
+      total += chunk.length;
+      largest = Math.max(largest, chunk.length);
+    }
+    expect(total).toBeGreaterThan(16 * 1024 ** 2);
+    expect(largest).toBeLessThan(256 * 1024);
+    const changing = await directoryArchive(workspace, 'project');
+    let changed = false;
+    await expect(
+      (async () => {
+        for await (const chunk of changing as AsyncIterable<Buffer>) {
+          if (!changed && chunk.length > 1024) {
+            const writer = await open(target, 'r+');
+            await writer.write(Buffer.from('changed'), 0, 7, 0);
+            await writer.close();
+            changed = true;
+          }
+        }
+      })()
+    ).rejects.toThrow('changed');
+    expect(changed).toBe(true);
+    const cancelled = await directoryArchive(workspace, 'project');
+    let observed = 0;
+    for await (const chunk of cancelled as AsyncIterable<Buffer>) {
+      observed += chunk.length;
+      break;
+    }
+    expect(observed).toBeGreaterThan(0);
+    expect(cancelled.destroyed).toBe(true);
   });
 
   it('streams a scientific output larger than the reader cap and resumes a bounded byte range', async () => {

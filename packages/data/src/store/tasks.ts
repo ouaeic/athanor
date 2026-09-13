@@ -1058,6 +1058,28 @@ export class TaskStore {
     return result.rows.map(mapTask);
   }
 
+  /** Owned execution roots and task lineage, including branches. */
+  async projectExecutionMembers(
+    userId: string,
+    taskId: string
+  ): Promise<Array<{ taskId: string; workspaceId: string }>> {
+    const result = await this.database.query(
+      `WITH RECURSIVE ancestors AS (
+        SELECT id,parent_task_id FROM tasks WHERE id=$2 AND user_id=$1
+        UNION SELECT t.id,t.parent_task_id FROM tasks t JOIN ancestors a ON t.id=a.parent_task_id WHERE t.user_id=$1
+      ), members AS (
+        SELECT t.id,t.workspace_id FROM tasks t JOIN ancestors a ON a.id=t.id
+        WHERE a.parent_task_id IS NULL AND t.user_id=$1
+        UNION SELECT t.id,t.workspace_id FROM tasks t JOIN members m ON t.parent_task_id=m.id WHERE t.user_id=$1
+      ) SELECT m.id,m.workspace_id FROM members m JOIN workspaces w ON w.id=m.workspace_id WHERE w.user_id=$1`,
+      [userId, taskId]
+    );
+    return result.rows.map((row) => ({
+      taskId: String(row.id),
+      workspaceId: String(row.workspace_id)
+    }));
+  }
+
   /**
    * Whether this computer still has a conversation in any of these states.
    *

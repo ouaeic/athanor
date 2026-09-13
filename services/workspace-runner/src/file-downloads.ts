@@ -9,6 +9,8 @@ import { z } from 'zod';
 import { requireScope } from './auth.js';
 import type { RunnerConfig } from './config.js';
 import { assertOpenedInPlace, assertUserDataPath, resolveInside, workspacePath } from './files.js';
+import { listDirectory } from './directories.js';
+import { directoryArchive } from './directory-archive.js';
 
 export const BUNDLE_FILE_LIMIT = 1_000;
 const BundleRequest = z.object({
@@ -209,6 +211,41 @@ export const registerFileDownloadRoutes = (
   app: FastifyInstance,
   config: Pick<RunnerConfig, 'WORKSPACE_ROOT'>
 ): void => {
+  app.get<{ Params: { workspaceId: string }; Querystring: { path?: string; cursor?: string } }>(
+    '/v1/workspaces/:workspaceId/directory',
+    async (request) => {
+      requireScope(request, 'files.read');
+      const query = z
+        .object({
+          path: z.string().min(1).max(4096).default('workspace'),
+          cursor: z.string().max(8192).optional()
+        })
+        .parse(request.query);
+      return listDirectory(
+        workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId),
+        query.path,
+        query.cursor
+      );
+    }
+  );
+  app.get<{ Params: { workspaceId: string }; Querystring: { path?: string } }>(
+    '/v1/workspaces/:workspaceId/directory.zip',
+    async (request, reply) => {
+      requireScope(request, 'files.read');
+      const requested = z.string().min(1).max(4096).default('workspace').parse(request.query.path);
+      const stream = await directoryArchive(
+        workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId),
+        requested
+      );
+      reply.raw.once('close', () => stream.destroy());
+      return reply
+        .type('application/zip')
+        .header('content-disposition', attachment(`${path.basename(requested)}.zip`))
+        .header('cache-control', 'private, no-store')
+        .header('x-content-type-options', 'nosniff')
+        .send(stream);
+    }
+  );
   app.get<{ Params: { workspaceId: string }; Querystring: { path: string; sha256?: string } }>(
     '/v1/workspaces/:workspaceId/download',
     async (request, reply) => {
@@ -216,7 +253,7 @@ export const registerFileDownloadRoutes = (
       const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
       const opened = await openDownloadFile(
         root,
-        z.string().min(1).max(1_024).parse(request.query.path)
+        z.string().min(1).max(4096).parse(request.query.path)
       );
       const { stat, handle } = opened;
       const etag = `"${stat.dev.toString(16)}-${stat.ino.toString(16)}-${stat.size.toString(16)}-${stat.mtimeMs.toString(16)}-${stat.ctimeMs.toString(16)}"`;

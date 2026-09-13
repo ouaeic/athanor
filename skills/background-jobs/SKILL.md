@@ -6,7 +6,7 @@ compatibility: No external binaries required beyond the job's own toolchain.
 allowed-tools: shell process schedule notify file_read file_write files_list set_plan set_acceptance publish_artifact
 metadata:
   athanor.tier: 'builtin'
-  athanor.version: '1.3.0'
+  athanor.version: '1.4.0'
   athanor.risk: 'workspace'
   athanor.domain: 'long-running'
 ---
@@ -21,10 +21,21 @@ repeated here. What follows is the part that is true on this computer and nowher
 
 ## The manifest is the checkpoint
 
-A job — many items, a definite end, a report — belongs in `workspace/jobs/<job>/manifest.json` plus
-a schedule that resumes from it, not in one long-lived process. A run that restarts from the
-beginning is worse than one that stopped, and a named service is for a server the owner keeps
-using, not for work that finishes.
+Run a long analysis with `shell(background=true, job="Analysis name", ...)`. Omit `timeoutSeconds`
+when its duration is unknown; an explicitly requested deadline is preserved across recovery.
+Write scripts and let them use the machine's available CPUs within its reported memory allowance.
+Closing the browser or finishing the agent turn does not stop a named job. Report its session ID
+and output paths so the owner can follow it in the project's process view.
+
+Verify startup, then hand over when the work can continue independently. Do not spend model turns
+polling a long job in a tight loop. Schedule a follow-up only when later interpretation or an
+owner-requested notification is needed; the process monitor updates without model calls.
+
+For work that can checkpoint, keep `workspace/jobs/<job>/manifest.json` or the analysis tool's native
+checkpoint and declare `checkpointResumeCommand` only when it can safely resume saved work. A runner
+restart cannot restore arbitrary process memory. Without a checkpoint command Garden preserves an
+interruption for inspection. Use a schedule when later independent runs are wanted, and a service
+for a server that should restart after every exit. A successful finite job never repeats itself.
 
 One entry per item, each `pending`, `running`, `done` or `failed`, carrying its output path and its
 error text, rewritten after every item rather than at the end — which is exactly when the crash

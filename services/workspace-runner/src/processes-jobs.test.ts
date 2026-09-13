@@ -52,6 +52,40 @@ afterEach(async () => {
 });
 
 describe('durable finite jobs', () => {
+  it('allows a finite job without a deadline and recovers only its checkpoint', async () => {
+    const { root, current } = await setup();
+    const launched = await start(current, root, "console.log('ready'); setInterval(()=>{},1000)", {
+      timeoutSeconds: undefined,
+      checkpointResume: command("console.log('checkpoint recovered')")
+    });
+    expect(launched).not.toHaveProperty('deadlineAt');
+    expect(launched).not.toHaveProperty('remainingMs');
+    await expect.poll(() => poll(current, launched.sessionId).stdout).toContain('ready');
+    expect(current.backgroundWork()).toMatchObject({ commands: 1, longestRemainingMs: null });
+    await current.close();
+    const resumed = manager();
+    expect(await resumed.resumeWorkspace(root, 'workspace-1', false)).toBe(1);
+    const result = await settled(resumed, launched.sessionId);
+    expect(result.status).toBe('completed');
+    expect(result.stdout).toContain('checkpoint recovered');
+    expect(result).not.toHaveProperty('deadlineAt');
+  });
+
+  it('accepts a multi-month named job deadline without applying the unnamed session ceiling', async () => {
+    const { root, current } = await setup();
+    const timeoutSeconds = 90 * 24 * 3600;
+    const before = Date.now();
+    const launched = await start(current, root, "console.log('ready'); setInterval(()=>{},1000)", {
+      timeoutSeconds
+    });
+    await expect.poll(() => poll(current, launched.sessionId).stdout).toContain('ready');
+    expect(poll(current, launched.sessionId).status).toBe('running');
+    expect(Date.parse(launched.deadlineAt!)).toBeGreaterThanOrEqual(before + timeoutSeconds * 1000);
+    expect(launched.ownerTaskId).toBe('task-1');
+    current.action('workspace-1', null, launched.sessionId, { action: 'kill' });
+    expect((await settled(current, launched.sessionId)).status).toBe('stopped');
+  });
+
   it('persists successful identity and logs without repeating completed work after restart', async () => {
     const { root, current } = await setup();
     const launched = await start(
