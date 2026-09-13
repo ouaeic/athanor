@@ -972,7 +972,9 @@ try {
       await activity.getByText('Earlier project direction.', { exact: true }).count(),
       0
     );
-    await activity.getByRole('button', { name: 'Close Activity and directions', exact: true }).click();
+    await activity
+      .getByRole('button', { name: 'Close Activity and directions', exact: true })
+      .click();
     const autonomy = page.getByRole('combobox', { name: 'Approvals for this prompt', exact: true });
     await autonomy.selectOption('autonomous');
     assert.equal(
