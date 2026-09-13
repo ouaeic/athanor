@@ -564,7 +564,7 @@ describe('desktop session lifecycle', () => {
         '#!/bin/sh',
         'set -eu',
         'mkdir -p "$1/.athanor/desktop"',
-        'printf "DISPLAY=:99\\nDBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null\\n' +
+        'printf "DISPLAY=:99\\nXAUTHORITY=/nonexistent/authority\\nDBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null\\n' +
           'XDG_RUNTIME_DIR=%s\\nATHANOR_BOOT_RES=1600x1000\\nATHANOR_MAX_RES=3840x2160\\n"' +
           ' "$1" > "$1/.athanor/desktop/environment"',
         'exec sleep 30'

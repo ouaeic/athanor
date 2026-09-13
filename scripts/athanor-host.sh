@@ -187,6 +187,7 @@ xvfb	xvfb	xorg-x11-server-Xvfb	xorg-server-xvfb	xorg-x11-server
 xrandr	x11-xserver-utils	/usr/bin/xrandr	xorg-xrandr	xrandr
 xdpyinfo	x11-utils	/usr/bin/xdpyinfo	xorg-xdpyinfo	xdpyinfo
 xprop	x11-utils	/usr/bin/xprop	xorg-xprop	xprop
+xauth	xauth	/usr/bin/xauth	xorg-xauth	xauth
 xdotool	xdotool	xdotool	xdotool	xdotool
 zip	zip	zip	zip	zip
 TABLE

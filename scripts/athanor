@@ -688,7 +688,7 @@ doctor() {
     fi
   fi
   missing_desktop_tools=""
-  for desktop_binary in Xvfb xdpyinfo xprop xrandr xdotool dbus-run-session; do
+  for desktop_binary in Xvfb xdpyinfo xprop xauth xrandr xdotool dbus-run-session; do
     command -v "$desktop_binary" >/dev/null 2>&1 ||
       missing_desktop_tools="$missing_desktop_tools $desktop_binary"
   done

@@ -846,6 +846,7 @@ export class DesktopManager {
     const session = await this.ensure(workspaceId, root);
     return {
       DISPLAY: session.env.DISPLAY,
+      XAUTHORITY: session.env.XAUTHORITY,
       XDG_RUNTIME_DIR: session.env.XDG_RUNTIME_DIR,
       DBUS_SESSION_BUS_ADDRESS: session.env.DBUS_SESSION_BUS_ADDRESS
     };
@@ -1012,6 +1013,7 @@ export class DesktopManager {
             return [line.slice(0, separator), line.slice(separator + 1)] as [string, string];
           })
       );
+      if (!values.XAUTHORITY) throw new Error('GUI desktop environment has no X11 authorization');
       // The control and the session reference each other: the control's release callback needs the
       // session, and the session holds the control. The binding is therefore declared before it can
       // be assigned and captured by the closure below, which const cannot express.
@@ -1029,6 +1031,7 @@ export class DesktopManager {
       const env: NodeJS.ProcessEnv = {
         ...processEnv(root),
         DISPLAY: values.DISPLAY,
+        XAUTHORITY: values.XAUTHORITY,
         DBUS_SESSION_BUS_ADDRESS: values.DBUS_SESSION_BUS_ADDRESS,
         XDG_RUNTIME_DIR: values.XDG_RUNTIME_DIR,
         NO_AT_BRIDGE: '0',

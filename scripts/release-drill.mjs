@@ -132,6 +132,7 @@ try {
     'tesseract',
     'typst',
     'unzip',
+    'xauth',
     'xdpyinfo',
     'xprop',
     'xrandr',
@@ -324,6 +325,29 @@ try {
       Buffer.from(desktop.screenshotBase64, 'base64').length > 5_000,
     'Linux GUI launch and visual desktop observation',
     `${desktop.mode}, ${desktop.windows.length} window(s), ${desktop.width}x${desktop.height} of ${desktop.displayWidth}x${desktop.displayHeight}, screenshot ${Buffer.from(desktop.screenshotBase64 ?? '', 'base64').length} bytes${desktop.message ? `, ${desktop.message}` : ''}`
+  );
+
+  const x11Denied = await exec('/usr/bin/python3', [
+    '-c',
+    `
+import glob, os, subprocess
+sockets = glob.glob('/tmp/.X11-unix/X*')
+assert sockets, 'The live desktop must provide an X11 socket for the negative control'
+for socket in sockets:
+    display = socket.rsplit('X', 1)[-1]
+    assert display.isdigit()
+    result = subprocess.run(['/usr/bin/xdpyinfo', '-display', 'unix:' + display],
+        env={'PATH':'/usr/bin:/bin','HOME':'/nonexistent','XAUTHORITY':'/dev/null'},
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+    assert result.returncode != 0, 'Agent command reached a desktop without authorization'
+print('unauthorized X11 connections refused:', len(sockets))
+`
+  ]);
+  check(
+    x11Denied.exitCode === 0 &&
+      /unauthorized X11 connections refused: [1-9]/.test(x11Denied.stdout),
+    'agent commands cannot bypass desktop control through X11',
+    x11Denied.stdout.trim() || x11Denied.stderr.trim()
   );
 
   const previewProcess = await request(`${root}/processes/start`, {

@@ -48,7 +48,7 @@ const bridgeRequests: string[] = [];
 let blockedOperation = '';
 let windowList = '_NET_CLIENT_LIST(WINDOW): window id #\n';
 const environment = (display: string) =>
-  `DISPLAY=:${display}\nDBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/bus\nXDG_RUNTIME_DIR=/nonexistent/runtime\n`;
+  `DISPLAY=:${display}\nXAUTHORITY=/nonexistent/authority\nDBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/bus\nXDG_RUNTIME_DIR=/nonexistent/runtime\n`;
 let readEnvironment = (root: string): Promise<string> =>
   Promise.resolve(environment([...starts].reverse().find((entry) => entry.root === root)!.display));
 
@@ -303,6 +303,18 @@ describe('desktop session ownership', () => {
     readEnvironment = () => Promise.resolve(environment(starts.at(-1)!.display));
     await expect(manager.ensure(workspace, root)).resolves.toBeDefined();
     expect(starts).toHaveLength(2);
+  });
+
+  it('refuses a desktop without authorization and passes the private authority path to the browser', async () => {
+    const { manager, root } = await setup();
+    readEnvironment = () =>
+      Promise.resolve(environment('90').replace('XAUTHORITY=/nonexistent/authority\n', ''));
+    await expect(manager.ensure(workspace, root)).rejects.toThrow('no X11 authorization');
+    expect(starts[0]!.child.kill).toHaveBeenCalled();
+    readEnvironment = () => Promise.resolve(environment('90'));
+    expect(await manager.displayEnvironment(workspace, root)).toMatchObject({
+      XAUTHORITY: '/nonexistent/authority'
+    });
   });
 
   it('rejects an incomplete environment and reaps the process after readiness expires', async () => {

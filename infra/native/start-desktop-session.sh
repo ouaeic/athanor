@@ -6,7 +6,7 @@ display_number="${2:?display number is required}"
 state_dir="$workspace_root/.athanor/desktop"
 environment_file="$state_dir/environment"
 
-for desktop_binary in /usr/bin/Xvfb /usr/bin/xdpyinfo /usr/bin/dbus-run-session; do
+for desktop_binary in /usr/bin/Xvfb /usr/bin/xdpyinfo /usr/bin/dbus-run-session /usr/bin/xauth; do
   [ -x "$desktop_binary" ] || {
     printf 'Desktop prerequisite is missing: %s. Run sudo garden update to repair the installation.\n' "$desktop_binary" >&2
     exit 1
@@ -65,6 +65,14 @@ rm -f "$environment_file"
 
 export HOME="$workspace_root"
 export DISPLAY=":$display_number"
+export XAUTHORITY="$state_dir/Xauthority"
+# X11 uses a public local socket; a private cookie keeps other sessions and agent commands out.
+authority_file=$(mktemp "$state_dir/Xauthority.XXXXXX")
+chmod 0600 "$authority_file"
+authority_cookie=$(/usr/bin/python3 -c 'import secrets; print(secrets.token_hex(16))')
+printf 'add %s MIT-MAGIC-COOKIE-1 %s\n' "$DISPLAY" "$authority_cookie" | /usr/bin/xauth -q -f "$authority_file"
+unset authority_cookie
+mv -f "$authority_file" "$XAUTHORITY"
 export XDG_RUNTIME_DIR="$runtime_dir"
 export ATHANOR_MAX_RES ATHANOR_BOOT_RES ATHANOR_KEYBOARD_LAYOUT
 export NO_AT_BRIDGE=0
@@ -89,7 +97,7 @@ exec /usr/bin/dbus-run-session -- /bin/sh -c '
   chmod 1777 /tmp/.X11-unix 2>/dev/null || true
   # DAMAGE and XFIXES back the capture and cursor paths, MIT-SHM keeps a full-screen fetch a
   # single memcpy, and RANDR is how the display follows the client viewport.
-  /usr/bin/Xvfb "$DISPLAY" \
+  /usr/bin/Xvfb "$DISPLAY" -auth "$XAUTHORITY" \
     -screen 0 "${ATHANOR_MAX_RES}x24" \
     +extension RANDR +extension DAMAGE +extension XFIXES +extension MIT-SHM \
     +extension Composite \
@@ -133,8 +141,8 @@ exec /usr/bin/dbus-run-session -- /bin/sh -c '
   atspi_pid=$!
   /usr/bin/openbox-session >/dev/null 2>&1 &
   openbox_pid=$!
-  printf "DISPLAY=%s\nDBUS_SESSION_BUS_ADDRESS=%s\nXDG_RUNTIME_DIR=%s\nATHANOR_MAX_RES=%s\nATHANOR_BOOT_RES=%s\nATHANOR_KEYBOARD_LAYOUT=%s\n" \
-    "$DISPLAY" "$DBUS_SESSION_BUS_ADDRESS" "$XDG_RUNTIME_DIR" \
+  printf "DISPLAY=%s\nXAUTHORITY=%s\nDBUS_SESSION_BUS_ADDRESS=%s\nXDG_RUNTIME_DIR=%s\nATHANOR_MAX_RES=%s\nATHANOR_BOOT_RES=%s\nATHANOR_KEYBOARD_LAYOUT=%s\n" \
+    "$DISPLAY" "$XAUTHORITY" "$DBUS_SESSION_BUS_ADDRESS" "$XDG_RUNTIME_DIR" \
     "$ATHANOR_MAX_RES" "$ATHANOR_BOOT_RES" "$ATHANOR_KEYBOARD_LAYOUT" > "$1"
   chmod 0600 "$1"
   wait "$xvfb_pid"
