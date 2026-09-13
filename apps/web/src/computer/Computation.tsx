@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import type { ComputationSession } from '@athanor/contracts';
 import { get, post } from '../client';
 import { bytes, message } from './format';
+const ComputationHistory = lazy(() => import('./ComputationHistory'));
 
 export function ComputationCard({
   session,
@@ -13,6 +14,7 @@ export function ComputationCard({
   onControl: (action: 'interrupt' | 'stop') => void;
 }) {
   const [confirmStop, setConfirmStop] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
   const active = ['starting', 'idle', 'busy', 'interrupted'].includes(session.state);
   const cell = session.latestCell;
   return (
@@ -73,6 +75,18 @@ export function ComputationCard({
             </ul>
           )}
         </details>
+      )}
+      <button
+        className="button"
+        aria-expanded={showHistory}
+        onClick={() => setShowHistory((value) => !value)}
+      >
+        {showHistory ? 'Hide execution history' : 'View execution history'}
+      </button>
+      {showHistory && (
+        <Suspense fallback={<p role="status">Loading execution history…</p>}>
+          <ComputationHistory key={session.sessionId} session={session} />
+        </Suspense>
       )}
       {active && (
         <div className="row">

@@ -420,6 +420,50 @@ const computation = {
   stateRetained: true,
   variables: [{ name: 'samples', type: 'DataFrame', preview: '20 rows, 4 columns' }]
 };
+const computationHistoryRequests = [];
+const historyEvent = (sequence, kind, payload) => ({
+  ...event,
+  id: `history-${sequence}`,
+  sequence,
+  kind,
+  payload
+});
+const historyStart = (sequence, cellId, code) =>
+  historyEvent(sequence, 'tool_started', {
+    toolCallId: cellId,
+    tool: 'process',
+    arguments: {
+      action: 'compute',
+      sessionId: computation.sessionId,
+      options: { action: 'cell', cellId, code }
+    }
+  });
+const historyReceipt = (sequence, cellId, state, stdout) =>
+  historyEvent(sequence, 'tool_result', {
+    toolCallId: cellId,
+    result: {
+      sessionId: computation.sessionId,
+      latestCell: {
+        cellId,
+        state,
+        startedAt: time,
+        stdout,
+        stderr: '',
+        artifacts: [],
+        ...(state === 'failed' ? { error: 'Fixture cell failure' } : {})
+      }
+    }
+  });
+const computationHistoryPages = [
+  [
+    historyStart(10, 'cell-earlier', 'earlier_total = 2 + 2'),
+    historyReceipt(11, 'cell-earlier', 'completed', '4')
+  ],
+  [
+    historyStart(220, 'cell-latest', 'raise ValueError("fixture")'),
+    historyReceipt(221, 'cell-latest', 'failed', 'partial output')
+  ]
+];
 const debugSession = {
   sessionId: 'debug-80000000-0000-4000-8000-000000000008',
   taskId: task.id,
@@ -820,6 +864,22 @@ try {
       );
     if (path.endsWith('/plan'))
       return json({ id: 'plan', taskId: task.id, version: 1, steps: presentation.progress.phases });
+    if (
+      path === `/v1/tasks/${task.id}/events` &&
+      url.searchParams.has('before') &&
+      url.searchParams.get('limit') === '200'
+    ) {
+      assert.equal(route.request().method(), 'GET');
+      const before = Number(url.searchParams.get('before'));
+      computationHistoryRequests.push(before);
+      const events = computationHistoryPages[before > 220 ? 1 : 0];
+      return json({
+        events,
+        hasMore: before > 220,
+        oldestSequence: events[0].sequence,
+        nextCursor: events.at(-1).sequence
+      });
+    }
     if (path.endsWith('/events'))
       return json({
         events: path.includes(childTask.id) ? (childQuestion ? [childQuestion] : []) : [event],
@@ -1354,6 +1414,45 @@ try {
     assert.deepEqual(recordedReceipt, { providerCharacterId: 'char_recorded', costUsd: 0.0125 });
     await page.getByRole('button', { name: 'Computer', exact: true }).click();
     await page.getByRole('button', { name: 'Processes', exact: true }).click();
+    await page.getByRole('button', { name: 'View execution history', exact: true }).click();
+    const history = page.getByRole('region', { name: 'Execution history', exact: true });
+    await history.getByText('cell-latest', { exact: true }).click();
+    await history.getByText('raise ValueError("fixture")', { exact: true }).waitFor();
+    await history.getByText('Fixture cell failure', { exact: true }).waitFor();
+    const historyDownloadPromise = page.waitForEvent('download');
+    await history.getByRole('button', { name: 'Export this history page', exact: true }).click();
+    const historyDownload = await historyDownloadPromise;
+    const exportedHistory = JSON.parse(await readFile(await historyDownload.path(), 'utf8'));
+    assert.equal(exportedHistory.entries.length, 1);
+    assert.equal(exportedHistory.entries[0].receipt.state, 'failed');
+    assert.deepEqual(exportedHistory.coverage, {
+      olderEventsAvailable: true,
+      newerEventsAvailable: false,
+      oldestSequence: 220,
+      newestSequence: 221,
+      eventCount: 2
+    });
+    await history.getByRole('button', { name: 'Earlier history', exact: true }).click();
+    await history.getByText('cell-earlier', { exact: true }).click();
+    await history.getByText('earlier_total = 2 + 2', { exact: true }).waitFor();
+    assert.equal(
+      await history.getByText('cell-latest', { exact: true }).count(),
+      0,
+      'History must release the previous page'
+    );
+    await history.getByRole('button', { name: 'Newer history', exact: true }).click();
+    await history.getByText('cell-latest', { exact: true }).waitFor();
+    assert.deepEqual(computationHistoryRequests, [
+      Number.MAX_SAFE_INTEGER,
+      220,
+      Number.MAX_SAFE_INTEGER
+    ]);
+    assert.deepEqual(
+      computationControls,
+      [],
+      'Inspecting and exporting history must never execute or interrupt a cell'
+    );
+    await page.getByRole('button', { name: 'Hide execution history', exact: true }).click();
     await page.getByRole('button', { name: 'Interrupt cell', exact: true }).click();
     await page.getByText('Python · interrupted', { exact: true }).waitFor();
     await page.getByRole('button', { name: 'End session…', exact: true }).click();
