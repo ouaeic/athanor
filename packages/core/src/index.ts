@@ -19,3 +19,5 @@ export * from './redaction.js';
 export * from './schedule.js';
 export * from './spend.js';
 export * from './usage.js';
+
+export { ownerMessageContent, type OwnerMessage } from './owner-message.js';

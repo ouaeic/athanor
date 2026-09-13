@@ -15,6 +15,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { TaskPlanStep, WebToolPlan } from '@athanor/contracts';
 import {
+  ownerMessageContent,
+  type OwnerMessage,
   AthanorError,
   decryptBytes,
   decryptJson,
@@ -254,9 +256,9 @@ const resolveForkAnchor = async (
     // workspace whose rows this code is entitled to open, and the check should say so rather than
     // compare a row against a label it carries itself.
     if (anchor.promptCiphertext.aad !== `task-prompt:${task.workspaceId}`) return null;
-    const { prompt } = decryptJson<{ prompt: string }>(anchor.promptCiphertext, key);
-    if (typeof prompt !== 'string') return null;
-    return { anchor, prompt };
+    const message = decryptJson<OwnerMessage>(anchor.promptCiphertext, key);
+    if (typeof message.prompt !== 'string') return null;
+    return { anchor, prompt: ownerMessageContent(message) };
   } catch {
     return null;
   }

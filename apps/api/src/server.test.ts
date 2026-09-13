@@ -1063,6 +1063,7 @@ describe('API production boundaries', () => {
       payload: {
         workspaceId,
         prompt: 'Prepare a concise report',
+        attachments: ['workspace/attached-note.txt'],
         modelId: 'openrouter/openai/gpt-oss-120b',
         privacyRoute: 'provider_zdr',
         maxComputeCredits: 1
@@ -1072,6 +1073,37 @@ describe('API production boundaries', () => {
     const taskId = task.json<{ id: string }>().id;
     const taskExecutionWorkspaceId = task.json<{ workspaceId: string }>().workspaceId;
     expect(taskExecutionWorkspaceId).not.toBe(workspaceId);
+    const sealedTask = await database.query(
+      'SELECT t.prompt_ciphertext,k.wrapped_key FROM tasks t JOIN workspace_keys k ON k.workspace_id=t.workspace_id WHERE t.id=$1',
+      [taskId]
+    );
+    expect(sealedTask.rows).toHaveLength(1);
+    const attachmentKey = unwrapDataKey(
+      String(sealedTask.rows[0]!.wrapped_key),
+      Buffer.alloc(32, 7),
+      taskExecutionWorkspaceId
+    );
+    expect(
+      decryptJson(
+        sealedTask.rows[0]!.prompt_ciphertext as EncryptedEnvelope,
+        attachmentKey,
+        `task-prompt:${taskExecutionWorkspaceId}`
+      )
+    ).toEqual({
+      prompt: 'Prepare a concise report',
+      attachments: ['workspace/attached-note.txt']
+    });
+    const attachedOpening = await store.listTaskEvents(taskId, 0, {
+      kind: 'user_message',
+      limit: 1
+    });
+    expect(attachedOpening).toHaveLength(1);
+    expect(
+      decryptJson(attachedOpening[0]!.payloadCiphertext!, attachmentKey, `task-event:${taskId}`)
+    ).toMatchObject({
+      markdown: 'Prepare a concise report',
+      attachments: ['workspace/attached-note.txt']
+    });
     expect(task.json()).toMatchObject({ securityMode: 'balanced', forkKind: null });
     const conversationSearch = await app.inject({
       method: 'GET',
@@ -1344,6 +1376,18 @@ describe('API production boundaries', () => {
             event.payload.editedFromEventId === branchPoint.id
         )
     ).toBe(true);
+    const editedRecord = (await store.getTask(taskWorkspace!.userId, editedTaskId))!;
+    expect(decryptJson(editedRecord.promptCiphertext, taskKey)).toEqual({
+      prompt: 'Prepare a detailed report with a comparison table',
+      attachments: ['workspace/attached-note.txt']
+    });
+    expect(
+      editedEvents
+        .json<Array<{ kind: string; payload?: unknown }>>()
+        .find((event) => event.kind === 'user_message')?.payload
+    ).toMatchObject({
+      attachments: ['workspace/attached-note.txt']
+    });
     const cancelledEdit = await app.inject({
       method: 'POST',
       url: `/v1/tasks/${editedTaskId}/cancel`,
@@ -1380,6 +1424,21 @@ describe('API production boundaries', () => {
       forkKind: 'retry',
       status: 'queued'
     });
+    const retriedRecord = (await store.getTask(
+      taskWorkspace!.userId,
+      retried.json<{ id: string }>().id
+    ))!;
+    expect(decryptJson(retriedRecord.promptCiphertext, taskKey)).toEqual({
+      prompt: 'Prepare a concise report',
+      attachments: ['workspace/attached-note.txt']
+    });
+    const retriedState = decryptJson<{ messages: Array<{ role: string; content: string }> }>(
+      retriedRecord.agentStateCiphertext!,
+      taskKey
+    );
+    expect(retriedState.messages.find((message) => message.role === 'user')?.content).toContain(
+      'workspace/attached-note.txt'
+    );
     await app.inject({
       method: 'POST',
       url: `/v1/tasks/${retried.json<{ id: string }>().id}/cancel`,

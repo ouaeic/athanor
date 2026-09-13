@@ -987,7 +987,12 @@ try {
                 ...event,
                 id: 'opening-activity',
                 sequence: 1,
-                summary: 'Earlier project direction.'
+                summary: 'Earlier project direction.',
+                kind: 'user_message',
+                payload: {
+                  markdown: 'Earlier project direction.',
+                  attachments: ['workspace/uploads/' + 'long attachment name '.repeat(8) + '.txt']
+                }
               }
             ]
           : recordedReply
@@ -1067,6 +1072,34 @@ try {
     const activity = page.getByRole('dialog', { name: 'Activity and directions', exact: true });
     await activity.getByRole('button', { name: 'Earlier activity', exact: true }).click();
     await activity.getByText('Earlier project direction.', { exact: true }).waitFor();
+    await activity.getByRole('button', { name: 'Details', exact: true }).click();
+    const messageDetails = page.getByRole('dialog', { name: 'user message', exact: true });
+    const attachment = messageDetails
+      .getByRole('list', { name: 'Attached files' })
+      .getByRole('link');
+    await attachment.waitFor();
+    assert.match(await attachment.getAttribute('href'), /workspace%2Fuploads%2Flong%20attachment/);
+    for (const width of [1440, 390, 320]) {
+      await page.setViewportSize({ width, height: 844 });
+      const bounds = await attachment.evaluate((element) => {
+        const link = element.getBoundingClientRect(),
+          list = element.closest('ul').getBoundingClientRect(),
+          text = element.querySelector('span').getBoundingClientRect();
+        return {
+          fits: link.left >= list.left && link.right <= list.right + 1,
+          padded: text.left > link.left && text.right < link.right,
+          overflow: element.scrollWidth > element.clientWidth + 1
+        };
+      });
+      assert(
+        bounds.fits && bounds.padded && !bounds.overflow,
+        'Long attachment names must wrap inside padded links'
+      );
+    }
+    await page.screenshot({ path: resolve(report, 'message-attachment-phone.png') });
+    await messageDetails.getByRole('button', { name: 'Close user message', exact: true }).click();
+    await page.setViewportSize({ width: 1440, height: 1000 });
+
     assert.equal(
       projectEventRequests.at(-1),
       event.sequence,

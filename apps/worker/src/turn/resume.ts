@@ -15,7 +15,7 @@
  * Lifted out of `AgentWorker.run()` unchanged: two hundred and eighteen lines that ran once, before
  * the loop, and had nothing to do with the loop.
  */
-import { decryptJson, encryptJson } from '@athanor/core';
+import { ownerMessageContent, type OwnerMessage, decryptJson, encryptJson } from '@athanor/core';
 import type { ModelRelease, WebToolPlan } from '@athanor/contracts';
 import type { TaskRecord } from '@athanor/data';
 import type { ModelToolCall } from '@athanor/model-gateway';
@@ -305,15 +305,17 @@ export const resumeParkedTurn = async (
       if (await honorUserControl()) return true;
       waiting = await deps.store.getNextQueuedTaskMessage(task.id);
     }
-    const answer = waiting
-      ? decryptJson<{ prompt: string }>(waiting.promptCiphertext, key).prompt.trim()
-      : '';
+    const message = waiting ? decryptJson<OwnerMessage>(waiting.promptCiphertext, key) : null;
+    const answer = message?.prompt.trim() ?? '';
     const answeredState = waiting && answer ? structuredClone(state) : null;
     if (answeredState) {
       answeredState.ownerReasoningEffort =
         waiting?.reasoningEffort ?? task.reasoningEffort ?? 'auto';
       delete answeredState.question;
-      answeredState.messages.push({ role: 'user', content: answer });
+      answeredState.messages.push({
+        role: 'user',
+        content: ownerMessageContent({ prompt: answer, attachments: message?.attachments })
+      });
     }
     const consumed =
       waiting && answeredState
@@ -326,7 +328,7 @@ export const resumeParkedTurn = async (
             additionalComputeCredits: waiting.maxComputeCredits,
             ...(waiting.maxSpendUsd === null ? {} : { additionalSpendUsd: waiting.maxSpendUsd }),
             userMessageCiphertext: encryptJson(
-              { markdown: answer, messageId: waiting.id },
+              { markdown: answer, attachments: message?.attachments, messageId: waiting.id },
               key,
               `task-event:${task.id}`
             ),

@@ -100,6 +100,47 @@ const fixture = async (status = 'running') => {
   return { task: current, user, context, retained, send, resolveSpendCeiling };
 };
 
+describe('attachment delivery in owner messages', () => {
+  it('keeps queued attachment references sealed beside the exact typed text', async () => {
+    const f = await fixture();
+    const input = { prompt: 'Read the attached note.', attachments: ['workspace/note.txt'] };
+    await continueTaskOperation(f.context, f.user, f.task.id, input);
+    const queued = await store.getNextQueuedTaskMessage(f.task.id);
+    expect(queued).not.toBeNull();
+    expect(decryptJson(queued!.promptCiphertext, key, `task-message:${f.task.id}`)).toEqual(input);
+    const events = await store.listTaskEvents(f.task.id, 0, { kind: 'queued_message', limit: 1 });
+    expect(events).toHaveLength(1);
+    expect(
+      decryptJson(events[0]!.payloadCiphertext!, key, `task-event:${f.task.id}`)
+    ).toMatchObject({
+      markdown: input.prompt,
+      attachments: input.attachments
+    });
+  });
+
+  it('puts completed-task follow-up attachments in model context and preserves the transcript', async () => {
+    const f = await fixture('completed');
+    const input = { prompt: 'Read this note.', attachments: ['workspace/follow-up.txt'] };
+    await continueTaskOperation(f.context, f.user, f.task.id, input);
+    const current = (await store.getTask(f.user.id, f.task.id))!;
+    const state = decryptJson<{ messages: Array<{ content: string }> }>(
+      current.agentStateCiphertext!,
+      key,
+      `task-state:${f.task.id}`
+    );
+    expect(state.messages.length).toBeGreaterThan(0);
+    expect(state.messages.at(-1)!.content).toContain(input.attachments[0]);
+    const events = await store.listTaskEvents(f.task.id, 0, { kind: 'user_message', limit: 1 });
+    expect(events).toHaveLength(1);
+    expect(
+      decryptJson(events[0]!.payloadCiphertext!, key, `task-event:${f.task.id}`)
+    ).toMatchObject({
+      markdown: input.prompt,
+      attachments: input.attachments
+    });
+  });
+});
+
 describe('confirmed continuation within existing task authority', () => {
   it('queues and promotes real work without raising either allowance or changing the selected route', async () => {
     const f = await fixture();

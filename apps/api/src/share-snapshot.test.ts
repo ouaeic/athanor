@@ -11,6 +11,20 @@ import { snapshotLine } from './share-snapshot.js';
 const off = { includeReasoning: false, includeToolResults: false };
 
 describe('the line a viewer reads for one event', () => {
+  it('shares typed prompt text without private attachment paths', () => {
+    expect(
+      snapshotLine(
+        'user_message',
+        'Inspect the attachment',
+        {
+          markdown: 'Inspect the attachment',
+          attachments: ['workspace/private/customer.csv']
+        },
+        off
+      )
+    ).toEqual({ kind: 'user_message', text: 'Inspect the attachment' });
+  });
+
   /**
    * `recordToolFailure` writes `<tool> failed` with the error's message beside it. The summary is
    * the per-step activity line every link carries; the message can quote the path or the page

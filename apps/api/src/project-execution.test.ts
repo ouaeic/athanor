@@ -73,6 +73,35 @@ describe('project preparation API operation', () => {
       'workspace/uploads/selected.wav'
     ]);
   });
+  it('copies only the explicitly attached files from conversation history', () => {
+    const paths = projectSourcePaths([
+      {
+        id: randomUUID(),
+        taskId: randomUUID(),
+        sequence: 1,
+        kind: 'user_message',
+        summary: 'Inspect the attached data',
+        createdAt: new Date().toISOString(),
+        payload: {
+          markdown: 'Inspect the attached data',
+          attachments: [
+            'workspace/analysis/input.csv',
+            'workspace/.home/private',
+            '../private',
+            'workspace/uploads/photo.png'
+          ]
+        }
+      }
+    ]);
+    expect(paths).toEqual([
+      'workspace/AGENTS.md',
+      'workspace/ATHANOR.md',
+      'workspace/OPEN_CLOUD.md',
+      'workspace/analysis/input.csv',
+      'workspace/uploads/photo.png'
+    ]);
+    expect(paths).not.toContain('workspace/analysis');
+  });
   it('rebinds prompt/title under the same data key and preserves owner policy and allocation', async () => {
     const f = await fixture(),
       execution = await beginProjectExecution(f.context, f.task, []);

@@ -174,10 +174,7 @@ export const registerTaskRoutes = (context: RouteContext): void => {
       },
       signals: {
         prompt: input.prompt,
-        // `attachments` is optional on the request and the web client never sends it: it appends
-        // the paths to the prompt as an "Attached files:" block instead, which is what the agent
-        // reads them from. So this is false for every task the browser starts, and the notice
-        // below is decided by the prose alone. A caller that sends the list gets the image signal.
+        // Legacy clients may include image paths in text beside separate attachment metadata.
         hasImages: input.attachments.some((path) => IMAGE_ATTACHMENT.test(path))
       }
     });
@@ -281,7 +278,10 @@ export const registerTaskRoutes = (context: RouteContext): void => {
           // long it was meant to live - so an owner who does not choose gets exactly what they had.
           ...(input.lifetime ? { lifetime: input.lifetime } : {}),
           promptCiphertext: encryptJson(
-            { prompt: input.prompt },
+            {
+              prompt: input.prompt,
+              attachments: input.attachments?.length ? input.attachments : undefined
+            },
             dataKey,
             `task-prompt:${workspace.id}`
           )
@@ -348,7 +348,10 @@ export const registerTaskRoutes = (context: RouteContext): void => {
               kind: 'user_message',
               summary: 'User message',
               payloadCiphertext: encryptJson(
-                { markdown: input.prompt },
+                {
+                  markdown: input.prompt,
+                  attachments: input.attachments?.length ? input.attachments : undefined
+                },
                 dataKey,
                 `task-event:${task.id}`
               )

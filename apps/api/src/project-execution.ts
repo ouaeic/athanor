@@ -21,7 +21,20 @@ export function projectSourcePaths(
   events: readonly TaskEvent[],
   attachments: string[] = []
 ): string[] {
-  const found = new Set<string>([...BRIEFS, ...attachments, ...taskSourceFiles(events).keys()]);
+  const namedAttachments = [
+    ...attachments,
+    ...events.flatMap((event) => {
+      const paths = record(event.payload).attachments;
+      return event.kind === 'user_message' && Array.isArray(paths)
+        ? paths.filter((value): value is string => typeof value === 'string' && value.length <= 400)
+        : [];
+    })
+  ];
+  const found = new Set<string>([
+    ...BRIEFS,
+    ...namedAttachments,
+    ...taskSourceFiles(events).keys()
+  ]);
   const add = (value: unknown, cwd = 'workspace') => {
     if (typeof value !== 'string' || value.length > 1024 || value.includes('\0')) return;
     const relative = value.startsWith('workspace/') ? value : path.posix.join(cwd, value);
@@ -44,7 +57,7 @@ export function projectSourcePaths(
             add(match[1], cwd);
         }
   }
-  const exactAttachments = new Set(attachments.map((value) => path.posix.normalize(value)));
+  const exactAttachments = new Set(namedAttachments.map((value) => path.posix.normalize(value)));
   const selected = new Set<string>();
   for (const value of found) {
     const normalized = path.posix.normalize(value);

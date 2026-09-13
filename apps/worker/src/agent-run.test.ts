@@ -711,6 +711,28 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+describe('owner message attachments', () => {
+  it('delivers sealed attachment references in the first owner message sent to the model', async () => {
+    const task = makeTask();
+    const prompt = 'Read the attached note.';
+    task.promptCiphertext = encryptJson(
+      { prompt, attachments: ['workspace/note.txt'] },
+      dataKey,
+      `task-prompt:${workspaceId}`
+    );
+    const probe = probeStore(() => task);
+    const log: FetchLog = { calls: [], modelRequests: [] };
+    installFetch([textFrame('I can inspect the note.')], log);
+    await new AgentWorker(probe.store, config(), masterKey, runnerSecret).run(task);
+    expect(log.modelRequests.length).toBeGreaterThan(0);
+    const messages = log.modelRequests[0]!.messages as Array<{ role: string; content: string }>;
+    const owner = messages.find((message) => message.role === 'user');
+    expect(owner).toBeDefined();
+    expect(owner!.content).toContain(prompt);
+    expect(owner!.content).toContain('workspace/note.txt');
+  });
+});
+
 describe('the turn wall clock', () => {
   /**
    * Nothing in the product bounded a turn on time. The credit ceiling is what stops a frontier
@@ -5491,7 +5513,7 @@ describe('a correction sent while the task is working', () => {
           taskId,
           userId,
           promptCiphertext: encryptJson(
-            { prompt: 'Stop - use Postgres, not SQLite.' },
+            { prompt: 'Stop - use Postgres, not SQLite.', attachments: ['workspace/schema.sql'] },
             dataKey,
             `task-message:${taskId}`
           ),
@@ -5537,13 +5559,19 @@ describe('a correction sent while the task is working', () => {
       )
     ).toMatchObject({
       messageId: 'correction-1',
-      markdown: 'Stop - use Postgres, not SQLite.'
+      markdown: 'Stop - use Postgres, not SQLite.',
+      attachments: ['workspace/schema.sql']
     });
 
     // And it reached the provider as the owner's own words, in the same turn.
     const sent = log.modelRequests.at(-1)?.messages as Array<{ role: string; content: string }>;
     expect(
-      sent.some((message) => message.role === 'user' && message.content.includes('use Postgres'))
+      sent.some(
+        (message) =>
+          message.role === 'user' &&
+          message.content.includes('use Postgres') &&
+          message.content.includes('workspace/schema.sql')
+      )
     ).toBe(true);
     // The turn was kept: the work done before the correction is still in the window.
     expect(sent.some((message) => message.role === 'tool')).toBe(true);
@@ -5605,7 +5633,7 @@ describe('queued message spending', () => {
               taskId,
               userId,
               promptCiphertext: encryptJson(
-                { prompt: 'Check the saved result next.' },
+                { prompt: 'Check the saved result next.', attachments: ['workspace/result.csv'] },
                 dataKey,
                 `task-message:${taskId}`
               ),
@@ -5654,14 +5682,17 @@ describe('queued message spending', () => {
       )
     ).toMatchObject({
       messageId: 'funded-followup',
-      markdown: 'Check the saved result next.'
+      markdown: 'Check the saved result next.',
+      attachments: ['workspace/result.csv']
     });
     const next = decryptJson<{
       reservationKey: string;
       messages: Array<{ role: string; content: string }>;
     }>(promoted[0]?.agentStateCiphertext as Parameters<typeof decryptJson>[0], dataKey);
     expect(next.reservationKey).toBe('funded-followup-reservation');
-    expect(next.messages.at(-1)).toEqual({ role: 'user', content: 'Check the saved result next.' });
+    expect(next.messages.at(-1)).toMatchObject({ role: 'user' });
+    expect(next.messages.at(-1)?.content).toContain('Check the saved result next.');
+    expect(next.messages.at(-1)?.content).toContain('workspace/result.csv');
   });
 
   it.each([false, true])(
@@ -5919,7 +5950,11 @@ describe('a question the agent stops to ask', () => {
           id: 'answer-1',
           taskId,
           userId,
-          promptCiphertext: encryptJson({ prompt: 'billing@' }, dataKey, `task-message:${taskId}`),
+          promptCiphertext: encryptJson(
+            { prompt: 'billing@', attachments: ['workspace/invoice.pdf'] },
+            dataKey,
+            `task-message:${taskId}`
+          ),
           modelId: model.id,
           privacyRoute: 'provider_zdr',
           maxComputeCredits: 5,
@@ -5957,14 +5992,20 @@ describe('a question the agent stops to ask', () => {
       )
     ).toMatchObject({
       messageId: 'answer-1',
-      markdown: 'billing@'
+      markdown: 'billing@',
+      attachments: ['workspace/invoice.pdf']
     });
     const sent = log.modelRequests.at(-1)?.messages as Array<{ role: string; content: string }>;
     // Their words, in their own role, in the same window as the question - so the turn carries on
     // with everything it had already established rather than re-deriving it from a new turn.
-    expect(sent.some((message) => message.role === 'user' && message.content === 'billing@')).toBe(
-      true
-    );
+    expect(
+      sent.some(
+        (message) =>
+          message.role === 'user' &&
+          message.content.startsWith('billing@') &&
+          message.content.includes('workspace/invoice.pdf')
+      )
+    ).toBe(true);
     expect(sent.some((message) => message.role === 'tool')).toBe(true);
     expect(decryptCheckpoints(probe.checkpoints).at(-1)).not.toHaveProperty('question');
   });

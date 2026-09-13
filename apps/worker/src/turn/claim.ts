@@ -15,7 +15,7 @@ import { codingMissionView } from '@athanor/data';
  * `state` is the trajectory, and the caller mutates it from the next line onward. Handing back one
  * object that mixed them would make the read-only half look editable.
  */
-import { decryptJson, unwrapDataKey } from '@athanor/core';
+import { ownerMessageContent, type OwnerMessage, decryptJson, unwrapDataKey } from '@athanor/core';
 import {
   resolveWebToolPlan,
   type ConnectorKind,
@@ -136,7 +136,7 @@ export const claimTurn = async (
   const workspace = await deps.store.getWorkspaceById(task.workspaceId);
   if (!workspace?.wrappedKey) throw new Error('Workspace key not found');
   const key = unwrapDataKey(workspace.wrappedKey, deps.masterKey, workspace.id);
-  const prompt = decryptJson<{ prompt: string }>(task.promptCiphertext, key);
+  const prompt = decryptJson<OwnerMessage>(task.promptCiphertext, key);
   const catalog = (await deps.store.listModels()) as unknown as ModelRelease[];
   const savedState = task.agentStateCiphertext
     ? decryptJson<AgentState>(task.agentStateCiphertext, key)
@@ -144,7 +144,7 @@ export const claimTurn = async (
   const state: AgentState = savedState ?? {
     messages: [
       { role: 'system', content: BASE_SYSTEM_PROMPT },
-      { role: 'user', content: prompt.prompt }
+      { role: 'user', content: ownerMessageContent(prompt) }
     ],
     step: 0,
     credits: 0,

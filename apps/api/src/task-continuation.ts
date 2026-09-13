@@ -231,9 +231,21 @@ async function performContinuation(
       reservationKey: `task:${task.id}:message:${messageId}:reservation`,
       ...(!retained && input.interrupt ? { interrupt: true } : {}),
       ...(retained ? { queuedEventId: messageId } : {}),
-      promptCiphertext: encryptJson({ prompt: input.prompt }, dataKey, `task-message:${task.id}`),
+      promptCiphertext: encryptJson(
+        {
+          prompt: input.prompt,
+          attachments: input.attachments?.length ? input.attachments : undefined
+        },
+        dataKey,
+        `task-message:${task.id}`
+      ),
       queuedEventCiphertext: encryptJson(
-        { markdown: input.prompt, messageId, position: task.queuedMessageCount + 1 },
+        {
+          markdown: input.prompt,
+          attachments: input.attachments?.length ? input.attachments : undefined,
+          messageId,
+          position: task.queuedMessageCount + 1
+        },
         dataKey,
         `task-event:${task.id}`
       )
@@ -270,6 +282,7 @@ async function performContinuation(
     : `task:${task.id}:turn:${nextTurn}:reservation`;
   const nextState = startTurnState(previousState, {
     prompt: input.prompt,
+    attachments: input.attachments,
     turn: nextTurn,
     reservationKey
   });
@@ -286,7 +299,10 @@ async function performContinuation(
     reservationKey,
     resourceClass: selected.usageClass,
     userMessageCiphertext: encryptJson(
-      { markdown: input.prompt },
+      {
+        markdown: input.prompt,
+        attachments: input.attachments?.length ? input.attachments : undefined
+      },
       dataKey,
       `task-event:${task.id}`
     ),

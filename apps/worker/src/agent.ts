@@ -12,6 +12,7 @@ import {
   type WebToolPlan
 } from '@athanor/contracts';
 import {
+  type OwnerMessage,
   decryptJson,
   encryptJson,
   readInferenceConnections,
@@ -1767,10 +1768,10 @@ export class AgentWorker {
             'queued_message_context',
             'Queued message encryption context is invalid'
           );
-        const prompt = decryptJson<{ prompt: string }>(queued.promptCiphertext, key).prompt;
+        const message = decryptJson<OwnerMessage>(queued.promptCiphertext, key);
         const nextTurn = turn + 1;
         const nextState = startTurnState(state as unknown as Record<string, unknown>, {
-          prompt,
+          ...message,
           turn: nextTurn,
           reservationKey: queued.reservationKey
         }) as unknown as AgentState;
@@ -1784,7 +1785,7 @@ export class AgentWorker {
           ...(queued.maxSpendUsd === null ? {} : { additionalSpendUsd: queued.maxSpendUsd }),
           agentStateCiphertext: encryptJson(nextState, key, `task-state:${task.id}`),
           userMessageCiphertext: encryptJson(
-            { markdown: prompt, messageId: queued.id },
+            { markdown: message.prompt, attachments: message.attachments, messageId: queued.id },
             key,
             `task-event:${task.id}`
           ),
@@ -2544,9 +2545,13 @@ export class AgentWorker {
       // not be able to throw: this is the last thing said about a conversation that has already
       // failed once, and losing the refusal to a bad envelope would leave the owner with silence.
       let markdown = '';
+      let attachments: string[] | undefined;
       try {
-        if (queued.promptCiphertext.aad === `task-message:${task.id}`)
-          markdown = decryptJson<{ prompt: string }>(queued.promptCiphertext, key).prompt.trim();
+        if (queued.promptCiphertext.aad === `task-message:${task.id}`) {
+          const message = decryptJson<OwnerMessage>(queued.promptCiphertext, key);
+          markdown = message.prompt.trim();
+          attachments = message.attachments;
+        }
       } catch {
         markdown = '';
       }
@@ -2556,7 +2561,11 @@ export class AgentWorker {
         key,
         'warning',
         `Your message was not started, and athanor is not going to start it on its own.${exhausted}${markdown ? ` What you sent was: "${markdown.slice(0, 240)}"` : ''} Send it again to try.`,
-        { owner: true, code: 'queued_message_undelivered', ...(markdown ? { markdown } : {}) }
+        {
+          owner: true,
+          code: 'queued_message_undelivered',
+          ...(markdown ? { markdown, attachments } : {})
+        }
       ).catch(() => undefined);
     }
   }

@@ -2,7 +2,8 @@ import { useEffect, useState } from 'react';
 import { GitBranch } from 'lucide-react';
 import type { Task, TaskEvent, TaskRewindPreview, RewindScope } from '@athanor/contracts';
 import { get, post } from './client';
-import { eventText } from './model';
+import { data, eventText } from './model';
+import MessageAttachmentList from './MessageAttachmentList';
 import { Button, ErrorNotice, Field } from './ui';
 
 export default function Trajectory({
@@ -49,6 +50,10 @@ export default function Trajectory({
   return (
     <div className="stack">
       <p>{event.summary}</p>
+      <MessageAttachmentList
+        workspaceId={task.workspaceId}
+        paths={data(event.payload).attachments}
+      />
       <Field label="Continue with">
         <select
           value={operation}

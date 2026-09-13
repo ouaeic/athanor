@@ -10,7 +10,13 @@
  * lease-guarded writes matched no rows, its timeline events are not lease-guarded and did, and the
  * conversation gained a second copy of the batch.
  */
-import { AthanorError, decryptJson, encryptJson } from '@athanor/core';
+import {
+  ownerMessageContent,
+  type OwnerMessage,
+  AthanorError,
+  decryptJson,
+  encryptJson
+} from '@athanor/core';
 import type { DataStore, TaskRecord } from '@athanor/data';
 import type { ModelMessage, ModelTool } from '@athanor/model-gateway';
 import type { AgentState, AgentWorkerConfig } from './agent-state.js';
@@ -49,13 +55,14 @@ export const drainCorrection = async (
 ): Promise<boolean> => {
   const queued = await deps.store.getNextQueuedTaskMessage(task.id, { interruptOnly: true });
   if (!queued?.interrupt) return false;
-  const correction = decryptJson<{ prompt: string }>(queued.promptCiphertext, key).prompt;
+  const message = decryptJson<OwnerMessage>(queued.promptCiphertext, key);
+  const correction = message.prompt;
   if (!correction.trim()) return false;
   const nextState = structuredClone(state);
   if (!queued.approvalId)
     nextState.ownerReasoningEffort = queued.reasoningEffort ?? task.reasoningEffort ?? 'auto';
   sealUnansweredToolCalls(nextState.messages, 'the user redirected the task before this call ran');
-  nextState.messages.push({ role: 'user', content: correction });
+  nextState.messages.push({ role: 'user', content: ownerMessageContent(message) });
   const consumed = await deps.store.consumeQueuedTaskMessageInTurn({
     taskId: task.id,
     messageId: queued.id,
@@ -63,7 +70,7 @@ export const drainCorrection = async (
     additionalComputeCredits: queued.maxComputeCredits,
     ...(queued.maxSpendUsd === null ? {} : { additionalSpendUsd: queued.maxSpendUsd }),
     userMessageCiphertext: encryptJson(
-      { markdown: correction, messageId: queued.id },
+      { markdown: correction, attachments: message.attachments, messageId: queued.id },
       key,
       `task-event:${task.id}`
     ),

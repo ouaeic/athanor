@@ -44,6 +44,7 @@ import { TaskOutputs, TaskProgress } from './TaskCanvas';
 import WorkTrace from './WorkTrace';
 import { currentWork } from './current-work';
 import { completionChecks, evidenceSource } from './completion-checks';
+import MessageAttachmentList from './MessageAttachmentList';
 import './presentation.css';
 import { effortLabel } from './reasoning-options';
 const PlanEditor = lazy(() => import('./PlanEditor'));
@@ -228,6 +229,8 @@ export default function TaskSurface({
   const ownerDirections = events.filter((event) =>
     ['user_message', 'queued_message'].includes(event.kind)
   );
+  if (opening && !ownerDirections.some((event) => event.id === opening.id))
+    ownerDirections.unshift(opening);
   /*
    * How long this has taken. A finished run ends at `completedAt`, not at `updatedAt`: the latter
    * moves when the conversation is renamed, pinned or shared, so a run measured that way keeps
@@ -956,6 +959,10 @@ export default function TaskSurface({
                     <Suspense fallback={<p>{event.summary}</p>}>
                       <Markdown>{eventText(event)}</Markdown>
                     </Suspense>
+                    <MessageAttachmentList
+                      workspaceId={task.workspaceId}
+                      paths={data(event.payload).attachments}
+                    />
                     <small className="muted">{date(event.createdAt)}</small>
                   </div>
                 </li>
@@ -1079,6 +1086,12 @@ export default function TaskSurface({
             </Suspense>
           ) : (
             <pre>{JSON.stringify(evidence.payload, null, 2)}</pre>
+          )}
+          {evidence.kind === 'user_message' && (
+            <MessageAttachmentList
+              workspaceId={task.workspaceId}
+              paths={data(evidence.payload).attachments}
+            />
           )}
         </Dialog>
       )}

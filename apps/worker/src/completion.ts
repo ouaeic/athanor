@@ -12,6 +12,7 @@
  *
  * Lifted out of `agent.ts` unchanged by Wave 7.1.
  */
+import { ownerMessageContent, type OwnerMessage } from '@athanor/core';
 import type { ModelToolCall } from '@athanor/model-gateway';
 import {
   acceptanceObservation,
@@ -135,12 +136,12 @@ const DECLARATION_TOOLS = new Set([
  */
 export const startTurnState = <T extends Record<string, unknown>>(
   previous: T,
-  input: { prompt: string; turn: number; reservationKey: string }
+  input: OwnerMessage & { turn: number; reservationKey: string }
 ): T => {
   const messages: unknown[] = Array.isArray(previous.messages) ? previous.messages : [];
   const next = {
     ...previous,
-    messages: [...messages, { role: 'user', content: input.prompt }],
+    messages: [...messages, { role: 'user', content: ownerMessageContent(input) }],
     step: 0,
     turn: input.turn,
     reservationKey: input.reservationKey,

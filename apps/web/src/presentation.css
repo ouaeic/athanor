@@ -10,6 +10,34 @@
   padding: 1.25rem;
   line-height: 1.6;
 }
+.message-attachment-list {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0.85rem 0;
+  padding: 0;
+  list-style: none;
+  min-width: 0;
+}
+.message-attachment-list li {
+  display: block;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.message-attachment-list a {
+  display: grid;
+  gap: 0.2rem;
+  padding: 0.7rem 0.85rem;
+  border: 1px solid var(--line, #727c6940);
+  border-radius: 0.65rem;
+  overflow-wrap: anywhere;
+  min-width: 0;
+  color: inherit;
+}
+.message-attachment-list small {
+  opacity: 0.7;
+}
 .garden-preview-live {
   position: relative;
   min-width: 0;

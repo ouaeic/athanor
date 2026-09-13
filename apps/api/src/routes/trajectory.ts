@@ -15,7 +15,13 @@ import type {
   TaskRewindPreview,
   ModelRelease
 } from '@athanor/contracts';
-import { AthanorError, decryptJson, encryptJson, unwrapDataKey } from '@athanor/core';
+import {
+  AthanorError,
+  decryptJson,
+  encryptJson,
+  unwrapDataKey,
+  ownerMessageContent
+} from '@athanor/core';
 import type { UserRecord, WorkspaceCheckpointRecord } from '@athanor/data';
 import type { z } from 'zod';
 import { checkpointResponse, ownerPriceCeiling } from '../context.js';
@@ -180,18 +186,32 @@ export const registerTrajectoryRoutes = (context: RouteContext): void => {
         ? event.sequence <= target.sequence
         : event.sequence < target.sequence
     );
-    const eventMarkdown = (event: (typeof conversational)[number]): string => {
-      if (!event.payloadCiphertext) return '';
+    type MessagePayload = { markdown?: string; attachments?: string[] };
+    const messagePayloads = new Map<string, MessagePayload>();
+    const eventPayload = (event: (typeof conversational)[number]): MessagePayload => {
+      const cached = messagePayloads.get(event.id);
+      if (cached) return cached;
+      if (!event.payloadCiphertext) return {};
       if (event.payloadCiphertext.aad !== `task-event:${parent.id}`)
         throw new AthanorError(
           'encrypted_event_context',
           'Task event encryption context is invalid'
         );
-      return decryptJson<{ markdown?: string }>(event.payloadCiphertext, dataKey).markdown ?? '';
+      const payload = decryptJson<MessagePayload>(event.payloadCiphertext, dataKey);
+      messagePayloads.set(event.id, payload);
+      return payload;
+    };
+    const eventMarkdown = (event: (typeof conversational)[number]): string =>
+      eventPayload(event).markdown ?? '';
+    const eventModelContent = (event: (typeof conversational)[number]): string => {
+      const payload = eventPayload(event);
+      return event.kind === 'user_message' && payload.markdown
+        ? ownerMessageContent({ prompt: payload.markdown, attachments: payload.attachments })
+        : (payload.markdown ?? '');
     };
     let inheritedMessages: Array<Record<string, unknown> & { role: string; content: string }> =
       copiedEvents.flatMap((event) => {
-        const markdown = eventMarkdown(event);
+        const markdown = eventModelContent(event);
         return markdown
           ? [
               {
@@ -224,7 +244,7 @@ export const registerTrajectoryRoutes = (context: RouteContext): void => {
           const expected = conversational[nextEvent];
           if (!expected) break;
           const expectedRole = expected.kind === 'user_message' ? 'user' : 'assistant';
-          if (message.role !== expectedRole || message.content !== eventMarkdown(expected))
+          if (message.role !== expectedRole || message.content !== eventModelContent(expected))
             continue;
           eventIndexes.set(expected.id, messageIndex);
           nextEvent += 1;
@@ -315,6 +335,16 @@ export const registerTrajectoryRoutes = (context: RouteContext): void => {
 
     const parentTitle = await taskTitle(parent, workspace);
     const editedPrompt = input.operation === 'edit' ? input.prompt : undefined;
+    const editedAttachments = editedPrompt ? eventPayload(target).attachments : undefined;
+    const lastOwnerEvent = [...copiedEvents]
+      .reverse()
+      .find((event) => event.kind === 'user_message');
+    const retriedMessage = lastOwnerEvent ? eventPayload(lastOwnerEvent) : {};
+    const promptAttachments = editedPrompt
+      ? editedAttachments
+      : input.operation === 'retry'
+        ? retriedMessage.attachments
+        : undefined;
     const title = (
       input.operation === 'edit'
         ? `${editedPrompt!.split(/\s+/).slice(0, 9).join(' ')} · edited`
@@ -331,7 +361,14 @@ export const registerTrajectoryRoutes = (context: RouteContext): void => {
     const trajectoryMessages = [
       ...systemMessages,
       ...inheritedMessages,
-      ...(editedPrompt ? [{ role: 'user', content: editedPrompt }] : []),
+      ...(editedPrompt
+        ? [
+            {
+              role: 'user',
+              content: ownerMessageContent({ prompt: editedPrompt, attachments: editedAttachments })
+            }
+          ]
+        : []),
       trajectoryInstruction
     ];
     const agentStateCiphertext = editingInitialPrompt
@@ -344,7 +381,8 @@ export const registerTrajectoryRoutes = (context: RouteContext): void => {
     const prompt =
       editedPrompt ??
       (input.operation === 'retry'
-        ? ([...inheritedMessages].reverse().find((message) => message.role === 'user')?.content ??
+        ? (retriedMessage.markdown ??
+          [...inheritedMessages].reverse().find((message) => message.role === 'user')?.content ??
           'Retry the preceding user request.')
         : 'Continue from this conversation branch.');
     await restoreComputer();
@@ -363,7 +401,11 @@ export const registerTrajectoryRoutes = (context: RouteContext): void => {
       status: runsImmediately ? 'queued' : 'completed',
       maxComputeCredits: reservedCredits,
       maxSpendUsd: spendCeilingUsd,
-      promptCiphertext: encryptJson({ prompt }, dataKey, `task-prompt:${workspace.id}`),
+      promptCiphertext: encryptJson(
+        { prompt, attachments: promptAttachments },
+        dataKey,
+        `task-prompt:${workspace.id}`
+      ),
       agentStateCiphertext,
       rewindScope,
       restoredCheckpointId: restoredCheckpoint?.id ?? null
@@ -410,7 +452,16 @@ export const registerTrajectoryRoutes = (context: RouteContext): void => {
         taskId: fork.id,
         kind: event.kind,
         summary: event.summary,
-        payloadCiphertext: encryptJson({ markdown }, dataKey, `task-event:${fork.id}`)
+        payloadCiphertext: encryptJson(
+          {
+            markdown,
+            ...(event.kind === 'user_message'
+              ? { attachments: eventPayload(event).attachments }
+              : {})
+          },
+          dataKey,
+          `task-event:${fork.id}`
+        )
       });
     }
     if (editedPrompt) {
@@ -419,7 +470,7 @@ export const registerTrajectoryRoutes = (context: RouteContext): void => {
         kind: 'user_message',
         summary: 'Edited user message',
         payloadCiphertext: encryptJson(
-          { markdown: editedPrompt, editedFromEventId: target.id },
+          { markdown: editedPrompt, attachments: editedAttachments, editedFromEventId: target.id },
           dataKey,
           `task-event:${fork.id}`
         )
