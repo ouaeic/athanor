@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import type { DebugSession } from '@athanor/contracts';
 import { get, post } from '../client';
 import { message } from './format';
+const SourceInspector = lazy(() => import('./SourceInspector'));
 
 export function DebugSessionCard({
   session,
@@ -13,6 +14,9 @@ export function DebugSessionCard({
   onStop: () => void;
 }) {
   const [confirm, setConfirm] = useState(false);
+  const [source, setSource] = useState<DebugSession['frames'][number] | null>(null);
+  const [sourceDirty, setSourceDirty] = useState(false);
+  const [sourceEdited, setSourceEdited] = useState(false);
   const active = !['terminated', 'lost'].includes(session.state) || session.cleanupPending;
   const stopping = session.state === 'stopping';
   return (
@@ -40,9 +44,9 @@ export function DebugSessionCard({
             {session.frames.map((frame) => (
               <li key={frame.id}>
                 <code>{frame.name}</code>
-                <span className="muted">
+                <button className="button" disabled={sourceDirty} onClick={() => setSource(frame)}>
                   {frame.path}:{frame.line}
-                </span>
+                </button>
               </li>
             ))}
           </ol>
@@ -50,6 +54,32 @@ export function DebugSessionCard({
       )}
       {session.excludedFrames > 0 && (
         <p className="muted">External library frames are excluded from source inspection.</p>
+      )}
+      {source && (
+        <div className="stack">
+          <Suspense fallback={<p role="status">Opening paused source…</p>}>
+            <SourceInspector
+              key={`${session.workspaceId}:${source.path}:${source.line}`}
+              workspaceId={session.workspaceId}
+              path={source.path}
+              line={source.line}
+              expectedHash={source.sourceHash}
+              onDirtyChange={setSourceDirty}
+              onSaved={async () => setSourceEdited(true)}
+            />
+          </Suspense>
+          {sourceEdited && (
+            <p role="status">
+              Source saved. The paused process still uses its loaded code; restart the debugging
+              task to test these edits.
+            </p>
+          )}
+          <div>
+            <button className="button" disabled={sourceDirty} onClick={() => setSource(null)}>
+              Close source
+            </button>
+          </div>
+        </div>
       )}
       {session.variables.length > 0 && (
         <details open>

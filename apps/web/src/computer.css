@@ -76,6 +76,18 @@ button.computer-file-row:hover {
   display: grid;
   gap: 0.8rem;
 }
+.garden-source-inspector {
+  margin-block: 1rem;
+  padding-block: 1rem;
+  border-block: 1px solid var(--line);
+}
+.garden-source-inspector > .row {
+  gap: 0.75rem;
+}
+.garden-source-inspector .computer-source {
+  height: auto;
+  min-height: 8rem;
+}
 .computer-source {
   width: 100%;
   height: 420px;

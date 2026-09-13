@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import type { CodingMission, CodingMissionReview } from '@athanor/contracts';
 import { get, post } from './client';
 import { Button, Dialog, ErrorNotice } from './ui';
 import { bytes, money } from './model';
+const SourceInspector = lazy(() => import('./computer/SourceInspector'));
 
 const labels: Record<CodingMission['state'], string> = {
   preparing: 'Preparing workspace',
@@ -18,7 +19,15 @@ const labels: Record<CodingMission['state'], string> = {
   integrated: 'Changes applied'
 };
 
-export function MissionReviewChanges({ review }: { review: CodingMissionReview }) {
+export function MissionReviewChanges({
+  review,
+  onInspect,
+  editing = false
+}: {
+  review: CodingMissionReview;
+  onInspect?: (path: string) => void;
+  editing?: boolean;
+}) {
   return (
     <div className="garden-mission-changes stack">
       <p>{review.detail}</p>
@@ -36,12 +45,19 @@ export function MissionReviewChanges({ review }: { review: CodingMissionReview }
           </p>
           {change.diff && <pre className="garden-mission-diff">{change.diff}</pre>}
           {change.kind !== 'deleted' && (
-            <a
-              download={change.path.split('/').at(-1)}
-              href={`/v1/workspaces/${review.mission.workspaceId}/download?path=${encodeURIComponent(change.path)}`}
-            >
-              Download proposed file
-            </a>
+            <div className="row">
+              {onInspect && (
+                <Button disabled={editing} onClick={() => onInspect(change.path)}>
+                  Inspect proposed file
+                </Button>
+              )}
+              <a
+                download={change.path.split('/').at(-1)}
+                href={`/v1/workspaces/${review.mission.workspaceId}/download?path=${encodeURIComponent(change.path)}`}
+              >
+                Download proposed file
+              </a>
+            </div>
           )}
         </details>
       ))}
@@ -65,6 +81,10 @@ export default function CodingMissions({
   const [loadError, setLoadError] = useState<unknown>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [revision, setRevision] = useState(0);
+  const [source, setSource] = useState<string | null>(null);
+  const [sourceDirty, setSourceDirty] = useState(false);
+  const [sourceSaving, setSourceSaving] = useState(false);
+  const [reviewStale, setReviewStale] = useState(false);
   useEffect(() => {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
@@ -97,9 +117,10 @@ export default function CodingMissions({
     setBusy(id);
     setError(null);
     try {
-      if (operation === 'review')
+      if (operation === 'review') {
         setReview(await post<CodingMissionReview>(`/v1/coding-missions/${id}/review`, {}));
-      else {
+        setReviewStale(false);
+      } else {
         await post(
           `/v1/coding-missions/${id}/${operation}`,
           operation === 'integrate' && review
@@ -107,6 +128,7 @@ export default function CodingMissions({
             : {}
         );
         setReview(null);
+        setSource(null);
         setRevision((value) => value + 1);
         onChange();
       }
@@ -115,6 +137,15 @@ export default function CodingMissions({
     } finally {
       setBusy(null);
     }
+  }
+  function closeReview() {
+    if (sourceSaving) return;
+    if (sourceDirty) {
+      setError(new Error('Save or discard the file edits before closing this review.'));
+      return;
+    }
+    setReview(null);
+    setSource(null);
   }
   if (!missions.length && !error && !loadError) return null;
   return (
@@ -175,14 +206,63 @@ export default function CodingMissions({
         </article>
       ))}
       {review && (
-        <Dialog title={`Review ${review.mission.name}`} wide onClose={() => setReview(null)}>
+        <Dialog title={`Review ${review.mission.name}`} wide onClose={closeReview}>
           <ErrorNotice error={error} />
-          <MissionReviewChanges review={review} />
+          <MissionReviewChanges
+            review={review}
+            onInspect={setSource}
+            editing={sourceDirty || sourceSaving || busy !== null}
+          />
+          {source && (
+            <Suspense fallback={<p role="status">Opening proposed source…</p>}>
+              <SourceInspector
+                key={`${review.mission.workspaceId}:${source}`}
+                workspaceId={review.mission.workspaceId}
+                path={source}
+                expectedHash={review.changes.find((change) => change.path === source)?.resultHash}
+                onDirtyChange={(dirty) => {
+                  setSourceDirty(dirty);
+                  if (dirty) setReviewStale(true);
+                }}
+                onSavingChange={setSourceSaving}
+                onSaved={async () => {
+                  setReviewStale(true);
+                  try {
+                    const next = await post<CodingMissionReview>(
+                      `/v1/coding-missions/${review.mission.id}/review`,
+                      {}
+                    );
+                    setReview(next);
+                    setReviewStale(false);
+                  } catch (cause) {
+                    setError(cause);
+                  }
+                  onChange();
+                }}
+              />
+            </Suspense>
+          )}
+          {reviewStale && (
+            <p role="status">
+              Refresh the review after saving or discarding edits before applying changes.
+            </p>
+          )}
           <div className="row">
-            <Button onClick={() => setReview(null)}>Close review</Button>
+            <Button disabled={sourceSaving} onClick={closeReview}>
+              Close review
+            </Button>
+            {reviewStale && (
+              <Button
+                disabled={sourceDirty || sourceSaving}
+                busy={busy === review.mission.id}
+                onClick={() => void action(review.mission.id, 'review')}
+              >
+                Refresh review
+              </Button>
+            )}
             <Button
               busy={busy === review.mission.id}
-              disabled={!review.canIntegrate}
+              disabled={!review.canIntegrate || sourceDirty || sourceSaving || reviewStale}
               onClick={() => void action(review.mission.id, 'integrate')}
             >
               Apply reviewed changes

@@ -725,9 +725,10 @@ export default function TaskSurface({
                                     : 'Verification not recorded'}
                     </span>
                   </div>
-                  {!answer.markdown && text(completion.summary) && (
-                    <p>{text(completion.summary)}</p>
-                  )}
+                  {text(completion.summary) &&
+                    text(completion.summary).trim() !== answer.markdown.trim() && (
+                      <p>{text(completion.summary)}</p>
+                    )}
                   {strings(verification.remainingRisks).length > 0 && (
                     <div className="remaining-risks">
                       <strong>Still to consider</strong>

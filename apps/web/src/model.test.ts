@@ -100,19 +100,29 @@ describe('the current work surface', () => {
     });
   });
 
-  it('uses the verified finish result instead of the tool-call introduction, while preserving an interrupted answer', () => {
+  it('preserves the answer when the timeline receipt only describes the work', () => {
     const events = [
-      event(1, 'assistant_message', { markdown: 'Perfect! Now I can finish:' }),
-      event(2, 'completed', {
-        summary: 'Created the requested note and verified its contents.',
+      event(1, 'user_message', { markdown: 'What is my current stored report label?' }),
+      event(2, 'assistant_message', { markdown: 'harbor-cobalt-46' }),
+      event(3, 'completed', {
+        summary: 'Read current stored owner memory; one active entry supplies the report label.',
         verification: { status: 'verified' }
       })
     ];
-    expect(surfaceAnswer(events).markdown).toBe(
-      'Created the requested note and verified its contents.'
-    );
-    events[1] = event(2, 'completed', { summary: 'Stopped without finish', interrupted: true });
-    expect(surfaceAnswer(events).markdown).toBe('Perfect! Now I can finish:');
+    expect(surfaceAnswer(events).markdown).toBe('harbor-cobalt-46');
+    events[2] = event(3, 'completed', { summary: 'Stopped without finish', interrupted: true });
+    expect(surfaceAnswer(events).markdown).toBe('harbor-cobalt-46');
+  });
+
+  it('uses the receipt when this completion has no reply, without borrowing an earlier answer', () => {
+    const events = [
+      event(1, 'assistant_message', { markdown: 'An earlier answer' }),
+      event(2, 'completed', { summary: 'Earlier completion' }),
+      event(3, 'user_message', { markdown: 'A new direction' }),
+      event(4, 'completed', { summary: 'Completed the new direction' })
+    ];
+    expect(surfaceAnswer(events).markdown).toBe('Completed the new direction');
+    expect(surfaceAnswer([events[3]!]).markdown).toBe('Completed the new direction');
   });
 
   it('never resurfaces an answered question while a different approval waits', () => {

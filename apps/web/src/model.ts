@@ -202,6 +202,16 @@ export function surfaceAnswer(events: TaskEvent[]): {
     !finish.interrupted &&
     text(finish.summary) &&
     (completed?.sequence ?? 0) > (message?.sequence ?? 0);
+  const completionStart = events.reduce(
+    (boundary, event) =>
+      ['completed', 'user_message'].includes(event.kind) &&
+      event.sequence < (completed?.sequence ?? 0)
+        ? Math.max(boundary, event.sequence)
+        : boundary,
+    0
+  );
+  // The completion summary is a timeline receipt; the model's answer is a separate message.
+  const replyForCompletion = message && message.sequence > completionStart;
   const boundary = Math.max(
     message?.sequence ?? 0,
     lastEvent(events, 'user_message')?.sequence ?? 0,
@@ -213,7 +223,12 @@ export function surfaceAnswer(events: TaskEvent[]): {
   if (deltas.length)
     return { markdown: deltas.map(eventText).join(''), partial: true, previous: false };
   return {
-    markdown: finished ? text(finish.summary) : message ? eventText(message) : text(finish.summary),
+    markdown:
+      finished && !replyForCompletion
+        ? text(finish.summary)
+        : message
+          ? eventText(message)
+          : text(finish.summary),
     partial: false,
     previous:
       (lastEvent(events, 'user_message')?.sequence ?? 0) >

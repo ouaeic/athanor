@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
 import { readFile, mkdir, mkdtemp, rm } from 'node:fs/promises';
@@ -407,6 +408,15 @@ const missionReview = {
     }
   ]
 };
+const inspectedFiles = new Map([
+  [`${childWorkspace.id}/workspace/controls.ts`, { text: 'newControl()\n', sha: 'after' }],
+  [
+    `${workspace.id}/workspace/main.py`,
+    { text: 'answer = 40\nprint(answer)\n', sha: 'current-source-hash' }
+  ]
+]);
+const sourceWrites = [];
+let failReviewRefresh = false;
 const computation = {
   sessionId: 'kernel-60000000-0000-4000-8000-000000000006',
   taskId: task.id,
@@ -422,6 +432,7 @@ const computation = {
 };
 const computationHistoryRequests = [];
 const projectEventRequests = [];
+let recordedReply = null;
 const historyEvent = (sequence, kind, payload) => ({
   ...event,
   id: `history-${sequence}`,
@@ -782,7 +793,45 @@ try {
     if (path.endsWith('/coding-missions'))
       return json({ missions: path.includes(childTask.id) ? [] : missions });
     if (path === `/v1/workspaces/${childWorkspace.id}`) return json(childWorkspace);
-    if (path === `/v1/coding-missions/${mission.id}/review`) return json(missionReview);
+    if (path === `/v1/coding-missions/${mission.id}/review`) {
+      if (failReviewRefresh) {
+        failReviewRefresh = false;
+        return route.fulfill({
+          status: 503,
+          json: { error: { message: 'Review temporarily unavailable' } }
+        });
+      }
+      const file = inspectedFiles.get(`${childWorkspace.id}/workspace/controls.ts`);
+      missionReview.digest = `reviewed-${file.sha}`;
+      missionReview.changes[0].resultHash = file.sha;
+      missionReview.changes[0].diff = `@@ -1 +1 @@\n-oldControl()\n+${file.text.trim()}`;
+      return json(missionReview);
+    }
+    if (path.endsWith('/file')) {
+      const key = `${path.split('/')[3]}/${url.searchParams.get('path')}`;
+      const file = inspectedFiles.get(key);
+      assert(file, `Unexpected source file ${key}`);
+      if (route.request().method() === 'PUT') {
+        sourceWrites.push({ key, expected: url.searchParams.get('expectSha256') });
+        if (url.searchParams.get('expectSha256') !== file.sha)
+          return route.fulfill({
+            status: 409,
+            json: { error: { code: 'file_changed', message: 'File changed on disk' } }
+          });
+        file.text = route.request().postData();
+        file.sha = createHash('sha256').update(file.text).digest('hex');
+        return json({ ok: true });
+      }
+      return route.fulfill({
+        contentType: 'text/plain',
+        headers: {
+          'x-content-sha256': file.sha,
+          'x-truncated': 'false',
+          'x-end-line': String(file.text.trimEnd().split('\n').length)
+        },
+        body: file.text
+      });
+    }
     if (path === `/v1/coding-missions/${mission.id}/integrate`) {
       reviewedSubmission = route.request().postDataJSON();
       mission.state = 'integrated';
@@ -895,7 +944,18 @@ try {
                 summary: 'Earlier project direction.'
               }
             ]
-          : [event],
+          : recordedReply
+            ? [
+                {
+                  ...event,
+                  id: 'recorded-answer',
+                  sequence: 2,
+                  kind: 'assistant_message',
+                  payload: { markdown: recordedReply }
+                },
+                event
+              ]
+            : [event],
         hasMore: !earlier,
         oldestSequence: earlier ? 1 : event.sequence,
         nextCursor: earlier ? 1 : event.sequence
@@ -1297,6 +1357,22 @@ try {
     await page.screenshot({ path: resolve(report, 'task-light.png') });
     await page.getByRole('button', { name: /Switch to dark/ }).click();
     await page.getByRole('button', { name: 'Hide projects', exact: true }).click();
+    recordedReply = 'harbor-cobalt-46';
+    await page.reload();
+    await page.locator('.garden-answer').getByText('harbor-cobalt-46', { exact: true }).waitFor();
+    await page
+      .locator('.completion-record')
+      .getByText(event.payload.summary, { exact: true })
+      .waitFor();
+    assert.equal(
+      await page
+        .locator('.garden-answer')
+        .getByText(event.payload.summary, { exact: true })
+        .count(),
+      0,
+      'A timeline receipt must not replace the actual answer'
+    );
+    recordedReply = null;
     presentation.results = [];
     await page.reload();
     await page.getByText('Recorded activity · latest 2 actions', { exact: true }).click();
@@ -1388,6 +1464,72 @@ try {
       await reviewDialog.locator('.garden-mission-diff').textContent(),
       /\+newControl\(\)/
     );
+    await reviewDialog.getByRole('button', { name: 'Inspect proposed file' }).click();
+    const source = reviewDialog.getByRole('region', {
+      name: 'Source workspace/controls.ts',
+      exact: true
+    });
+    const sourceInput = source.getByRole('textbox', {
+      name: 'Contents of workspace/controls.ts',
+      exact: true
+    });
+    await sourceInput.fill('revisedControl()\n');
+    assert.equal(
+      await reviewDialog.getByRole('button', { name: 'Apply reviewed changes' }).isDisabled(),
+      true
+    );
+    await reviewDialog.getByRole('button', { name: 'Close review', exact: true }).click();
+    await reviewDialog
+      .getByText('Save or discard the file edits before closing this review.', { exact: true })
+      .waitFor();
+    const proposed = inspectedFiles.get(`${childWorkspace.id}/workspace/controls.ts`);
+    proposed.text = 'externalControl()\n';
+    proposed.sha = 'external-version';
+    await source.getByRole('button', { name: 'Save changes', exact: true }).click();
+    await source.getByText('File changed on disk', { exact: true }).waitFor();
+    assert.equal(
+      await sourceInput.inputValue(),
+      'revisedControl()\n',
+      'A conflict must preserve local edits'
+    );
+    assert.equal(proposed.text, 'externalControl()\n', 'A conflict must preserve the other writer');
+    await source.getByRole('button', { name: 'Discard edits', exact: true }).click();
+    await source.getByRole('button', { name: 'Reload file', exact: true }).click();
+    await page.waitForFunction(
+      () =>
+        document.querySelector('[aria-label="Contents of workspace/controls.ts"]')?.value ===
+        'externalControl()\n'
+    );
+    await sourceInput.fill('revisedControl()\n');
+    failReviewRefresh = true;
+    await source.getByRole('button', { name: 'Save changes', exact: true }).click();
+    await reviewDialog.getByText('Review temporarily unavailable', { exact: true }).waitFor();
+    assert.equal(proposed.text, 'revisedControl()\n');
+    assert.equal(
+      await reviewDialog.getByRole('button', { name: 'Apply reviewed changes' }).isDisabled(),
+      true,
+      'An unrefreshed review cannot apply an edited file'
+    );
+    await reviewDialog.getByRole('button', { name: 'Refresh review', exact: true }).click();
+    await reviewDialog
+      .getByText('@@ -1 +1 @@\n-oldControl()\n+revisedControl()', { exact: true })
+      .waitFor();
+    assert.equal(
+      await reviewDialog.getByText('Review temporarily unavailable', { exact: true }).count(),
+      0,
+      'A refreshed review clears its previous error'
+    );
+    assert.deepEqual(sourceWrites, [
+      { key: `${childWorkspace.id}/workspace/controls.ts`, expected: 'after' },
+      { key: `${childWorkspace.id}/workspace/controls.ts`, expected: 'external-version' }
+    ]);
+    await page.setViewportSize({ width: 390, height: 844 });
+    assert(
+      await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
+      'The source review must fit a phone'
+    );
+    await page.screenshot({ path: resolve(report, 'source-review-phone.png') });
+    await page.setViewportSize({ width: 1280, height: 900 });
     await reviewDialog.getByRole('button', { name: 'Apply reviewed changes' }).click();
     await page.getByText('Changes applied', { exact: true }).waitFor();
     assert.deepEqual(
@@ -1508,6 +1650,24 @@ try {
     await page.getByText('Python · stopped', { exact: true }).waitFor();
     assert.deepEqual(computationControls, [{ action: 'interrupt' }, { action: 'stop' }]);
     await page.getByText('workspace/main.py:2', { exact: true }).waitFor();
+    await page.getByRole('button', { name: 'workspace/main.py:2', exact: true }).click();
+    const debugSource = page.getByRole('region', { name: 'Source workspace/main.py', exact: true });
+    await debugSource
+      .getByText(
+        'This file has changed since the recorded source. The contents below are current.',
+        { exact: true }
+      )
+      .waitFor();
+    const debugInput = debugSource.getByRole('textbox', { name: 'Contents of workspace/main.py' });
+    assert.equal(
+      await debugInput.evaluate((input) =>
+        input.value.slice(input.selectionStart, input.selectionEnd)
+      ),
+      'print(answer)',
+      'The paused source line must be selected'
+    );
+    assert.deepEqual(debugControls, [], 'Source inspection must not run or resume the program');
+    await page.getByRole('button', { name: 'Close source', exact: true }).click();
     await page.getByRole('button', { name: 'End debug session…', exact: true }).click();
     await page.getByRole('button', { name: 'Keep debugging', exact: true }).click();
     assert.deepEqual(debugControls, [], 'Keeping a debug session must preserve the paused program');

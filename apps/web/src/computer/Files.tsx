@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Artifact, Workspace } from '@athanor/contracts';
-import { del, get, post, request, responseError } from '../client.js';
+import { del, get, post, request } from '../client.js';
 import { download } from '../management.js';
+import { readWorkspaceFile, saveWorkspaceFile } from './workspace-file';
+import type { WorkspaceTextFile } from './workspace-file';
 import { ResultPreview } from './ResultPreview.js';
-import { artifactRequest, bytes, decodeEditableText, message } from './format.js';
+import { artifactRequest, bytes, message } from './format.js';
 
 interface Entry {
   name: string;
@@ -11,17 +13,6 @@ interface Entry {
   type: 'directory' | 'file' | 'symlink';
   sizeBytes: number;
   modifiedAt: string;
-}
-interface OpenFile {
-  path: string;
-  text: string;
-  original: string;
-  sha: string | null;
-  truncated: boolean;
-  next: number | null;
-  start: number;
-  end: number | null;
-  binary: boolean;
 }
 export function Files({
   workspace,
@@ -37,7 +28,7 @@ export function Files({
   const [entries, setEntries] = useState<Entry[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [preview, setPreview] = useState<Artifact | null>(null);
-  const [file, setFile] = useState<OpenFile | null>(null);
+  const [file, setFile] = useState<WorkspaceTextFile | null>(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [newName, setNewName] = useState('');
@@ -90,47 +81,14 @@ export function Files({
     const windowed =
       !complete &&
       (start > 1 || (entries.find((entry) => entry.path === path)?.sizeBytes ?? 262145) > 262144);
-    const query = new URLSearchParams({
-      path,
-      ...(windowed ? { startLine: String(start), maxBytes: '262144' } : {})
-    });
-    const response = await fetch(`${base}/file?${query}`, {
-      credentials: 'include',
-      signal: AbortSignal.timeout(20_000)
-    });
-    if (!response.ok) throw await responseError(response);
-    const content = new Uint8Array(await response.arrayBuffer());
+    const result = await readWorkspaceFile(workspace.id, path, { start, windowed });
     if (sequence !== readSequence.current) return;
-    const decoded = decodeEditableText(content);
-    const text = decoded ?? '';
-    const number = (header: string) =>
-      response.headers.has(header) ? Number(response.headers.get(header)) : null;
-    setFile({
-      path,
-      text,
-      original: text,
-      sha: response.headers.get('x-content-sha256'),
-      truncated: response.headers.get('x-truncated') === 'true' || start > 1,
-      next: number('x-next-start-line'),
-      start,
-      end: number('x-end-line'),
-      binary: decoded === null
-    });
+    setFile(result);
     setRename(path.split('/').at(-1) ?? path);
   };
   const save = async () => {
-    if (!file?.sha || file.truncated || file.binary)
-      throw new Error(
-        'Only a complete text file can be edited. Download this file to work with it.'
-      );
-    await request(
-      `${base}/file?${new URLSearchParams({ path: file.path, expectSha256: file.sha })}`,
-      {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: new TextEncoder().encode(file.text)
-      }
-    );
+    if (!file) return;
+    await saveWorkspaceFile(workspace.id, file);
     await read(file.path);
     await load();
   };
