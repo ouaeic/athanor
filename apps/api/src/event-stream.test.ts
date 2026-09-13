@@ -101,6 +101,8 @@ interface LatencyHarness {
    * assumed.
    */
   heldReadRows: () => number[];
+  readSizes: () => number[];
+  appendReplay: (taskId: string, count: number) => Promise<void>;
   /**
    * Turn the server's half of one connection into a peer that accepts nothing: every byte handed
    * to the socket from that point on is buffered and never completes.
@@ -348,18 +350,31 @@ const start = async (
    * so an own property shadowing the prototype takes effect for connections already open.
    */
   const readTaskEvents = store.listTaskEvents.bind(store);
+  const readTaskEventPage = store.listTaskEventPage.bind(store);
+  const readSizes: number[] = [];
   let parkedReads: Array<() => void> | null = null;
   const parkedReadRows: number[] = [];
   store.listTaskEvents = async (taskId, after) => {
     const queue = parkedReads;
-    if (!queue) return readTaskEvents(taskId, after);
     const rows = await readTaskEvents(taskId, after);
+    readSizes.push(rows.length);
+    if (!queue) return rows;
     // Only a read that has something to write is worth holding. A stream parked on an empty read
     // wakes up, writes nothing, and would make the test below green for no reason at all.
     if (rows.length === 0) return rows;
     parkedReadRows.push(rows.length);
     await new Promise<void>((resolve) => queue.push(resolve));
     return rows;
+  };
+  store.listTaskEventPage = async (taskId, options) => {
+    const queue = parkedReads;
+    const page = await readTaskEventPage(taskId, options);
+    readSizes.push(page.events.length);
+    if (queue && page.events.length) {
+      parkedReadRows.push(page.events.length);
+      await new Promise<void>((resolve) => queue.push(resolve));
+    }
+    return page;
   };
   disposers.push(async () => {
     await app.close().catch(() => undefined);
@@ -412,6 +427,16 @@ const start = async (
       for (const resolve of waiting) resolve();
     },
     heldReadRows: () => [...parkedReadRows],
+    readSizes: () => [...readSizes],
+    appendReplay: async (taskId, count) => {
+      for (let index = 0; index < count; index += 1)
+        await store.appendTaskEvent({
+          taskId,
+          kind: 'status',
+          summary: `Replay record ${index}: ${'synthetic '.repeat(30)}`
+        });
+      readSizes.length = 0;
+    },
     responseErrors: () => [...responseErrors],
     stall: (clientPort) => {
       const socket = serverSockets.get(clientPort);
@@ -790,6 +815,41 @@ describe('when a device drops and comes back', () => {
     expect(recorded.filter((event) => event.kind === 'assistant_delta')).toEqual([]);
     expect(recorded.filter((event) => event.kind === 'assistant_message').length).toBe(1);
   }, 90_000);
+});
+
+describe('bounded event replay', () => {
+  test('rejects malformed reconnect cursors instead of restarting the entire history', async () => {
+    const harness = await start('The requested result is ready.');
+    const taskId = await harness.send('Give a brief answer.');
+    for (const cursor of ['not-a-sequence', 'Infinity', '-1', '1.5']) {
+      const response = await realFetch(`${harness.origin}/v1/tasks/${taskId}/events/stream`, {
+        headers: { cookie: harness.cookie, 'last-event-id': cursor },
+        signal: AbortSignal.timeout(5000)
+      });
+      expect(response.status).toBe(400);
+      await response.body?.cancel();
+    }
+    const stream = await connect(harness, taskId);
+    await withTimeout(stream.ended, 30_000);
+  }, 40_000);
+
+  test('replays a long completed history in bounded reads without gaps or duplicates', async () => {
+    const harness = await start('The requested result is ready.');
+    const taskId = await harness.send('Give a brief answer.');
+    const initial = await connect(harness, taskId);
+    await withTimeout(initial.ended, 30_000);
+    await harness.appendReplay(taskId, 1250);
+    const replay = await connect(harness, taskId);
+    await withTimeout(replay.ended, 30_000);
+    const sizes = harness.readSizes();
+    expect(sizes.length).toBeGreaterThan(1);
+    expect(sizes.some((size) => size > 0)).toBe(true);
+    expect(Math.max(...sizes)).toBeLessThanOrEqual(250);
+    const recorded = await harness.events(taskId);
+    expect(recorded.length).toBeGreaterThan(1250);
+    expect(replay.ids()).toEqual(recorded.map((event) => event.sequence));
+    expect(new Set(replay.ids()).size).toBe(replay.ids().length);
+  }, 60_000);
 });
 
 describe('when a stream is evicted while events are flowing', () => {

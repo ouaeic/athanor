@@ -15,6 +15,7 @@ import { STREAM_TOKEN_RECHECK_MS, maxEventStreamsPerUser, revealedTaskEvent } fr
 import { requireUser } from '../http/auth-hook.js';
 import type { RouteContext } from '../http/server-context.js';
 import { errorFields } from '../log.js';
+import { writeEventFrame } from '../http/event-stream-write.js';
 
 export const registerTaskEventRoutes = (context: RouteContext): void => {
   const { log, app, database, store, masterKey, openEventStreams, nextEventStreamId } = context;
@@ -121,10 +122,12 @@ export const registerTaskEventRoutes = (context: RouteContext): void => {
        * read. Every `assistant_delta` frame is a row, and one measured turn wrote 1,015 of them.
        */
       const { after } = TaskEventWindowQuery.parse(request.query);
-      let cursor = Math.max(0, after ?? 0, Number(lastEventId ?? 0) || 0);
+      const resumed = TaskEventWindowQuery.parse({ after: lastEventId }).after;
+      let cursor = Math.max(0, after ?? 0, resumed ?? 0);
       let sending = false;
       let resend = false;
       let closed = false;
+      const streamAbort = new AbortController();
       let idleTerminalChecks = 0;
       // The credential was checked to open this connection; the clock for re-checking it starts
       // there rather than at zero, so the first re-check is one interval away and not immediate.
@@ -183,6 +186,7 @@ export const registerTaskEventRoutes = (context: RouteContext): void => {
       const close = () => {
         if (closed) return;
         closed = true;
+        streamAbort.abort();
         clearInterval(timer);
         clearInterval(heartbeat);
         unsubscribe();
@@ -190,119 +194,79 @@ export const registerTaskEventRoutes = (context: RouteContext): void => {
         if (streams.size === 0) openEventStreams.delete(user.id);
         if (!reply.raw.destroyed) reply.raw.end();
       };
+      const write = async (frame: string): Promise<boolean> => {
+        if (await writeEventFrame(reply.raw, frame, streamAbort.signal)) return true;
+        close();
+        // A peer that cannot drain must not retain the final buffer indefinitely after end().
+        if (!reply.raw.destroyed) reply.raw.destroy();
+        return false;
+      };
       const send = async () => {
         if (closed) return;
-        // A signal that lands mid-read is remembered rather than dropped, so the frame it was
-        // announcing is never left sitting in the table until the next safety-net tick.
         if (sending) {
           resend = true;
           return;
         }
         sending = true;
         try {
-          const records = await store.listTaskEvents(task.id, cursor);
-          for (const event of records) {
-            /*
-             * Re-checked per row, because `closed` can become true while this read is in flight and
-             * `send()` only tested it on the way in.
-             *
-             * Eviction is what makes that happen: it runs `close()` from another request's handler,
-             * on a connection the client has not hung up, so `reply.raw.end()` finishes a response
-             * this loop is about to write to. Node answers a write onto a finished response with
-             * `false` and an `'error'` a tick later - a tick after the `catch` below has gone, so
-             * nothing here would ever have seen it. Measured on Node 24.18.1 against a peer that
-             * had stopped reading, which is the case eviction exists for: the response is still
-             * attached to its socket, `destroyed` is still false, and the emit is real. It is
-             * absorbed today only because `reply.hijack()` leaves Fastify's own `onResFinished`
-             * listening for it, which is a thin thing for the frame's delivery to rest on.
-             */
-            if (closed) return;
-            const revealed = revealedTaskEvent(
-              event.summary,
-              event.payloadCiphertext
-                ? decryptJson(event.payloadCiphertext, dataKey, `task-event:${task.id}`)
-                : undefined
-            );
-            const response: TaskEvent = {
-              id: event.id,
-              taskId: event.taskId,
-              sequence: event.sequence,
-              kind: event.kind,
-              summary: revealed.summary,
-              ...(revealed.payload === undefined ? {} : { payload: revealed.payload }),
-              createdAt: event.createdAt
-            };
-            reply.raw.write(`id: ${event.sequence}\ndata: ${JSON.stringify(response)}\n\n`);
-            cursor = event.sequence;
-          }
-          /*
-           * A revoked token stops being able to read part-way through, not only at the next
-           * request. This stream is opened once and then lives for as long as the task does, so
-           * revoking a token the owner no longer trusts left it reading every event of every
-           * conversation until the task finished - which for a long job is hours after they
-           * pressed the button and believed they had cut it off.
-           *
-           * On a clock rather than per batch. `send()` runs once per timeline write and a streamed
-           * reply writes `assistant_delta` by the hundred, so this was a table read and a decode
-           * per frame to answer a question whose answer changes at most once in the life of a
-           * token. `STREAM_TOKEN_RECHECK_MS` is the window a revoked one keeps reading for, and it
-           * is the difference between one frame and thirty seconds - against the hours it kept
-           * reading for before the check existed.
-           */
-          if (streamToken && Date.now() - tokenCheckedAt >= STREAM_TOKEN_RECHECK_MS) {
-            tokenCheckedAt = Date.now();
-            const stillValid = (await store.listApiTokens(user.id)).some(
-              (candidate) => candidate.id === streamToken
-            );
-            if (!stillValid) {
+          do {
+            resend = false;
+            // Check authority between bounded pages, including a long reconnect replay.
+            if (streamToken && Date.now() - tokenCheckedAt >= STREAM_TOKEN_RECHECK_MS) {
+              tokenCheckedAt = Date.now();
+              const stillValid = (await store.listApiTokens(user.id)).some(
+                (candidate) => candidate.id === streamToken
+              );
+              if (!stillValid) {
+                close();
+                return;
+              }
+            }
+            const status = await streamTaskStatus();
+            if (status === null || closed) {
               close();
               return;
             }
-          }
-          const status = await streamTaskStatus();
-          // Re-read through the caller's own access scope so a revoked membership ends the stream
-          // instead of leaking events for the rest of the connection's life.
-          if (status === null) {
-            close();
-            return;
-          }
-          /*
-           * Two idle ticks and a terminal status, and this frame is the last thing the client will
-           * accept: it closes the `EventSource` explicitly, which never fires `onerror`, so the
-           * stream does not come back. Events written after it - the final `status` and `error` a
-           * worker writes when it returns from a tool call into a task that was cancelled under it -
-           * land in a transcript nobody is reading.
-           *
-           * The audit's fix for that was "also require the lease to be released". It cannot work,
-           * and the reason is worth leaving here so nobody spends another wave on it: every terminal
-           * transition clears the lease in the same statement that sets the status -
-           * `completeTaskIfNoQueued` (store.ts:3179), `setTaskStatusForUser` (:5422),
-           * `cancelTaskAndReleaseReservations` (:5451) and the failure path (:5614) all write
-           * `lease_owner=NULL` alongside it, deliberately, so the workspace is released for the next
-           * turn. A lease test here is therefore always true at this point and changes nothing. What
-           * is actually wrong is that the client treats this frame as final; the fix belongs at
-           * `apps/web/src/App.tsx:1497`, which reopens on `onerror` and on nothing else.
-           */
-          if (['completed', 'failed', 'cancelled'].includes(status)) {
-            idleTerminalChecks = records.length === 0 ? idleTerminalChecks + 1 : 0;
-            if (idleTerminalChecks >= 2) {
-              reply.raw.write(`event: terminal\ndata: ${JSON.stringify({ status })}\n\n`);
-              close();
+            const page = await store.listTaskEventPage(task.id, { after: cursor, limit: 250 });
+            for (const event of page.events) {
+              if (closed) return;
+              const revealed = revealedTaskEvent(
+                event.summary,
+                event.payloadCiphertext
+                  ? decryptJson(event.payloadCiphertext, dataKey, `task-event:${task.id}`)
+                  : undefined
+              );
+              const response: TaskEvent = {
+                id: event.id,
+                taskId: event.taskId,
+                sequence: event.sequence,
+                kind: event.kind,
+                summary: revealed.summary,
+                ...(revealed.payload === undefined ? {} : { payload: revealed.payload }),
+                createdAt: event.createdAt
+              };
+              if (!(await write(`id: ${event.sequence}\ndata: ${JSON.stringify(response)}\n\n`)))
+                return;
+              cursor = event.sequence;
             }
-          } else {
-            idleTerminalChecks = 0;
-          }
+            if (['completed', 'failed', 'cancelled'].includes(status)) {
+              idleTerminalChecks = page.events.length === 0 ? idleTerminalChecks + 1 : 0;
+              if (idleTerminalChecks >= 2) {
+                await write(`event: terminal\ndata: ${JSON.stringify({ status })}\n\n`);
+                close();
+                return;
+              }
+            } else {
+              idleTerminalChecks = 0;
+            }
+            // Drain consecutive pages in this loop; recursive sends would retain their buffers.
+            if (page.hasMore) resend = true;
+          } while (resend && !closed);
         } catch (error) {
-          // The client sees the stream drop and reconnects, so the only record that the timeline
-          // stopped because a read or a decrypt failed is this one.
           log.warn('events.stream_failed', { taskId: task.id, ...errorFields(error) });
           close();
         } finally {
           sending = false;
-        }
-        if (resend && !closed) {
-          resend = false;
-          await send();
         }
       };
       /**
@@ -317,7 +281,7 @@ export const registerTaskEventRoutes = (context: RouteContext): void => {
       // Proxies and sleeping phones both leave a connection that looks open and is not. A comment
       // frame is the cheapest thing that makes the socket fail, which is what releases the slot.
       const heartbeat = setInterval(() => {
-        if (!closed && !reply.raw.destroyed) reply.raw.write(': keepalive\n\n');
+        if (!closed && !sending && !reply.raw.destroyed) void write(': keepalive\n\n');
       }, 20_000);
       heartbeat.unref();
       streams.set(streamId, close);
