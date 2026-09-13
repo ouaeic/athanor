@@ -16,16 +16,7 @@ import {
   Terminal,
   X
 } from 'lucide-react';
-import type {
-  Artifact,
-  Task,
-  TaskEvent,
-  TaskPlan,
-  TaskPlanStep,
-  Workspace,
-  TaskRewindPreview,
-  RewindScope
-} from '@athanor/contracts';
+import type { Artifact, Task, TaskEvent, Workspace } from '@athanor/contracts';
 import type { Bootstrap, Decision, Draft } from './model';
 import {
   activeQuestion,
@@ -43,10 +34,10 @@ import {
   surfaceAnswer,
   text
 } from './model';
-import { get, post, patch } from './client';
+import { post } from './client';
 import { loadEventPage } from './stream';
 import { useTaskRecord } from './useTaskRecord';
-import { Button, Dialog, Empty, ErrorNotice, Field, Spinner } from './ui';
+import { Button, Dialog, ErrorNotice, Field, Spinner } from './ui';
 import { DecisionCard } from './DecisionQueue';
 import { createQuestionAnswerSender } from './task-actions';
 import { TaskOutputs, TaskProgress } from './TaskCanvas';
@@ -55,6 +46,9 @@ import { currentWork } from './current-work';
 import { completionChecks, evidenceSource } from './completion-checks';
 import './presentation.css';
 import { effortLabel } from './reasoning-options';
+const PlanEditor = lazy(() => import('./PlanEditor'));
+const TaskOptions = lazy(() => import('./TaskOptions'));
+const Trajectory = lazy(() => import('./Trajectory'));
 const Markdown = lazy(() => import('./MarkdownBody'));
 const Composer = lazy(() => import('./Composer'));
 const MediaJobs = lazy(() => import('./MediaJobs'));
@@ -1039,19 +1033,23 @@ export default function TaskSurface({
       )}
       {panel === 'plan' && (
         <Dialog title="The plan" wide onClose={() => setPanel(null)}>
-          <PlanEditor
-            task={task}
-            plan={plan}
-            onSaved={(next) => {
-              setPlan(next);
-              onRefresh();
-            }}
-          />
+          <Suspense fallback={<Spinner label="Opening plan…" />}>
+            <PlanEditor
+              task={task}
+              plan={plan}
+              onSaved={(next) => {
+                setPlan(next);
+                onRefresh();
+              }}
+            />
+          </Suspense>
         </Dialog>
       )}
       {panel === 'settings' && (
         <Dialog title="Work options" onClose={() => setPanel(null)}>
-          <TaskOptions task={task} onTask={onTask} onRefresh={onRefresh} />
+          <Suspense fallback={<Spinner label="Opening work options…" />}>
+            <TaskOptions task={task} onTask={onTask} onRefresh={onRefresh} />
+          </Suspense>
           <Button
             onClick={() => {
               const event = [...events]
@@ -1102,400 +1100,20 @@ export default function TaskSurface({
       )}
       {branchEvent && (
         <Dialog title="Continue from this point" wide onClose={() => setBranchEvent(null)}>
-          <Trajectory
-            task={task}
-            event={branchEvent}
-            onCreated={(result) => {
-              setBranchEvent(null);
-              setPanel(null);
-              onTask(result);
-              onRefresh();
-            }}
-          />
+          <Suspense fallback={<Spinner label="Opening continuation options…" />}>
+            <Trajectory
+              task={task}
+              event={branchEvent}
+              onCreated={(result) => {
+                setBranchEvent(null);
+                setPanel(null);
+                onTask(result);
+                onRefresh();
+              }}
+            />
+          </Suspense>
         </Dialog>
       )}
     </section>
-  );
-}
-const STEP_STATUSES = ['pending', 'in_progress', 'completed', 'skipped'] as const;
-
-function PlanEditor({
-  task,
-  plan,
-  onSaved
-}: {
-  task: Task;
-  plan: TaskPlan | null;
-  onSaved: (plan: TaskPlan) => void;
-}) {
-  const [steps, setSteps] = useState(plan?.steps ?? []);
-  const [name, setName] = useState(plan?.branchName ?? 'Main');
-  const [error, setError] = useState<unknown>(null);
-  const [busy, setBusy] = useState(false);
-  const [versions, setVersions] = useState<TaskPlan[]>([]);
-  useEffect(() => {
-    void get<TaskPlan[]>(`/v1/tasks/${task.id}/plans`).then(setVersions).catch(setError);
-  }, [task.id]);
-  const editStep = (id: string, patch: Partial<TaskPlanStep>) =>
-    setSteps((current) => current.map((item) => (item.id === id ? { ...item, ...patch } : item)));
-  const editSubstep = (stepId: string, subId: string, patch: Partial<TaskPlanStep>) =>
-    setSteps((current) =>
-      current.map((item) =>
-        item.id === stepId
-          ? {
-              ...item,
-              substeps: (item.substeps ?? []).map((sub) =>
-                sub.id === subId ? { ...sub, ...patch } : sub
-              )
-            }
-          : item
-      )
-    );
-  async function save() {
-    setBusy(true);
-    setError(null);
-    try {
-      const result = await post<TaskPlan>(`/v1/tasks/${task.id}/plan`, {
-        expectedVersion: plan?.version ?? 0,
-        branchName: name,
-        steps
-      });
-      onSaved(result);
-      setVersions((current) => [result, ...current]);
-    } catch (err) {
-      setError(err);
-    } finally {
-      setBusy(false);
-    }
-  }
-  return (
-    <div className="stack">
-      <Field label="Plan name">
-        <input value={name} maxLength={80} onChange={(event) => setName(event.target.value)} />
-      </Field>
-      {steps.map((step, index) => (
-        <div className="plan-editor-group" key={step.id}>
-          <div className="plan-editor-step">
-            <label className="sr-only" htmlFor={`step-${step.id}`}>
-              Step {index + 1}
-            </label>
-            <input
-              id={`step-${step.id}`}
-              value={step.title}
-              maxLength={240}
-              onChange={(event) => editStep(step.id, { title: event.target.value })}
-            />
-            <select
-              aria-label={`Step ${index + 1} status`}
-              value={step.status}
-              onChange={(event) =>
-                editStep(step.id, { status: event.target.value as typeof step.status })
-              }
-            >
-              {STEP_STATUSES.map((status) => (
-                <option key={status} value={status}>
-                  {status.replaceAll('_', ' ')}
-                </option>
-              ))}
-            </select>
-            <Button
-              aria-label={`Remove step ${index + 1}`}
-              onClick={() => setSteps((current) => current.filter((item) => item.id !== step.id))}
-            >
-              <X size={16} />
-            </Button>
-          </div>
-          {/*
-           * The parts, editable rather than merely preserved. A milestone the model broke into
-           * five is the level the owner actually wants to correct - "no, do the migration before
-           * the backfill" is a sentence about a part - and an editor that showed only the headline
-           * would leave them re-typing the whole milestone to change one line of it.
-           */}
-          <ol className="plan-editor-substeps">
-            {(step.substeps ?? []).map((sub, subIndex) => (
-              <li key={sub.id}>
-                <label className="sr-only" htmlFor={`substep-${sub.id}`}>
-                  Step {index + 1}, part {subIndex + 1}
-                </label>
-                <input
-                  id={`substep-${sub.id}`}
-                  value={sub.title}
-                  maxLength={240}
-                  onChange={(event) => editSubstep(step.id, sub.id, { title: event.target.value })}
-                />
-                <select
-                  aria-label={`Step ${index + 1}, part ${subIndex + 1} status`}
-                  value={sub.status}
-                  onChange={(event) =>
-                    editSubstep(step.id, sub.id, {
-                      status: event.target.value as typeof sub.status
-                    })
-                  }
-                >
-                  {STEP_STATUSES.map((status) => (
-                    <option key={status} value={status}>
-                      {status.replaceAll('_', ' ')}
-                    </option>
-                  ))}
-                </select>
-                <Button
-                  aria-label={`Remove step ${index + 1}, part ${subIndex + 1}`}
-                  onClick={() =>
-                    editStep(step.id, {
-                      substeps: (step.substeps ?? []).filter((item) => item.id !== sub.id)
-                    })
-                  }
-                >
-                  <X size={14} />
-                </Button>
-              </li>
-            ))}
-            <li>
-              <Button
-                className="text-button"
-                disabled={(step.substeps ?? []).length >= 30}
-                onClick={() =>
-                  editStep(step.id, {
-                    substeps: [
-                      ...(step.substeps ?? []),
-                      { id: crypto.randomUUID(), title: '', status: 'pending' as const }
-                    ]
-                  })
-                }
-              >
-                <Plus size={13} />
-                Add a part
-              </Button>
-            </li>
-          </ol>
-        </div>
-      ))}
-      {!steps.length && (
-        <Empty title="No plan yet">You or the agent can set a plan for this work.</Empty>
-      )}
-      <div className="row">
-        <Button
-          disabled={steps.length >= 30}
-          onClick={() =>
-            setSteps((current) => [
-              ...current,
-              { id: crypto.randomUUID(), title: '', status: 'pending' }
-            ])
-          }
-        >
-          <Plus size={15} />
-          Add step
-        </Button>
-        <Button
-          className="primary"
-          busy={busy}
-          disabled={
-            !steps.length ||
-            steps.some(
-              (step) => !step.title.trim() || (step.substeps ?? []).some((sub) => !sub.title.trim())
-            )
-          }
-          onClick={save}
-        >
-          Save plan
-        </Button>
-      </div>
-      <ErrorNotice error={error} />
-      {versions.length > 0 && (
-        <details>
-          <summary>Earlier plan versions</summary>
-          {versions.map((version) => (
-            <article key={version.id}>
-              <h3>
-                {version.branchName} · v{version.version}
-              </h3>
-              <p className="muted">
-                {date(version.createdAt)} · {version.createdBy}
-              </p>
-              <ol>
-                {version.steps.map((step) => (
-                  <li key={step.id}>
-                    {step.title} · {step.status.replaceAll('_', ' ')}
-                  </li>
-                ))}
-              </ol>
-              <Button
-                onClick={() => {
-                  setSteps(version.steps);
-                  setName(version.branchName);
-                }}
-              >
-                Use these steps as a new version
-              </Button>
-            </article>
-          ))}
-        </details>
-      )}
-    </div>
-  );
-}
-function TaskOptions({
-  task,
-  onTask,
-  onRefresh
-}: {
-  task: Task;
-  onTask: (task: Task) => void;
-  onRefresh: () => void;
-}) {
-  const [title, setTitle] = useState(task.title);
-  const [error, setError] = useState<unknown>(null);
-  const [busy, setBusy] = useState(false);
-  async function change(body: Record<string, unknown>, suffix = '') {
-    setBusy(true);
-    setError(null);
-    try {
-      onTask(await patch<Task>(`/v1/tasks/${task.id}${suffix}`, body));
-      onRefresh();
-    } catch (err) {
-      setError(err);
-    } finally {
-      setBusy(false);
-    }
-  }
-  return (
-    <div className="stack">
-      <form
-        className="row"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void change({ title });
-        }}
-      >
-        <Field label="Work title">
-          <input value={title} onChange={(event) => setTitle(event.target.value)} />
-        </Field>
-        <Button type="submit" busy={busy}>
-          Rename
-        </Button>
-      </form>
-      <dl className="facts">
-        <div>
-          <dt>Model</dt>
-          <dd>{task.modelId}</dd>
-        </div>
-        <div>
-          <dt>Privacy</dt>
-          <dd>
-            {task.privacyRoute === 'provider_zdr' ? 'Zero data retention' : 'External provider'}
-          </dd>
-        </div>
-        <div>
-          <dt>Spend</dt>
-          <dd>{money(task.spentUsd)}</dd>
-        </div>
-      </dl>
-      <div className="row">
-        <Button disabled={busy} onClick={() => change({ pinned: !task.pinned })}>
-          {task.pinned ? 'Unpin' : 'Pin this work'}
-        </Button>
-        <Button disabled={busy} onClick={() => change({ archived: !task.archivedAt })}>
-          {task.archivedAt ? 'Restore to work' : 'Archive'}
-        </Button>
-      </div>
-      <ErrorNotice error={error} />
-    </div>
-  );
-}
-function Trajectory({
-  task,
-  event,
-  onCreated
-}: {
-  task: Task;
-  event: TaskEvent;
-  onCreated: (task: Task) => void;
-}) {
-  const [preview, setPreview] = useState<TaskRewindPreview | null>(null);
-  const [operation, setOperation] = useState<'branch' | 'edit' | 'retry'>('branch');
-  const [rewind, setRewind] = useState<RewindScope>('conversation');
-  const [prompt, setPrompt] = useState(eventText(event));
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<unknown>(null);
-  useEffect(() => {
-    void get<TaskRewindPreview>(`/v1/tasks/${task.id}/rewind-preview?eventId=${event.id}`)
-      .then(setPreview)
-      .catch(setError);
-  }, [task.id, event.id]);
-  async function create() {
-    setBusy(true);
-    setError(null);
-    try {
-      const result = await post<Task>(`/v1/tasks/${task.id}/trajectory`, {
-        operation,
-        eventId: event.id,
-        rewind,
-        ...(rewind !== 'conversation' && preview?.checkpoint
-          ? { checkpointId: preview.checkpoint.id }
-          : {}),
-        ...(operation === 'edit' ? { prompt } : {}),
-        ...(operation !== 'branch' ? { stopSource: true } : {})
-      });
-      onCreated(result);
-    } catch (err) {
-      setError(err);
-    } finally {
-      setBusy(false);
-    }
-  }
-  return (
-    <div className="stack">
-      <p>{event.summary}</p>
-      <Field label="Continue with">
-        <select
-          value={operation}
-          onChange={(e) => setOperation(e.target.value as typeof operation)}
-        >
-          <option value="branch">Branch into separate work</option>
-          {event.kind === 'user_message' && (
-            <option value="edit">Edit this direction and retry</option>
-          )}
-          <option value="retry">Retry from this point</option>
-        </select>
-      </Field>
-      {operation === 'edit' && (
-        <Field label="Revised direction">
-          <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} rows={5} />
-        </Field>
-      )}
-      <Field label="Restore">
-        <select value={rewind} onChange={(e) => setRewind(e.target.value as RewindScope)}>
-          <option value="conversation">Conversation only · leave files as they are</option>
-          <option value="computer" disabled={!preview?.checkpoint}>
-            Computer only
-          </option>
-          <option value="both" disabled={!preview?.checkpoint}>
-            Conversation and computer
-          </option>
-        </select>
-      </Field>
-      {preview && (
-        <p>
-          {preview.droppedEventCount} later events stay in the source work.{' '}
-          {operation !== 'branch' && 'The source run will stop when this retry begins.'}
-        </p>
-      )}
-      {rewind !== 'conversation' && preview?.computer && (
-        <details open>
-          <summary>Changes to your computer</summary>
-          <pre>{JSON.stringify(preview.computer, null, 2)}</pre>
-        </details>
-      )}
-      <ErrorNotice error={error} />
-      <Button
-        className="primary"
-        disabled={!preview || (operation === 'edit' && !prompt.trim())}
-        busy={busy}
-        onClick={create}
-      >
-        Create {operation === 'branch' ? 'branch' : 'retry'}
-        <GitBranch size={16} />
-      </Button>
-    </div>
   );
 }

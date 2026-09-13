@@ -587,6 +587,16 @@ const voiceProposal = {
   messageId: null
 };
 const autonomyChanges = [];
+let currentPlan = {
+  id: 'plan-1',
+  taskId: task.id,
+  version: 1,
+  branchName: 'Main',
+  createdAt: time,
+  createdBy: 'user',
+  steps: [{ id: 'first-step', title: 'Original plan step', status: 'pending' }]
+};
+const planWrites = [];
 try {
   const context = await browser.newContext({
     viewport: { width: 1440, height: 1000 },
@@ -931,8 +941,25 @@ try {
           ? { ...presentation, taskId: childTask.id, results: [] }
           : presentation
       );
-    if (path.endsWith('/plan'))
-      return json({ id: 'plan', taskId: task.id, version: 1, steps: presentation.progress.phases });
+    if (path.endsWith('/plans')) return json([currentPlan]);
+    if (path.endsWith('/plan')) {
+      if (route.request().method() === 'POST') {
+        const body = route.request().postDataJSON();
+        planWrites.push(body);
+        if (body.expectedVersion !== currentPlan.version)
+          return route.fulfill({
+            status: 409,
+            json: {
+              error: {
+                code: 'plan_conflict',
+                message: 'Plan revision changed. Your draft has not been saved.'
+              }
+            }
+          });
+        currentPlan = { ...currentPlan, ...body, version: currentPlan.version + 1 };
+      }
+      return json(currentPlan);
+    }
     if (
       path === `/v1/tasks/${task.id}/events` &&
       url.searchParams.has('before') &&
@@ -1054,6 +1081,95 @@ try {
     await activity
       .getByRole('button', { name: 'Close Activity and directions', exact: true })
       .click();
+    await page.getByRole('button', { name: 'Plan', exact: true }).click();
+    const planDialog = page.getByRole('dialog', { name: 'The plan', exact: true });
+    await planDialog
+      .getByRole('textbox', { name: 'Step 1', exact: true })
+      .fill('My unsaved plan step');
+    currentPlan = {
+      ...currentPlan,
+      id: 'plan-2',
+      version: 2,
+      steps: [{ id: 'first-step', title: 'Concurrent server plan step', status: 'pending' }]
+    };
+    const refreshedPlan = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === `/v1/tasks/${task.id}/plan` &&
+        response.request().method() === 'GET'
+    );
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    await (await refreshedPlan).finished();
+    await page.evaluate(
+      () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+    );
+    const conflictResponse = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === `/v1/tasks/${task.id}/plan` &&
+        response.request().method() === 'POST'
+    );
+    await planDialog.getByRole('button', { name: 'Save plan', exact: true }).click();
+    await conflictResponse;
+    assert.equal(
+      planWrites.at(-1).expectedVersion,
+      1,
+      'An open draft must keep its original version when server metadata refreshes'
+    );
+    await planDialog
+      .getByText('Plan revision changed. Your draft has not been saved.', { exact: true })
+      .waitFor();
+    assert.equal(
+      await planDialog.getByRole('textbox', { name: 'Step 1', exact: true }).inputValue(),
+      'My unsaved plan step',
+      'A save conflict must preserve the owner draft'
+    );
+    assert.equal(currentPlan.steps[0].title, 'Concurrent server plan step');
+    await page.setViewportSize({ width: 390, height: 844 });
+    await planDialog
+      .getByText('A newer plan is available. Your draft is still based on version 1.', {
+        exact: true
+      })
+      .waitFor();
+    await page.screenshot({ path: resolve(report, 'plan-conflict-phone.png') });
+    assert(
+      await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+      'Plan conflict controls must fit on a phone'
+    );
+    await planDialog
+      .getByRole('button', { name: 'Discard draft and load latest plan', exact: true })
+      .click();
+    assert.equal(
+      await planDialog.getByRole('textbox', { name: 'Step 1', exact: true }).inputValue(),
+      'Concurrent server plan step'
+    );
+    await planDialog
+      .getByRole('textbox', { name: 'Step 1', exact: true })
+      .fill('Revised latest plan step');
+    const saveLatest = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === `/v1/tasks/${task.id}/plan` &&
+        response.request().method() === 'POST'
+    );
+    await planDialog.getByRole('button', { name: 'Save plan', exact: true }).click();
+    assert.equal((await saveLatest).status(), 200);
+    assert.equal(planWrites.at(-1).expectedVersion, 2);
+    assert.equal(currentPlan.steps[0].title, 'Revised latest plan step');
+    await planDialog
+      .getByRole('textbox', { name: 'Step 1', exact: true })
+      .fill('Second saved revision');
+    const saveAgain = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === `/v1/tasks/${task.id}/plan` &&
+        response.request().method() === 'POST'
+    );
+    await planDialog.getByRole('button', { name: 'Save plan', exact: true }).click();
+    assert.equal((await saveAgain).status(), 200);
+    assert.equal(
+      planWrites.at(-1).expectedVersion,
+      3,
+      'A successful save advances the draft version'
+    );
+    await planDialog.getByRole('button', { name: 'Close The plan', exact: true }).click();
+    await page.setViewportSize({ width: 1440, height: 1000 });
     const autonomy = page.getByRole('combobox', { name: 'Approvals for this prompt', exact: true });
     await autonomy.selectOption('autonomous');
     assert.equal(
