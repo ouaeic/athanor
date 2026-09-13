@@ -48,6 +48,25 @@ test('release Rust flags never silently discard caller flags', () => {
   assert.ok(configured.CARGO_ENCODED_RUSTFLAGS.startsWith('-C\u001ftarget-cpu=native\u001f'));
 });
 
+test('Android release flags preserve caller flags and align LOAD and RELRO without affecting Apple builds', () => {
+  const environment = { HOME: '/home/builder', CARGO_ENCODED_RUSTFLAGS: '-C\u001flto=thin' };
+  const args = withReleaseRustFlags(environment, 'android').CARGO_ENCODED_RUSTFLAGS.split('\u001f');
+  assert.deepEqual(args.slice(0, 2), ['-C', 'lto=thin']);
+  assert.ok(args.includes('--remap-path-prefix'));
+  assert.deepEqual(args.slice(-4), [
+    '-C',
+    'link-arg=-Wl,-z,max-page-size=16384',
+    '-C',
+    'link-arg=-Wl,-z,common-page-size=16384'
+  ]);
+  for (const platform of ['ios', undefined]) {
+    assert.ok(
+      !withReleaseRustFlags(environment, platform).CARGO_ENCODED_RUSTFLAGS.includes('page-size')
+    );
+  }
+  assert.equal(environment.CARGO_ENCODED_RUSTFLAGS, '-C\u001flto=thin');
+});
+
 test('native artifact audit rejects a build home and accepts remapped output', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'athanor-native-audit-'));
   const release = join(directory, 'release');

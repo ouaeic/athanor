@@ -14,7 +14,7 @@ if (platform !== 'android' && platform !== 'ios') {
   throw new Error('The native mobile build platform must be android or ios');
 }
 
-const environment = withReleaseRustFlags(process.env);
+const environment = withReleaseRustFlags(process.env, platform);
 if (!environment.GRADLE_USER_HOME && environment.CARGO_TARGET_DIR) {
   environment.GRADLE_USER_HOME = resolve(environment.CARGO_TARGET_DIR, '..', 'gradle-home');
 }

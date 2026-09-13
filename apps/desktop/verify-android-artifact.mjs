@@ -238,6 +238,23 @@ export function parseLoadAlignments(readelfOutput) {
     .map((line) => Number.parseInt(line.trim().split(/\s+/).at(-1), 16));
 }
 
+export function validateRelroAlignment(programHeaders, minimumAlignment) {
+  const segments = programHeaders.split('\n').filter((line) => /^\s*GNU_RELRO\s/.test(line));
+  invariant(segments.length > 0, 'Native library has no GNU_RELRO protection segment');
+  for (const segment of segments) {
+    const fields = segment.trim().split(/\s+/);
+    invariant(
+      /^0x[0-9a-f]+$/i.test(fields[2] ?? '') && /^0x[0-9a-f]+$/i.test(fields[5] ?? ''),
+      'Malformed GNU_RELRO program header'
+    );
+    const end = BigInt(fields[2]) + BigInt(fields[5]);
+    invariant(
+      end % BigInt(minimumAlignment) === 0n,
+      `GNU_RELRO end is not aligned to ${minimumAlignment / 1024} KiB pages`
+    );
+  }
+}
+
 export function minimumElfPageAlignment(archivePath) {
   return /^lib\/(?:arm64-v8a|x86_64)\//.test(archivePath) ? 0x4000 : 0x1000;
 }
@@ -294,6 +311,7 @@ async function auditNativeLibraries(archivePath, nativeLibraries, environment) {
         alignments.every((alignment) => alignment >= minimumAlignment),
         `${entry} does not satisfy Android's ${minimumAlignment / 1024} KiB ELF page alignment requirement`
       );
+      validateRelroAlignment(programHeaders, minimumAlignment);
     }
   } finally {
     await rm(auditDirectory, { recursive: true, force: true });

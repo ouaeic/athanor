@@ -28,7 +28,7 @@ export function releasePathMappings(environment = process.env) {
   return [...mappings].map(([source, destination]) => ({ source, destination }));
 }
 
-export function withReleaseRustFlags(environment = process.env) {
+export function withReleaseRustFlags(environment = process.env, platform) {
   if (environment.RUSTFLAGS && !environment.CARGO_ENCODED_RUSTFLAGS) {
     throw new Error(
       'RUSTFLAGS is set. Move those arguments to CARGO_ENCODED_RUSTFLAGS so athanor can append reproducible-build path remapping safely.'
@@ -43,9 +43,19 @@ export function withReleaseRustFlags(environment = process.env) {
     ? environment.CARGO_ENCODED_RUSTFLAGS.split(unitSeparator).filter(Boolean)
     : [];
 
+  // NDK r27 needs both settings for LOAD and RELRO alignment on 16 KB devices.
+  const pageArguments =
+    platform === 'android'
+      ? [
+          '-C',
+          'link-arg=-Wl,-z,max-page-size=16384',
+          '-C',
+          'link-arg=-Wl,-z,common-page-size=16384'
+        ]
+      : [];
   return {
     ...environment,
-    CARGO_ENCODED_RUSTFLAGS: [...existing, ...remapArguments].join(unitSeparator)
+    CARGO_ENCODED_RUSTFLAGS: [...existing, ...remapArguments, ...pageArguments].join(unitSeparator)
   };
 }
 

@@ -6,6 +6,7 @@ import {
   parseBadging,
   parseLoadAlignments,
   validateBackupRules,
+  validateRelroAlignment,
   validateNetworkSecurity
 } from './verify-android-artifact.mjs';
 
@@ -69,6 +70,16 @@ LOAD 0x100 0x100 RW 0x4000
 NOTE 0x200 0x200 R 0x4`),
     [0x4000, 0x4000]
   );
+});
+
+test('rejects missing, malformed or page-straddling RELRO protection even with aligned LOAD segments', () => {
+  const valid = '  GNU_RELRO 0x0cfaf0 0x00000000000dfaf0 0x00000000000dfaf0 0x01510 0x00510 R 0x1';
+  assert.doesNotThrow(() => validateRelroAlignment(valid, 0x4000));
+  const invalid = valid.replace('0x00510', '0x01510');
+  assert.throws(() => validateRelroAlignment(invalid, 0x4000), /not aligned/);
+  assert.doesNotThrow(() => validateRelroAlignment(invalid, 0x1000));
+  assert.throws(() => validateRelroAlignment('', 0x4000), /no GNU_RELRO/);
+  assert.throws(() => validateRelroAlignment(valid.replace('0x00510', 'bad'), 0x4000), /Malformed/);
 });
 
 test('requires 16 KiB ELF pages only for Android 64-bit ABIs', () => {
