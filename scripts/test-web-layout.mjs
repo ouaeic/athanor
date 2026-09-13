@@ -421,6 +421,7 @@ const computation = {
   variables: [{ name: 'samples', type: 'DataFrame', preview: '20 rows, 4 columns' }]
 };
 const computationHistoryRequests = [];
+const projectEventRequests = [];
 const historyEvent = (sequence, kind, payload) => ({
   ...event,
   id: `history-${sequence}`,
@@ -880,6 +881,26 @@ try {
         nextCursor: events.at(-1).sequence
       });
     }
+    if (path === `/v1/tasks/${task.id}/events` && url.searchParams.get('limit') === '250') {
+      const before = Number(url.searchParams.get('before'));
+      projectEventRequests.push(before);
+      const earlier = before === event.sequence;
+      return json({
+        events: earlier
+          ? [
+              {
+                ...event,
+                id: 'opening-activity',
+                sequence: 1,
+                summary: 'Earlier project direction.'
+              }
+            ]
+          : [event],
+        hasMore: !earlier,
+        oldestSequence: earlier ? 1 : event.sequence,
+        nextCursor: earlier ? 1 : event.sequence
+      });
+    }
     if (path.endsWith('/events'))
       return json({
         events: path.includes(childTask.id) ? (childQuestion ? [childQuestion] : []) : [event],
@@ -934,6 +955,24 @@ try {
     );
     await page.getByRole('button', { name: /^Add a direction/ }).click();
     await page.getByText('Tools & activity', { exact: true }).click();
+    assert(projectEventRequests.length > 0, 'Opening a project must load its event page');
+    assert.equal(projectEventRequests[0], Number.MAX_SAFE_INTEGER, 'Open the most recent page');
+    await page.getByRole('button', { name: 'Activity', exact: true }).click();
+    const activity = page.getByRole('dialog', { name: 'Activity and directions', exact: true });
+    await activity.getByRole('button', { name: 'Earlier activity', exact: true }).click();
+    await activity.getByText('Earlier project direction.', { exact: true }).waitFor();
+    assert.equal(
+      projectEventRequests.at(-1),
+      event.sequence,
+      'Earlier activity uses its oldest cursor'
+    );
+    await activity.getByRole('button', { name: 'Latest', exact: true }).click();
+    await activity.getByText(event.summary, { exact: true }).waitFor();
+    assert.equal(
+      await activity.getByText('Earlier project direction.', { exact: true }).count(),
+      0
+    );
+    await activity.getByRole('button', { name: 'Close Activity and directions', exact: true }).click();
     const autonomy = page.getByRole('combobox', { name: 'Approvals for this prompt', exact: true });
     await autonomy.selectOption('autonomous');
     assert.equal(

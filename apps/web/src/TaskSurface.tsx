@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import {
   ArrowLeft,
   ArrowUpRight,
@@ -22,7 +22,6 @@ import type {
   TaskEvent,
   TaskPlan,
   TaskPlanStep,
-  TaskPresentation,
   Workspace,
   TaskRewindPreview,
   RewindScope
@@ -45,15 +44,14 @@ import {
   text
 } from './model';
 import { get, post, patch } from './client';
-import { loadEventPage, subscribeTaskEvents } from './stream';
-import type { StreamConnection } from './stream';
+import { loadEventPage } from './stream';
+import { useTaskRecord } from './useTaskRecord';
 import { Button, Dialog, Empty, ErrorNotice, Field, Spinner } from './ui';
 import { DecisionCard } from './DecisionQueue';
 import { createQuestionAnswerSender } from './task-actions';
 import { TaskOutputs, TaskProgress } from './TaskCanvas';
 import WorkTrace from './WorkTrace';
 import { currentWork } from './current-work';
-import { presentationArtifacts } from './task-artifacts';
 import './presentation.css';
 import { effortLabel } from './reasoning-options';
 const Markdown = lazy(() => import('./MarkdownBody'));
@@ -98,14 +96,26 @@ export default function TaskSurface({
   onOpenTask,
   onComputer
 }: TaskSurfaceProps) {
-  const [events, setEvents] = useState<TaskEvent[]>([]);
-  const [plan, setPlan] = useState<TaskPlan | null>(null);
-  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
-  const [storedPresentation, setPresentation] = useState<TaskPresentation | null>(null);
+  const {
+    events,
+    plan,
+    setPlan,
+    artifacts,
+    storedPresentation,
+    initialPage,
+    loading,
+    error,
+    setError,
+    connection,
+    reload
+  } = useTaskRecord({
+    taskId: task.id,
+    workspaceId: workspace.id,
+    finished: isFinished(task),
+    onTask,
+    onRefresh
+  });
   const [preview, setPreview] = useState<Artifact | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<unknown>(null);
-  const [connection, setConnection] = useState<StreamConnection>('connecting');
   const [panel, setPanel] = useState<
     'direction' | 'history' | 'plan' | 'settings' | 'share' | 'brief' | 'models' | 'stop' | null
   >(null);
@@ -115,6 +125,11 @@ export default function TaskSurface({
   );
   const [historyMore, setHistoryMore] = useState(false);
   const [historyPage, setHistoryPage] = useState<TaskEvent[]>([]);
+  useEffect(() => {
+    if (!initialPage) return;
+    setHistoryPage(initialPage.events);
+    setHistoryMore(initialPage.hasMore);
+  }, [initialPage]);
   const [evidence, setEvidence] = useState<TaskEvent | null>(null);
   const [scope, setScope] = useState('');
   const [questionAnswer, setQuestionAnswer] = useState('');
@@ -136,113 +151,6 @@ export default function TaskSurface({
     const ticker = setInterval(() => setClock(Date.now()), 30_000);
     return () => clearInterval(ticker);
   }, [task.id, running]);
-  const onTaskRef = useRef(onTask);
-  onTaskRef.current = onTask;
-  const onRefreshRef = useRef(onRefresh);
-  onRefreshRef.current = onRefresh;
-  const reload = useCallback(
-    async (signal?: AbortSignal) => {
-      const options = signal ? { signal } : {};
-      const results = await Promise.allSettled([
-        get<Task>(`/v1/tasks/${task.id}`, options),
-        get<TaskPlan | null>(`/v1/tasks/${task.id}/plan`, options),
-        get<Artifact[]>(`/v1/workspaces/${workspace.id}/artifacts`, options),
-        get<TaskPresentation>(`/v1/tasks/${task.id}/presentation`, options)
-      ]);
-      if (signal?.aborted) return;
-      const [nextTask, nextPlan, nextArtifacts, nextPresentation] = results;
-      if (nextTask.status === 'fulfilled') onTaskRef.current(nextTask.value);
-      else setError(nextTask.reason);
-      if (nextPlan.status === 'fulfilled') setPlan(nextPlan.value);
-      else setError(nextPlan.reason);
-      if (nextArtifacts.status === 'fulfilled')
-        setArtifacts(
-          nextPresentation.status === 'fulfilled'
-            ? presentationArtifacts(nextPresentation.value, nextArtifacts.value)
-            : nextArtifacts.value.filter((item) => item.taskId === task.id)
-        );
-      else {
-        setError(nextArtifacts.reason);
-        if (nextPresentation.status === 'fulfilled')
-          setArtifacts(presentationArtifacts(nextPresentation.value, []));
-      }
-      if (nextPresentation.status === 'fulfilled') setPresentation(nextPresentation.value);
-      else setError(nextPresentation.reason);
-    },
-    [task.id, workspace.id]
-  );
-  useEffect(() => {
-    const controller = new AbortController();
-    let unsubscribe: () => void = () => undefined;
-    let refreshTimer: ReturnType<typeof setTimeout> | undefined;
-    setLoading(true);
-    setError(null);
-    void Promise.all([
-      loadEventPage(task.id, { limit: 250, signal: controller.signal }),
-      reload(controller.signal)
-    ])
-      .then(([page]) => {
-        if (controller.signal.aborted) return;
-        setEvents(page.events);
-        setHistoryPage(page.events);
-        setHistoryMore(page.hasMore);
-        setLoading(false);
-        unsubscribe = subscribeTaskEvents(task.id, {
-          after: page.nextCursor,
-          signal: controller.signal,
-          onEvents: (incoming) => {
-            setEvents((current) =>
-              Array.from(
-                new Map([...current, ...incoming].map((event) => [event.sequence, event])).values()
-              )
-                .sort((a, b) => a.sequence - b.sequence)
-                .slice(-4000)
-            );
-            if (
-              incoming.some((event) =>
-                [
-                  'completed',
-                  'approval_requested',
-                  'approval_resolved',
-                  'question_asked',
-                  'error',
-                  'artifact',
-                  'plan',
-                  'status',
-                  'cost',
-                  'preview',
-                  'tool_result'
-                ].includes(event.kind)
-              )
-            ) {
-              if (!refreshTimer)
-                refreshTimer = setTimeout(() => {
-                  refreshTimer = undefined;
-                  void reload(controller.signal);
-                  onRefreshRef.current();
-                }, 1000);
-            }
-          },
-          onConnection: setConnection,
-          onError: setError
-        });
-      })
-      .catch((err: unknown) => {
-        if (!controller.signal.aborted) {
-          setError(err);
-          setLoading(false);
-        }
-      });
-    const timer = setInterval(() => {
-      void reload(controller.signal);
-    }, 15000);
-    return () => {
-      controller.abort();
-      unsubscribe();
-      clearInterval(timer);
-      clearTimeout(refreshTimer);
-    };
-  }, [task.id, reload, isFinished(task)]);
   function showArtifact(id: string) {
     const artifact = artifacts.find((item) => item.id === id);
     if (artifact) setPreview(artifact);
@@ -1016,7 +924,11 @@ export default function TaskSurface({
       </div>
       {panel === 'brief' && (
         <Dialog title="What you asked" wide onClose={() => setPanel(null)}>
-          <p className="muted">Your opening direction and every direction since, oldest first.</p>
+          <p className="muted">
+            {(events[0]?.sequence ?? 1) > 1
+              ? 'Your opening direction and recent directions. Earlier activity holds the rest.'
+              : 'Your opening direction and every direction since, oldest first.'}
+          </p>
           {briefLoading && !opening ? (
             <Spinner label="Loading your original direction…" />
           ) : ownerDirections.length === 0 ? (
@@ -1031,10 +943,10 @@ export default function TaskSurface({
             </p>
           ) : (
             <ol className="activity-ledger">
-              {ownerDirections.map((event, index) => (
+              {ownerDirections.map((event) => (
                 <li key={event.id}>
                   <span className="activity-kind">
-                    {index === 0 ? 'Original direction' : `Direction ${index + 1}`}
+                    {event.id === opening?.id ? 'Original direction' : 'Direction'}
                   </span>
                   <div>
                     <Suspense fallback={<p>{event.summary}</p>}>
