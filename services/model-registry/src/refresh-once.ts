@@ -110,6 +110,23 @@ export const refreshOnce = async (input: {
       let refused = false;
       for (const credential of credentials) {
         try {
+          const connectionId = credential.connectionId ?? credential.provider;
+          // Unscoped legacy rows belong only to the default account for their protocol.
+          const replacing = existing.filter(
+            (model) =>
+              model.connectionId === connectionId ||
+              (connectionId === credential.provider &&
+                (!model.connectionId || model.connectionId === model.provider) &&
+                (model.provider === credential.provider ||
+                  (credential.provider !== 'openrouter' &&
+                    model.provider === 'custom' &&
+                    Array.isArray(model.recommendationTags) &&
+                    model.recommendationTags.includes(
+                      credential.provider === 'ollama-cloud'
+                        ? 'Ollama Cloud'
+                        : 'Configured endpoint'
+                    ))))
+          );
           // A real refresh, and a replace rather than an upsert: a model the provider has withdrawn
           // should leave the picker rather than sit in it until somebody tries to use it.
           const live =
@@ -126,7 +143,7 @@ export const refreshOnce = async (input: {
                    * which the privacy projection would read as a reason to take every private model
                    * out of the picker.
                    */
-                  previous: existing.flatMap((model) => {
+                  previous: replacing.flatMap((model) => {
                     const parsed = ModelRelease.safeParse(model);
                     return parsed.success ? [parsed.data] : [];
                   })
@@ -145,20 +162,9 @@ export const refreshOnce = async (input: {
                   apiKey: credential.apiKey,
                   modelId: credential.modelId,
                   enforceZeroDataRetention: credential.enforceZeroDataRetention,
-                  connectionId: credential.provider,
+                  connectionId,
                   ...(credential.catalogDefaults ? { defaults: credential.catalogDefaults } : {}),
-                  previous: existing.filter(
-                    (model) =>
-                      model.connectionId === credential.provider ||
-                      (!model.connectionId &&
-                        model.provider === 'custom' &&
-                        Array.isArray(model.recommendationTags) &&
-                        model.recommendationTags.includes(
-                          credential.provider === 'ollama-cloud'
-                            ? 'Ollama Cloud'
-                            : 'Configured endpoint'
-                        ))
-                  )
+                  previous: replacing
                 });
           /*
            * The last thing between a provider's answer and deleting the owner's catalogue.
@@ -175,20 +181,7 @@ export const refreshOnce = async (input: {
            * ones an answer can be judged against. A catalogue holding both an OpenRouter set and a
            * configured one must not have either judged by the other's shape.
            */
-          const scoped = live.map((model) => ({ ...model, connectionId: credential.provider }));
-          const replacing = existing.filter(
-            (model) =>
-              model.connectionId === credential.provider ||
-              (!model.connectionId &&
-                (model.provider === credential.provider ||
-                  (model.provider === 'custom' &&
-                    Array.isArray(model.recommendationTags) &&
-                    model.recommendationTags.includes(
-                      credential.provider === 'ollama-cloud'
-                        ? 'Ollama Cloud'
-                        : 'Configured endpoint'
-                    ))))
-          );
+          const scoped = live.map((model) => ({ ...model, connectionId }));
           const refusal = implausibleReplacement({ previous: replacing, live: scoped });
           if (refusal) {
             refused = true;

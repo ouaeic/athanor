@@ -795,7 +795,9 @@ export const createServerSupport = (context: ServerBase) => {
           ...ModelRelease.parse(record),
           ...readRoutingMetadata(record)
         }))
-        .filter((model) => modelConnectionId(model, [secret.provider]) !== null),
+        .filter(
+          (model) => modelConnectionId(model, [secret.connectionId ?? secret.provider]) !== null
+        ),
       {
         provider: secret.provider === 'openrouter' ? 'openrouter' : 'custom',
         privacyRoute: privacy,

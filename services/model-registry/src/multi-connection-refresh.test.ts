@@ -103,3 +103,108 @@ describe('refreshing every saved connection', () => {
     expect(replaced[0]?.[0]?.connectionId).toBe('openai-compatible');
   });
 });
+
+describe('named accounts during scheduled catalog refresh', () => {
+  it.each([
+    { failNamed: false, legacyId: undefined },
+    { failNamed: true, legacyId: undefined },
+    { failNamed: false, legacyId: 'custom' },
+    { failNamed: true, legacyId: 'custom' }
+  ])(
+    'retains account identity and model facts across legacy rows and endpoint failure: %j',
+    async ({ failNamed, legacyId }) => {
+      const ids = [
+        'openai-compatible',
+        'openai-compatible:10000000-0000-4000-8000-000000000001',
+        'openai-compatible:10000000-0000-4000-8000-000000000002'
+      ];
+      const records = ids.map((connectionId, index) => ({
+        id: `custom/account-${index}/shared`,
+        providerModelId: 'shared',
+        provider: 'custom',
+        ...(index ? { connectionId } : legacyId ? { connectionId: legacyId } : {}),
+        recommendationTags: ['Configured endpoint'],
+        capabilities: ['chat', 'tools'],
+        contextTokens: 128000 + index * 1000
+      }));
+      const credentials = ids.map((connectionId, index) => ({
+        provider: `inference:${connectionId}`,
+        status: 'active',
+        secretCiphertext: encryptJson(
+          {
+            connectionId,
+            provider: 'openai-compatible',
+            baseUrl: `https://account-${index}.example/v1`,
+            apiKey: `account-${index}-key`,
+            enforceZeroDataRetention: true
+          },
+          masterKey,
+          inferenceCredentialAad(ownerId)
+        )
+      }));
+      const { store, replaced } = fixture();
+      store.listManagedProviderCredentials = async () => credentials;
+      store.listModels = async () => records;
+      const seen: Array<{
+        connectionId: string | undefined;
+        key: string | undefined;
+        previousIds: unknown[];
+      }> = [];
+      const outcome = await refreshOnce({
+        store,
+        masterKey,
+        baseUrl: 'https://openrouter.example/v1',
+        scope: 'provider_catalog',
+        configuredCatalog: async (input) => {
+          seen.push({
+            connectionId: input.connectionId,
+            key: input.apiKey,
+            previousIds: input.previous.map((row) => row.id)
+          });
+          if (failNamed && input.apiKey === 'account-1-key')
+            throw new Error('Named endpoint temporarily unavailable');
+          return input.previous.map((row) => ({
+            ...row,
+            contextTokens: Number(row.contextTokens) + 1000
+          }));
+        }
+      });
+      expect(outcome).toEqual({
+        state: failNamed ? 'failed' : 'refreshed',
+        models: 3,
+        reason: failNamed ? 'Named endpoint temporarily unavailable' : null
+      });
+      expect(seen).toEqual(
+        ids.map((connectionId, index) => ({
+          connectionId,
+          key: `account-${index}-key`,
+          previousIds: [`custom/account-${index}/shared`]
+        }))
+      );
+      expect(replaced).toHaveLength(failNamed ? 2 : 3);
+      expect(
+        replaced.map((rows) =>
+          rows.map((row) => ({
+            id: row.id,
+            connectionId: row.connectionId,
+            contextTokens: row.contextTokens
+          }))
+        )
+      ).toEqual(
+        ids.flatMap((connectionId, index) =>
+          failNamed && index === 1
+            ? []
+            : [
+                [
+                  {
+                    id: `custom/account-${index}/shared`,
+                    connectionId,
+                    contextTokens: 129000 + index * 1000
+                  }
+                ]
+              ]
+        )
+      );
+    }
+  );
+});

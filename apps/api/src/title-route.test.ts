@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { RoutableModel } from '@athanor/core';
+import { encryptJson, inferenceCredentialAad, type RoutableModel } from '@athanor/core';
 import { seedModels } from '@athanor/model-gateway';
 import type { ServerBase } from './http/server-context.js';
 import { createServerSupport } from './routes/support.js';
@@ -19,20 +19,39 @@ const model = (overrides: Partial<RoutableModel> = {}): RoutableModel => ({
 });
 const select = (models: RoutableModel[]) =>
   selectTitleRoute(models, { provider: 'openrouter', privacyRoute: 'provider_zdr', ceiling: {} });
-const support = (models: RoutableModel[], native = false) =>
+const titleMasterKey = Buffer.alloc(32, 29);
+const support = (models: RoutableModel[], native = false, connectionId?: string) =>
   createServerSupport({
     store: {
       getManagedProviderCredential: async () => null,
-      // Nothing saved: the credential comes from the environment, which is the shape a self-hosted
-      // box configured through `control.env` has. A double missing this method fails on the store
-      // call that looks for saved connections rather than on what the case is about.
-      listManagedProviderCredentials: async () => [],
+      // Exercise both environment configuration and an independently sealed named account.
+      listManagedProviderCredentials: async () =>
+        connectionId
+          ? [
+              {
+                provider: `inference:${connectionId}`,
+                status: 'active',
+                secretCiphertext: encryptJson(
+                  {
+                    connectionId,
+                    provider: 'openai-compatible',
+                    baseUrl: 'https://api.openai.com/v1',
+                    apiKey: 'named-account-key',
+                    enforceZeroDataRetention: true
+                  },
+                  titleMasterKey,
+                  inferenceCredentialAad('owner')
+                )
+              }
+            ]
+          : [],
       rerouteTaskModel: async () => false,
       recordModelThroughputCeiling: async () => undefined,
       modelThroughputCeiling: async () => null,
       listModels: async () => models,
       effectiveSpendLimits: async () => ({})
     },
+    masterKey: titleMasterKey,
     overrides: {},
     config: {
       AI_PROVIDER: native ? 'openai-compatible' : 'openrouter',
@@ -198,4 +217,50 @@ describe('bounded auxiliary title route', () => {
       expect(fetch).toHaveBeenCalledOnce();
     }
   );
+});
+
+it('binds an auxiliary title to its named account instead of a cheaper sibling account', async () => {
+  const connectionId = 'openai-compatible:10000000-0000-4000-8000-000000000001';
+  const calls: Array<{ model: unknown; authorization: string | null }> = [];
+  const fetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+    if (init?.method !== 'POST') return new Response(JSON.stringify({ data: [] }));
+    const body = JSON.parse(init.body as string) as Record<string, unknown>;
+    calls.push({
+      model: body.model,
+      authorization: new Headers(init.headers).get('authorization')
+    });
+    return new Response(
+      JSON.stringify({
+        choices: [{ message: { content: 'Named account title' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 20, completion_tokens: 4 }
+      })
+    );
+  });
+  vi.stubGlobal('fetch', fetch);
+  const result = await support(
+    [
+      model({
+        id: 'custom/default-title',
+        providerModelId: 'default-title',
+        provider: 'custom',
+        connectionId: 'openai-compatible',
+        inputUsdPerMillionTokens: 0.01
+      }),
+      model({
+        id: 'custom/named-title',
+        providerModelId: 'named-title',
+        provider: 'custom',
+        connectionId
+      })
+    ],
+    true,
+    connectionId
+  ).titleCompletion({
+    userId: 'owner',
+    modelId: 'irrelevant-task-model',
+    privacyRoute: 'provider_zdr',
+    prompt: 'Name this task'
+  });
+  expect(result).toMatchObject({ text: 'Named account title' });
+  expect(calls).toEqual([{ model: 'named-title', authorization: 'Bearer named-account-key' }]);
 });
