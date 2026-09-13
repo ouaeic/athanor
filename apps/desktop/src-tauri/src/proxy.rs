@@ -1470,7 +1470,8 @@ fn offline_page(
   .eyebrow {{ color: #adbaa4; text-transform: uppercase; letter-spacing: .14em; font-size: 11px; }}
   h1 {{ font-size: clamp(29px, 5vw, 42px); line-height: 1.05; margin: 10px 0 14px; }}
   p {{ color: #adbaa4; line-height: 1.55; }}
-  textarea {{ width: 100%; min-height: 120px; resize: vertical; margin: 18px 0 12px; padding: 15px;
+  label {{ display: block; margin-top: 20px; font-size: 14px; font-weight: 650; }}
+  textarea {{ width: 100%; min-height: 120px; resize: vertical; margin: 8px 0 12px; padding: 15px;
     color: #e9eee2; background: #151d19; border: 1px solid #48573e; border-radius: 14px; outline: none; }}
   textarea:focus {{ border-color: #d5e8a9; box-shadow: 0 0 0 3px #e9ecef14, 0 0 28px #dfe3e61c; }}
   button {{ width: 100%; border: 1px solid #d5e8a9; border-radius: 13px; padding: 13px 18px;
@@ -1494,10 +1495,11 @@ fn offline_page(
   <div class="brand">garden</div>
   <div class="eyebrow">Private server connection</div>
   <h1>Connect your AI computer</h1>
-  <p>Paste the one-time connection ticket printed after installing garden. The app will pin your server’s permanent identity and follow its address when the IP changes.</p>
-  <textarea id="ticket" spellcheck="false" autocomplete="off" placeholder="garden://pair/…"></textarea>
+  <p id="ticket-help">Paste the one-time connection ticket printed after installing garden. The app will pin your server’s permanent identity and follow its address when the IP changes.</p>
+  <label for="ticket">Connection ticket</label>
+  <textarea id="ticket" aria-label="Connection ticket" aria-describedby="ticket-help error" spellcheck="false" autocomplete="off" placeholder="garden://pair/…"></textarea>
   <button id="connect">Connect securely</button>
-  <div class="error" id="error">{safe_message}</div>
+  <div class="error" id="error" role="status" aria-live="polite">{safe_message}</div>
   <p class="hint">The server’s SSH login, IP address, and TLS warnings are not needed here.</p>
   <a class="install-link" href="{installer_url}">Install garden on a cloud server</a>
   {network_help}
@@ -1505,18 +1507,20 @@ fn offline_page(
 <script>
   const button = document.querySelector('#connect');
   const error = document.querySelector('#error');
+  const ticket = document.querySelector('#ticket');
   button.addEventListener('click', async () => {{
-    button.disabled = true; error.textContent = 'Verifying server identity…';
+    button.disabled = true; ticket.removeAttribute('aria-invalid'); error.textContent = 'Verifying server identity…';
     try {{
       const response = await fetch('/__athanor/client/pair', {{
         method: 'POST', headers: {{'content-type':'application/json'}},
-        body: JSON.stringify({{ticket: document.querySelector('#ticket').value.trim()}})
+        body: JSON.stringify({{ticket: ticket.value.trim()}})
       }});
       const body = await response.json();
       if (!response.ok) throw new Error(body.error?.message || 'Connection failed');
       location.replace('/');
     }} catch (cause) {{
       error.textContent = cause.message || 'Connection failed'; button.disabled = false;
+      ticket.setAttribute('aria-invalid', 'true'); ticket.focus();
     }}
   }});
   document.querySelectorAll('[data-network]').forEach((choice) => {{
