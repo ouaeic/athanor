@@ -64,12 +64,9 @@ it('answers an unverified Autonomous read without running it, parking the owner 
       { honorUserControl: async () => false, refreshActivePlan: async () => false }
     )
   ).toBe('done');
-  expect(state.messages).toEqual([
-    expect.objectContaining({
-      toolCallId: 'read',
-      content: expect.stringContaining('Not executed:')
-    })
-  ]);
+  expect(state.messages).toHaveLength(1);
+  expect(state.messages[0]).toMatchObject({ role: 'tool', toolCallId: 'read' });
+  expect(state.messages[0]?.content).toContain('Not executed:');
   expect(state.seenCalls ?? {}).toEqual({});
   expect(state.toolsStarted).toBe(0);
   expect(appendTaskEvent).toHaveBeenCalledOnce();

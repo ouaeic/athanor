@@ -29,13 +29,9 @@ describe('Autonomous alternatives pass the floor without executing the rejected 
     expect(requirement?.recovery).toBe('separate_network_steps');
     const current = state();
     expect(recoverApprovalProposal(task, current, script, requirement!)).toBe(true);
-    expect(current.messages).toEqual([
-      expect.objectContaining({
-        role: 'tool',
-        toolCallId: script.id,
-        content: expect.stringContaining('Not executed:')
-      })
-    ]);
+    expect(current.messages).toHaveLength(1);
+    expect(current.messages[0]).toMatchObject({ role: 'tool', toolCallId: script.id });
+    expect(current.messages[0]?.content).toContain('Not executed:');
     expect(current.turnToolResults?.download).toEqual({ name: 'shell', success: false });
     const args = {
       executable: 'curl',

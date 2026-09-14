@@ -2254,6 +2254,28 @@ try {
         await card.evaluate((element) => element.scrollWidth > element.clientWidth + 1),
         false
       );
+      await card
+        .getByRole('button', { name: 'Approve once', exact: true })
+        .scrollIntoViewIfNeeded();
+      assert(
+        await card.locator('.decision-actions').evaluate((element) => {
+          const area = document.querySelector('.garden-task-composer').getBoundingClientRect();
+          const buttons = [...element.querySelectorAll('button')];
+          return (
+            buttons.length === 2 &&
+            buttons.every((button) => {
+              const box = button.getBoundingClientRect();
+              return (
+                box.top >= area.top &&
+                box.bottom <= area.bottom &&
+                box.left >= 0 &&
+                box.right <= innerWidth
+              );
+            })
+          );
+        }),
+        'Both compact approval actions must be reachable inside the prompt area'
+      );
       await card.screenshot({ path: resolve(report, `approval-compact-${width}.png`) });
       await card.getByText('Inspect full action', { exact: true }).click();
       const detail = await card.locator('.decision-detail').innerText();

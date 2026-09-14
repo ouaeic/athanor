@@ -94,15 +94,12 @@ export function DecisionCard({
             <dd>{addresses.join(', ')}</dd>
           </div>
         )}
-        <div>
-          <dt>Expires</dt>
-          <dd>{date(decision.expiresAt)}</dd>
-        </div>
       </dl>
       <details className="decision-detail">
         <summary>Inspect full action</summary>
         {decision.origin && <p>Content read before this action: {decision.origin}</p>}
         <p>Effect: {decision.sideEffect.replaceAll('_', ' ')}</p>
+        <p>Expires: {date(decision.expiresAt)}</p>
         {command && (
           <pre className="command-preview">
             <code>{command}</code>
