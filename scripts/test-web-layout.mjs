@@ -2254,9 +2254,7 @@ try {
         await card.evaluate((element) => element.scrollWidth > element.clientWidth + 1),
         false
       );
-      await card
-        .getByRole('button', { name: 'Approve once', exact: true })
-        .scrollIntoViewIfNeeded();
+      await card.locator('.decision-actions').scrollIntoViewIfNeeded();
       assert(
         await card.locator('.decision-actions').evaluate((element) => {
           const area = document.querySelector('.garden-task-composer').getBoundingClientRect();
