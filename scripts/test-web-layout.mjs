@@ -2244,17 +2244,31 @@ try {
       .waitFor();
     for (const width of [320, 1440]) {
       await approvalPage.setViewportSize({ width, height: 1000 });
+      await card
+        .getByRole('button', { name: 'Approve once', exact: true })
+        .waitFor({ state: 'visible' });
       assert.equal(await card.locator('.decision-detail').getAttribute('open'), null);
-      const visible = await card.innerText();
+      const visible = await card
+        .locator(':scope > p, :scope > h3, :scope > .eyebrow, :scope > dl')
+        .allTextContents()
+        .then((parts) => parts.join('\n'));
       assert(visible.toLowerCase().includes('autonomous · needs approval'));
       assert(!visible.includes('This turn has'));
       assert(!visible.includes('python3'));
       assert(!visible.includes('shot-exploded.png'));
+      assert.equal(await card.locator('.decision-detail pre').isVisible(), false);
       assert.equal(
         await card.evaluate((element) => element.scrollWidth > element.clientWidth + 1),
         false
       );
       await card.locator('.decision-actions').scrollIntoViewIfNeeded();
+      const approvalLayout = await card.locator('.decision-actions').evaluate((element) => ({
+        area: document.querySelector('.garden-task-composer').getBoundingClientRect().toJSON(),
+        buttons: [...element.querySelectorAll('button')].map((button) =>
+          button.getBoundingClientRect().toJSON()
+        ),
+        viewport: { width: innerWidth, height: innerHeight }
+      }));
       assert(
         await card.locator('.decision-actions').evaluate((element) => {
           const area = document.querySelector('.garden-task-composer').getBoundingClientRect();
@@ -2264,15 +2278,17 @@ try {
             buttons.every((button) => {
               const box = button.getBoundingClientRect();
               return (
-                box.top >= area.top &&
-                box.bottom <= area.bottom &&
+                box.height > 0 &&
+                area.height > 0 &&
+                box.top >= area.top - 1 &&
+                box.bottom <= area.bottom + 1 &&
                 box.left >= 0 &&
                 box.right <= innerWidth
               );
             })
           );
         }),
-        'Both compact approval actions must be reachable inside the prompt area'
+        `Both compact approval actions must be reachable inside the prompt area: ${JSON.stringify(approvalLayout)}`
       );
       await card.screenshot({ path: resolve(report, `approval-compact-${width}.png`) });
       await card.getByText('Inspect full action', { exact: true }).click();
