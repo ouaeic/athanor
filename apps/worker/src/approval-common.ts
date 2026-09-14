@@ -71,7 +71,7 @@ export const SECURITY_MODE_FLOOR: Record<
     asksBeforeReachingTheInternet: false,
     asksBeforeInstallingSoftware: false,
     sentence:
-      'Works independently. Asks before external commitments, irreversible changes, durable instructions or services, sensitive or unidentified screen actions, and network access it cannot verify after trying an alternative.'
+      'Works independently. Asks before publishing, sending, spending, destroying data, signing or accepting terms in your name, a durable instruction, schedule, service or tool configuration, private input, an unidentified screen action, or network access it still cannot verify after trying an alternative.'
   }
 };
 
