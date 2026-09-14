@@ -7019,6 +7019,7 @@ describe('searching the owner’s own history', () => {
           payload: {
             workspaceId,
             prompt,
+            title: prompt,
             modelId: 'openrouter/openai/gpt-oss-120b',
             privacyRoute: 'provider_zdr',
             maxComputeCredits: 5

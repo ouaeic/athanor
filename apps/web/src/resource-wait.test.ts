@@ -35,6 +35,8 @@ it('uses the server failure when it is outside the visible activity page', () =>
     resourceWaitReason([], { code: 'provider_unavailable', summary: 'Current provider error' })
   ).toEqual({ label: 'Waiting for model provider', detail: 'Current provider error' });
   expect(resourceWaitReason(old, null)).toBeNull();
+  expect(resourceWaitReason(old, { code: '__proto__', summary: 'Unknown cause' })).toBeNull();
+  expect(resourceWaitReason([notice(2, 'constructor', 'Unknown cause')])).toBeNull();
   expect(
     resourceWaitReason(old, { code: 'different_failure', summary: 'Different cause' })
   ).toBeNull();
