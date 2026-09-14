@@ -17,7 +17,7 @@
  * and none of it can change what the floor was already handed. The throw stops the batch exactly
  * where the question has been answered.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { ModelRelease, WebToolPlan } from '@athanor/contracts';
 import type { TaskRecord } from '@athanor/data';
 import type { ModelResponse, ModelToolCall } from '@athanor/model-gateway';
@@ -31,6 +31,51 @@ import type { TurnRun } from './claim.js';
 
 const task = { id: 'task-1', workspaceId: 'ws-1', securityMode: 'autonomous' } as TaskRecord;
 const key = new Uint8Array(32);
+
+it('answers an unverified Autonomous read without running it, parking the owner or marking it as executed', async () => {
+  const call = {
+    id: 'read',
+    name: 'parallel_web_read',
+    arguments: { urls: ['https://source.example/page'] }
+  };
+  const state = { messages: [], turn: 3, toolsStarted: 0 } as unknown as AgentState;
+  const appendTaskEvent = vi.fn(async () => ({}));
+  const parkTaskForApproval = vi.fn();
+  const executeTool = vi.fn();
+  const deps = {
+    store: { appendTaskEvent, parkTaskForApproval },
+    config: {},
+    resume: { ensureTurnUndoPoint: async () => {}, executeTool },
+    approvalForCallOnce: async () =>
+      approvalRequirement(call.name, call.arguments, 'autonomous', {
+        taintSources: ['workspace/file']
+      })
+  } as unknown as TurnDispatchDeps;
+  expect(
+    await dispatchToolCalls(
+      deps,
+      task,
+      key,
+      state,
+      { toolCalls: [call] } as ModelResponse,
+      '',
+      { model: {}, catalog: [], webPlan: {} } as unknown as TurnRun,
+      { maxOutputTokens: 1024, turn: 3 },
+      { honorUserControl: async () => false, refreshActivePlan: async () => false }
+    )
+  ).toBe('done');
+  expect(state.messages).toEqual([
+    expect.objectContaining({
+      toolCallId: 'read',
+      content: expect.stringContaining('Not executed:')
+    })
+  ]);
+  expect(state.seenCalls ?? {}).toEqual({});
+  expect(state.toolsStarted).toBe(0);
+  expect(appendTaskEvent).toHaveBeenCalledOnce();
+  expect(executeTool).not.toHaveBeenCalled();
+  expect(parkTaskForApproval).not.toHaveBeenCalled();
+});
 
 const toolCall = (name: string, args: Record<string, unknown>): ModelToolCall =>
   ({ id: `call-${name}`, name, arguments: args }) as ModelToolCall;

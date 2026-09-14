@@ -6,7 +6,11 @@ import { data, text, date } from './model';
 import { post, ApiError } from './client';
 import { stepUp } from './auth';
 import { Button, ErrorNotice } from './ui';
-import { APPROVAL_NOTE_MAX_CHARS, approvalToolPhrases } from './approval-copy';
+import {
+  APPROVAL_NOTE_MAX_CHARS,
+  approvalIntroduction,
+  approvalToolPhrases
+} from './approval-copy';
 export function DecisionCard({
   decision,
   onResolved,
@@ -35,6 +39,10 @@ export function DecisionCard({
       text(preview.explanation, text(preview.summary, text(preview.preview)))
     )
   );
+  const introduction = approvalIntroduction(tool, decision.action, description);
+  const addresses = Array.isArray(preview.addresses)
+    ? preview.addresses.filter((value): value is string => typeof value === 'string')
+    : [];
   const privateInput =
     ['secure_input', 'type_secure'].includes(text(args.action)) ||
     decision.action === 'secure_input_handoff' ||
@@ -69,7 +77,7 @@ export function DecisionCard({
     <article className="decision-card">
       <div className="eyebrow">
         <ShieldCheck size={14} aria-hidden="true" />
-        Your approval
+        {preview.securityMode === 'autonomous' ? 'Autonomous · needs approval' : 'Your approval'}
       </div>
       {taskTitle && onOpenTask && (
         <button className="text-button" onClick={() => onOpenTask(decision.taskId)}>
@@ -77,35 +85,29 @@ export function DecisionCard({
           <ArrowUpRight size={14} />
         </button>
       )}
-      <h3>{approvalToolPhrases[tool] ?? decision.action}</h3>
-      {description && <p>{description}</p>}
+      <h3>{decision.action === tool ? (approvalToolPhrases[tool] ?? tool) : decision.action}</h3>
+      {introduction && <p>{introduction}</p>}
       <dl className="facts">
-        <div>
-          <dt>Action</dt>
-          <dd>{decision.action}</dd>
-        </div>
-        {decision.origin && (
+        {addresses.length > 0 && (
           <div>
-            <dt>Destination</dt>
-            <dd>{decision.origin}</dd>
+            <dt>Addresses referenced</dt>
+            <dd>{addresses.join(', ')}</dd>
           </div>
         )}
-        <div>
-          <dt>Reach</dt>
-          <dd>{decision.sideEffect.replaceAll('_', ' ')}</dd>
-        </div>
         <div>
           <dt>Expires</dt>
           <dd>{date(decision.expiresAt)}</dd>
         </div>
       </dl>
-      {command && (
-        <pre className="command-preview">
-          <code>{command}</code>
-        </pre>
-      )}
-      <details>
+      <details className="decision-detail">
         <summary>Inspect full action</summary>
+        {decision.origin && <p>Content read before this action: {decision.origin}</p>}
+        <p>Effect: {decision.sideEffect.replaceAll('_', ' ')}</p>
+        {command && (
+          <pre className="command-preview">
+            <code>{command}</code>
+          </pre>
+        )}
         <pre>
           {typeof decision.preview === 'string'
             ? decision.preview

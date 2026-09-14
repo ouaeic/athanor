@@ -264,7 +264,6 @@ export const shellApprovalRequirement = (
   }
   if (name === 'shell') {
     const executable = textValue(args.executable).split('/').pop() ?? '';
-    const commandArgs = Array.isArray(args.args) ? args.args.map(String) : [];
     const commands = effectiveCommands(args);
     const requirement = commandRequirement();
     if (requirement) return requirement;
@@ -284,7 +283,8 @@ export const shellApprovalRequirement = (
         return {
           sideEffect: 'external_reversible',
           action: `Review network access for ${unlisted?.[0] || executable || 'command'}`,
-          preview: `Run ${[executable, ...commandArgs].join(' ')}. It reaches ${outbound.length ? namedObjects([...new Set(outbound.map(({ host }) => host))]) : 'an address this could not read'}, and ${unlisted ? `it runs ${unlisted[0]}, which is not read-only or package-install use of the allowlist.` : 'what it runs could not be read, so its network use is unknown.'}`
+          recovery: 'separate_network_steps',
+          preview: `Garden cannot verify the network effects of ${unlisted?.[0] || executable || 'this command'}. Addresses referenced: ${outbound.length ? namedObjects([...new Set(outbound.map(({ host }) => host))]) : 'unresolved'}.\n\nCommand: ${shellInvocation(args)}`
         };
     }
     if (reachesOutside && SECURITY_MODE_FLOOR[securityMode].asksBeforeReachingTheInternet)
@@ -292,8 +292,8 @@ export const shellApprovalRequirement = (
         sideEffect: 'external_reversible',
         action: `Allow internet access for ${executable || 'command'}`,
         preview: outbound.length
-          ? `Run ${[executable, ...commandArgs].join(' ')}. It reaches ${namedObjects([...new Set(outbound.map(({ host }) => host))])}, which is outside this computer, so it can send data out.`
-          : `Run ${[executable, ...commandArgs].join(' ')}. It connects to somewhere this computer could not read out of the command, so where it sends data is unknown.`
+          ? `This command accesses ${namedObjects([...new Set(outbound.map(({ host }) => host))])}.\n\nCommand: ${shellInvocation(args)}`
+          : `Garden could not determine this command's network destination.\n\nCommand: ${shellInvocation(args)}`
       };
   }
   return undefined;

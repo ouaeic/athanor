@@ -1,7 +1,12 @@
 /** The strongest provenance, lifetime and ordinary-effect requirement is authoritative. */
 import { publishesPublicly, type SecurityMode } from '@athanor/contracts';
 import { connectorActions } from '@athanor/core';
-import { classifyDestination, MAX_TURN_NOVEL_BYTES, type DestinationVerdict } from './egress.js';
+import {
+  classifyDestination,
+  MAX_TURN_NOVEL_BYTES,
+  MAX_NOVEL_URL_BYTES,
+  type DestinationVerdict
+} from './egress.js';
 import { scanSkillBodyForSecrets } from './skills.js';
 import { surfaceActionVerb } from './surface-actions.js';
 import { textValue } from './values.js';
@@ -80,8 +85,18 @@ const strongestRequirement = (
   if (!ordinary) return raised;
   const strongest =
     APPROVAL_RANK[ordinary.sideEffect] > APPROVAL_RANK[raised.sideEffect] ? ordinary : raised;
+  const { recovery: _recovery, ...required } = strongest;
   return {
-    ...strongest,
+    ...required,
+    ...(raised.recovery && ordinary.recovery
+      ? {
+          recovery:
+            raised.recovery === 'separate_network_steps' ||
+            ordinary.recovery === 'separate_network_steps'
+              ? ('separate_network_steps' as const)
+              : ('verify_public_source' as const)
+        }
+      : {}),
     preview:
       raised.preview === ordinary.preview
         ? strongest.preview
@@ -94,22 +109,26 @@ const destinationCard = (
   taintSources: readonly string[],
   what: string,
   spent: number
-): {
-  sideEffect: 'external_reversible';
-  action: string;
-  preview: string;
-} => ({
+): ApprovalRequirement => ({
   sideEffect: 'external_reversible',
   action: `Allow ${what} to ${verdicts[0]?.host ?? 'an outside host'}`,
+  ...(verdicts.length > 0 &&
+  verdicts.every(
+    (verdict) => verdict.unfamiliarPublicHost && verdict.noveltyBytes <= MAX_NOVEL_URL_BYTES
+  ) &&
+  spent + verdicts.reduce((total, verdict) => total + verdict.noveltyBytes, 0) <=
+    MAX_TURN_NOVEL_BYTES
+    ? { recovery: 'verify_public_source' as const }
+    : {}),
   preview: [
-    `This turn has read untrusted content (${taintSources.slice(0, 3).join(', ')}), and this request goes somewhere it did not come from.`,
+    'Garden could not verify these destinations against the request and sources already checked.',
     ...verdicts
       .slice(0, 6)
       .map(
         (verdict) => `- ${verdict.host}: ${verdict.reason} (${verdict.noveltyBytes} bytes charged)`
       ),
-    `This turn has put ${spent} of the ${MAX_TURN_NOVEL_BYTES} bytes it may put into addresses while untrusted content is in it, and this request adds ${verdicts.reduce((total, verdict) => total + verdict.noveltyBytes, 0)}.`,
-    'An address is how data leaves this computer without a file ever moving.'
+    `Address allowance: ${spent} of ${MAX_TURN_NOVEL_BYTES} bytes used; ${verdicts.reduce((total, verdict) => total + verdict.noveltyBytes, 0)} requested.`,
+    `Content read: ${taintSources.slice(0, 3).join(', ')}.`
   ].join('\n')
 });
 

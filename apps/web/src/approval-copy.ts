@@ -1,5 +1,15 @@
 export const APPROVAL_NOTE_MAX_CHARS = 600;
 
+/** Policy detail stays inspectable; a script is not a useful card introduction. */
+export const approvalIntroduction = (tool: string, action: string, detail: string): string => {
+  if (tool === 'shell' && /Allow this command to|Review network access for/.test(action))
+    return 'This command includes network access that Garden could not verify automatically. Review the addresses and command before allowing it.';
+  if (tool === 'shell' && /Allow internet access for/.test(action))
+    return 'Your approval setting asks before commands access the internet.';
+  const first = detail.split(/\n\s*\n/)[0]?.trim() ?? '';
+  return first.length > 280 ? `${first.slice(0, 279).trimEnd()}…` : first;
+};
+
 export const approvalToolPhrases: Record<string, string> = {
   audio_read: 'Read audio',
   browser_action: 'Use the browser',

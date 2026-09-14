@@ -33,6 +33,8 @@ export interface ApprovalRequirement {
   sideEffect: 'workspace_write' | 'external_reversible' | 'external_consequential';
   action: string;
   preview: string;
+  /** Reject this proposal and let Autonomous try a separately checked alternative. */
+  recovery?: 'verify_public_source' | 'separate_network_steps';
 }
 
 export const APPROVAL_RANK: Record<ApprovalRequirement['sideEffect'], number> = {
@@ -69,7 +71,7 @@ export const SECURITY_MODE_FLOOR: Record<
     asksBeforeReachingTheInternet: false,
     asksBeforeInstallingSoftware: false,
     sentence:
-      'Only what this computer cannot take back for you — publishing, sending, spending, destroying data, signing or accepting terms in your name, a startup file, hook, schedule, service or tool configuration it would run on its own afterwards, and a control on a screen that nothing could identify.'
+      'Works independently. Asks before external commitments, irreversible changes, durable instructions or services, sensitive or unidentified screen actions, and network access it cannot verify after trying an alternative.'
   }
 };
 

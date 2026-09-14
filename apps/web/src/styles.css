@@ -999,6 +999,20 @@ canvas {
 .decision-card details {
   font-size: 12px;
 }
+.decision-card {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.decision-detail pre {
+  max-height: 420px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.decision-detail summary {
+  cursor: pointer;
+  padding: 10px 0;
+}
 .decision-card small {
   color: var(--muted);
   font-size: 10px;

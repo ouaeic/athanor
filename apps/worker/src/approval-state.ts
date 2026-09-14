@@ -15,6 +15,7 @@ export interface AgentApprovalRequirement {
   action: string;
   preview: string;
   handoffOnly?: boolean;
+  recovery?: 'verify_public_source' | 'separate_network_steps';
 }
 
 /**

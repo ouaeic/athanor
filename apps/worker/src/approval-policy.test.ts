@@ -1771,9 +1771,7 @@ describe('what a tainted turn may still do through shell', () => {
     expect(batch?.preview).toContain('this turn has already put');
 
     // And the owner can see the charge itself, not only that one was made.
-    expect(batch?.preview).toContain(
-      `of the ${MAX_TURN_NOVEL_BYTES} bytes it may put into addresses`
-    );
+    expect(batch?.preview).toContain(`of ${MAX_TURN_NOVEL_BYTES} bytes used`);
 
     // And the same batch one at a time is still the same fact, so nothing was gained by splitting.
     const single = approvalRequirement(
@@ -1849,7 +1847,7 @@ describe('what a tainted turn may still do through shell', () => {
     // It is charged rather than exempted, which is the whole of the bound: the turn's total is what
     // makes a payload split across many small requests finite.
     expect(carried('Accept: application/json', MAX_TURN_NOVEL_BYTES - 10)?.preview).toContain(
-      'bytes it may put into addresses'
+      'Address allowance:'
     );
   });
 
@@ -4880,7 +4878,9 @@ describe('balanced, before a fetch whose far end it could not read', () => {
     ]) {
       const card = approvalRequirement('shell', shell(body), 'balanced', clean);
       expect(card?.action, body).toBe('Allow internet access for bash');
-      expect(card?.preview, body).toContain('could not read out of the command');
+      expect(card?.preview, body).toContain(
+        "could not determine this command's network destination"
+      );
       // With the network field declared as well as left out.
       expect(
         approvalRequirement('shell', { ...shell(body), network: true }, 'balanced', clean)?.action,

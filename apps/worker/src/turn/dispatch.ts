@@ -53,6 +53,7 @@ import { textValue } from '../values.js';
 import { isMutatingToolCall } from '../write-classification.js';
 import { declareAcceptance, type AcceptanceDeclarationDeps } from './acceptance-declaration.js';
 import { parkForApproval } from './approval-park.js';
+import { recoverApprovalProposal } from './approval-recovery.js';
 import type { TurnRun } from './claim.js';
 import { executeApprovedCall } from './execute-call.js';
 import { handleFinishCall, type TurnFinishDeps } from './finish.js';
@@ -573,6 +574,17 @@ export const dispatchToolCalls = async (
     await deps.resume.ensureTurnUndoPoint(task, key, state, call.name);
     const approval = await deps.approvalForCallOnce(approvalMemo, task, call, state);
     if (approval) {
+      if (recoverApprovalProposal(task, state, call, approval)) {
+        if (IDEMPOTENT_WITHIN_TURN.has(call.name) && state.seenCalls)
+          delete state.seenCalls[idempotentCallKey(call)];
+        await event(deps.store, task, key, 'status', 'Checking another way to complete this step', {
+          toolCallId: call.id,
+          tool: call.name,
+          executed: false,
+          reason: approval.recovery
+        });
+        continue;
+      }
       // The card, the calls behind it, and the saved state, in that order and together.
       // @see parkForApproval in `turn/approval-park.ts`.
       await parkForApproval(

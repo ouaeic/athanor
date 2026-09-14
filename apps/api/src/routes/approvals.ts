@@ -56,7 +56,7 @@ export const registerApprovalRoutes = (context: RouteContext): void => {
           return {
             ...approval,
             action: textValue(decryptedPreview.action, textValue(approval.action)),
-            preview: decryptedPreview,
+            preview: { ...decryptedPreview, securityMode: task?.securityMode },
             previewCiphertext: undefined
           };
         })

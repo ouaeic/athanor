@@ -23,6 +23,7 @@ import { approvalPreviewHash, type AgentApprovalRequirement } from '../approval-
 import { event } from '../tool-recording.js';
 import { approvalOrigin } from '../turn-bounds.js';
 import { textValue } from '../values.js';
+import { callDestinations } from '../command-classification.js';
 
 /** What parking a turn on a card needs from the worker that owns it. */
 export interface ApprovalParkDeps {
@@ -68,6 +69,18 @@ export const parkForApproval = async (
         action: approval.action,
         preview: approval.preview,
         tool: call.name,
+        securityMode: task.securityMode,
+        addresses: [
+          ...new Set(
+            callDestinations(call.name, call.arguments).map((address) => {
+              try {
+                return new URL(address).hostname;
+              } catch {
+                return 'Unresolved address';
+              }
+            })
+          )
+        ],
         arguments: approval.handoffOnly
           ? { action: textValue(call.arguments.action, 'secure_input') }
           : call.arguments

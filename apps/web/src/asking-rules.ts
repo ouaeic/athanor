@@ -6,5 +6,5 @@ export const modeFloors: Record<SecurityMode, string> = {
   balanced:
     'A command reaching an address out on the internet, and installing software onto it, on top of everything Autonomous asks about; the built-in web tools read without asking.',
   autonomous:
-    'Only what this computer cannot take back for you — publishing, sending, spending, destroying data, signing or accepting terms in your name, a startup file, hook, schedule, service or tool configuration it would run on its own afterwards, and a control on a screen that nothing could identify.'
+    'Works independently. Asks before external commitments, irreversible changes, durable instructions or services, sensitive or unidentified screen actions, and network access it cannot verify after trying an alternative.'
 };

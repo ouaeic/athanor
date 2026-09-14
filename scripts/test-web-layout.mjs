@@ -2220,6 +2220,52 @@ try {
       false
     );
     assert.equal(approvalRequests.length, 5, 'Expired decisions must not submit');
+    const longCommand = "python3 - <<'PY'\n" + 'print("download fixture")\n'.repeat(150) + 'PY';
+    approvals = [
+      {
+        ...approvals[0],
+        id: 'a0000000-0000-4000-8000-000000000091',
+        action: 'Allow this command to unpkg.com',
+        origin: 'workspace file pocket-watch/shot-exploded.png',
+        sideEffect: 'external_reversible',
+        expiresAt: new Date(Date.now() + 600000).toISOString(),
+        preview: {
+          tool: 'shell',
+          securityMode: 'autonomous',
+          addresses: ['unpkg.com'],
+          preview: 'This turn has read untrusted content.\n\nRun ' + longCommand,
+          arguments: { executable: 'bash', args: ['-lc', longCommand] }
+        }
+      }
+    ];
+    await approvalPage.goto(`${origin}/?task=${task.id}`);
+    await card
+      .getByRole('heading', { name: 'Allow this command to unpkg.com', exact: true })
+      .waitFor();
+    for (const width of [320, 1440]) {
+      await approvalPage.setViewportSize({ width, height: 1000 });
+      assert.equal(await card.locator('.decision-detail').getAttribute('open'), null);
+      const visible = await card.innerText();
+      assert(visible.includes('Autonomous · needs approval'));
+      assert(!visible.includes('This turn has'));
+      assert(!visible.includes('python3'));
+      assert(!visible.includes('shot-exploded.png'));
+      assert.equal(
+        await card.evaluate((element) => element.scrollWidth > element.clientWidth + 1),
+        false
+      );
+      await card.screenshot({ path: resolve(report, `approval-compact-${width}.png`) });
+      await card.getByText('Inspect full action', { exact: true }).click();
+      const detail = await card.locator('.decision-detail').innerText();
+      assert(detail.includes('python3'));
+      assert(detail.includes('shot-exploded.png'));
+      assert.equal((detail.match(/download fixture/g) ?? []).length, 300);
+      assert.equal(
+        await card.evaluate((element) => element.scrollWidth > element.clientWidth + 1),
+        false
+      );
+      await card.getByText('Inspect full action', { exact: true }).click();
+    }
     await approvalPage.close();
     approvals = [];
     const modelsPage = await context.newPage();

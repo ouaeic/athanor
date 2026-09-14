@@ -187,6 +187,8 @@ export interface AgentState {
   preparedInputTokens?: number;
   /** Consecutive replies this turn that carried no tool call at all. Persisted for the same reason. */
   completionNags?: number;
+  /** Counts rejected proposals, not executed actions; survives worker restarts. */
+  approvalRecovery?: { turn: number; attempts: number };
   /**
    * Tools this turn has actually started, counted where `tool_started` is written.
    *

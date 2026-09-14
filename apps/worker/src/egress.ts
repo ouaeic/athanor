@@ -66,6 +66,8 @@ export interface DestinationContext {
 }
 
 export interface DestinationVerdict {
+  /** Permits source verification as an alternative proposal; never authorizes the request. */
+  unfamiliarPublicHost?: boolean;
   readonly sink: boolean;
   readonly host: string;
   /**
@@ -452,6 +454,7 @@ export const classifyDestination = (
     return {
       sink: true,
       host,
+      ...(reach === 'internet' ? { unfamiliarPublicHost: true } : {}),
       noveltyBytes: addressNovelty + chosenBytes(host.split('.'), corpus),
       /*
        * Named separately for the estate, because "not a host the user named" is a true sentence
