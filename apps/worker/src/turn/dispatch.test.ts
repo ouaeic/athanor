@@ -57,7 +57,7 @@ it('answers an unverified Autonomous read without running it, parking the owner 
       task,
       key,
       state,
-      { toolCalls: [call] } as ModelResponse,
+      { toolCalls: [call] } as unknown as ModelResponse,
       '',
       { model: {}, catalog: [], webPlan: {} } as unknown as TurnRun,
       { maxOutputTokens: 1024, turn: 3 },

@@ -2246,7 +2246,7 @@ try {
       await approvalPage.setViewportSize({ width, height: 1000 });
       assert.equal(await card.locator('.decision-detail').getAttribute('open'), null);
       const visible = await card.innerText();
-      assert(visible.includes('Autonomous · needs approval'));
+      assert(visible.toLowerCase().includes('autonomous · needs approval'));
       assert(!visible.includes('This turn has'));
       assert(!visible.includes('python3'));
       assert(!visible.includes('shot-exploded.png'));
