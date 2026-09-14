@@ -1,5 +1,5 @@
 /** Shared approval facts and presentation bounds; no authority is derived here. */
-import { type SecurityMode } from '@athanor/contracts';
+import { type SecurityMode, type TaskApprovalScope } from '@athanor/contracts';
 import { type ResolvedMediaModel } from './media.js';
 import { textValue } from './values.js';
 
@@ -30,6 +30,7 @@ export interface ApprovalContext {
 }
 
 export interface ApprovalRequirement {
+  taskGrant?: TaskApprovalScope;
   sideEffect: 'workspace_write' | 'external_reversible' | 'external_consequential';
   action: string;
   preview: string;

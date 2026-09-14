@@ -19,8 +19,8 @@ describe('browser approval settlement', () => {
     registerApprovalRoutes({
       app: {
         get() {},
-        post(_path: string, route: typeof handler) {
-          handler = route;
+        post(path: string, route: typeof handler) {
+          if (path === '/v1/approvals/:approvalId/:decision') handler = route;
         }
       },
       store: {

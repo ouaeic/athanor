@@ -1,3 +1,4 @@
+import { withTaskApproval } from './approval-grants.js';
 /** Command effects, including destructive operations, publishing and network access. */
 import { type SecurityMode } from '@athanor/contracts';
 import { textValue } from './values.js';
@@ -226,11 +227,16 @@ export const shellApprovalRequirement = (
         rest.some((argument) => packageInstallCommands.has(argument.toLowerCase()))
     );
     if (installer && SECURITY_MODE_FLOOR[securityMode].asksBeforeInstallingSoftware)
-      return {
-        sideEffect: 'external_reversible',
-        action: `Install or update software with ${installer[0]}`,
-        preview: `Run ${invocation} inside the persistent Linux computer. Downloaded software and its publisher terms become part of this installation.`
-      };
+      return withTaskApproval(
+        {
+          sideEffect: 'external_reversible',
+          action: `Install or update software with ${installer[0]}`,
+          preview: `Run ${invocation} inside the persistent Linux computer. Downloaded software and its publisher terms become part of this installation.`
+        },
+        name,
+        args,
+        'install'
+      );
     const forced = commands.find((command) => forcedGitPush(command));
     if (forced)
       return {
@@ -280,21 +286,31 @@ export const shellApprovalRequirement = (
           )
       );
       if (unlisted || commands.length === 0)
-        return {
-          sideEffect: 'external_reversible',
-          action: `Review network access for ${unlisted?.[0] || executable || 'command'}`,
-          recovery: 'separate_network_steps',
-          preview: `Garden cannot verify the network effects of ${unlisted?.[0] || executable || 'this command'}. Addresses referenced: ${outbound.length ? namedObjects([...new Set(outbound.map(({ host }) => host))]) : 'unresolved'}.\n\nCommand: ${shellInvocation(args)}`
-        };
+        return withTaskApproval(
+          {
+            sideEffect: 'external_reversible',
+            action: `Review network access for ${unlisted?.[0] || executable || 'command'}`,
+            recovery: 'separate_network_steps',
+            preview: `Garden cannot verify the network effects of ${unlisted?.[0] || executable || 'this command'}. Addresses referenced: ${outbound.length ? namedObjects([...new Set(outbound.map(({ host }) => host))]) : 'unresolved'}.\n\nCommand: ${shellInvocation(args)}`
+          },
+          name,
+          args,
+          'network'
+        );
     }
     if (reachesOutside && SECURITY_MODE_FLOOR[securityMode].asksBeforeReachingTheInternet)
-      return {
-        sideEffect: 'external_reversible',
-        action: `Allow internet access for ${executable || 'command'}`,
-        preview: outbound.length
-          ? `This command accesses ${namedObjects([...new Set(outbound.map(({ host }) => host))])}.\n\nCommand: ${shellInvocation(args)}`
-          : `Garden could not determine this command's network destination.\n\nCommand: ${shellInvocation(args)}`
-      };
+      return withTaskApproval(
+        {
+          sideEffect: 'external_reversible',
+          action: `Allow internet access for ${executable || 'command'}`,
+          preview: outbound.length
+            ? `This command accesses ${namedObjects([...new Set(outbound.map(({ host }) => host))])}.\n\nCommand: ${shellInvocation(args)}`
+            : `Garden could not determine this command's network destination.\n\nCommand: ${shellInvocation(args)}`
+        },
+        name,
+        args,
+        'network'
+      );
   }
   return undefined;
 };

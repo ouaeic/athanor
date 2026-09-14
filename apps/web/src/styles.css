@@ -1776,3 +1776,22 @@ canvas {
     white-space: pre-wrap;
   }
 }
+.decision-permission {
+  padding: 0.65rem 1rem;
+  border-left: 2px solid var(--line-strong);
+  overflow-wrap: anywhere;
+}
+.decision-permission p {
+  margin: 0.5rem 0;
+}
+.task-permission {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+.task-permission p {
+  flex: 1 1 15rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}

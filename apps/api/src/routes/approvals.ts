@@ -4,7 +4,14 @@
  * Pending is the default listing because that is the list with something to answer.
  */
 
-import { APPROVAL_NOTE_MAX_CHARS, approvalDenialMessage } from '@athanor/contracts';
+import {
+  APPROVAL_NOTE_MAX_CHARS,
+  approvalDenialMessage,
+  TaskApprovalOffer,
+  canonicalApprovalScope,
+  describeApprovalScope
+} from '@athanor/contracts';
+import { createHmac } from 'node:crypto';
 import { AthanorError, decryptJson, encryptJson, unwrapDataKey } from '@athanor/core';
 import { z } from 'zod';
 import { textValue } from '../context.js';
@@ -53,10 +60,22 @@ export const registerApprovalRoutes = (context: RouteContext): void => {
             key,
             `approval:${String(approval.taskId)}`
           );
+          const offered = TaskApprovalOffer.safeParse(decryptedPreview.taskGrant);
           return {
             ...approval,
             action: textValue(decryptedPreview.action, textValue(approval.action)),
-            preview: { ...decryptedPreview, securityMode: task?.securityMode },
+            preview: {
+              ...decryptedPreview,
+              securityMode: task?.securityMode,
+              taskGrant:
+                approval.sideEffect !== 'external_consequential' &&
+                offered.success &&
+                offered.data.scope.tool === decryptedPreview.tool &&
+                offered.data.securityMode === task?.securityMode &&
+                !task?.parentMissionId
+                  ? { ...offered.data, description: describeApprovalScope(offered.data.scope) }
+                  : undefined
+            },
             previewCiphertext: undefined
           };
         })
@@ -73,7 +92,7 @@ export const registerApprovalRoutes = (context: RouteContext): void => {
         const input = (
           decision === 'deny'
             ? z.object({ note: z.string().max(APPROVAL_NOTE_MAX_CHARS).optional() }).strict()
-            : z.object({}).strict()
+            : z.object({ scope: z.enum(['once', 'run']).optional() }).strict()
         ).parse(request.body ?? {});
         const approval = await store.getApproval(request.params.approvalId);
         if (!approval || approval.userId !== user.id)
@@ -83,9 +102,67 @@ export const registerApprovalRoutes = (context: RouteContext): void => {
           );
         const note = approvalDenialMessage({
           tool: textValue(approval.action),
-          ...('note' in input ? { note: input.note } : {})
+          ...('note' in input && typeof input.note === 'string' ? { note: input.note } : {})
         });
-        let correction;
+        let correction: Parameters<typeof store.resolveApproval>[3];
+        let grant: Parameters<typeof store.resolveApproval>[4];
+        if ('scope' in input && input.scope === 'run') {
+          if (request.apiToken)
+            throw new AthanorError(
+              'approval_grant_owner_required',
+              'Reusable permissions require the owner’s session',
+              403
+            );
+          const task = await store.getTask(user.id, String(approval.taskId));
+          const workspace = task ? await store.getWorkspace(user.id, task.workspaceId) : null;
+          if (
+            !task ||
+            task.parentMissionId ||
+            approval.sideEffect === 'external_consequential' ||
+            !workspace?.wrappedKey ||
+            !task.agentStateCiphertext
+          )
+            throw new AthanorError(
+              'approval_grant_unavailable',
+              'This action supports approval once only',
+              409
+            );
+          const key = unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id);
+          const preview = decryptJson<Record<string, unknown>>(
+            approval.previewCiphertext as Parameters<typeof decryptJson>[0],
+            key,
+            `approval:${task.id}`
+          );
+          const offer = TaskApprovalOffer.safeParse(preview.taskGrant);
+          const state = decryptJson<{ turn?: number }>(
+            task.agentStateCiphertext,
+            key,
+            `task-state:${task.id}`
+          );
+          if (
+            !offer.success ||
+            offer.data.scope.tool !== preview.tool ||
+            offer.data.turn !== (state.turn ?? 0) ||
+            offer.data.securityMode !== task.securityMode
+          )
+            throw new AthanorError(
+              'approval_grant_unavailable',
+              'This permission no longer matches the current run',
+              409
+            );
+          grant = {
+            turn: offer.data.turn,
+            securityMode: offer.data.securityMode,
+            scopeHash: createHmac('sha256', key)
+              .update(canonicalApprovalScope(offer.data.scope))
+              .digest('hex'),
+            scopeCiphertext: encryptJson(
+              offer.data.scope,
+              key,
+              `task-approval:${task.id}:${request.params.approvalId}`
+            )
+          };
+        }
         if (note) {
           const task = await store.getTask(user.id, String(approval.taskId));
           const workspace = task ? await store.getWorkspace(user.id, task.workspaceId) : null;
@@ -97,17 +174,72 @@ export const registerApprovalRoutes = (context: RouteContext): void => {
             queuedEventCiphertext: encryptJson({ markdown: note }, key, `task-event:${task.id}`)
           };
         }
+        const settlement: [
+          Parameters<typeof store.resolveApproval>[3]?,
+          Parameters<typeof store.resolveApproval>[4]?
+        ] = grant ? [undefined, grant] : correction ? [correction] : [];
         const changed = await store.resolveApproval(
           user.id,
           request.params.approvalId,
           decision === 'approve' ? 'approved' : 'denied',
-          ...(correction ? ([correction] as const) : [])
+          ...settlement
         );
         if (!changed)
           throw new AthanorError(
             'approval_unavailable',
             'Approval is missing, resolved, or expired'
           );
+        return { ok: true };
+      });
+    }
+  );
+
+  app.get<{ Params: { taskId: string }; Querystring: { before?: string } }>(
+    '/v1/approvals/tasks/:taskId/permissions',
+    async (request) => {
+      const user = requireUser(request.user);
+      const { before } = z.object({ before: z.string().uuid().optional() }).parse(request.query);
+      const task = await store.getTask(user.id, request.params.taskId);
+      if (!task) throw new AthanorError('task_not_found', 'Work not found', 404);
+      const workspace = await store.getWorkspace(user.id, task.workspaceId);
+      if (!workspace?.wrappedKey || !task.agentStateCiphertext) return [];
+      const key = unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id);
+      const state = decryptJson<{ turn?: number }>(
+        task.agentStateCiphertext,
+        key,
+        `task-state:${task.id}`
+      );
+      const grants = await store.listTaskApprovalGrants(user.id, task.id, state.turn ?? 0, before);
+      return grants.map((grant) => {
+        const scope = decryptJson<TaskApprovalOffer['scope']>(
+          grant.scopeCiphertext,
+          key,
+          `task-approval:${task.id}:${grant.id}`
+        );
+        return {
+          id: grant.id,
+          description: describeApprovalScope(scope),
+          createdAt: grant.createdAt
+        };
+      });
+    }
+  );
+  app.post<{ Params: { taskId: string; grantId: string } }>(
+    '/v1/approvals/tasks/:taskId/permissions/:grantId/revoke',
+    async (request, reply) => {
+      const user = requireUser(request.user);
+      return idempotent(request, reply, user, async () => {
+        z.object({})
+          .strict()
+          .parse(request.body ?? {});
+        if (
+          !(await store.revokeTaskApprovalGrant(
+            user.id,
+            request.params.taskId,
+            request.params.grantId
+          ))
+        )
+          throw new AthanorError('approval_grant_unavailable', 'Permission not found', 404);
         return { ok: true };
       });
     }

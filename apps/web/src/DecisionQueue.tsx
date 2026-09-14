@@ -43,14 +43,20 @@ export function DecisionCard({
   const addresses = Array.isArray(preview.addresses)
     ? preview.addresses.filter((value): value is string => typeof value === 'string')
     : [];
+  const grantDescription = text(data(preview.taskGrant).description);
   const privateInput =
     ['secure_input', 'type_secure'].includes(text(args.action)) ||
     decision.action === 'secure_input_handoff' ||
     /^Secure (browser|desktop) input required$/.test(decision.action);
   const [inputFinished, setInputFinished] = useState(false);
   const expired = Date.parse(decision.expiresAt) <= Date.now();
-  async function resolve(action: 'approve' | 'deny') {
-    const body = action === 'deny' && note.trim() ? { note: note.trim() } : {};
+  async function resolve(action: 'approve' | 'deny', scope: 'once' | 'run' = 'once') {
+    const body =
+      action === 'deny' && note.trim()
+        ? { note: note.trim() }
+        : action === 'approve' && scope === 'run'
+          ? { scope }
+          : {};
     setBusy(true);
     setError(null);
     try {
@@ -100,6 +106,12 @@ export function DecisionCard({
         {decision.origin && <p>Content read before this action: {decision.origin}</p>}
         <p>Effect: {decision.sideEffect.replaceAll('_', ' ')}</p>
         <p>Expires: {date(decision.expiresAt)}</p>
+        {grantDescription && (
+          <p>
+            Run permissions survive pause and reconnect. They end with a new direction, run
+            completion, a change of approval mode, or revocation in Work options.
+          </p>
+        )}
         {command && (
           <pre className="command-preview">
             <code>{command}</code>
@@ -157,6 +169,13 @@ export function DecisionCard({
         </small>
       </details>
       <ErrorNotice error={error} />
+      {grantDescription && !privateInput && (
+        <div className="decision-permission">
+          <strong>For this run</strong>
+          <p>{grantDescription}</p>
+          <small>Review or revoke in Work options.</small>
+        </div>
+      )}
       <div className="row decision-actions">
         <Button
           className="primary"
@@ -166,11 +185,18 @@ export function DecisionCard({
         >
           {expired ? 'Expired' : privateInput ? 'Continue after private input' : 'Approve once'}
         </Button>
+        {grantDescription && !privateInput && (
+          <Button disabled={busy || expired} onClick={() => resolve('approve', 'run')}>
+            Allow for this run
+          </Button>
+        )}
         <Button disabled={busy || expired} onClick={() => resolve('deny')}>
           Deny
         </Button>
       </div>
-      <small>This approval applies to the action shown here.</small>
+      {(!grantDescription || privateInput) && (
+        <small>This approval applies to the action shown here.</small>
+      )}
     </article>
   );
 }

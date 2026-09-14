@@ -38,6 +38,7 @@ import {
 } from './approval-common.js';
 import { shellApprovalRequirement } from './approval-shell.js';
 import { mediaApprovalRequirement } from './approval-media.js';
+import { mergeTaskApproval, withTaskApproval } from './approval-grants.js';
 export { SECURITY_MODE_FLOOR, type ApprovalContext } from './approval-common.js';
 
 const NON_CREDENTIAL_SECRET_LABELS = new Set(['an email address']);
@@ -85,9 +86,11 @@ const strongestRequirement = (
   if (!ordinary) return raised;
   const strongest =
     APPROVAL_RANK[ordinary.sideEffect] > APPROVAL_RANK[raised.sideEffect] ? ordinary : raised;
-  const { recovery: _recovery, ...required } = strongest;
+  const { recovery: _recovery, taskGrant: _taskGrant, ...required } = strongest;
+  const taskGrant = mergeTaskApproval(raised.taskGrant, ordinary.taskGrant);
   return {
     ...required,
+    ...(taskGrant ? { taskGrant } : {}),
     ...(raised.recovery && ordinary.recovery
       ? {
           recovery:
@@ -159,13 +162,17 @@ const taintedRequirement = (
     destinationVerdicts().filter((verdict) => verdict.sink);
   if (name === 'parallel_web_read' || name === 'browser_action') {
     const verdicts = sinkVerdicts();
-    if (verdicts.length)
-      return destinationCard(
+    if (verdicts.length) {
+      const card = destinationCard(
         verdicts,
         taintSources,
         name === 'browser_action' ? 'this page' : 'this read',
         destinations.spentNoveltyBytes
       );
+      return card.recovery && name === 'parallel_web_read'
+        ? withTaskApproval(card, name, args, 'network')
+        : card;
+    }
   }
   const durable = writtenPaths(name, args).filter(isDurableInstructionPath);
   if (durable.length)
@@ -183,8 +190,17 @@ const taintedRequirement = (
   if (name === 'shell' || name === 'desktop_launch') {
     const verdicts = destinationVerdicts();
     const sinks = verdicts.filter((verdict) => verdict.sink);
-    if (sinks.length)
-      return destinationCard(sinks, taintSources, 'this command', destinations.spentNoveltyBytes);
+    if (sinks.length) {
+      const card = destinationCard(
+        sinks,
+        taintSources,
+        'this command',
+        destinations.spentNoveltyBytes
+      );
+      return card.recovery && name === 'shell'
+        ? withTaskApproval(card, name, args, 'network')
+        : card;
+    }
     if (name === 'desktop_launch')
       return {
         sideEffect: 'external_consequential',
@@ -339,11 +355,16 @@ const ordinaryRequirement = (
   context: ApprovalContext
 ): ApprovalRequirement | null => {
   if (name === 'code_diagnostics' && textValue(args.action) === 'start')
-    return {
-      sideEffect: 'external_reversible',
-      action: 'Start native code analysis',
-      preview: `Launch the bundled ${textValue(args.language)} language server for ${textValue(args.path) || 'workspace'}. It reads project source under the workspace sandbox and network policy, and expires when idle. Rename returns previews only.`
-    };
+    return withTaskApproval(
+      {
+        sideEffect: 'external_reversible',
+        action: 'Start native code analysis',
+        preview: `Launch the bundled ${textValue(args.language)} language server for ${textValue(args.path) || 'workspace'}. It reads project source under the workspace sandbox and network policy, and expires when idle. Rename returns previews only.`
+      },
+      name,
+      args,
+      'analysis'
+    );
   const deferred = deferredExecutionPaths(name, args).sort(
     (left, right) => left.length - right.length
   );
@@ -563,23 +584,33 @@ const ordinaryRequirement = (
   }
   if (SECURITY_MODE_FLOOR[securityMode].asksBeforeEveryChange) {
     if (name === 'shell')
-      return {
-        sideEffect: 'workspace_write',
-        action: 'Run a command on this computer',
-        preview: `Run ${shellInvocation(args) || 'command'}`
-      };
+      return withTaskApproval(
+        {
+          sideEffect: 'workspace_write',
+          action: 'Run a command on this computer',
+          preview: `Run ${shellInvocation(args) || 'command'}`
+        },
+        name,
+        args,
+        'commands'
+      );
     if (name === 'file_write' || name === 'file_patch' || name === 'print_pdf') {
       const patched = namedObjects(writtenPaths(name, args));
-      return {
-        sideEffect: 'workspace_write',
-        action: 'Change a workspace file',
-        preview:
-          name === 'file_patch'
-            ? `Apply ${Array.isArray(args.patches) ? args.patches.length : 0} conflict-checked file patch(es) to ${patched || 'a workspace file'}`
-            : name === 'print_pdf'
-              ? `Print the current page to ${textValue(args.path, 'a workspace PDF')}`
-              : `Create or replace ${textValue(args.path, 'a workspace file')}`
-      };
+      return withTaskApproval(
+        {
+          sideEffect: 'workspace_write',
+          action: 'Change a workspace file',
+          preview:
+            name === 'file_patch'
+              ? `Apply ${Array.isArray(args.patches) ? args.patches.length : 0} conflict-checked file patch(es) to ${patched || 'a workspace file'}`
+              : name === 'print_pdf'
+                ? `Print the current page to ${textValue(args.path, 'a workspace PDF')}`
+                : `Create or replace ${textValue(args.path, 'a workspace file')}`
+        },
+        name,
+        args,
+        'files'
+      );
     }
     if (
       name === 'publish_artifact' ||

@@ -23,6 +23,32 @@ const decision: Decision = {
 };
 
 describe('approval cards separate the decision from inspection detail', () => {
+  it('offers both scopes with the exact type visible and leaves older or private-input cards once-only', () => {
+    const preview = {
+      ...(decision.preview as Record<string, unknown>),
+      taskGrant: { description: 'Network commands · using python3 · referencing https://unpkg.com' }
+    };
+    const html = renderToStaticMarkup(
+      <DecisionCard decision={{ ...decision, preview }} onResolved={() => {}} />
+    );
+    expect(html).toContain('Allow for this run');
+    expect(html).toContain('Approve once');
+    expect(html).toContain('using python3');
+    expect(html).toContain('Work options');
+    const privateHtml = renderToStaticMarkup(
+      <DecisionCard
+        decision={{
+          ...decision,
+          preview: { ...preview, tool: 'browser_action', arguments: { action: 'type_secure' } }
+        }}
+        onResolved={() => {}}
+      />
+    );
+    expect(privateHtml).not.toContain('Allow for this run');
+    expect(
+      renderToStaticMarkup(<DecisionCard decision={decision} onResolved={() => {}} />)
+    ).not.toContain('Allow for this run');
+  });
   it('keeps the complete command inspectable without showing a script or provenance as the destination', () => {
     const html = renderToStaticMarkup(<DecisionCard decision={decision} onResolved={() => {}} />);
     const introduction = html.split('<details')[0]!;

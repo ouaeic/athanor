@@ -270,6 +270,21 @@ against the page the owner reads by `scripts/check-repository.mjs`. It is delibe
 here in full: three descriptions of this behaviour once existed in three files and had drifted
 apart, and a fourth copy in a document no check reads is how that happens again.
 
+**Permissions for the current run.** Eligible cards offer approval once or a reusable permission
+whose programs, referenced network origins, or project directories are shown before selection.
+The owner session can grant only the scope sealed by the worker; API tokens cannot create reusable
+permissions. Grant creation and approval settlement share a transaction. Scope bodies are encrypted,
+and matching uses a keyed digest bound to the owner, task, turn and approval mode. Each new proposal
+still passes the complete approval floor; an additional requirement without a reusable scope keeps
+its individual decision. Referenced origins are a static command constraint, not a per-host runtime
+firewall for arbitrary interpreter code.
+
+Permissions survive pauses and reconnects. A new owner direction does not inherit the preceding
+turn's permissions, and completing or stopping a run or changing its approval mode revokes them.
+They do not transfer into forks or specialist tasks. Work options lists the current permissions and
+allows revocation. Revocation stops future reuse; it does not undo an action already approved or
+interrupt a process already running.
+
 ### Why two dials and not one
 
 Each ladder is ordered on its own, so either could be a slider. Joining them into one cannot be

@@ -1,3 +1,4 @@
+import { useTaskApproval } from './approval-grants.js';
 import { debuggerApproval } from './debugger-approval.js';
 import { codingMissionApproval } from './coding-mission-approval.js';
 import { prepareNativeInputApproval } from './native-input.js';
@@ -312,7 +313,10 @@ export const approvalForCall = async (
       preview: `${declared.preview}\n\nDestination: ${new URL(transcription.credential.baseUrl).origin}. Source SHA-256: ${proof.sourceSha256} (${proof.sourceBytes} bytes). The source, credential, route and price must still match when this approval runs.`
     };
   }
-  if (!['browser_action', 'desktop_action'].includes(call.name)) return declared;
+  if (!['browser_action', 'desktop_action'].includes(call.name)) {
+    if (declared && (await useTaskApproval(deps, task, state, declared))) return null;
+    return declared;
+  }
   const surface = call.name === 'browser_action' ? 'browser' : 'desktop';
   try {
     const policy = await deps.runner.call<{

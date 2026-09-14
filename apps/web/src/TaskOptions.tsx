@@ -3,6 +3,7 @@ import type { Task } from '@athanor/contracts';
 import { patch } from './client';
 import { money } from './model';
 import { Button, ErrorNotice, Field } from './ui';
+import TaskPermissions from './TaskPermissions';
 
 export default function TaskOptions({
   task,
@@ -69,6 +70,7 @@ export default function TaskOptions({
         </Button>
       </div>
       <ErrorNotice error={error} />
+      <TaskPermissions taskId={task.id} />
     </div>
   );
 }

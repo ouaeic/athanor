@@ -3725,5 +3725,38 @@ CREATE TABLE IF NOT EXISTS model_throughput_ceiling (
       ALTER TABLE message_drafts ALTER COLUMN body_ciphertext DROP NOT NULL;
       ALTER TABLE message_drafts ADD COLUMN IF NOT EXISTS revision INTEGER NOT NULL DEFAULT 1;
     `
+  },
+  {
+    version: 104,
+    name: 'task_approval_grants',
+    sql: `
+      ALTER TABLE approvals ADD COLUMN IF NOT EXISTS decision_scope TEXT NOT NULL DEFAULT 'once'
+        CHECK(decision_scope IN ('once','run'));
+      CREATE TABLE IF NOT EXISTS task_approval_grants (
+        id UUID PRIMARY KEY REFERENCES approvals(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        task_id UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        turn INTEGER NOT NULL CHECK(turn >= 0),
+        security_mode TEXT NOT NULL CHECK(security_mode IN ('review','balanced','autonomous')),
+        scope_hash TEXT NOT NULL,
+        scope_ciphertext JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        revoked_at TIMESTAMPTZ
+      );
+      CREATE INDEX IF NOT EXISTS task_approval_grant_match_idx
+        ON task_approval_grants(task_id,turn,security_mode,scope_hash) WHERE revoked_at IS NULL;
+      CREATE OR REPLACE FUNCTION revoke_ended_task_approvals() RETURNS trigger LANGUAGE plpgsql AS $grant$
+      BEGIN
+        IF NEW.security_mode IS DISTINCT FROM OLD.security_mode OR
+          (NEW.status IN ('completed','failed','cancelled') AND NEW.status IS DISTINCT FROM OLD.status) THEN
+          UPDATE task_approval_grants SET revoked_at=NOW() WHERE task_id=NEW.id AND revoked_at IS NULL;
+        END IF;
+        RETURN NEW;
+      END;
+      $grant$;
+      DROP TRIGGER IF EXISTS task_approval_grants_expire ON tasks;
+      CREATE TRIGGER task_approval_grants_expire AFTER UPDATE OF status,security_mode ON tasks
+        FOR EACH ROW EXECUTE FUNCTION revoke_ended_task_approvals();
+    `
   }
 ] as const;

@@ -1262,6 +1262,16 @@ export class DataStore {
     return this.#connectors.getApproval(...args);
   }
 
+  hasTaskApprovalGrant(...args: Parameters<ConnectorStore['hasTaskApprovalGrant']>) {
+    return this.#connectors.hasTaskApprovalGrant(...args);
+  }
+  listTaskApprovalGrants(...args: Parameters<ConnectorStore['listTaskApprovalGrants']>) {
+    return this.#connectors.listTaskApprovalGrants(...args);
+  }
+  revokeTaskApprovalGrant(...args: Parameters<ConnectorStore['revokeTaskApprovalGrant']>) {
+    return this.#connectors.revokeTaskApprovalGrant(...args);
+  }
+
   getManagedProviderCredential(
     ...args: Parameters<ConnectorStore['getManagedProviderCredential']>
   ) {

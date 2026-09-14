@@ -9,8 +9,10 @@
  */
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { canonicalJson, textValue } from './values.js';
+import type { TaskApprovalScope } from '@athanor/contracts';
 
 export interface AgentApprovalRequirement {
+  taskGrant?: TaskApprovalScope;
   sideEffect: 'workspace_write' | 'external_reversible' | 'external_consequential';
   action: string;
   preview: string;

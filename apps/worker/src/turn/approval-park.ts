@@ -70,6 +70,18 @@ export const parkForApproval = async (
         preview: approval.preview,
         tool: call.name,
         securityMode: task.securityMode,
+        ...(!task.parentMissionId &&
+        !approval.handoffOnly &&
+        approval.sideEffect !== 'external_consequential' &&
+        approval.taskGrant?.tool === call.name
+          ? {
+              taskGrant: {
+                scope: approval.taskGrant,
+                turn: state.turn ?? 0,
+                securityMode: task.securityMode
+              }
+            }
+          : {}),
         addresses: [
           ...new Set(
             callDestinations(call.name, call.arguments).map((address) => {

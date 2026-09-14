@@ -28,6 +28,13 @@ import {
  */
 export const MAX_APPROVAL_PAGE = 200;
 
+interface TaskApprovalGrantInput {
+  turn: number;
+  securityMode: string;
+  scopeHash: string;
+  scopeCiphertext: EncryptedEnvelope;
+}
+
 interface ApprovalInput {
   userId: string;
   taskId: string;
@@ -174,6 +181,7 @@ export class ConnectorStore {
       previewCiphertext: json<EncryptedEnvelope>(row.preview_ciphertext),
       previewHash: String(row.preview_hash),
       status: String(row.status),
+      decisionScope: String(row.decision_scope),
       expiresAt: iso(row.expires_at),
       createdAt: iso(row.created_at),
       cursor: encodeApprovalCursor(row)
@@ -194,21 +202,30 @@ export class ConnectorStore {
     userId: string,
     id: string,
     decision: 'approved' | 'denied',
-    correction?: { promptCiphertext: EncryptedEnvelope; queuedEventCiphertext: EncryptedEnvelope }
+    correction?: { promptCiphertext: EncryptedEnvelope; queuedEventCiphertext: EncryptedEnvelope },
+    grant?: TaskApprovalGrantInput
   ): Promise<boolean> {
     if (correction && decision !== 'denied')
       throw new AthanorError('approval_correction_invalid', 'Only a denial may carry a correction');
+    if (grant && decision !== 'approved')
+      throw new AthanorError('approval_grant_invalid', 'Only an approval may create a permission');
     const resolved = await this.database.transaction(async (tx) => {
       // Cancellation locks the task before its decisions. Keep that order and hold the task
       // through settlement so a later pause or cancellation cannot be overwritten by queuing.
-      const owned = await tx.query<{ task_id: string; status: string }>(
-        `SELECT t.id AS task_id,t.status FROM tasks t
+      const owned = await tx.query<{ task_id: string; status: string; security_mode: string }>(
+        `SELECT t.id AS task_id,t.status,t.security_mode FROM tasks t
          JOIN approvals a ON a.task_id=t.id
          WHERE a.id=$1 AND a.user_id=$2 AND t.user_id=$2 FOR UPDATE OF t`,
         [id, userId]
       );
       const task = owned.rows[0];
       if (!task || ['completed', 'failed', 'cancelled'].includes(task.status)) return null;
+      if (
+        grant &&
+        (grant.securityMode !== task.security_mode ||
+          grant.scopeCiphertext.aad !== `task-approval:${task.task_id}:${id}`)
+      )
+        throw new AthanorError('approval_grant_invalid', 'Permission no longer matches this task');
       if (
         decision === 'approved' &&
         (
@@ -229,11 +246,26 @@ export class ConnectorStore {
           'Correction encryption context does not match the task'
         );
       const changed = await tx.query(
-        `UPDATE approvals SET status=$3,resolved_at=NOW()
+        `UPDATE approvals SET status=$3,resolved_at=NOW(),decision_scope=$4
          WHERE id=$1 AND user_id=$2 AND status='pending' AND expires_at > NOW()`,
-        [id, userId, decision]
+        [id, userId, decision, grant ? 'run' : 'once']
       );
       if (changed.rowCount !== 1) return null;
+      if (grant) {
+        await tx.query(
+          `INSERT INTO task_approval_grants(id,user_id,task_id,turn,security_mode,scope_hash,scope_ciphertext)
+           VALUES($1,$2,$3,$4,$5,$6,$7::jsonb)`,
+          [
+            id,
+            userId,
+            task.task_id,
+            grant.turn,
+            grant.securityMode,
+            grant.scopeHash,
+            JSON.stringify(grant.scopeCiphertext)
+          ]
+        );
+      }
       if (correction) {
         const messageId = randomUUID();
         await tx.query(
@@ -280,10 +312,56 @@ export class ConnectorStore {
           taskId: String(row.task_id),
           action: String(row.action),
           status: String(row.status),
+          decisionScope: String(row.decision_scope),
+          sideEffect: String(row.side_effect),
+          previewCiphertext: json<EncryptedEnvelope>(row.preview_ciphertext),
           previewHash: String(row.preview_hash),
           expiresAt: iso(row.expires_at)
         }
       : null;
+  }
+
+  async hasTaskApprovalGrant(
+    userId: string,
+    taskId: string,
+    turn: number,
+    securityMode: string,
+    scopeHash: string
+  ): Promise<boolean> {
+    const result = await this.database.query(
+      `SELECT 1 FROM task_approval_grants g JOIN tasks t ON t.id=g.task_id
+       WHERE g.user_id=$1 AND g.task_id=$2 AND g.turn=$3 AND g.security_mode=$4 AND g.scope_hash=$5
+         AND g.revoked_at IS NULL AND t.user_id=$1 AND t.security_mode=$4
+         AND t.status NOT IN ('completed','failed','cancelled') LIMIT 1`,
+      [userId, taskId, turn, securityMode, scopeHash]
+    );
+    return result.rows.length > 0;
+  }
+
+  async listTaskApprovalGrants(userId: string, taskId: string, turn: number, before?: string) {
+    const result = await this.database.query(
+      `SELECT g.* FROM task_approval_grants g JOIN tasks t ON t.id=g.task_id
+       WHERE g.user_id=$1 AND g.task_id=$2 AND g.turn=$3 AND g.revoked_at IS NULL
+         AND t.user_id=$1 AND t.security_mode=g.security_mode AND t.status NOT IN ('completed','failed','cancelled')
+         AND ($4::uuid IS NULL OR (g.created_at,g.id) <
+           (SELECT created_at,id FROM task_approval_grants WHERE id=$4 AND user_id=$1 AND task_id=$2))
+       ORDER BY g.created_at DESC,g.id DESC LIMIT 200`,
+      [userId, taskId, turn, before ?? null]
+    );
+    return result.rows.map((row) => ({
+      id: String(row.id),
+      createdAt: iso(row.created_at),
+      scopeCiphertext: json<EncryptedEnvelope>(row.scope_ciphertext)
+    }));
+  }
+
+  async revokeTaskApprovalGrant(userId: string, taskId: string, id: string): Promise<boolean> {
+    const result = await this.database.query(
+      `UPDATE task_approval_grants SET revoked_at=COALESCE(revoked_at,NOW())
+       WHERE user_id=$1 AND task_id=$2 AND id=$3 RETURNING id`,
+      [userId, taskId, id]
+    );
+    return result.rows.length === 1;
   }
 
   async getManagedProviderCredential(

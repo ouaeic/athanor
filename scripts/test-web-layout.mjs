@@ -530,6 +530,7 @@ const nativeAuthorization = {
 let nativeStepUp, nativeDecision;
 let approvals = [];
 const approvalRequests = [];
+let taskPermissions = [];
 let approvalFailures = [];
 let transcriptions = [];
 const dictationOptions = {
@@ -788,6 +789,17 @@ try {
       return json(task);
     }
     if (path === '/v1/approvals') return json(approvals);
+    if (path === `/v1/approvals/tasks/${task.id}/permissions`) return json(taskPermissions);
+    if (
+      path.startsWith(`/v1/approvals/tasks/${task.id}/permissions/`) &&
+      path.endsWith('/revoke')
+    ) {
+      assert.equal(route.request().method(), 'POST');
+      assert.deepEqual(route.request().postDataJSON(), {});
+      taskPermissions = taskPermissions.filter((permission) => !path.includes(permission.id));
+      return json({ ok: true });
+    }
+
     const approvalAction = path.match(/^\/v1\/approvals\/([^/]+)\/(approve|deny)$/);
     if (approvalAction) {
       const request = route.request();
@@ -800,6 +812,15 @@ try {
       });
       const failure = approvalFailures.shift();
       if (failure) return route.fulfill({ status: failure.status, json: { error: failure } });
+      if (approvalAction[2] === 'approve' && request.postDataJSON().scope === 'run') {
+        const source = approvals.find((approval) => approval.id === approvalAction[1]);
+        assert(source?.preview?.taskGrant?.description);
+        taskPermissions.push({
+          id: source.id,
+          description: source.preview.taskGrant.description,
+          createdAt: time
+        });
+      }
       approvals = approvals.filter((approval) => approval.id !== approvalAction[1]);
       return json({ ok: true });
     }
@@ -2232,6 +2253,9 @@ try {
         preview: {
           tool: 'shell',
           securityMode: 'autonomous',
+          taskGrant: {
+            description: 'Network commands · using python3 · referencing https://unpkg.com'
+          },
           addresses: ['unpkg.com'],
           preview: 'This turn has read untrusted content.\n\nRun ' + longCommand,
           arguments: { executable: 'bash', args: ['-lc', longCommand] }
@@ -2261,6 +2285,13 @@ try {
         await card.evaluate((element) => element.scrollWidth > element.clientWidth + 1),
         false
       );
+      assert.equal(
+        await card.getByRole('button', { name: 'Allow for this run', exact: true }).isEnabled(),
+        true
+      );
+      assert(
+        (await card.locator('.decision-permission').innerText()).includes('https://unpkg.com')
+      );
       await card.locator('.decision-actions').scrollIntoViewIfNeeded();
       const approvalLayout = await card.locator('.decision-actions').evaluate((element) => ({
         area: document.querySelector('.garden-task-composer').getBoundingClientRect().toJSON(),
@@ -2274,7 +2305,7 @@ try {
           const area = document.querySelector('.garden-task-composer').getBoundingClientRect();
           const buttons = [...element.querySelectorAll('button')];
           return (
-            buttons.length === 2 &&
+            buttons.length === 3 &&
             buttons.every((button) => {
               const box = button.getBoundingClientRect();
               return (
@@ -2288,7 +2319,7 @@ try {
             })
           );
         }),
-        `Both compact approval actions must be reachable inside the prompt area: ${JSON.stringify(approvalLayout)}`
+        `All three approval actions must be reachable inside the prompt area: ${JSON.stringify(approvalLayout)}`
       );
       await card.screenshot({ path: resolve(report, `approval-compact-${width}.png`) });
       await card.getByText('Inspect full action', { exact: true }).click();
@@ -2302,6 +2333,32 @@ try {
       );
       await card.getByText('Inspect full action', { exact: true }).click();
     }
+    const scopeId = approvals[0].id;
+    approvalFailures = [{ status: 403, code: 'step_up_required', message: 'Authenticate again.' }];
+    await card.getByRole('button', { name: 'Allow for this run', exact: true }).click();
+    await card.waitFor({ state: 'hidden' });
+    assert.deepEqual(
+      approvalRequests.slice(-2),
+      [
+        { id: scopeId, action: 'approve', body: { scope: 'run' } },
+        { id: scopeId, action: 'approve', body: { scope: 'run' } }
+      ],
+      'The selected scope must survive authentication retry'
+    );
+    assert.equal(taskPermissions.length, 1);
+    await approvalPage.reload();
+    await approvalPage.getByRole('button', { name: 'Work options', exact: true }).click();
+    const permissionPanel = approvalPage.getByRole('region', { name: 'Run permissions' });
+    await permissionPanel.getByRole('button', { name: 'Revoke', exact: true }).waitFor();
+    assert((await permissionPanel.innerText()).includes('https://unpkg.com'));
+    await permissionPanel.getByRole('button', { name: 'Revoke', exact: true }).click();
+    await permissionPanel
+      .getByText('No reusable permissions in this run.', { exact: true })
+      .waitFor();
+    assert.equal(taskPermissions.length, 0);
+    await approvalPage.reload();
+    await approvalPage.getByRole('button', { name: 'Work options', exact: true }).click();
+    await approvalPage.getByText('No reusable permissions in this run.', { exact: true }).waitFor();
     await approvalPage.close();
     approvals = [];
     const modelsPage = await context.newPage();
