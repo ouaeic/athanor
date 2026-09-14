@@ -29,6 +29,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { sealLegacyOperationResponses } from './http/operation-receipts.js';
+import { taskFailure } from './task-failure.js';
 import { z } from 'zod';
 import type {
   ApiToken,
@@ -815,6 +816,14 @@ export const createApiContext = async (config: ApiConfig, overrides: ApiOverride
     const workspace = knownWorkspace ?? (await store.getWorkspaceById(task.workspaceId));
     return {
       ...taskResponse(task, await taskTitle(task, workspace ?? undefined)),
+      resourceWait:
+        task.status === 'awaiting_resource' && workspace?.wrappedKey
+          ? await taskFailure(
+              store,
+              task.id,
+              unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id)
+            )
+          : null,
       ...(workspace?.parentWorkspaceId ? { parentWorkspaceId: workspace.parentWorkspaceId } : {})
     };
   };

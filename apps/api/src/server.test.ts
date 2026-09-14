@@ -1113,7 +1113,7 @@ describe('API production boundaries', () => {
     expect(conversationSearch.statusCode, conversationSearch.body).toBe(200);
     expect(conversationSearch.json()).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ taskId, workspaceId, title: 'Prepare a concise report' })
+        expect.objectContaining({ taskId, workspaceId, title: 'New project' })
       ])
     );
     const reviewedTask = await app.inject({
@@ -1266,7 +1266,7 @@ describe('API production boundaries', () => {
         })
       ).statusCode
     ).toBe(404);
-    expect(task.json<{ title: string }>().title).toBe('Prepare a concise report');
+    expect(task.json<{ title: string }>().title).toBe('New project');
     const storedTaskContent = await database.query(
       'SELECT title,prompt_ciphertext FROM tasks WHERE id=$1',
       [taskId]
@@ -3670,6 +3670,35 @@ describe('unattended recovery', () => {
     // A wall seconds old is not retried: the whole point of the interval is that a provider is
     // someone else's server and this box does not hammer it.
     await park('5 seconds');
+    await database.query(
+      `INSERT INTO task_events(id,task_id,sequence,kind,summary)
+       SELECT gen_random_uuid(), $1, (SELECT MAX(sequence) FROM task_events WHERE task_id=$1) + g,
+         'assistant_delta', 'Encrypted activity'
+       FROM generate_series(1, 300) g`,
+      [taskId]
+    );
+    const latestActivity = await store.listRecentTaskEvents(taskId, 250);
+    expect(latestActivity.events).toHaveLength(250);
+    expect(latestActivity.events.every((event) => event.kind === 'assistant_delta')).toBe(true);
+    const heldTask = await app.inject({
+      method: 'GET',
+      url: `/v1/tasks/${taskId}`,
+      headers: { cookie }
+    });
+    expect(heldTask.json()).toMatchObject({
+      resourceWait: {
+        code: 'provider_quota_exhausted',
+        summary: 'The provider refused the request: no quota left'
+      }
+    });
+    // Waiting for child work cannot be mistaken for an earlier provider hold.
+    await database.query(
+      `INSERT INTO coding_families(parent_task_id,ceiling_credits,initial_credits,wait_requested)
+       VALUES ($1,5,0,TRUE)`,
+      [taskId]
+    );
+    expect(await store.taskResourceFailure(taskId)).toBeNull();
+    await database.query('DELETE FROM coding_families WHERE parent_task_id=$1', [taskId]);
     await runMaintenance();
     expect(await status()).toBe('awaiting_resource');
     expect(await notices()).toEqual([]);
@@ -3704,6 +3733,20 @@ describe('unattended recovery', () => {
     expect(retries[0]).toBe(
       'Asking your provider again after it refused this work: attempt 1 of 24.'
     );
+
+    await store.appendTaskEvent({
+      taskId,
+      kind: 'error',
+      summary: 'Encrypted error event',
+      payloadCiphertext: encryptJson(
+        { summary: 'An unrelated failure', payload: { code: 'different_failure' } },
+        key,
+        `task-event:${taskId}`
+      )
+    });
+    await park('2 hours');
+    await runMaintenance();
+    expect(await status()).toBe('awaiting_resource');
   }, 30_000);
 
   /*
@@ -6696,6 +6739,7 @@ describe('searching the owner’s own history', () => {
         payload: {
           workspaceId,
           prompt: 'Look at the mail server',
+          title: 'Look at the mail server',
           modelId: 'openrouter/openai/gpt-oss-120b',
           privacyRoute: 'provider_zdr',
           maxComputeCredits: 5
@@ -6771,15 +6815,13 @@ describe('searching the owner’s own history', () => {
     expect(events).not.toHaveBeenCalled();
 
     /*
-     * A conversation is findable by what the owner called it from the moment it exists, before any
+     * A conversation is findable by its opening request from the moment it exists, before any
      * turn has finished and so before anything of it has been captured.
      */
     const named = await search('concise report');
     expect(named.statusCode, named.body).toBe(200);
     expect(named.json()).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ taskId, title: 'Prepare a concise report' })
-      ])
+      expect.arrayContaining([expect.objectContaining({ taskId, title: 'New project' })])
     );
     expect(events).not.toHaveBeenCalled();
 

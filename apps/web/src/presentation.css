@@ -252,3 +252,16 @@
   margin: 0.3rem 0;
   overflow-wrap: anywhere;
 }
+.resource-wait-note {
+  margin: 16px 0;
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel);
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+.resource-wait-note p {
+  margin: 8px 0 0;
+  line-height: 1.65;
+}

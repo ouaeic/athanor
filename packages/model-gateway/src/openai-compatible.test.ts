@@ -455,6 +455,88 @@ describe('OpenAICompatibleAdapter', () => {
     expect(deltas).toEqual(['Working on ']);
   });
 
+  it.each([400, 502])(
+    'recovers an explicit tool output cutoff reported as error %s',
+    async (code) => {
+      const partial = '{"path":"workspace/report.py","content":"unfinished';
+      const body = [
+        {
+          id: 'generation-cutoff',
+          provider: 'Upstream',
+          choices: [
+            {
+              delta: {
+                tool_calls: [
+                  { index: 0, id: 'write-1', function: { name: 'file_write', arguments: partial } }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          error: {
+            code,
+            message: 'Upstream error: HttpError: HTTP 400: Tool calls cutoff by max_tokens.'
+          }
+        }
+      ]
+        .map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`)
+        .join('');
+      await expect(streamRequest(streamingAdapter(body), [])).resolves.toMatchObject({
+        finishReason: 'tool_calls',
+        toolCalls: [
+          {
+            id: 'write-1',
+            name: 'file_write',
+            arguments: {},
+            parseFailed: true,
+            argumentsTruncated: true,
+            rawArguments: partial
+          }
+        ],
+        usage: { estimated: true },
+        metadata: { generationId: 'generation-cutoff', upstreamProvider: 'Upstream' }
+      });
+    }
+  );
+
+  it('keeps reasoning and length recovery when the provider withholds truncated tool fragments', async () => {
+    const body = [
+      { choices: [{ delta: { reasoning: 'Prepare a smaller script in separate files.' } }] },
+      {
+        error: { code: 502, message: 'Tool calls cutoff by max_tokens' },
+        usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 }
+      }
+    ]
+      .map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`)
+      .join('');
+    await expect(streamRequest(streamingAdapter(body), [])).resolves.toMatchObject({
+      finishReason: 'length',
+      toolCalls: [],
+      reasoning: 'Prepare a smaller script in separate files.',
+      usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 }
+    });
+  });
+
+  it('does not turn quota errors or ordinary text into output-limit recovery', async () => {
+    await expect(
+      streamRequest(
+        streamingAdapter(
+          'data: {"error":{"code":429,"message":"Tool calls cutoff by max_tokens"}}\n\n'
+        ),
+        []
+      )
+    ).rejects.toMatchObject({ code: 'provider_quota_exhausted' });
+    await expect(
+      streamRequest(
+        streamingAdapter(
+          'data: {"choices":[{"delta":{"content":"Tool calls cutoff by max_tokens"},"finish_reason":"stop"}]}\n\n'
+        ),
+        []
+      )
+    ).resolves.toMatchObject({ finishReason: 'stop', text: 'Tool calls cutoff by max_tokens' });
+  });
+
   it('treats an unnumbered mid-stream fault as a retryable upstream failure', async () => {
     const failure = await streamRequest(
       streamingAdapter('data: {"error":{"message":"upstream model crashed"}}\n\n'),

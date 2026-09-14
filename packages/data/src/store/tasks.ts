@@ -2058,13 +2058,26 @@ export class TaskStore {
   ): Promise<TaskEventRecord[]> {
     const result = await this.database.query(
       selection
-        ? `SELECT * FROM (SELECT * FROM task_events WHERE task_id=$1 AND sequence>$2 AND kind=$3 ORDER BY sequence DESC LIMIT $4) recent ORDER BY sequence ASC`
-        : `SELECT * FROM task_events WHERE task_id = $1 AND sequence > $2 ORDER BY sequence`,
+        ? `SELECT * FROM (SELECT * FROM task_events WHERE task_id=$1 AND sequence>$2::bigint AND kind=$3 ORDER BY sequence DESC LIMIT $4) recent ORDER BY sequence ASC`
+        : `SELECT * FROM task_events WHERE task_id = $1 AND sequence > $2::bigint ORDER BY sequence`,
       selection
         ? [taskId, after, selection.kind, Math.max(1, Math.min(1_000, Math.trunc(selection.limit)))]
         : [taskId, after]
     );
     return result.rows.map(mapTaskEvent);
+  }
+
+  /** A provider hold must remain discoverable after later output fills the timeline page. */
+  async taskResourceFailure(taskId: string): Promise<TaskEventRecord | null> {
+    const result = await this.database.query(
+      `SELECT e.* FROM task_events e JOIN tasks t ON t.id=e.task_id
+       WHERE e.task_id=$1 AND t.status='awaiting_resource' AND e.kind IN ('warning','error')
+         AND NOT EXISTS (SELECT 1 FROM coding_families f
+           WHERE f.parent_task_id=t.id AND f.wait_requested=TRUE)
+       ORDER BY e.sequence DESC LIMIT 1`,
+      [taskId]
+    );
+    return result.rows[0] ? mapTaskEvent(result.rows[0]) : null;
   }
 
   /**
@@ -2084,9 +2097,9 @@ export class TaskStore {
     const forward = options.before === undefined;
     const result = await this.database.query(
       forward
-        ? `SELECT * FROM task_events WHERE task_id = $1 AND sequence > $2
+        ? `SELECT * FROM task_events WHERE task_id = $1 AND sequence > $2::bigint
            ORDER BY sequence LIMIT $3`
-        : `SELECT * FROM task_events WHERE task_id = $1 AND sequence < $2
+        : `SELECT * FROM task_events WHERE task_id = $1 AND sequence < $2::bigint
            ORDER BY sequence DESC LIMIT $3`,
       [taskId, forward ? Math.max(0, Math.trunc(options.after ?? 0)) : options.before, limit + 1]
     );

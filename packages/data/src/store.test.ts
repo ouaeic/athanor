@@ -3137,6 +3137,22 @@ describe('DataStore', () => {
     expect(newest.nextCursor).toBe(450);
     expect(newest.hasMore).toBe(true);
 
+    // The HTTP cursor accepts safe JavaScript integers even when the stored sequence is int4.
+    const wideCursor = await store.listTaskEventPage(task.id, {
+      before: Number.MAX_SAFE_INTEGER,
+      limit: 100
+    });
+    expect(wideCursor).toEqual(newest);
+    expect(
+      await store.listTaskEventPage(task.id, { after: Number.MAX_SAFE_INTEGER, limit: 100 })
+    ).toEqual({
+      events: [],
+      hasMore: false,
+      oldestSequence: null,
+      nextCursor: Number.MAX_SAFE_INTEGER
+    });
+    expect(await store.listTaskEvents(task.id, Number.MAX_SAFE_INTEGER)).toEqual([]);
+
     // Older material is reachable on demand, oldest first however it was fetched.
     const older = await store.listTaskEventPage(task.id, {
       before: newest.oldestSequence!,

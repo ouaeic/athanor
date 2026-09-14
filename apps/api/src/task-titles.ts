@@ -81,6 +81,8 @@ const PROMPT_EXCERPT_CHARACTERS = 2_000;
 export const TITLE_SYSTEM_PROMPT =
   'You name conversations. Reply with nothing but a clear, specific title naming the request and its intended outcome. Keep it concise, but preserve the details needed to distinguish this work, in the language the request is written in. No quotation marks, no final full stop, no preamble.';
 
+export const INITIAL_TASK_TITLE = 'New project';
+
 /**
  * Turns whatever the model said into a name, or nothing.
  *
@@ -88,14 +90,6 @@ export const TITLE_SYSTEM_PROMPT =
  * string, or a sentence the rest of the time. What cannot be reduced to a plausible line is
  * refused: the placeholder is a poor name, and a paragraph in the sidebar is a worse one.
  */
-export const openingTaskTitle = (prompt: string): string =>
-  prompt
-    .trim()
-    .split(/\n\s*\n/, 1)[0]!
-    .replace(/\s+/g, ' ')
-    .slice(0, TASK_TITLE_MAX_LENGTH)
-    .trim();
-
 export const cleanGeneratedTitle = (raw: string): string | null => {
   const firstLine = raw
     .split('\n')

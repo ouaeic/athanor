@@ -9,10 +9,11 @@
  * write, so there is no column, no lock and nothing to reconcile after a restart.
  */
 
-import { decryptJson, encryptJson, unwrapDataKey } from '@athanor/core';
+import { encryptJson, unwrapDataKey } from '@athanor/core';
 import { agentNotificationAad } from '@athanor/data';
 import type { SupportedContext } from '../http/server-context.js';
 import { errorFields } from '../log.js';
+import { taskFailure } from '../task-failure.js';
 
 /**
  * The three ways a provider turns work away, and whether waiting is any use.
@@ -148,23 +149,7 @@ export const createProviderWallMaintenance = (context: SupportedContext) => {
    * it is behind.
    */
   const providerWallCode = async (taskId: string, key: Uint8Array): Promise<string | null> => {
-    const page = await store.listRecentTaskEvents(taskId, 50);
-    const failure = page.events
-      .filter((item) => item.kind === 'error' || item.kind === 'warning')
-      .at(-1);
-    if (!failure?.payloadCiphertext) return null;
-    try {
-      const decoded = decryptJson<{ payload?: { code?: unknown } }>(
-        failure.payloadCiphertext,
-        key,
-        `task-event:${taskId}`
-      );
-      return typeof decoded.payload?.code === 'string' ? decoded.payload.code : null;
-    } catch {
-      // A conversation whose key no longer opens keeps its status; there is nothing to read and
-      // guessing at a wall would restart work nobody can see the reason for.
-      return null;
-    }
+    return (await taskFailure(store, taskId, key))?.code ?? null;
   };
 
   /**

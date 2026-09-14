@@ -596,6 +596,8 @@ export const Task = z.object({
   scheduleId: Id.nullable().default(null),
   title: z.string().min(1).max(TASK_TITLE_MAX_LENGTH),
   status: TaskStatus,
+  /** Latest failure behind a held run, independent of the visible activity page. */
+  resourceWait: z.object({ code: z.string(), summary: z.string() }).nullable().optional(),
   modelId: z.string(),
   reasoningEffort: TaskReasoningEffort.optional(),
   deliveryStatus: z.enum(['pending', 'ready', 'incomplete']).nullable().optional(),

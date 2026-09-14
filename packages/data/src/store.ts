@@ -1038,6 +1038,10 @@ export class DataStore {
     return this.#tasks.listTaskEvents(...args);
   }
 
+  taskResourceFailure(...args: Parameters<TaskStore['taskResourceFailure']>) {
+    return this.#tasks.taskResourceFailure(...args);
+  }
+
   listTaskEvidenceByIds(...args: Parameters<TaskStore['listTaskEvidenceByIds']>) {
     return this.#tasks.listTaskEvidenceByIds(...args);
   }

@@ -47,6 +47,7 @@ import { completionChecks, evidenceSource } from './completion-checks';
 import MessageAttachmentList from './MessageAttachmentList';
 import './presentation.css';
 import { effortLabel } from './reasoning-options';
+import { resourceWaitReason } from './resource-wait';
 const ProcessPanel = lazy(() => import('./ProcessPanel'));
 const DirectoryPanel = lazy(() => import('./DirectoryPanel'));
 const PlanEditor = lazy(() => import('./PlanEditor'));
@@ -202,6 +203,8 @@ export default function TaskSurface({
     (phase) => phase.status !== 'completed' && phase.status !== 'skipped'
   ).length;
   const partlyDone = task.status === 'completed' && openPhases > 0;
+  const waitingReason =
+    task.status === 'awaiting_resource' ? resourceWaitReason(events, task.resourceWait) : null;
   const displayStatus =
     task.status === 'completed' && pendingDelivery
       ? 'Generating media'
@@ -209,7 +212,7 @@ export default function TaskSurface({
         ? 'Delivery needs attention'
         : partlyDone
           ? `Stopped with ${openPhases} step${openPhases === 1 ? '' : 's'} open`
-          : taskStatusLabel(task);
+          : (waitingReason?.label ?? taskStatusLabel(task));
   const question = activeQuestion(events, task);
   const questionData = data(question?.payload);
   const taskDecisions = decisions.filter((decision) => decision.taskId === task.id);
@@ -381,7 +384,7 @@ export default function TaskSurface({
                   ? 'Live updates connected'
                   : connection === 'idle'
                     ? 'Checking for late updates'
-                    : connection
+                    : 'Connection to project activity updates; separate from task execution'
               }
             >
               {' '}
@@ -392,7 +395,9 @@ export default function TaskSurface({
                   ? 'Up to date'
                   : connection === 'closed'
                     ? 'Disconnected'
-                    : 'Reconnecting'}
+                    : connection === 'connecting'
+                      ? 'Connecting'
+                      : 'Reconnecting'}
             </span>
             <Button aria-label="Work options" onClick={() => setPanel('settings')}>
               <MoreHorizontal size={19} />
@@ -519,7 +524,11 @@ export default function TaskSurface({
                   ) : (
                     <Pause size={14} />
                   )}{' '}
-                  {['paused', 'awaiting_resource'].includes(task.status) ? 'Resume' : 'Pause'}
+                  {task.status === 'awaiting_resource'
+                    ? 'Retry now'
+                    : task.status === 'paused'
+                      ? 'Resume'
+                      : 'Pause'}
                 </Button>
                 {/*
                  * Stop belongs beside Pause, not two clicks into Work options.
@@ -542,6 +551,15 @@ export default function TaskSurface({
             )}
           </div>
         </div>
+        {waitingReason && (
+          <aside className="resource-wait-note" role="status" aria-label="Why this work is waiting">
+            <strong>{waitingReason.label}</strong>
+            <p>{waitingReason.detail}</p>
+            <p className="muted">
+              Your work is saved. Retry now makes another attempt with the current model settings.
+            </p>
+          </aside>
+        )}
         <ErrorNotice
           error={error}
           onRetry={() => {

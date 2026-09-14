@@ -103,8 +103,8 @@ export interface TaskRecord {
   titleCiphertext: EncryptedEnvelope | null;
   legacyTitle: string | null;
   /**
-   * Who named this conversation. `prompt` is the placeholder cut from the first words of the
-   * request and is the only value the titler is allowed to replace.
+   * Who named this conversation. `prompt` is a temporary name awaiting a generated title and is
+   * the only value the titler is allowed to replace.
    */
   titleSource: 'prompt' | 'generated' | 'owner';
   /** Held above the recency buckets in the sidebar. */

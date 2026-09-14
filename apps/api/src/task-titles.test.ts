@@ -17,7 +17,6 @@ import { createDatabase, DataStore, migrateDatabase, type Database } from '@atha
 import { createLogger } from './log.js';
 import {
   cleanGeneratedTitle,
-  openingTaskTitle,
   MAX_GENERATED_TITLE_LENGTH,
   startTaskTitler,
   titleTasksOnce,
@@ -101,12 +100,6 @@ const boxWithAnsweredTask = async () => {
 const freshState = () => ({ attempts: new Map<string, number>(), providerReadyAt: 0 });
 
 describe('turning a model answer into a name', () => {
-  it('preserves the complete opening rather than cutting it to a word count', () => {
-    const opening =
-      'Investigate every cause of the release pipeline failure and repair the stale dependency lockfile across all workspaces';
-    expect(openingTaskTitle(opening + '\n\nSupporting details')).toBe(opening);
-  });
-
   it('keeps a complete descriptive title and drops only decoration', () => {
     expect(cleanGeneratedTitle('Release job failure')).toBe('Release job failure');
     expect(cleanGeneratedTitle('  "Release job failure."  ')).toBe('Release job failure');

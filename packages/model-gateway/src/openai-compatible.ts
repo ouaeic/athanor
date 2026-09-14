@@ -1566,6 +1566,7 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
     // would otherwise be deduplicated against a growing list on every frame of a long answer.
     const annotations: unknown[] = [];
     let finishReason: string | undefined;
+    let outputLimit = false;
     let model: string | undefined;
     let upstreamProvider: string | undefined;
     /*
@@ -1592,12 +1593,24 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
       // One frame proves the reply is a stream, so the bytes kept for the recovery parse are of no
       // further use and the memory goes back.
       if (frames === 1) unstreamed = '';
-      const fault = this.#fault(chunk.error, 'mid-response');
-      if (fault) throw fault;
       model = chunk.model ?? model;
       upstreamProvider = chunk.provider ?? upstreamProvider;
       generationId = chunk.id ?? generationId;
       usage = chunk.usage ?? usage;
+      const fault = this.#fault(chunk.error, 'mid-response');
+      if (fault) {
+        // Some routes report a truncated tool call as an error frame. Preserve its partial
+        // arguments so the normal truncation recovery can request a smaller, complete call.
+        if (
+          [400, 502].includes(fault.statusCode) &&
+          /\bTool calls cutoff by max_tokens\.?\s*$/i.test(fault.message)
+        ) {
+          finishReason = 'length';
+          outputLimit = true;
+          return;
+        }
+        throw fault;
+      }
       const choice = chunk.choices?.[0];
       finishReason = choice?.finish_reason ?? finishReason;
       const delta = choice?.delta;
@@ -1692,13 +1705,16 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
         buffer += text;
         const lines = buffer.split(/\r?\n/);
         buffer = lines.pop() ?? '';
-        for (const line of lines) await consume(line);
+        for (const line of lines) {
+          await consume(line);
+          if (outputLimit) break;
+        }
         // One line longer than this is not a frame of anything: the longest legitimate frame on this
         // product carries a whole file inside a tool call's arguments, and a few hundred kilobytes
         // covers that with room to spare. Past it the reply is a producer with no newline in it, and
         // holding more of it only spends the worker's memory waiting for a line that is not coming.
         if (buffer.length > MAX_STREAM_LINE_CHARS) cutoff ??= 'overrun';
-        if (done || cutoff) break;
+        if (done || cutoff || outputLimit) break;
         /*
          * The clock is read again here, and not only raced against the read above, because a race
          * is not a bound.
@@ -1715,10 +1731,10 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
           break;
         }
       }
-      if (!cutoff && buffer.trim()) await consume(buffer);
+      if (!cutoff && !outputLimit && buffer.trim()) await consume(buffer);
       // Every cutoff leaves the socket open and the provider still writing into it, so the read side
       // is torn down here rather than left to garbage collection.
-      if (cutoff) await reader.cancel().catch(() => undefined);
+      if (cutoff || outputLimit) await reader.cancel().catch(() => undefined);
     } catch (cause) {
       await reader.cancel().catch(() => undefined);
       /*

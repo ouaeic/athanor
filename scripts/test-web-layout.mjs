@@ -9,6 +9,7 @@ import { resolve, extname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { processFixture, checkProjectProcesses } from './browser-processes.mjs';
 import { directoryFixture, checkProjectDirectories } from './browser-directories.mjs';
+import { checkTaskRecovery } from './browser-task-recovery.mjs';
 
 // Local fixtures exercise browser interactions; API and runner suites own authorization and delivery.
 const requireRunner = createRequire(
@@ -982,7 +983,7 @@ try {
       });
     }
     if (path === `/v1/tasks/${task.id}/events` && url.searchParams.get('limit') === '250') {
-      const before = Number(url.searchParams.get('before'));
+      const before = url.searchParams.has('before') ? Number(url.searchParams.get('before')) : null;
       projectEventRequests.push(before);
       const earlier = before === event.sequence;
       return json({
@@ -1038,6 +1039,7 @@ try {
     return route.fulfill({ status: 501, json: { error: { message: 'Unspecified UI fixture' } } });
   });
   if (process.env.GARDEN_UI_FOCUS !== 'drafts') {
+    await checkTaskRecovery({ context, origin, task, report, errors });
     await checkProjectDirectories({
       context,
       origin,
@@ -1089,7 +1091,7 @@ try {
     await page.getByRole('button', { name: /^Add a direction/ }).click();
     await page.getByText('Tools & activity', { exact: true }).click();
     assert(projectEventRequests.length > 0, 'Opening a project must load its event page');
-    assert.equal(projectEventRequests[0], Number.MAX_SAFE_INTEGER, 'Open the most recent page');
+    assert.equal(projectEventRequests[0], null, 'Open the most recent page without a sentinel');
     await page.getByRole('button', { name: 'Activity', exact: true }).click();
     const activity = page.getByRole('dialog', { name: 'Activity and directions', exact: true });
     await activity.getByRole('button', { name: 'Earlier activity', exact: true }).click();
