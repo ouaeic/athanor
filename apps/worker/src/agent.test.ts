@@ -266,13 +266,13 @@ describe('the journal record a failed turn leaves', () => {
    */
   it('identifies a failure that is nobody’s task without quoting it', () => {
     const refused = Object.assign(
-      new Error('terminating connection due to administrator command'),
+      new Error('terminating connection due to administrator command: private-detail-52a7a3a2'),
       {
         code: '57P01'
       }
     );
     expect(failureFields(refused).code).toBe('57P01');
-    expect(JSON.stringify(failureFields(refused))).not.toContain('administrator');
+    expect(JSON.stringify(failureFields(refused))).not.toContain('private-detail-52a7a3a2');
     expect(failureFields(new AthanorError('workspace_missing', 'gone')).code).toBe(
       'workspace_missing'
     );
