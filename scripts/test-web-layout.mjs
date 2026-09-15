@@ -1874,7 +1874,7 @@ try {
       summary: 'Choose the movement keys',
       payload: { question: 'Which keys should move the player?', options: ['Arrow keys', 'WASD'] }
     };
-    await page.reload();
+    await page.reload({ waitUntil: 'domcontentloaded' });
     await page.getByLabel('Your answer').waitFor();
     await page.getByLabel('Your answer').fill('Use both arrow keys and WASD.');
     await page.getByRole('button', { name: 'Send answer', exact: true }).click();

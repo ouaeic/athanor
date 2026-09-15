@@ -24,6 +24,8 @@ const stateLabel: Record<ProjectUpdate['state'], string> = {
   failed: 'Preparation failed',
   cancelled: 'Cancelled'
 };
+const canStartChecks = (update: ProjectUpdate) =>
+  ['ready', 'checking', 'checks_failed'].includes(update.state);
 const active = (check: ProjectCheck) =>
   ['preparing', 'running', 'verifying'].includes(check.status);
 const label = (update: ProjectUpdate) =>
@@ -592,7 +594,7 @@ export default function ProjectUpdates({
                   </small>
                 )}
                 <div className="row">
-                  {check.status === 'pending' && selected.state === 'ready' && (
+                  {check.status === 'pending' && canStartChecks(selected) && (
                     <Button
                       disabled={!!busy}
                       onClick={() =>
@@ -704,7 +706,7 @@ export default function ProjectUpdates({
               )}
             </details>
             <div className="row">
-              {selected.state === 'ready' &&
+              {canStartChecks(selected) &&
                 selected.checks.some((check) => check.status === 'pending') && (
                   <Button
                     className="primary"

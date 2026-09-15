@@ -165,6 +165,9 @@ export async function checkProjectUpdates({ page, fixture, project, report }) {
     await dialog.getByRole('button', { name: 'Publish checked version', exact: true }).count(),
     0
   );
+  await dialog.getByRole('button', { name: 'Run check', exact: true }).first().click();
+  await dialog.getByRole('button', { name: 'Stop check', exact: true }).waitFor();
+  assert.equal(await dialog.getByRole('button', { name: 'Run check', exact: true }).count(), 1);
   await dialog.getByRole('button', { name: 'Run pending checks', exact: true }).click();
   await dialog.getByRole('button', { name: 'Stop check', exact: true }).first().waitFor();
   assert.equal(fixture.actions.filter((action) => action.action === 'check').length, 2);
