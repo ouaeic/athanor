@@ -90,8 +90,10 @@ exec "$@"'
 
 # This records the mission handoff only. A real Linux canary proves kernel teardown.
 cat >"$fake_bin/mission-supervisor.py" <<'PYTHON'
-import json, os, sys
+import json, os, stat, sys
 fd, gate = int(sys.argv[1]), int(sys.argv[2])
+inputs = json.loads(sys.argv[3])
+assert all(stat.S_ISDIR(os.fstat(item).st_mode) for item in inputs)
 record = json.loads(os.read(fd, 8192))
 if record["phase"] != "prepared" or os.read(gate, 16) != b"go":
     raise RuntimeError("Mission was not authorized to launch")
@@ -99,7 +101,9 @@ os.close(fd)
 os.close(gate)
 with open(os.environ["ATHANOR_TEST_RECORDS"] + "/mission", "w") as stream:
     stream.write("closed-private-fds")
-os.execv(sys.argv[4], sys.argv[4:])
+with open(os.environ["ATHANOR_TEST_RECORDS"] + "/mission-inputs", "w") as stream:
+    stream.write(str(len(inputs)))
+os.execv(sys.argv[5], sys.argv[5:])
 PYTHON
 
 # The helper calls these by absolute path so that a search path it does not control cannot
@@ -252,6 +256,7 @@ root="$workspaces/$workspace_id"
 # the helper's write loop granted nothing and every assertion below stayed green while the ruleset
 # said something new; that is the saturation this harness exists to avoid.
 mkdir -p "$root/.home" "$root/.athanor/artifacts"
+chmod 0700 "$root/.athanor"
 output=$(run_sandbox run network confine "$root" /bin/sh -c 'printf confined')
 test "$output" = confined
 grep -q -- '--landlock-access fs' "$records/setpriv"
@@ -676,6 +681,10 @@ printf '{"sources":[],"projects":["%s"]}' "$version_id" > "$root/.athanor/projec
 output=$(run_sandbox run network confine "$root" /bin/sh -c 'printf project-version')
 test "$output" = project-version
 grep -Eq -- 'path-beneath:execute,read-file,read-dir:/proc/self/fd/[0-9]+' "$records/setpriv"
+output=$(run_sandbox run network mission "$root" /bin/sh -c 'printf supervised-project-version')
+test "$output" = supervised-project-version
+test "$(cat "$records/mission-inputs")" = 1
+grep -Eq -- 'path-beneath:execute,read-file,read-dir:/proc/self/fd/[0-9]+' "$records/setpriv"
 if grep -Eq -- 'path-beneath:[a-z,-]*(write|remove|make|truncate)[a-z,-]*:/proc/self/fd/' "$records/setpriv"; then
   printf 'immutable project versions acquired write access\n' >&2
   exit 1
@@ -703,3 +712,5 @@ if run_sandbox run network open - /bin/sh -c : >/dev/null 2>&1; then
   exit 1
 fi
 printf 'ok  the sandbox refuses to run without the privilege it drops\n'
+
+python3 "$repository_root/scripts/test-mission-supervisor.py"

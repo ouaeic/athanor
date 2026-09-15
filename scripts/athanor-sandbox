@@ -366,8 +366,8 @@ try:
 except OSError as error:
     fail("the working directory could not be entered: %s" % error.strerror)
 # The control plane writes membership; command output cannot extend this read-only grant.
+held = []
 if landlock:
-    held = []
     try:
         target = os.open(root, directory_flags)
         metadata = os.open(".athanor", directory_flags, dir_fd=target)
@@ -437,7 +437,7 @@ if network == "isolated":
     isolate = "ip link set lo up 2>/dev/null || true\nexec \"$@\""
     chain = [unshare, "--net", "--", "/bin/sh", "-c", isolate, "athanor-sandbox"] + chain
 if process_tree == "mission":
-    chain = ["/usr/bin/python3", "-I", "-S", supervisor, str(lease_fd), str(gate_fd), unshare] + chain
+    chain = ["/usr/bin/python3", "-I", "-S", supervisor, str(lease_fd), str(gate_fd), json.dumps(held), unshare] + chain
 os.execv(chain[0], chain)
 '
 

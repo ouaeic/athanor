@@ -82,7 +82,12 @@ if sys.argv[1] == "--init":
     subprocess.run([mount, "-t", "proc", "-o", "nosuid,nodev,noexec", "proc", "/proc"], check=True)
     os.execv(sys.argv[4], sys.argv[4:])
 
-fd, gate, unshare = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+fd, gate, unshare = int(sys.argv[1]), int(sys.argv[2]), sys.argv[4]
+inputs = json.loads(sys.argv[3])
+if not isinstance(inputs, list) or len(inputs) > 4160 or any(type(item) is not int or item < 3 or item in (fd, gate) for item in inputs):
+    raise RuntimeError("Invalid mission input descriptors")
+if len(set(inputs)) != len(inputs) or any(not stat.S_ISDIR(os.fstat(item).st_mode) for item in inputs):
+    raise RuntimeError("Mission inputs must be distinct held directories")
 record = read_record(fd)
 record["supervisor"] = identity(os.getpid())
 record["group"] = identity(os.getpgrp())
@@ -126,9 +131,10 @@ while not stopping and os.pread(gate, 16, 0) == b"" and time.time() * 1000 < rec
     time.sleep(0.01)
 if not stopping and os.pread(gate, 16, 0) == b"go" and time.time() * 1000 < record["launchExpiresAt"]:
     child = subprocess.Popen(
-        [unshare, "--mount", "--pid", "--fork", "--kill-child", "--", "/usr/bin/python3", "-I", "-S", __file__, "--init", str(fd), str(gate)] + sys.argv[4:],
+        [unshare, "--mount", "--pid", "--fork", "--kill-child", "--", "/usr/bin/python3", "-I", "-S", __file__, "--init", str(fd), str(gate)] + sys.argv[5:],
         start_new_session=True,
-        pass_fds=(fd, gate),
+        # Landlock rules resolve these held directories after namespace creation.
+        pass_fds=(fd, gate, *inputs),
         preexec_fn=parent_death,
     )
     if stopping:
