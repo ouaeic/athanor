@@ -45,6 +45,18 @@ afterEach(async () => {
 /** The native preparation handshake, including its exact task/source/target binding. */
 const projectPreparationFixture = (url: string, init?: RequestInit): Response | null => {
   if (new URL(url).pathname.endsWith('/project-inputs')) return Response.json({ sources: [] });
+  if (
+    /^\/v1\/workspaces\/[0-9a-f-]{36}\/projects\/[0-9a-f-]{36}\/updates$/.test(
+      new URL(url).pathname
+    )
+  )
+    return Response.json({
+      head: null,
+      updates: [],
+      revisions: [],
+      nextCursor: null,
+      observedAt: new Date().toISOString()
+    });
   const match = new URL(url).pathname.match(
     /^\/v1\/workspaces\/([0-9a-f-]{36})\/project-execution$/
   );

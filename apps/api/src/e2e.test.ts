@@ -108,6 +108,14 @@ const start = async (
         // Each route has to answer in the shape the worker parses. A generic {ok:true} reads as a
         // failed tool, which then fails verification - a real-looking failure with a fake cause.
         if (path.endsWith('/project-inputs')) return json({ sources: [] });
+        if (/^\/v1\/workspaces\/[0-9a-f-]{36}\/projects\/[0-9a-f-]{36}\/updates$/.test(path))
+          return json({
+            head: null,
+            updates: [],
+            revisions: [],
+            nextCursor: null,
+            observedAt: new Date().toISOString()
+          });
         if (path.endsWith('/project-execution')) {
           if (init?.method !== 'POST' || typeof init.body !== 'string')
             throw Error('Expected a JSON project preparation request');

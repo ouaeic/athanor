@@ -179,6 +179,14 @@ const start = async (
           });
         }
         if (path.endsWith('/project-inputs')) return json({ sources: [] });
+        if (/^\/v1\/workspaces\/[0-9a-f-]{36}\/projects\/[0-9a-f-]{36}\/updates$/.test(path))
+          return json({
+            head: null,
+            updates: [],
+            revisions: [],
+            nextCursor: null,
+            observedAt: new Date().toISOString()
+          });
         if (path.endsWith('/usage')) {
           // The real runner walks the whole tree here. This is that walk, on a modest project -
           // or, while a test holds it, a walk that has not finished at all yet.
