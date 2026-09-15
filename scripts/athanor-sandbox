@@ -404,6 +404,28 @@ if landlock:
                 os.set_inheritable(input_fd, True)
                 held.append(input_fd)
                 landlock += ["--landlock-rule", "path-beneath:execute,read-file,read-dir:/proc/self/fd/%d" % input_fd]
+            projects = membership.get("projects", [])
+            if not isinstance(projects, list) or len(projects) > 64:
+                fail("invalid project version list")
+            if projects:
+                store_fd = os.open(".project-store", directory_flags, dir_fd=parent_fd)
+                try:
+                    for project in projects:
+                        if not isinstance(project, str) or not re.fullmatch(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", project):
+                            fail("invalid project version identity")
+                        project_fd = os.open(project, directory_flags, dir_fd=store_fd)
+                        try:
+                            input_fd = os.open("public", directory_flags, dir_fd=project_fd)
+                        finally:
+                            os.close(project_fd)
+                        info = os.fstat(input_fd)
+                        if info.st_uid != int(asker) or info.st_mode & 0o022:
+                            fail("project versions are not protected")
+                        os.set_inheritable(input_fd, True)
+                        held.append(input_fd)
+                        landlock += ["--landlock-rule", "path-beneath:execute,read-file,read-dir:/proc/self/fd/%d" % input_fd]
+                finally:
+                    os.close(store_fd)
             os.close(parent_fd)
     except FileNotFoundError:
         pass

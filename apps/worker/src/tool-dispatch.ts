@@ -1,3 +1,4 @@
+import { executeProjectUpdate } from './project-updates.js';
 import { CODING_CHILD_TOOLS } from './coding-missions.js';
 import type { ModelRelease, WebToolPlan } from '@athanor/contracts';
 import type { DataStore, TaskRecord } from '@athanor/data';
@@ -146,6 +147,7 @@ type ToolDomain = (context: ToolContext, call: ModelToolCall) => Promise<unknown
  */
 const DOMAIN_OF: Readonly<Record<string, ToolDomain>> = {
   set_plan: executePlanTool,
+  project_update: executeProjectUpdate,
   shell: executeWorkspaceTool,
   process: executeWorkspaceTool,
   files_list: executeWorkspaceTool,

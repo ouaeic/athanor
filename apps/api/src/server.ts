@@ -1,3 +1,4 @@
+import { registerProjectUpdateRoutes } from './routes/project-updates.js';
 /**
  * One server, assembled.
  *
@@ -280,6 +281,7 @@ export const buildServer = async (
   registerTranscriptionRoutes(routes);
   registerTaskRoutes(routes);
   registerProjectRoutes(routes);
+  registerProjectUpdateRoutes(routes);
   registerTaskPresentationRoutes(routes);
   registerTrajectoryRoutes(routes);
   registerTaskEventRoutes(routes);

@@ -1,3 +1,4 @@
+import { projectUpdateApproval } from './project-updates.js';
 import { useTaskApproval } from './approval-grants.js';
 import { debuggerApproval } from './debugger-approval.js';
 import { codingMissionApproval } from './coding-mission-approval.js';
@@ -178,6 +179,12 @@ export const approvalForCall = async (
     if (strength[parent.securityMode] < strength[task.securityMode])
       task.securityMode = parent.securityMode;
   }
+  if (call.name === 'project_update')
+    return projectUpdateApproval(deps.runner, task, call, {
+      ...(state?.taint ? { taintSources: state.taint.sources } : {}),
+      ...undoPointFor(state),
+      ...deps.destinationContext(state)
+    });
   if (
     call.name === 'coding_agent' &&
     call.arguments.agent === 'garden' &&

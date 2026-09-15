@@ -229,6 +229,8 @@ export const parallelToolRun = (
  * measured writing too (see above). What the card asked, this answers.
  */
 export const CHECKPOINT_EXEMPT_TOOLS = new Set([
+  // Versions are immutable and checkout only creates missing files. No existing source is overwritten.
+  'project_update',
   ...[...REPEATABLE_TOOLS].filter((name) => !REPEATABLE_TOOLS_THAT_WRITE.has(name)),
   'finish',
   'compact_context',

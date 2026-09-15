@@ -1,3 +1,5 @@
+import { projectRequest } from './project-updates.js';
+import type { ProjectUpdates } from '@athanor/contracts';
 import { ConversationSource } from '@athanor/contracts';
 import { decryptJson, unwrapDataKey } from '@athanor/core';
 import { projectResponse, type TaskRecord } from '@athanor/data';
@@ -13,7 +15,7 @@ export async function conversationContext(
   key: Uint8Array
 ): Promise<string> {
   if (!task.projectId || task.parentMissionId) return '';
-  const [record, page, inputs, notes] = await Promise.all([
+  const [record, page, inputs, notes, versions] = await Promise.all([
     deps.store.getProject(task.userId, task.projectId),
     deps.store.listProjectConversations(task.userId, task.projectId, { limit: 12 }),
     deps.runner.call<{ sources: Array<{ workspaceId: string; path: string }> }>(
@@ -22,7 +24,8 @@ export async function conversationContext(
       'files.read',
       `/v1/workspaces/${task.workspaceId}/project-inputs`
     ),
-    deps.store.listProjectNotes(task.userId, task.projectId, deps.masterKey, { limit: 8 })
+    deps.store.listProjectNotes(task.userId, task.projectId, deps.masterKey, { limit: 8 }),
+    projectRequest<ProjectUpdates>(deps.runner, task, { action: 'status' })
   ]);
   if (!record) return '';
   const project = projectResponse(record, deps.masterKey);
@@ -30,7 +33,16 @@ export async function conversationContext(
     `Project ${project.id}: ${project.title}`,
     `Shared brief:\n${excerpt(project.brief, 8000)}`,
     'Each conversation has its own direction, history and approvals. Search related conversations with session_search; an empty search is not proof that work did not happen.',
-    'Write outputs in your own workspace. Shared input paths are read-only; scripts can read datasets in place without copying them. Use process tools for long-running work.',
+    'Write in your own working area. Other conversations can run concurrently. Use project_update to capture selected files, test the combined candidate and publish it. A conversation finishing does not publish its files or finish its jobs. Pin long-running inputs to immutable version paths; never follow a moving latest link. Checkout only the published files you need to edit; read large datasets in place. Use named process jobs for long-running work.',
+    versions.head
+      ? `Published version ${versions.head.number}: ${versions.head.id}; digest ${versions.head.digest}; immutable files ${versions.head.path}`
+      : 'No published version yet. Prepare an initial update from your files or a sourceTaskId; each candidate has an immutable input path once ready.',
+    ...versions.updates
+      .slice(0, 8)
+      .map(
+        (update) =>
+          `Update ${update.id} [${update.state}] ${update.title}; conversation ${update.taskId}; files ${update.path ?? 'not prepared'}; checks ${update.checks.map((check) => `${check.name}: ${check.status}`).join(', ') || 'none declared'}`
+      ),
     ...inputs.sources
       .slice(0, 24)
       .map((source) => `Input workspace ${source.workspaceId}: ${source.path}`),

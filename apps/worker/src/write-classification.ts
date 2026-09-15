@@ -84,6 +84,7 @@ const NON_MUTATING_TOOLS = new Set([
  * the shell, which is most of them, can never ground a completion.
  */
 export const isMutatingToolCall = (name: string, args: Record<string, unknown> = {}): boolean => {
+  if (name === 'project_update') return args.action === 'checkout';
   if (NON_MUTATING_TOOLS.has(name)) return false;
   // Zoom returns captured pixels without sending input or writing a workspace artifact.
   if (name === 'desktop_action' && surfaceActionVerb(args) === 'zoom') return false;

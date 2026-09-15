@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { open, opendir } from 'node:fs/promises';
 import path from 'node:path';
 import { Readable } from 'node:stream';
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { ZipFile } from 'yazl';
 import { z } from 'zod';
 import { requireScope } from './auth.js';
@@ -211,8 +211,48 @@ export const registerFileDownloadRoutes = (
   app: FastifyInstance,
   config: Pick<RunnerConfig, 'WORKSPACE_ROOT'>
 ): void => {
+  registerFileReadRoutes(app, '/v1/workspaces/:workspaceId', async (request) =>
+    workspacePath(config.WORKSPACE_ROOT, (request.params as { workspaceId: string }).workspaceId)
+  );
+  app.post<{ Params: { workspaceId: string }; Body: z.input<typeof BundleRequest> }>(
+    '/v1/workspaces/:workspaceId/bundle',
+    async (request, reply) => {
+      requireScope(request, 'files.read');
+      const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
+      const { paths, directories, instructions } = BundleRequest.parse(request.body);
+      const stream = await sourceBundle(root, paths, directories, instructions);
+      return reply
+        .type('application/zip')
+        .header('content-disposition', attachment('garden-source.zip'))
+        .header('cache-control', 'private, no-store')
+        .header('x-content-type-options', 'nosniff')
+        .send(stream);
+    }
+  );
+  app.post<{ Params: { workspaceId: string }; Body: z.input<typeof BundleRequest> }>(
+    '/v1/workspaces/:workspaceId/bundle-manifest',
+    async (request) => {
+      requireScope(request, 'files.read');
+      const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
+      const { paths, directories } = BundleRequest.parse(request.body);
+      const manifest = await sourceManifest(root, paths, directories);
+      for (const file of manifest.paths) {
+        const opened = await openDownloadFile(root, file);
+        await opened.handle.close();
+      }
+      return { fileCount: manifest.paths.length, excluded: manifest.excluded };
+    }
+  );
+};
+
+/** The same streaming and range contracts apply to working files and immutable versions. */
+export function registerFileReadRoutes(
+  app: FastifyInstance,
+  prefix: string,
+  rootFor: (request: FastifyRequest) => Promise<string>
+): void {
   app.get<{ Params: { workspaceId: string }; Querystring: { path?: string; cursor?: string } }>(
-    '/v1/workspaces/:workspaceId/directory',
+    `${prefix}/directory`,
     async (request) => {
       requireScope(request, 'files.read');
       const query = z
@@ -221,22 +261,15 @@ export const registerFileDownloadRoutes = (
           cursor: z.string().max(8192).optional()
         })
         .parse(request.query);
-      return listDirectory(
-        workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId),
-        query.path,
-        query.cursor
-      );
+      return listDirectory(await rootFor(request), query.path, query.cursor);
     }
   );
   app.get<{ Params: { workspaceId: string }; Querystring: { path?: string } }>(
-    '/v1/workspaces/:workspaceId/directory.zip',
+    `${prefix}/directory.zip`,
     async (request, reply) => {
       requireScope(request, 'files.read');
       const requested = z.string().min(1).max(4096).default('workspace').parse(request.query.path);
-      const stream = await directoryArchive(
-        workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId),
-        requested
-      );
+      const stream = await directoryArchive(await rootFor(request), requested);
       reply.raw.once('close', () => stream.destroy());
       return reply
         .type('application/zip')
@@ -247,10 +280,10 @@ export const registerFileDownloadRoutes = (
     }
   );
   app.get<{ Params: { workspaceId: string }; Querystring: { path: string; sha256?: string } }>(
-    '/v1/workspaces/:workspaceId/download',
+    `${prefix}/download`,
     async (request, reply) => {
       requireScope(request, 'files.read');
-      const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
+      const root = await rootFor(request);
       const opened = await openDownloadFile(
         root,
         z.string().min(1).max(4096).parse(request.query.path)
@@ -329,33 +362,4 @@ export const registerFileDownloadRoutes = (
       return reply.send(handle.createReadStream({ autoClose: true, start: 0, ...(range ?? {}) }));
     }
   );
-  app.post<{ Params: { workspaceId: string }; Body: z.input<typeof BundleRequest> }>(
-    '/v1/workspaces/:workspaceId/bundle',
-    async (request, reply) => {
-      requireScope(request, 'files.read');
-      const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      const { paths, directories, instructions } = BundleRequest.parse(request.body);
-      const stream = await sourceBundle(root, paths, directories, instructions);
-      return reply
-        .type('application/zip')
-        .header('content-disposition', attachment('garden-source.zip'))
-        .header('cache-control', 'private, no-store')
-        .header('x-content-type-options', 'nosniff')
-        .send(stream);
-    }
-  );
-  app.post<{ Params: { workspaceId: string }; Body: z.input<typeof BundleRequest> }>(
-    '/v1/workspaces/:workspaceId/bundle-manifest',
-    async (request) => {
-      requireScope(request, 'files.read');
-      const root = workspacePath(config.WORKSPACE_ROOT, request.params.workspaceId);
-      const { paths, directories } = BundleRequest.parse(request.body);
-      const manifest = await sourceManifest(root, paths, directories);
-      for (const file of manifest.paths) {
-        const opened = await openDownloadFile(root, file);
-        await opened.handle.close();
-      }
-      return { fileCount: manifest.paths.length, excluded: manifest.excluded };
-    }
-  );
-};
+}

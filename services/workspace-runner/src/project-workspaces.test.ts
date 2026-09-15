@@ -191,7 +191,7 @@ it('shares protected input paths without copying data and replaces membership at
   expect(await manager.inputs(f.workspaceId)).toEqual(receipt);
   expect(await readdir(path.join(f.root, f.workspaceId, 'workspace'))).toEqual([]);
   await manager.setInputs(f.workspaceId, { sources: [] });
-  expect(await manager.inputs(f.workspaceId)).toEqual({ sources: [] });
+  expect(await manager.inputs(f.workspaceId)).toEqual({ sources: [], projects: [] });
 });
 it('refuses symlinked input roots and never replaces membership with an invalid source', async () => {
   const f = await fixture(),

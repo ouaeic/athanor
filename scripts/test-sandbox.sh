@@ -669,6 +669,30 @@ if run_sandbox run network confine "$root" /bin/sh -c 'printf should-not-run' > 
   exit 1
 fi
 grep -q 'invalid project input identity' "$records/input-refusal"
+version_id=bbbbbbbb-cccc-4ddd-8eee-ffffffffffff
+mkdir -p "$workspaces/.project-store/$version_id/public"
+chmod 0755 "$workspaces/.project-store/$version_id/public"
+printf '{"sources":[],"projects":["%s"]}' "$version_id" > "$root/.athanor/project-inputs.json"
+output=$(run_sandbox run network confine "$root" /bin/sh -c 'printf project-version')
+test "$output" = project-version
+grep -Eq -- 'path-beneath:execute,read-file,read-dir:/proc/self/fd/[0-9]+' "$records/setpriv"
+if grep -Eq -- 'path-beneath:[a-z,-]*(write|remove|make|truncate)[a-z,-]*:/proc/self/fd/' "$records/setpriv"; then
+  printf 'immutable project versions acquired write access\n' >&2
+  exit 1
+fi
+chmod 0777 "$workspaces/.project-store/$version_id/public"
+if run_sandbox run network confine "$root" /bin/sh -c 'printf should-not-run' > "$records/input-refusal" 2>&1; then
+  printf 'writable project version directory was accepted\n' >&2
+  exit 1
+fi
+grep -q 'project versions are not protected' "$records/input-refusal"
+chmod 0755 "$workspaces/.project-store/$version_id/public"
+printf '{"sources":[],"projects":["../private"]}' > "$root/.athanor/project-inputs.json"
+if run_sandbox run network confine "$root" /bin/sh -c 'printf should-not-run' > "$records/input-refusal" 2>&1; then
+  printf 'project version traversal was accepted\n' >&2
+  exit 1
+fi
+grep -q 'invalid project version identity' "$records/input-refusal"
 rm "$root/.athanor/project-inputs.json"
 printf 'ok  protected project inputs grant only reads and reject tampered membership\n'
 

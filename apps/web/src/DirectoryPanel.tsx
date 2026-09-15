@@ -15,12 +15,16 @@ const textFile =
 export default function DirectoryPanel({
   taskId,
   projectId,
-  openRequest = 0
+  openRequest = 0,
+  readOnlyRoot
 }: {
   taskId?: string;
   projectId?: string;
   openRequest?: number;
+  readOnlyRoot?: { base: string; id: string; name: string; description: string };
 }) {
+  const readOnlyId = readOnlyRoot?.id,
+    readOnlyName = readOnlyRoot?.name;
   const [expanded, setExpanded] = useState(false);
   useEffect(() => {
     if (openRequest) setExpanded(true);
@@ -37,6 +41,12 @@ export default function DirectoryPanel({
   const request = useRef<AbortController | null>(null);
   useEffect(() => {
     if (!expanded) return;
+    if (readOnlyId && readOnlyName) {
+      setRoots([{ workspaceId: readOnlyId, name: readOnlyName, path: 'workspace', current: true }]);
+      setRootId(readOnlyId);
+      setFolder('workspace');
+      return;
+    }
     const controller = new AbortController();
     setError(null);
     setLoading(true);
@@ -62,8 +72,8 @@ export default function DirectoryPanel({
         if (!controller.signal.aborted) setLoading(false);
       });
     return () => controller.abort();
-  }, [taskId, projectId, expanded, rootsRevision]);
-  const base = `/v1/workspaces/${rootId}`;
+  }, [taskId, projectId, expanded, rootsRevision, readOnlyId, readOnlyName]);
+  const base = readOnlyRoot ? readOnlyRoot.base : `/v1/workspaces/${rootId}`;
   const root = roots.find((item) => item.workspaceId === rootId);
   const load = useCallback(
     async (cursor?: string) => {
@@ -125,7 +135,9 @@ export default function DirectoryPanel({
             <FolderOpen size={17} aria-hidden="true" /> Project files
           </h3>
           <p className="muted">
-            Scripts, data and results in your project’s execution directories.
+            {readOnlyRoot
+              ? readOnlyRoot.description
+              : 'Scripts, data and results in your project’s execution directories.'}
           </p>
         </div>
         <Button
@@ -146,7 +158,7 @@ export default function DirectoryPanel({
             <>
               <div className="directory-toolbar">
                 <label className="directory-root">
-                  Execution directory
+                  {readOnlyRoot ? 'File source' : 'Execution directory'}
                   <select
                     className="field"
                     value={rootId}
@@ -229,11 +241,13 @@ export default function DirectoryPanel({
                             </small>
                           </div>
                           <div className="directory-entry-actions">
-                            {entry.type === 'file' && textFile.test(entry.name) && (
-                              <Button disabled={dirty} onClick={() => setFile(entry)}>
-                                Inspect<span className="sr-only"> {entry.name}</span>
-                              </Button>
-                            )}
+                            {entry.type === 'file' &&
+                              !readOnlyRoot &&
+                              textFile.test(entry.name) && (
+                                <Button disabled={dirty} onClick={() => setFile(entry)}>
+                                  Inspect<span className="sr-only"> {entry.name}</span>
+                                </Button>
+                              )}
                             {(entry.type === 'file' || entry.type === 'directory') && (
                               <a
                                 className="button"

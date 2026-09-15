@@ -6,6 +6,7 @@ import { money, taskStatusLabel, conversationResultSource } from './model';
 import { Button, Dialog, ErrorNotice, Field, Spinner } from './ui';
 import { projectStatus } from './ProjectCollection';
 import './projects.css';
+const ProjectUpdates = lazy(() => import('./ProjectUpdates'));
 const ProjectNotes = lazy(() => import('./ProjectNotes'));
 const ProcessPanel = lazy(() => import('./ProcessPanel'));
 const DirectoryPanel = lazy(() => import('./DirectoryPanel'));
@@ -89,7 +90,15 @@ export default function ProjectSpace({
     [draft, setDraft] = useState<{ title: string; brief: string; revision: number } | null>(null),
     [busy, setBusy] = useState(false),
     [archived, setArchived] = useState(false),
-    [query, setQuery] = useState('');
+    [query, setQuery] = useState(''),
+    [activityTick, setActivityTick] = useState(0);
+  useEffect(() => {
+    if (taskId) return;
+    const timer = setInterval(() => {
+      if (document.visibilityState === 'visible') setActivityTick((value) => value + 1);
+    }, 15_000);
+    return () => clearInterval(timer);
+  }, [taskId]);
   const loadedScope = useRef('');
   const paged = useRef(false);
   const conversationTabs = useRef<HTMLElement>(null);
@@ -138,7 +147,7 @@ export default function ProjectSpace({
         if (!controller.signal.aborted) setError(cause);
       });
     return () => controller.abort();
-  }, [projectId, revision, archived]);
+  }, [projectId, revision, archived, activityTick]);
   async function more() {
     if (!cursor || busy) return;
     setBusy(true);
@@ -261,6 +270,7 @@ export default function ProjectSpace({
             </details>
           )}
           <Suspense fallback={<Spinner />}>
+            <ProjectUpdates projectId={project.id} tasks={tasks} onTask={onTask} />
             <ProjectNotes projectId={project.id} revision={project.updatedAt} onTask={onTask} />
           </Suspense>
           <section aria-label="Conversations">
@@ -289,8 +299,24 @@ export default function ProjectSpace({
                   <span>
                     <strong>{task.title}</strong>
                     <small>
-                      {taskStatusLabel(task)} · {money(task.spentUsd)}
+                      {task.status === 'completed'
+                        ? 'Conversation finished'
+                        : taskStatusLabel(task)}{' '}
+                      · {money(task.spentUsd)}
                     </small>
+                    {task.activity && (
+                      <>
+                        <small className="project-activity-detail">
+                          {task.activity.currentStep ?? task.activity.latest}
+                        </small>
+                        <small>
+                          {task.activity.stepsTotal > 0 &&
+                            `Plan: ${task.activity.stepsCompleted} of ${task.activity.stepsTotal} marked complete · `}
+                          {task.activity.observedAt &&
+                            `Last activity ${new Date(task.activity.observedAt).toLocaleTimeString()}`}
+                        </small>
+                      </>
+                    )}
                   </span>
                 </button>
               ))}

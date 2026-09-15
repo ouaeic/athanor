@@ -120,9 +120,16 @@ export class ProjectWorkspaces {
         const info = await file.stat();
         if (info.size > 262144 || !info.isFile()) throw Error('Invalid project input metadata');
         const data = z
-          .object({ sources: z.array(z.uuid()).max(4096) })
+          .object({
+            sources: z.array(z.uuid()).max(4096),
+            projects: z.array(z.uuid()).max(64).default([])
+          })
           .parse(JSON.parse(await file.readFile('utf8')));
         return {
+          projects: data.projects.map((projectId) => ({
+            projectId,
+            path: path.join(this.root, '.project-store', projectId, 'public')
+          })),
           sources: data.sources.map((id) => ({
             workspaceId: id,
             path: path.join(this.root, id, 'workspace')
@@ -132,13 +139,16 @@ export class ProjectWorkspaces {
         await file.close();
       }
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { sources: [] };
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { sources: [], projects: [] };
       throw error;
     }
   }
   async setInputs(workspaceId: string, raw: unknown) {
     const input = z
-      .object({ sources: z.array(z.uuid()).max(4096) })
+      .object({
+        sources: z.array(z.uuid()).max(4096),
+        projects: z.array(z.uuid()).max(64).default([])
+      })
       .strict()
       .parse(raw);
     const target = workspacePath(this.root, workspaceId);
@@ -170,7 +180,7 @@ export class ProjectWorkspaces {
         0o600
       );
       try {
-        await output.writeFile(JSON.stringify({ sources }));
+        await output.writeFile(JSON.stringify({ sources, projects: input.projects }));
         await output.sync();
       } finally {
         await output.close();
@@ -182,6 +192,10 @@ export class ProjectWorkspaces {
       await rm(temporary, { force: true });
     }
     return {
+      projects: input.projects.map((projectId) => ({
+        projectId,
+        path: path.join(this.root, '.project-store', projectId, 'public')
+      })),
       sources: sources.map((workspaceId) => ({
         workspaceId,
         path: path.join(this.root, workspaceId, 'workspace')

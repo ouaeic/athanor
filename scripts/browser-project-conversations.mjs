@@ -1,3 +1,4 @@
+import { projectUpdateFixture, checkProjectUpdates } from './browser-project-updates.mjs';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
@@ -52,11 +53,13 @@ export async function checkProjectConversations({
     drafts = new Map(),
     requests = [];
   project.latestTaskId = root.id;
+  const updates = projectUpdateFixture(project, tasks);
   await page.route('**/v1/**', async (route) => {
     const url = new URL(route.request().url()),
       path = url.pathname,
       method = route.request().method(),
       json = (body) => route.fulfill({ json: body });
+    if (await updates.handle(route)) return;
     if (path === '/v1/bootstrap')
       return json({
         ...bootstrap,
@@ -171,25 +174,18 @@ export async function checkProjectConversations({
       await dialog.getByRole('combobox', { name: 'Approvals for this prompt' }).inputValue(),
       'autonomous'
     );
-    await dialog.locator('summary').filter({ hasText: 'Working area' }).click();
-    await dialog.getByRole('radio', { name: 'Shared project files' }).check();
+    assert.equal(await dialog.getByRole('radio', { name: 'Shared project files' }).count(), 0);
     await page.waitForResponse(
       (response) =>
         new URL(response.url()).pathname === '/v1/drafts' &&
         response.request().method() === 'PUT' &&
-        response.request().postDataJSON().controls?.conversation?.execution === 'shared'
+        response.request().postDataJSON().controls?.conversation?.execution === 'independent'
     );
     await page.reload();
     await page.getByRole('button', { name: 'New conversation', exact: true }).click();
     dialog = page.getByRole('dialog', { name: 'New conversation', exact: true });
     input = dialog.getByPlaceholder('Describe what you want to do…');
     assert.equal(await input.inputValue(), 'Review quality without changing the assembly.');
-    await dialog.locator('summary').filter({ hasText: 'Working area' }).click();
-    assert.equal(
-      await dialog.getByRole('radio', { name: 'Shared project files' }).isChecked(),
-      true
-    );
-    await dialog.getByRole('radio', { name: 'Independent area' }).check();
     await dialog.getByRole('button', { name: 'Begin', exact: true }).click();
     await dialog.waitFor({ state: 'detached' });
     await page.getByRole('heading', { name: 'QC conversation', exact: true }).waitFor();
@@ -247,7 +243,7 @@ export async function checkProjectConversations({
     assert.deepEqual(await tabs.getByRole('button').allTextContents(), expandedOrder);
     tasks.splice(2);
     project.conversationCount = tasks.length;
-    await page.goto(`${origin}/?task=${child.id}`);
+    await page.goto(`${origin}/?task=${child.id}`, { waitUntil: 'domcontentloaded' });
     await page.getByRole('heading', { name: 'QC conversation', exact: true }).waitFor();
     for (const width of [1440, 390, 320]) {
       await page.setViewportSize({ width, height: 900 });
@@ -298,6 +294,12 @@ export async function checkProjectConversations({
       drafts.get(`new:${anchor.id}`).controls.conversation.source.result.id,
       'The selected result identity must survive draft recovery'
     );
+    await linked.getByRole('button', { name: 'Close New conversation', exact: true }).click();
+    await page
+      .getByRole('navigation', { name: 'Project conversations' })
+      .getByRole('button', { name: 'Overview', exact: true })
+      .click();
+    await checkProjectUpdates({ page, fixture: updates, project, report });
     console.log(
       'Project conversation browser checks passed: persistent working-area drafts, inherited autonomy, independent creation, stable tab order across navigation and activity, pinned tabs, scrollable overflow and restored selection, reloads, responsive names and controls, notes with correction history, and exact result references.'
     );

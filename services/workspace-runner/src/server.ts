@@ -1,3 +1,5 @@
+import { ProjectUpdatesManager } from './project-updates.js';
+import { registerProjectUpdateRoutes } from './project-update-routes.js';
 import { DebuggerManager } from './debugger.js';
 import { registerDebuggerRoutes } from './debugger-routes.js';
 import { NativeCodingMissions, registerCodingMissionRoutes } from './coding-missions.js';
@@ -601,6 +603,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     const backgroundWork = processes.backgroundWork();
     const computationWork = computations.backgroundWork();
     const debuggerWork = debuggers.backgroundWork();
+    const projectPreparations = projectUpdates.backgroundPreparations();
     return {
       ok: true,
       service: 'workspace-runner',
@@ -639,11 +642,16 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
       missionProcessIsolation: sandbox?.processIsolation === true,
       nativeNetworkIsolation: sandbox?.networkIsolation === true,
       backgroundCommands:
-        backgroundWork.commands + computationWork.commands + debuggerWork.commands,
-      backgroundLongestRemainingMs:
-        backgroundWork.longestRemainingMs === null &&
-        computationWork.longestRemainingMs === null &&
-        debuggerWork.longestRemainingMs === null
+        backgroundWork.commands +
+        computationWork.commands +
+        debuggerWork.commands +
+        projectPreparations,
+      projectPreparations,
+      backgroundLongestRemainingMs: projectPreparations
+        ? null
+        : backgroundWork.longestRemainingMs === null &&
+            computationWork.longestRemainingMs === null &&
+            debuggerWork.longestRemainingMs === null
           ? null
           : Math.max(
               backgroundWork.longestRemainingMs ?? 0,
@@ -674,6 +682,34 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
     ]
   });
   registerProjectWorkspaceRoutes(app, projectWorkspaces);
+  const projectUpdates = new ProjectUpdatesManager(config.WORKSPACE_ROOT, {
+    start: async (workspaceId, taskId, command, job) => {
+      if (!sandbox?.confineFilesystem || !sandbox.processIsolation || !sandbox.networkIsolation)
+        throw new Error(
+          'Project checks require measured filesystem, network and process-tree isolation'
+        );
+      const root = workspacePath(config.WORKSPACE_ROOT, workspaceId);
+      await assertHostStorageWrite(root, 0, probeHostStorage);
+      return processes.start(
+        root,
+        workspaceId,
+        taskId,
+        { executable: command.executable, args: command.args, cwd: command.cwd, job },
+        config.MAX_BACKGROUND_SECONDS,
+        config.ISOLATE_AGENT_NETWORK,
+        { ...guards, superviseProcessTree: true }
+      );
+    },
+    poll: (workspaceId, taskId, sessionId, logs) =>
+      processes.action(workspaceId, taskId, sessionId, { action: logs ? 'log' : 'poll' }),
+    stop: (workspaceId, taskId, sessionId) => {
+      processes.action(workspaceId, taskId, sessionId, { action: 'kill' });
+    }
+  });
+  await projectUpdates.restore((error) =>
+    app.log.warn({ err: error }, 'Project check status could not be refreshed')
+  );
+  registerProjectUpdateRoutes(app, projectUpdates);
 
   app.put<{ Params: { workspaceId: string } }>('/v1/workspaces/:workspaceId', async (request) => {
     requireScope(request, 'workspace.manage');
@@ -2345,6 +2381,7 @@ export const buildServer = async (config: RunnerConfig, options: RunnerServerOpt
   }, TAB_SWEEP_MS);
   sessionTimer.unref();
   app.addHook('onClose', async () => {
+    await projectUpdates.close();
     clearInterval(sessionTimer);
     await sessionSweep;
     await computations.close();

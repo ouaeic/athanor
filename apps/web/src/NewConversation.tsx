@@ -23,12 +23,7 @@ export default function NewConversation({
   onClose: () => void;
 }) {
   const [workspace, setWorkspace] = useState<Workspace | null>(null),
-    [error, setError] = useState<unknown>(null),
-    [execution, setExecution] = useState<'independent' | 'shared'>(
-      draft?.controls?.conversation?.projectId === project.id
-        ? draft.controls.conversation.execution
-        : 'independent'
-    );
+    [error, setError] = useState<unknown>(null);
   const selectedSource =
     source ??
     (draft?.controls?.conversation?.projectId === project.id
@@ -61,36 +56,10 @@ export default function NewConversation({
             )}
           </p>
         )}
-        <details>
-          <summary>Working area</summary>
-          <div className="stack">
-            <label>
-              <input
-                type="radio"
-                name="conversation-execution"
-                checked={execution === 'independent'}
-                onChange={() => setExecution('independent')}
-              />{' '}
-              Independent area
-            </label>
-            <p className="muted">
-              Work concurrently in a separate directory, with access to project inputs.
-            </p>
-            <label>
-              <input
-                type="radio"
-                name="conversation-execution"
-                checked={execution === 'shared'}
-                onChange={() => setExecution('shared')}
-              />{' '}
-              Shared project files
-            </label>
-            <p className="muted">
-              Work directly on the main files. Conversations using this area take turns; background
-              jobs keep using these files.
-            </p>
-          </div>
-        </details>
+        <p className="muted">
+          Each conversation works in its own directory. Tested updates can be combined into a
+          published project version without interrupting other work.
+        </p>
         <ErrorNotice error={error} />
         {workspace ? (
           <Suspense fallback={<Spinner />}>
@@ -98,7 +67,7 @@ export default function NewConversation({
               workspace={workspace}
               bootstrap={bootstrap}
               project={project}
-              execution={execution}
+              execution="independent"
               {...(selectedSource ? { source: selectedSource } : {})}
               {...(draft ? { initialDraft: draft } : {})}
               onDraft={onDraft}

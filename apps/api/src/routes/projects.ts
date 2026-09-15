@@ -4,6 +4,7 @@ import { projectResponse } from '@athanor/data';
 import { z } from 'zod';
 import { requireUser } from '../http/auth-hook.js';
 import type { RouteContext } from '../http/server-context.js';
+import { projectActivity } from '../project-activity.js';
 
 const Page = z.object({
   before: z.uuid().optional(),
@@ -88,9 +89,20 @@ export function registerProjectRoutes(context: RouteContext) {
         ...(query.before ? { before: query.before } : {}),
         ...(query.archived ? { archived: query.archived === 'true' } : {})
       });
+      const activity = await projectActivity(
+        context,
+        user.id,
+        request.params.projectId,
+        page.tasks.map((task) => task.id)
+      );
       return {
         ...page,
-        tasks: await Promise.all(page.tasks.map((task) => context.privateTaskResponse(task)))
+        tasks: await Promise.all(
+          page.tasks.map(async (task) => ({
+            ...(await context.privateTaskResponse(task)),
+            activity: activity.get(task.id)
+          }))
+        )
       };
     }
   );

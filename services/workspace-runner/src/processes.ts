@@ -138,6 +138,7 @@ interface Supervised {
  * moment the command started and says nothing about the command that is filling it.
  */
 export interface Guards extends ExecutionGuards {
+  superviseProcessTree?: boolean;
   sandbox?: AgentSandbox | undefined;
   /**
    * Where the root-owned system-package helper lives, so this path can refuse a command that names
@@ -348,15 +349,19 @@ export class ProcessManager {
     // service is subject to the same rules as a command an agent runs in front of you. The one
     // difference is stated in the policy rather than left implicit in a second copy of the checks:
     // a package manager is refused here, not rewritten onto the approved helper.
-    const prepared = await prepareInvocation(workspaceRoot, request, {
-      isolateNetwork: options.isolateNetwork,
-      sandbox: guards.sandbox,
-      limits: guards.limits,
-      limiter: guards.limiter,
-      // Refused, and named: refusing an install is not the same statement as refusing to be the
-      // helper, and this path owes both.
-      systemPackages: { mode: 'refused', helper: guards.systemPackageHelper }
-    });
+    const prepared = await prepareInvocation(
+      workspaceRoot,
+      { ...request, superviseProcessTree: guards.superviseProcessTree === true },
+      {
+        isolateNetwork: options.isolateNetwork,
+        sandbox: guards.sandbox,
+        limits: guards.limits,
+        limiter: guards.limiter,
+        // Refused, and named: refusing an install is not the same statement as refusing to be the
+        // helper, and this path owes both.
+        systemPackages: { mode: 'refused', helper: guards.systemPackageHelper }
+      }
+    );
     if (this.#quiesced.has(workspaceId)) {
       await discardMissionInvocation(prepared);
       throw new Error('The coding mission execution scope is closed');

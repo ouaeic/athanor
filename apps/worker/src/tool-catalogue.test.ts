@@ -457,8 +457,8 @@ describe('the size of the catalogue the model is sent', () => {
     // sentence would go to a two-core laptop and a ninety-six-core server. Its home is the runtime
     // block in apps/worker/src/context.ts, which is already dynamic, already states the machine's
     // storage, and costs this cached prefix nothing.
-    // Durable provider jobs and resumable shell jobs; complete wire measures 56,294 bytes.
-    expect(bytes).toBeLessThan(56_400);
+    // Project version and check controls; complete wire measures 57,554 bytes.
+    expect(bytes).toBeLessThan(58_000);
     // Where the bytes actually are, because it is not where it looks. connector_action is now the
     // largest entry at ~6.6 kB, and 5.0 kB of that is one `input` object declaring 48 fields - the
     // union of what twenty-four actions across mail, calendar and repositories accept. Those are
@@ -812,8 +812,8 @@ describe('the wire a box without a browser or a screen is sent', () => {
      * so they are paid for here too. 44,000 against a measured 43,981, up from 43,908. The gap to
      * the provisioned wire is still exactly 11,692, because the same 73 bytes landed on both.
      */
-    // The same job controls on a bare box measure 44,376 bytes.
-    expect(Buffer.byteLength(JSON.stringify(bare))).toBeLessThan(44_500);
+    // The same job controls on a bare box measure 45,636 bytes.
+    expect(Buffer.byteLength(JSON.stringify(bare))).toBeLessThan(46_000);
     // The other direction, and the one that fails silently. A gate wired to nothing returns the
     // unconditional constant on every box; this is the assertion that would go red if it did.
     expect(Buffer.byteLength(JSON.stringify(bare))).toBeLessThan(
@@ -987,8 +987,8 @@ describe('the wire a box is sent about the services it has actually connected', 
     // memories as one without. 54,307 measured, up from 54,147. Then by the same 73 as those two
     // ceilings, on the same rule: `shell` is on every wire, so a box with a mailbox connected can
     // start a six-hour background job exactly as one without can. 54,380 measured.
-    // The same job controls with connected mail/calendar measure 55,001 bytes.
-    expect(Buffer.byteLength(JSON.stringify(mailAndCalendar))).toBeLessThan(55_100);
+    // The same job controls with connected mail/calendar measure 56,261 bytes.
+    expect(Buffer.byteLength(JSON.stringify(mailAndCalendar))).toBeLessThan(56_700);
     // The other direction, and the one that fails silently. A gate wired to nothing returns the
     // unconditional catalogue on every box; this is the assertion that would go red if it did.
     expect(Buffer.byteLength(JSON.stringify(mailAndCalendar))).toBeLessThan(

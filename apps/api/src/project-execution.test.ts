@@ -1,3 +1,5 @@
+import { projectActivity } from './project-activity.js';
+import type { RouteContext } from './http/server-context.js';
 import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDatabase, migrateDatabase, DataStore, type Database } from '@athanor/data';
@@ -177,4 +179,55 @@ describe('project preparation API operation', () => {
     expect((await f.store.getProjectExecution(f.user.id, f.task.id))?.status).toBe('failed');
     expect(await f.store.leaseNextTask('not-ready')).toBeNull();
   });
+});
+
+it('projects recorded progress for the visible owned conversations without importing unrelated work', async () => {
+  const f = await fixture();
+  await f.store.createTaskPlan({
+    taskId: f.task.id,
+    expectedVersion: 0,
+    branchName: 'Main',
+    createdBy: 'agent',
+    stepsCiphertext: encryptJson(
+      {
+        steps: [
+          { id: randomUUID(), title: 'Prepare inputs', status: 'completed' },
+          { id: randomUUID(), title: 'Analyse cohorts', status: 'in_progress' }
+        ]
+      },
+      f.key,
+      `task-plan:${f.task.id}`
+    )
+  });
+  const event = await f.store.appendTaskEvent({
+    taskId: f.task.id,
+    kind: 'notice',
+    summary: 'Protected event',
+    payloadCiphertext: encryptJson(
+      { __athanorEventVersion: 1, summary: 'Cohort checks are running', payload: {} },
+      f.key,
+      `task-event:${f.task.id}`
+    )
+  });
+  const result = await projectActivity(
+    f.context as unknown as RouteContext,
+    f.user.id,
+    f.task.projectId!,
+    [f.task.id]
+  );
+  expect(result.size).toBe(1);
+  expect(result.get(f.task.id)).toMatchObject({
+    currentStep: 'Analyse cohorts',
+    stepsCompleted: 1,
+    stepsTotal: 2,
+    latest: 'Cohort checks are running',
+    eventId: event.id
+  });
+  expect(
+    (
+      await projectActivity(f.context as unknown as RouteContext, randomUUID(), f.task.projectId!, [
+        f.task.id
+      ])
+    ).size
+  ).toBe(0);
 });

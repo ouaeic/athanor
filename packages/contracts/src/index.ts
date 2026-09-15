@@ -581,6 +581,16 @@ export const publishesPublicly = (reach: unknown): boolean => reach === PublishR
 export const TASK_TITLE_MAX_LENGTH = 1024;
 
 export const Task = z.object({
+  activity: z
+    .object({
+      currentStep: z.string().nullable(),
+      stepsCompleted: z.number(),
+      stepsTotal: z.number(),
+      latest: z.string(),
+      eventId: z.string().nullable(),
+      observedAt: IsoDate.nullable()
+    })
+    .optional(),
   id: Id,
   projectId: Id.optional(),
   modelOverride: z.boolean().optional(),
@@ -2373,3 +2383,4 @@ export * from './dictation.js';
 export * from './voice.js';
 export type * from './processes.js';
 export type * from './directories.js';
+export * from './project-updates.js';

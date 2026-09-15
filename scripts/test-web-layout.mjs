@@ -642,6 +642,14 @@ try {
     if (!path.startsWith('/v1/')) return route.continue();
     if (path === '/v1/bootstrap')
       return json({ ...bootstrap, models: modelCatalog, drafts: [...modelDrafts.values()] });
+    if (path.endsWith('/updates') && path.startsWith('/v1/projects/'))
+      return json({
+        head: null,
+        updates: [],
+        revisions: [],
+        nextCursor: null,
+        observedAt: new Date().toISOString()
+      });
     if (path.endsWith('/notes') && path.startsWith('/v1/projects/'))
       return json({ notes: [], nextCursor: null });
     if (path === '/v1/projects') return json({ projects: [project], nextCursor: null });

@@ -1,0 +1,126 @@
+import { randomUUID } from 'node:crypto';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import Fastify from 'fastify';
+import { afterEach, expect, it } from 'vitest';
+import { capabilityAudience, signCapabilityToken } from '@athanor/core';
+import { authenticateRunnerRequest } from './auth.js';
+import { ensureWorkspace } from './files.js';
+import { ProjectUpdatesManager } from './project-updates.js';
+import { registerProjectUpdateRoutes } from './project-update-routes.js';
+
+const cleanup: Array<() => Promise<void>> = [];
+afterEach(async () => {
+  for (const close of cleanup.splice(0)) await close();
+});
+it('binds project reads and mutations to signed membership and keeps unchecked publication owner-only', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'project-route-'));
+  cleanup.push(() => rm(root, { recursive: true, force: true }));
+  const project = randomUUID(),
+    main = randomUUID(),
+    a = randomUUID(),
+    b = randomUUID(),
+    wa = randomUUID(),
+    wb = randomUUID();
+  await ensureWorkspace(path.join(root, wa));
+  await ensureWorkspace(path.join(root, wb));
+  await writeFile(path.join(root, wa, 'workspace/result.txt'), 'versioned result');
+  const manager = new ProjectUpdatesManager(root, {
+    start: async () => ({ sessionId: 'unused' }),
+    poll: () => {
+      throw Error('No job');
+    },
+    stop: () => {}
+  });
+  await manager.bind(project, main, a, wa);
+  await manager.bind(project, main, b, wb);
+  const update = await manager.prepare(project, a, { title: 'Result', paths: ['result.txt'] });
+  await manager.settle(update.id);
+  const prepared = await manager.inspect(project, update.id);
+  const app = Fastify();
+  cleanup.unshift(() => app.close());
+  const secret = 's'.repeat(32);
+  app.addHook('preHandler', authenticateRunnerRequest(secret));
+  registerProjectUpdateRoutes(app, manager);
+  const invoke = (
+    role: 'agent' | 'user' | 'control',
+    workspaceId: string,
+    sub: string,
+    scope: string,
+    operation: unknown
+  ) => {
+    const url = `/v1/workspaces/${workspaceId}/projects/${project}/updates`;
+    const token = signCapabilityToken(
+      {
+        workspaceId,
+        sub,
+        role,
+        scopes: [scope],
+        nonce: randomUUID(),
+        aud: capabilityAudience('POST', url)
+      },
+      secret,
+      60
+    );
+    return app.inject({
+      method: 'POST',
+      url,
+      headers: { authorization: `Bearer ${token}` },
+      payload: { operation }
+    });
+  };
+  expect(
+    (await invoke('agent', wa, a, 'project.updates.read', { action: 'status' })).statusCode
+  ).toBe(200);
+  expect(
+    (await invoke('agent', wa, b, 'project.updates.read', { action: 'status' })).statusCode
+  ).not.toBe(200);
+  expect(
+    (
+      await invoke('agent', wb, b, 'project.updates.write', {
+        action: 'cancel',
+        updateId: update.id
+      })
+    ).statusCode
+  ).not.toBe(200);
+  expect(
+    (
+      await invoke('agent', wa, a, 'project.updates.read', {
+        action: 'cancel',
+        updateId: update.id
+      })
+    ).statusCode
+  ).not.toBe(200);
+  const publish = {
+    action: 'publish',
+    updateId: update.id,
+    digest: prepared.candidateDigest,
+    uncheckedReason: 'Owner reviewed the output'
+  };
+  expect((await invoke('agent', wa, a, 'project.updates.write', publish)).statusCode).not.toBe(200);
+  expect((await invoke('user', wb, a, 'project.updates.write', publish)).statusCode).not.toBe(200);
+  const published = await invoke('user', main, a, 'project.updates.write', publish);
+  expect(published.statusCode).toBe(200);
+  const revision = published.json<{ id: string }>();
+  const url = `/v1/workspaces/${main}/projects/${project}/versions/${revision.id}/download?path=workspace/result.txt`;
+  const token = signCapabilityToken(
+    {
+      workspaceId: main,
+      sub: a,
+      role: 'user',
+      scopes: ['files.read'],
+      nonce: randomUUID(),
+      aud: capabilityAudience('GET', url)
+    },
+    secret,
+    60
+  );
+  const download = await app.inject({
+    method: 'GET',
+    url,
+    headers: { authorization: `Bearer ${token}`, range: 'bytes=0-8' }
+  });
+  expect(download.statusCode).toBe(206);
+  expect(download.body).toBe('versioned');
+});

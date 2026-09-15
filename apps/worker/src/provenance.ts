@@ -351,6 +351,10 @@ const unboundedOriginOfResult = (call: ModelToolCall, result: unknown): string |
     );
   }
   switch (call.name) {
+    case 'project_update':
+      return textValue(call.arguments.action) === 'log'
+        ? 'background process output'
+        : 'project history';
     case 'web_search':
       return 'web search results';
     /*

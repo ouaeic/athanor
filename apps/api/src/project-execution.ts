@@ -138,10 +138,18 @@ export async function configureConversationInputs(
   workspaceId = task.workspaceId
 ) {
   if (!task.projectId) return;
-  // Only dedicated project roots are shared; host and specialist state stay outside the input grant.
-  const sources = (await context.store.projectInputWorkspaceIds(task.userId, task.id)).filter(
-    (id) => id !== workspaceId
-  );
+  const project = await context.store.getProject(task.userId, task.projectId);
+  if (!project) throw new Error('Project membership is unavailable');
+  await context.runner.request({
+    workspaceId: project.workspaceId,
+    userId: task.userId,
+    role: 'control',
+    scopes: ['workspace.manage'],
+    method: 'PUT',
+    path: `/v1/workspaces/${project.workspaceId}/projects/${project.id}/members`,
+    contentType: 'application/json',
+    body: JSON.stringify([{ taskId: task.id, workspaceId }])
+  });
   await context.runner.request({
     workspaceId,
     userId: task.userId,
@@ -150,7 +158,7 @@ export async function configureConversationInputs(
     method: 'PUT',
     path: `/v1/workspaces/${workspaceId}/project-inputs`,
     contentType: 'application/json',
-    body: JSON.stringify({ sources })
+    body: JSON.stringify({ sources: [], projects: [task.projectId] })
   });
 }
 

@@ -363,15 +363,12 @@ export const registerTaskRoutes = (context: RouteContext): void => {
           });
         return {
           task: titled,
-          execution:
-            project && input.execution === 'shared'
-              ? null
-              : await beginProjectExecution(
-                  context,
-                  titled,
-                  input.attachments ?? [],
-                  Boolean(project)
-                )
+          execution: await beginProjectExecution(
+            context,
+            titled,
+            input.attachments ?? [],
+            Boolean(project)
+          )
         };
       });
       let task = prepared.task;

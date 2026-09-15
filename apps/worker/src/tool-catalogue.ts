@@ -620,6 +620,38 @@ export const agentTools: ModelTool[] = [
     }
   },
   {
+    name: 'project_update',
+    description:
+      'Combine parallel project work using immutable versions. status shows head, updates and checks. prepare captures selected paths (missing files never delete); checkout copies published paths into your area without overwriting files. Checks run independently on the combined candidate with no implicit deadline. Publish only after its checks pass; rebase onto a newer head resets checks. Resolve conflicts in your own files; prepare with resolvedPaths and expectedRevision to record the resolution. Running jobs keep their inputs. Use log for check output; stop only stops that check.',
+    parameters: {
+      type: 'object',
+      required: ['action'],
+      additionalProperties: false,
+      properties: {
+        action: {
+          type: 'string',
+          enum: [
+            'status',
+            'prepare',
+            'checkout',
+            'rebase',
+            'check',
+            'log',
+            'stop',
+            'cancel',
+            'publish'
+          ]
+        },
+        options: {
+          type: 'object',
+          description:
+            'status: updateId or before. prepare: update:{title,paths,deletePaths?,resolvedPaths?,expectedRevision?,checks:[{name,executable,args,cwd?}]}, sourceTaskId?. checkout: paths, revisionId?. Others: updateId; check/log/stop: checkId; check/publish: digest from status. IDs and paths come from returned records.',
+          additionalProperties: true
+        }
+      }
+    }
+  },
+  {
     name: 'shell',
     description:
       'Run an executable on the owner’s Linux computer. Use background=true and job for finite work, service for servers; process inspects or stops them. Nothing expands: use args; for pipes, globs or redirects run `bash -lc` or `python3 -c` with the script as one argument.',

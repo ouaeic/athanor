@@ -315,6 +315,11 @@ it('shares bounded source-linked context and corrections without importing other
   );
   const runner = new AgentRunnerClient('http://runner.invalid', 'x'.repeat(32));
   vi.spyOn(runner, 'call').mockResolvedValue({
+    head: null,
+    updates: [],
+    revisions: [],
+    nextCursor: null,
+    observedAt: new Date().toISOString(),
     sources: [
       { workspaceId: f.task.workspaceId, path: `/home/athanor/${f.task.workspaceId}/workspace` }
     ]
