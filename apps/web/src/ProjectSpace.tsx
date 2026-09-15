@@ -92,6 +92,16 @@ export default function ProjectSpace({
     [query, setQuery] = useState('');
   const loadedScope = useRef('');
   const paged = useRef(false);
+  const conversationTabs = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const tabs = conversationTabs.current;
+    const selected = tabs?.querySelector<HTMLElement>('[aria-current="page"]');
+    if (!tabs || !selected) return;
+    const viewport = tabs.getBoundingClientRect();
+    const tab = selected.getBoundingClientRect();
+    if (tab.left < viewport.left) tabs.scrollLeft += tab.left - viewport.left;
+    else if (tab.right > viewport.right) tabs.scrollLeft += tab.right - viewport.right;
+  }, [taskId, currentTask?.id, project?.id, tasks.length]);
   useEffect(() => {
     const scope = `${projectId}:${archived}`;
     const sameScope = loadedScope.current === scope;
@@ -209,7 +219,11 @@ export default function ProjectSpace({
           </Button>
         </div>
       </header>
-      <nav className="project-conversation-tabs" aria-label="Project conversations">
+      <nav
+        ref={conversationTabs}
+        className="project-conversation-tabs"
+        aria-label="Project conversations"
+      >
         <button aria-current={!taskId ? 'page' : undefined} onClick={onOverview}>
           Overview
         </button>
@@ -218,14 +232,12 @@ export default function ProjectSpace({
             [...tasks, ...(currentTask ? [currentTask] : [])].map((task) => [task.id, task])
           ).values()
         ]
-          .slice()
           .sort(
             (a, b) =>
-              Number(b.id === taskId) - Number(a.id === taskId) ||
               Number(b.pinned) - Number(a.pinned) ||
-              b.updatedAt.localeCompare(a.updatedAt)
+              a.createdAt.localeCompare(b.createdAt) ||
+              a.id.localeCompare(b.id)
           )
-          .slice(0, 6)
           .map((task) => (
             <button
               key={task.id}

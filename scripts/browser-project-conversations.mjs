@@ -199,6 +199,56 @@ export async function checkProjectConversations({
     assert.equal(requests[0].securityMode, 'autonomous');
     await page.reload();
     await page.getByRole('heading', { name: 'QC conversation', exact: true }).waitFor();
+    const tabs = page.getByRole('navigation', { name: 'Project conversations' });
+    const initialOrder = ['Overview', 'Assembly analysis', 'QC conversation'];
+    assert.deepEqual(await tabs.getByRole('button').allTextContents(), initialOrder);
+    for (const name of ['Assembly analysis', 'QC conversation', 'Overview', 'QC conversation']) {
+      const selected = tabs.getByRole('button', { name, exact: true });
+      await selected.click();
+      assert.equal(await selected.getAttribute('aria-current'), 'page');
+      assert.deepEqual(await tabs.getByRole('button').allTextContents(), initialOrder);
+    }
+    root.updatedAt = new Date(Date.now() + 60_000).toISOString();
+    const child = tasks[1];
+    const additional = Array.from({ length: 7 }, (_, index) => ({
+      ...root,
+      id: randomUUID(),
+      title: `Discussion ${index + 1}`,
+      pinned: index === 6,
+      createdAt: new Date(Date.parse(child.createdAt) + (index + 1) * 1000).toISOString()
+    }));
+    tasks.push(...additional);
+    project.conversationCount = tasks.length;
+    await page.reload();
+    await tabs.getByRole('button', { name: 'Discussion 7', exact: true }).waitFor();
+    const expandedOrder = [
+      'Overview',
+      'Discussion 7',
+      'Assembly analysis',
+      'QC conversation',
+      ...additional.slice(0, 6).map((task) => task.title)
+    ];
+    assert.deepEqual(await tabs.getByRole('button').allTextContents(), expandedOrder);
+    await page.setViewportSize({ width: 320, height: 900 });
+    await tabs.getByRole('button', { name: 'Discussion 6', exact: true }).click();
+    await page.reload();
+    const activeTab = tabs.getByRole('button', { name: 'Discussion 6', exact: true });
+    await activeTab.waitFor();
+    await page.waitForFunction(() => {
+      const row = document.querySelector('.project-conversation-tabs');
+      const active = row?.querySelector('[aria-current="page"]');
+      if (!row || !active) return false;
+      const frame = row.getBoundingClientRect(),
+        selected = active.getBoundingClientRect();
+      return selected.left >= frame.left - 1 && selected.right <= frame.right + 1;
+    });
+    assert.deepEqual(await tabs.getByRole('button').allTextContents(), expandedOrder);
+    await tabs.getByRole('button', { name: 'Assembly analysis', exact: true }).click();
+    assert.deepEqual(await tabs.getByRole('button').allTextContents(), expandedOrder);
+    tasks.splice(2);
+    project.conversationCount = tasks.length;
+    await page.goto(`${origin}/?task=${child.id}`);
+    await page.getByRole('heading', { name: 'QC conversation', exact: true }).waitFor();
     for (const width of [1440, 390, 320]) {
       await page.setViewportSize({ width, height: 900 });
       const title = page.locator('.project-space-title h1');
@@ -249,7 +299,7 @@ export async function checkProjectConversations({
       'The selected result identity must survive draft recovery'
     );
     console.log(
-      'Project conversation browser checks passed: persistent working-area drafts, inherited autonomy, independent creation, reloads, responsive names and controls, notes with correction history, and exact result references.'
+      'Project conversation browser checks passed: persistent working-area drafts, inherited autonomy, independent creation, stable tab order across navigation and activity, pinned tabs, scrollable overflow and restored selection, reloads, responsive names and controls, notes with correction history, and exact result references.'
     );
   } finally {
     await page.close();
