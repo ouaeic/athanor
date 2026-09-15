@@ -256,7 +256,7 @@ describe('background process manager', () => {
       const elevate = path.join(root, 'elevate');
       await writeFile(
         elevate,
-        `#!/bin/sh\nprintf '%s\\n' "$*" >"${record}"\nprintf '%s' "$PWD" >"${record}.pwd"\nshift\nexec "$@"\n`
+        `#!/bin/sh\nif [ "$3" = run ]; then\nprintf '%s\\n' "$*" >"${record}"\nprintf '%s' "$PWD" >"${record}.pwd"\nfi\nshift\nexec "$@"\n`
       );
       await chmod(elevate, 0o700);
       const helper = path.join(root, 'sandbox');
@@ -306,7 +306,10 @@ describe('background process manager', () => {
       // Stands in for sudo: records what it was asked to run, then runs it.
       const record = path.join(root, 'elevated');
       const elevate = path.join(root, 'elevate');
-      await writeFile(elevate, `#!/bin/sh\nprintf '%s\\n' "$*" >"${record}"\nshift\nexec "$@"\n`);
+      await writeFile(
+        elevate,
+        `#!/bin/sh\nif [ "$3" = run ]; then printf '%s\\n' "$*" >"${record}"; fi\nshift\nexec "$@"\n`
+      );
       await chmod(elevate, 0o700);
       // Stands in for athanor-sandbox: drops its own four leading arguments the way the real helper
       // consumes `run <network mode> <filesystem mode> <root>`, then applies the environment and

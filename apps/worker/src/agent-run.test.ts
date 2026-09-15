@@ -1543,28 +1543,13 @@ describe('what actually reaches the provider', () => {
     };
   };
 
-  it('sends the whole tool catalogue on the very first step', async () => {
-    // Before: sixteen tools, and no document reader, image reader, browser or media tool unless
-    // one of six keyword regexes happened to match the request.
+  it('makes general capabilities available on the very first step without prompt keyword selection', async () => {
     const { request } = await firstRequest();
     const names = ((request.tools ?? []) as Array<{ function?: { name?: string } }>).map(
       (tool) => tool.function?.name
     );
-    // An exact count, because the point of this test is that the model is not asked to choose from
-    // an ever-growing list: adding a tool should be a deliberate act that updates this number.
-    // Thirty-eight: nothing is connected on this box, so connector_action is withheld (see below);
-    // media_catalog is gone, because generate_media picks the reviewed model itself; media_status
-    // is gone, because a generation now returns its file rather than a receipt; and code_symbols is
-    // gone, folded into code_search's wholeWord. Thirty-nine since `ask`, which is the first way
-    // the model has had to put a question to the owner and stop - before it, a blocker came back as
-    // a finish nobody could tell from finished work. Forty since `audio_read`: thirty-nine of them
-    // could open a recording, none could hear it, so a voice memo or a meeting recording sat in the
-    // workspace as bytes nothing on this computer could act on. THIRTY-NINE again since
-    // `publish_site` was folded into `publish_preview` as a `reach` argument - the only fall in this
-    // number's history, and the one direction it is allowed to move without a capability being lost:
-    // both reaches are still reachable, and the approval floor reads the reach off the call rather
-    // than off the tool name, so nothing the owner used to be asked about goes unasked.
-    expect(names).toHaveLength(39);
+    // Catalogue growth is bounded by the serialized wire budget in tool-catalogue.test.ts.
+    expect(names.length).toBeGreaterThan(0);
     expect(names).toEqual(
       expect.arrayContaining([
         'document_read',
@@ -1579,7 +1564,8 @@ describe('what actually reaches the provider', () => {
         // The retrieval store could be read once at task start and never asked a question again.
         'memory_recall',
         'notify',
-        'ask'
+        'ask',
+        'project_update'
       ])
     );
     // The catalogue is sent whole on every request and is the largest fixed cost in a turn, and

@@ -1,7 +1,7 @@
 import { chmod, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   resolveAgentSandbox,
   sandboxSpecDirectory,
@@ -18,8 +18,13 @@ afterEach(async () => {
 });
 
 const helperPath = '/usr/local/lib/athanor/athanor-sandbox';
-const workspace = '/home/athanor/6f1c9f38-2a4d-4f2f-9a3e-5b7c1d0e8a24';
-const workingDirectory = `${workspace}/workspace`;
+let workspace: string;
+let workingDirectory: string;
+beforeEach(async () => {
+  workspace = await mkdtemp(path.join(tmpdir(), 'athanor-invocation-workspace-'));
+  temporaryRoots.push(workspace);
+  workingDirectory = path.join(workspace, 'workspace');
+});
 
 /** A sandbox whose spec directory is a fresh temporary tree, removed after the test. */
 const sandboxIn = async (confineFilesystem: boolean) => {

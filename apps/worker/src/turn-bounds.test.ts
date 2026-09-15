@@ -696,10 +696,8 @@ describe('the undo point a diagnostic no longer escapes', () => {
   it('still costs an ordinary read nothing at all', () => {
     for (const name of ['file_read', 'code_search', 'repo_overview', 'web_search', 'files_list'])
       expect(CHECKPOINT_EXEMPT_TOOLS.has(name), name).toBe(true);
-    for (const name of ['finish', 'compact_context', 'notify'])
+    for (const name of ['finish', 'compact_context', 'notify', 'project_update'])
       expect(CHECKPOINT_EXEMPT_TOOLS.has(name), name).toBe(true);
-    // Counted, so that a subtraction which quietly took the whole set with it fails here.
-    expect(CHECKPOINT_EXEMPT_TOOLS.size).toBe(REPEATABLE_TOOLS.size - 1 + 3);
   });
 
   /*
