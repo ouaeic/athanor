@@ -88,6 +88,7 @@ const boundedOrigin = (value: string): string =>
  * this file is the drift `connector-origin-totality.test.ts` was written to end.
  */
 const ORIGIN_PHRASES: readonly string[] = [
+  'project history',
   'web search results',
   'provider web search results',
   'web pages',

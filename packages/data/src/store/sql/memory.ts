@@ -389,9 +389,13 @@ export const MEMORY_SOURCE_SEARCH_PER_TASK = 3;
  * scoring and only ever moves a row down, so a conversation that genuinely holds the best rows
  * still leads - it just stops holding all of them.
  */
-const sourceSearchSql = (tier: 'indexed' | 'archived', ownerScoped = false): string => `
+const sourceSearchSql = (
+  tier: 'indexed' | 'archived',
+  ownerScoped = false,
+  projectScoped = false
+): string => `
 WITH q AS (
-  SELECT ${ownerScoped ? 'scope.id' : '$1::uuid'} AS ws, $3::uuid AS task, $4::timestamptz AS since, $5::timestamptz AS until,
+  SELECT ${ownerScoped || projectScoped ? 'scope.id' : '$1::uuid'} AS ws, $3::uuid AS task, $4::timestamptz AS since, $5::timestamptz AS until,
          $7::int AS per_task
 ),
 stats AS (
@@ -413,6 +417,7 @@ hits AS (
     )`
         : ''
     }
+    ${projectScoped ? `AND sc.user_id=$8 AND EXISTS(SELECT 1 FROM tasks t WHERE t.id=sc.task_id AND t.user_id=$8 AND t.project_id=$9)` : ''}
     AND (q.task IS NULL OR sc.task_id = q.task)
     AND (q.since IS NULL OR sc.occurred_at >= q.since)
     AND (q.until IS NULL OR sc.occurred_at <= q.until)
@@ -579,3 +584,12 @@ RETURNING user_id,
           octet_length(decode(ciphertext->>'ciphertext','base64')) AS content_bytes,
           created_at,
           updated_at`;
+
+/** Project membership is applied before ranking; no second document index is needed. */
+export const projectMemorySourceSearchSql = (tier: 'indexed' | 'archived') => `
+WITH project_scope AS (
+  SELECT DISTINCT s.workspace_id AS id FROM tasks t JOIN mem.source s ON s.task_id=t.id
+  WHERE t.project_id=$9 AND t.user_id=$8 AND s.user_id=$8 AND $1::uuid IS NOT NULL
+), hits AS (
+  SELECT hit.* FROM project_scope scope CROSS JOIN LATERAL (${sourceSearchSql(tier, false, true)}) hit
+) SELECT * FROM hits ORDER BY score DESC,id LIMIT $6`;

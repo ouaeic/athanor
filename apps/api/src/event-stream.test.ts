@@ -178,6 +178,7 @@ const start = async (
             bytes: 0
           });
         }
+        if (path.endsWith('/project-inputs')) return json({ sources: [] });
         if (path.endsWith('/usage')) {
           // The real runner walks the whole tree here. This is that walk, on a modest project -
           // or, while a test holds it, a walk that has not finished at all yet.

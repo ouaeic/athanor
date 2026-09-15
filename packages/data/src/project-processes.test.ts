@@ -26,10 +26,11 @@ async function fixture() {
   };
   const first = await workspace(),
     second = await workspace();
-  const task = (workspaceId: string) =>
+  const task = (workspaceId: string, projectId?: string) =>
     store.createTask({
       userId: user.id,
       workspaceId,
+      ...(projectId ? { projectId } : {}),
       titleCiphertext: encryptJson({ title: 'Analysis' }, key),
       nameIndex: { nameTokens: '', openingTokens: '' },
       modelId: 'fixture',
@@ -39,7 +40,7 @@ async function fixture() {
     });
   const root = await task(first.id),
     sibling = await task(first.id),
-    branch = await task(second.id);
+    branch = await task(second.id, root.projectId);
   await database.query('UPDATE tasks SET parent_task_id=$1 WHERE id=$2', [root.id, branch.id]);
   return { user, first, second, root, sibling, branch };
 }
@@ -57,9 +58,9 @@ describe('owned project execution membership', () => {
     expect(await store.projectExecutionMembers(randomUUID(), root.id)).toEqual([]);
     expect(await store.projectExecutionMembers(user.id, randomUUID())).toEqual([]);
   });
-  it('terminates on corrupt cyclic lineage without admitting unrelated work', async () => {
+  it('uses explicit membership even when ancestry is cyclic', async () => {
     const { user, root, branch } = await fixture();
     await database.query('UPDATE tasks SET parent_task_id=$1 WHERE id=$2', [branch.id, root.id]);
-    expect(await store.projectExecutionMembers(user.id, branch.id)).toEqual([]);
+    expect(await store.projectExecutionMembers(user.id, branch.id)).toHaveLength(2);
   });
 });

@@ -41,13 +41,17 @@ export default function ModelChoiceFields({
   choices,
   onChange,
   disabled,
-  inherit = true
+  inherit = true,
+  inheritLabel = 'Use global choice',
+  inheritDetail = 'Follow your defaults in Settings.'
 }: {
   purposes: ProjectModelPreferences['purposes'];
   choices: ProjectModelChoices;
   onChange: (choices: ProjectModelChoices) => void;
   disabled?: boolean | undefined;
   inherit?: boolean;
+  inheritLabel?: string;
+  inheritDetail?: string;
 }) {
   const change = (purpose: ModelPurpose, choice: PurposeModelChoice | undefined) => {
     const next = { ...choices };
@@ -97,8 +101,8 @@ export default function ModelChoiceFields({
                   ? [
                       {
                         value: 'inherit',
-                        label: 'Use global choice',
-                        detail: 'Follow your defaults in Settings.'
+                        label: inheritLabel,
+                        detail: inheritDetail
                       }
                     ]
                   : []),
@@ -143,7 +147,7 @@ export default function ModelChoiceFields({
               {effective
                 ? `${value === 'inherit' ? 'Inherits' : value === 'automatic' ? 'Currently' : 'Selected'}: ${effective.displayName}`
                 : value === 'inherit'
-                  ? 'Follows your global default when applied.'
+                  ? inheritDetail
                   : value === 'automatic' && !same
                     ? 'Resolves when applied.'
                     : (item.reason ?? 'This saved model is unavailable.')}

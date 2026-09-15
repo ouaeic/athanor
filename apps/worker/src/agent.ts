@@ -26,7 +26,7 @@ import {
 import {
   agentNotificationAad,
   TASK_MAX_ATTEMPTS,
-  readProjectModelPreferences,
+  readTaskModelPreferences,
   mergeProjectModelChoices
 } from '@athanor/data';
 import type { DataStore, TaskRecord, WorkspaceRecord } from '@athanor/data';
@@ -528,7 +528,7 @@ export class AgentWorker {
         503
       );
     if (!resolveMedia) return secret;
-    const project = await readProjectModelPreferences(this.store, this.#masterKey, task);
+    const project = await readTaskModelPreferences(this.store, this.#masterKey, task);
     const mediaModels = mergeProjectModelChoices(secret.mediaModels ?? {}, project.choices);
     return {
       ...secret,

@@ -125,6 +125,8 @@ export const taskResponse = (
   title: string
 ) => ({
   id: task.id,
+  projectId: task.projectId,
+  modelOverride: task.modelOverride ?? false,
   workspaceId: task.workspaceId,
   parentTaskId: task.parentTaskId,
   parentMissionId: task.parentMissionId ?? null,

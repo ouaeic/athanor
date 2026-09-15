@@ -111,6 +111,7 @@ const FIELDS: ReadonlyArray<keyof AgentState> = [
   'codingMissionWaiting',
   'codingMissionReviews',
   'mainModelPreference',
+  'projectContextFingerprint',
   'walledProviders'
 ];
 
@@ -125,6 +126,7 @@ const FIELDS: ReadonlyArray<keyof AgentState> = [
  */
 const FULL: Required<AgentState> = {
   mainModelPreference: '[true,"best",""]',
+  projectContextFingerprint: 'f'.repeat(64),
   walledProviders: ['openrouter'],
   mediaApprovals: { image: { binding: 'a'.repeat(64), modelId: 'test/image' } },
   transcriptionApprovals: {
@@ -441,6 +443,7 @@ describe('what a new turn inherits', () => {
       'knownOrigins',
       'knownAddresses',
       'mainModelPreference',
+      'projectContextFingerprint',
       // Carried, because a wall outlives the turn it stopped: the re-route that answers one lands
       // the task on a different provider for its *next* turn, and a list reset in between would
       // send it straight back to the provider that was rate-limiting it. Cleared on the first step

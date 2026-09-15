@@ -7,6 +7,7 @@
  */
 
 import { decryptJson, unwrapDataKey } from '@athanor/core';
+import { projectResponse } from '@athanor/data';
 import { cpus, freemem, loadavg, totalmem } from 'node:os';
 import { workspaceResponse } from '../context.js';
 import type { HostStorage } from '../context.js';
@@ -77,6 +78,7 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
     const [
       workspaces,
       workspaceMetadata,
+      projects,
       tasks,
       schedules,
       models,
@@ -90,6 +92,7 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
     ] = await Promise.all([
       workspacesRead,
       store.listWorkspaceMetadata(user.id),
+      store.listProjects(user.id),
       store.listTaskPage(user.id),
       store.listTaskSchedules(user.id),
       modelsForUser(user),
@@ -111,6 +114,8 @@ export const registerBootstrapRoutes = (context: RouteContext): void => {
     );
     const response = {
       user,
+      projects: projects.projects.map((project) => projectResponse(project, masterKey, false)),
+      projectsCursor: projects.nextCursor,
       drafts,
       workspaces: workspaces.map((workspace) =>
         workspaceResponse(

@@ -4,9 +4,11 @@ import { Button } from './ui';
 
 export function WorkDirections({
   surface,
+  onDiscuss,
   onRevisit
 }: {
   surface: WorkSurfaceView;
+  onDiscuss?: (eventId: string) => void;
   onRevisit: (eventId: string, sequence: number) => void;
 }) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -24,6 +26,9 @@ export function WorkDirections({
           >
             Edit / revisit
           </Button>
+          {onDiscuss && (
+            <Button onClick={() => onDiscuss(current.eventId)}>Discuss separately</Button>
+          )}
         </header>
         <p>
           {expanded ? current.text : current.text.slice(0, 400)}
@@ -57,6 +62,9 @@ export function WorkDirections({
                   <span title={direction.text}>{direction.text || 'Earlier direction'}</span>
                   {direction.acknowledgment && <p>{direction.acknowledgment}</p>}
                 </div>
+                {onDiscuss && (
+                  <Button onClick={() => onDiscuss(direction.eventId)}>Discuss separately</Button>
+                )}
                 <Button onClick={() => onRevisit(direction.eventId, direction.sequence)}>
                   Revisit
                 </Button>

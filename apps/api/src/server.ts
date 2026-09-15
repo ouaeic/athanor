@@ -76,6 +76,7 @@ import { registerSnapshotRoutes } from './routes/snapshots.js';
 import { createServerSupport } from './routes/support.js';
 import { registerTaskEventRoutes } from './routes/task-events.js';
 import { registerTaskRoutes } from './routes/tasks.js';
+import { registerProjectRoutes } from './routes/projects.js';
 import { registerTaskPresentationRoutes } from './routes/task-presentation.js';
 import { registerTrajectoryRoutes } from './routes/trajectory.js';
 import { registerTranscriptionRoutes } from './routes/transcriptions.js';
@@ -278,6 +279,7 @@ export const buildServer = async (
   registerCodingMissionRoutes(routes);
   registerTranscriptionRoutes(routes);
   registerTaskRoutes(routes);
+  registerProjectRoutes(routes);
   registerTaskPresentationRoutes(routes);
   registerTrajectoryRoutes(routes);
   registerTaskEventRoutes(routes);

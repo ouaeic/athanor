@@ -224,12 +224,12 @@
 }
 @media (prefers-reduced-motion: no-preference) {
   .garden-project-list
-    > button:is(:hover, :focus-visible)
+    button:is(:hover, :focus-visible)
     .garden-project-title[data-overflow='true'] {
     text-overflow: clip;
   }
   .garden-project-list
-    > button:is(:hover, :focus-visible)
+    button:is(:hover, :focus-visible)
     .garden-project-title[data-overflow='true']
     strong {
     animation: garden-title-reveal var(--title-duration) linear 0.8s infinite alternate;

@@ -221,6 +221,7 @@ const requiredApiTokenScope = (method: string, route: string): ApiTokenScope | u
   // before a body exists, so that one is refused at its own route instead.
   if (route.startsWith('/v1/tasks') || route.startsWith('/v1/schedules'))
     return writing ? 'tasks:write' : 'tasks:read';
+  if (route.startsWith('/v1/projects')) return writing ? undefined : 'tasks:read';
   if (route.startsWith('/v1/approvals')) return writing ? 'approvals:write' : 'approvals:read';
   if (route.startsWith('/v1/usage')) return 'usage:read';
   // Reading what has been spent is usage. Changing the ceiling is the owner deciding how much of

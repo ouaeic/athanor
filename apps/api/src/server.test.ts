@@ -44,6 +44,7 @@ afterEach(async () => {
 
 /** The native preparation handshake, including its exact task/source/target binding. */
 const projectPreparationFixture = (url: string, init?: RequestInit): Response | null => {
+  if (new URL(url).pathname.endsWith('/project-inputs')) return Response.json({ sources: [] });
   const match = new URL(url).pathname.match(
     /^\/v1\/workspaces\/([0-9a-f-]{36})\/project-execution$/
   );
@@ -9660,7 +9661,8 @@ describe('round trips before the first token', () => {
         }
       })
     );
-    expect(send.depth).toBeLessThanOrEqual(20);
+    // Measured at 21 with the owner-scoped query that installs read-only project inputs.
+    expect(send.depth).toBeLessThanOrEqual(21);
     expect(JSON.parse(send.body) as { workspaceId: string }).not.toMatchObject({ workspaceId });
     const taskId = (JSON.parse(send.body) as { id: string }).id;
 
@@ -10186,4 +10188,101 @@ describe('how long a conversation is meant to live', () => {
     const brief = await start({ lifetime: 'brief' }, 'lifetime-brief');
     expect(brief.json<{ lifetime: string }>().lifetime).toBe('brief');
   }, 30_000);
+});
+
+test('creates independent conversations with project defaults, selected context and owner-only membership', async () => {
+  stubProviderFetch();
+  const directory = await mkdtemp(join(tmpdir(), 'garden-conversations-'));
+  disposers.push(() => rm(directory, { recursive: true, force: true }));
+  const { app, store } = await buildServer(isolatedConfig(directory));
+  disposers.push(() => app.close());
+  const { cookie, taskId } = await seedOwnerWithTask(
+    app,
+    'project-conversations',
+    'Investigate the assembly'
+  );
+  const headers = { cookie, 'idempotency-key': randomUUID() };
+  const initial = (await app.inject({ method: 'GET', url: `/v1/tasks/${taskId}`, headers })).json<{
+    projectId: string;
+    workspaceId: string;
+  }>();
+  const project = (
+    await app.inject({ method: 'GET', url: `/v1/projects/${initial.projectId}`, headers })
+  ).json<{ revision: number; workspaceId: string }>();
+  expect(project.workspaceId).toBe(initial.workspaceId);
+  const updated = await app.inject({
+    method: 'PATCH',
+    url: `/v1/projects/${initial.projectId}`,
+    headers,
+    payload: {
+      expectedRevision: project.revision,
+      title: 'Assembly study',
+      securityMode: 'autonomous'
+    }
+  });
+  expect(updated.statusCode, updated.body).toBe(200);
+  const request = {
+    method: 'POST' as const,
+    url: '/v1/tasks',
+    headers: { cookie, 'idempotency-key': randomUUID() },
+    payload: {
+      projectId: initial.projectId,
+      workspaceId: initial.workspaceId,
+      prompt: 'Check a different aspect',
+      privacyRoute: 'provider_zdr',
+      source: { taskId },
+      execution: 'independent'
+    }
+  };
+  const created = await app.inject(request);
+  expect(created.statusCode, created.body).toBe(200);
+  const child = created.json<{
+    id: string;
+    projectId: string;
+    workspaceId: string;
+    securityMode: string;
+  }>();
+  expect(child.projectId).toBe(initial.projectId);
+  expect(child.workspaceId).not.toBe(initial.workspaceId);
+  expect(child.securityMode).toBe('autonomous');
+  expect((await app.inject(request)).json<{ id: string }>().id).toBe(child.id);
+  const conversations = (
+    await app.inject({
+      method: 'GET',
+      url: `/v1/projects/${initial.projectId}/conversations`,
+      headers
+    })
+  ).json<{ tasks: Array<{ id: string }> }>();
+  expect(new Set(conversations.tasks.map((task) => task.id))).toEqual(new Set([taskId, child.id]));
+  const stranger = sessionCookie(
+    await app.inject({
+      method: 'POST',
+      url: '/v1/auth/dev',
+      payload: { username: 'unrelated-owner' }
+    })
+  );
+  expect(
+    (
+      await app.inject({
+        method: 'GET',
+        url: `/v1/projects/${initial.projectId}`,
+        headers: { cookie: stranger }
+      })
+    ).statusCode
+  ).toBe(404);
+  expect(
+    (
+      await app.inject({
+        ...request,
+        headers: { cookie: stranger, 'idempotency-key': randomUUID() }
+      })
+    ).statusCode
+  ).toBe(404);
+  const owner = (await store.getUserByUsername('owner'))!;
+  const rootRecord = await store.getTask(owner.id, taskId),
+    childRecord = await store.getTask(owner.id, child.id);
+  expect(childRecord?.parentTaskId).toBeNull();
+  expect(childRecord?.agentStateCiphertext).toBeNull();
+  expect(childRecord?.conversationSourceCiphertext).not.toBeNull();
+  expect(rootRecord?.workspaceId).toBe(initial.workspaceId);
 });

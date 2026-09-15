@@ -14,9 +14,11 @@ const textFile =
 
 export default function DirectoryPanel({
   taskId,
+  projectId,
   openRequest = 0
 }: {
-  taskId: string;
+  taskId?: string;
+  projectId?: string;
   openRequest?: number;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -38,9 +40,12 @@ export default function DirectoryPanel({
     const controller = new AbortController();
     setError(null);
     setLoading(true);
-    void get<{ directories: ProjectDirectory[] }>(`/v1/tasks/${taskId}/directories`, {
-      signal: controller.signal
-    })
+    void get<{ directories: ProjectDirectory[] }>(
+      projectId ? `/v1/projects/${projectId}/directories` : `/v1/tasks/${taskId}/directories`,
+      {
+        signal: controller.signal
+      }
+    )
       .then((result) => {
         if (controller.signal.aborted) return;
         setRoots(result.directories);
@@ -57,7 +62,7 @@ export default function DirectoryPanel({
         if (!controller.signal.aborted) setLoading(false);
       });
     return () => controller.abort();
-  }, [taskId, expanded, rootsRevision]);
+  }, [taskId, projectId, expanded, rootsRevision]);
   const base = `/v1/workspaces/${rootId}`;
   const root = roots.find((item) => item.workspaceId === rootId);
   const load = useCallback(

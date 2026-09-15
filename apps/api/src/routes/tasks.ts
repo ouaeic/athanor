@@ -34,7 +34,7 @@ import {
   unwrapDataKey
 } from '@athanor/core';
 import type { RoutableModel } from '@athanor/core';
-import { writeProjectModelPreferences } from '@athanor/data';
+import { writeProjectModelPreferences, readProjectModelPreferences } from '@athanor/data';
 import { ownerPriceCeiling, resumableTaskStatuses } from '../context.js';
 import { withTaskDeliveryStatus } from '../task-delivery-status.js';
 import { requireUser } from '../http/auth-hook.js';
@@ -195,6 +195,48 @@ export const registerTaskRoutes = (context: RouteContext): void => {
     const user = requireUser(request.user);
     return idempotent(request, reply, user, async () => {
       const input = CreateTaskRequest.parse(request.body);
+      const project = input.projectId ? await store.getProject(user.id, input.projectId) : null;
+      if (input.projectId && !project)
+        throw new AthanorError('project_not_found', 'Project not found', 404);
+      if (project && input.workspaceId !== project.workspaceId)
+        throw new AthanorError(
+          'project_workspace_changed',
+          'Reload this project before starting a conversation.',
+          409
+        );
+      if (input.source) {
+        const source = await store.getTask(user.id, input.source.taskId);
+        if (!project || source?.projectId !== project.id)
+          throw new AthanorError(
+            'project_source_unavailable',
+            'The selected context is not in this project.',
+            404
+          );
+        if (
+          input.source.eventId &&
+          !(
+            await database.query('SELECT id FROM task_events WHERE task_id=$1 AND id=$2', [
+              source.id,
+              input.source.eventId
+            ])
+          ).rows.length
+        )
+          throw new AthanorError(
+            'project_source_unavailable',
+            'The selected message is unavailable.',
+            404
+          );
+      }
+      const conversationChoices = project ? input.modelChoices : undefined;
+      const conversationOverride = Boolean(project && input.modelId && !input.modelChoices?.main);
+      if (project && !input.modelId && !input.modelChoices?.main) {
+        const defaults = await readProjectModelPreferences(store, masterKey, {
+          id: project.id,
+          userId: user.id
+        });
+        if (defaults.choices.main)
+          input.modelChoices = { ...input.modelChoices, main: defaults.choices.main };
+      }
       // Three chains, none of which reads anything another one writes: the computer this runs on,
       // the money it may spend, and the model that will answer. See `started` above for why the
       // refusals still arrive in this order.
@@ -258,11 +300,30 @@ export const registerTaskRoutes = (context: RouteContext): void => {
       }
       const reasoningEffort = validateTaskReasoning(input.reasoningEffort ?? 'auto', selected);
       const dataKey = unwrapDataKey(workspace.wrappedKey, masterKey, workspace.id);
-      const title = input.title ?? INITIAL_TASK_TITLE;
+      const title = input.title ?? (project ? 'New conversation' : INITIAL_TASK_TITLE);
       const prepared = await database.transaction(async () => {
         const created = await store.createTask({
           userId: user.id,
           workspaceId: workspace.id,
+          ...(project ? { projectId: project.id, modelOverride: conversationOverride } : {}),
+          ...(conversationChoices
+            ? {
+                modelChoicesCiphertext: encryptJson(
+                  conversationChoices,
+                  dataKey,
+                  `conversation-models:${project!.id}`
+                )
+              }
+            : {}),
+          ...(input.source
+            ? {
+                conversationSourceCiphertext: encryptJson(
+                  input.source,
+                  dataKey,
+                  `conversation-source:${project!.id}`
+                )
+              }
+            : {}),
           titleCiphertext: encryptJson({ title }, dataKey, `task-title:${workspace.id}`),
           nameIndex: nameIndexFor(title, input.prompt, dataKey),
           modelId: selected.id,
@@ -273,7 +334,7 @@ export const registerTaskRoutes = (context: RouteContext): void => {
             computeAllowanceFor(selected, config.TASK_MAX_STEPS)
           ),
           maxSpendUsd: spendCeilingUsd,
-          securityMode: input.securityMode ?? workspace.securityMode,
+          securityMode: input.securityMode ?? project?.securityMode ?? workspace.securityMode,
           // Absent means `standard`, which is what every conversation was before one could say how
           // long it was meant to live - so an owner who does not choose gets exactly what they had.
           ...(input.lifetime ? { lifetime: input.lifetime } : {}),
@@ -295,14 +356,22 @@ export const registerTaskRoutes = (context: RouteContext): void => {
             )
           : created;
         if (!titled) throw new AthanorError('task_unavailable', 'The task could not be named', 409);
-        if (input.modelChoices && Object.keys(input.modelChoices).length)
+        if (!project && input.modelChoices && Object.keys(input.modelChoices).length)
           await writeProjectModelPreferences(store, masterKey, titled, {
             expectedRevision: 0,
             choices: input.modelChoices
           });
         return {
           task: titled,
-          execution: await beginProjectExecution(context, titled, input.attachments ?? [])
+          execution:
+            project && input.execution === 'shared'
+              ? null
+              : await beginProjectExecution(
+                  context,
+                  titled,
+                  input.attachments ?? [],
+                  Boolean(project)
+                )
         };
       });
       let task = prepared.task;

@@ -51,6 +51,7 @@ export class ProjectExecutionStore {
     wrappedKey: string;
     sourceManifestCiphertext: EncryptedEnvelope;
     seedKind: ProjectExecutionRecord['seedKind'];
+    independent?: boolean;
   }): Promise<ProjectExecutionRecord | null> {
     return this.database.transaction(async (tx) => {
       const rows = await tx.query(
@@ -63,7 +64,12 @@ export class ProjectExecutionStore {
         throw new AthanorError('workspace_unavailable', 'Workspace is not running', 409);
       const existing = await this.getProjectExecution(input.userId, input.taskId);
       if (existing?.status === 'ready') return existing;
-      if (t.parent_workspace_id || t.internal_parent_task_id || t.parent_mission_id) return null;
+      if (
+        (!input.independent && t.parent_workspace_id && !existing) ||
+        t.internal_parent_task_id ||
+        t.parent_mission_id
+      )
+        return null;
       if (t.lease_owner && new Date(String(t.lease_expires_at)).getTime() > Date.now()) return null;
       if (existing) {
         await tx.query(
@@ -87,7 +93,7 @@ export class ProjectExecutionStore {
           t.region,
           t.security_mode,
           t.runner_ref,
-          t.workspace_id,
+          t.parent_workspace_id ?? t.workspace_id,
           input.taskId
         ]
       );
@@ -96,14 +102,15 @@ export class ProjectExecutionStore {
         [input.workspaceId, input.wrappedKey]
       );
       const created = await tx.query(
-        `INSERT INTO project_executions(task_id,parent_workspace_id,source_workspace_id,workspace_id,seed_kind,source_manifest_ciphertext,source_task_status) VALUES($1,$2,$2,$3,$4,$5::jsonb,$6) RETURNING *`,
+        `INSERT INTO project_executions(task_id,parent_workspace_id,source_workspace_id,workspace_id,seed_kind,source_manifest_ciphertext,source_task_status) VALUES($1,$7,$2,$3,$4,$5::jsonb,$6) RETURNING *`,
         [
           input.taskId,
           t.workspace_id,
           input.workspaceId,
           input.seedKind,
           JSON.stringify(input.sourceManifestCiphertext),
-          t.status
+          t.status,
+          t.parent_workspace_id ?? t.workspace_id
         ]
       );
       return map(created.rows[0]!);

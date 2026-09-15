@@ -1,4 +1,7 @@
 import type {
+  Project,
+  ConversationSource,
+  TaskResult,
   ModelRelease,
   Task,
   TaskEvent,
@@ -25,6 +28,11 @@ export interface Draft {
   revision?: number;
   recoveryId?: string;
   controls?: {
+    conversation?: {
+      projectId: string;
+      execution: 'independent' | 'shared';
+      source?: ConversationSource;
+    };
     modelId: string;
     modelChoices?: ProjectModelChoices;
     lifetime?: TaskLifetime;
@@ -35,6 +43,8 @@ export interface Draft {
   };
 }
 export interface Bootstrap {
+  projects?: Project[];
+  projectsCursor?: string | null;
   user: {
     id: string;
     username?: string;
@@ -267,5 +277,31 @@ export function mergeTaskRefresh(
       .filter((task) => !removed.has(task.id)),
     tasksCursor: preserveCursor ? current.tasksCursor : fresh.tasksCursor,
     scheduleRunCounts: { ...current.scheduleRunCounts, ...fresh.scheduleRunCounts }
+  };
+}
+
+/** Preserve the result identity selected by the owner, including immutable version metadata. */
+export function conversationResultSource(taskId: string, result: TaskResult): ConversationSource {
+  const eventId = result.evidenceEventIds.find((id) =>
+    /^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(id)
+  );
+  return {
+    taskId,
+    ...(eventId ? { eventId } : {}),
+    ...(result.path
+      ? {
+          filePath: result.path.startsWith('workspace/') ? result.path : `workspace/${result.path}`
+        }
+      : {}),
+    result: {
+      id: result.id,
+      kind: result.kind,
+      title: result.title,
+      ...(result.version ? { version: result.version } : {}),
+      ...(result.sha256 && /^[a-f0-9]{64}$/i.test(result.sha256) ? { sha256: result.sha256 } : {}),
+      ...(result.workspaceId ? { workspaceId: result.workspaceId } : {}),
+      ...(result.artifactId ? { artifactId: result.artifactId } : {}),
+      ...(result.previewId ? { previewId: result.previewId } : {})
+    }
   };
 }

@@ -1,4 +1,5 @@
 import type { Database } from './database.js';
+import { ProjectStore } from './projects.js';
 import { ProjectExecutionStore } from './project-executions.js';
 export type { ProjectExecutionRecord } from './project-executions.js';
 import { IdentityStore } from './store/identity.js';
@@ -94,6 +95,7 @@ export class DataStore {
    * initialiser runs before the constructor body, so a field would have captured `undefined` and
    * every forwarded call would have queried nothing.
    */
+  readonly #projects: ProjectStore;
   readonly #projectExecutions: ProjectExecutionStore;
   readonly #identity: IdentityStore;
   readonly #billing: BillingStore;
@@ -115,6 +117,7 @@ export class DataStore {
   readonly #projectModelPreferences: ProjectModelPreferenceStore;
 
   constructor(database: Database) {
+    this.#projects = new ProjectStore(database);
     this.#projectModelPreferences = new ProjectModelPreferenceStore(database);
     this.#identity = new IdentityStore(database);
     this.#billing = new BillingStore(database);
@@ -145,6 +148,34 @@ export class DataStore {
     );
   }
 
+  projectInputWorkspaceIds(...args: Parameters<ProjectStore['projectInputWorkspaceIds']>) {
+    return this.#projects.projectInputWorkspaceIds(...args);
+  }
+  getProject(...args: Parameters<ProjectStore['getProject']>) {
+    return this.#projects.getProject(...args);
+  }
+  listProjects(...args: Parameters<ProjectStore['listProjects']>) {
+    return this.#projects.listProjects(...args);
+  }
+  updateProject(...args: Parameters<ProjectStore['updateProject']>) {
+    return this.#projects.updateProject(...args);
+  }
+  listProjectNotes(...args: Parameters<ProjectStore['listProjectNotes']>) {
+    return this.#projects.listProjectNotes(...args);
+  }
+  addProjectNote(...args: Parameters<ProjectStore['addProjectNote']>) {
+    return this.#projects.addProjectNote(...args);
+  }
+  removeProjectNote(...args: Parameters<ProjectStore['removeProjectNote']>) {
+    return this.#projects.removeProjectNote(...args);
+  }
+  projectSourceEvent(...args: Parameters<ProjectStore['projectSourceEvent']>) {
+    return this.#projects.projectSourceEvent(...args);
+  }
+  listProjectConversations(...args: Parameters<ProjectStore['listProjectConversations']>) {
+    return this.#projects.listProjectConversations(...args);
+  }
+
   listProjectWorkspaces(...args: Parameters<ProjectExecutionStore['listProjectWorkspaces']>) {
     return this.#projectExecutions.listProjectWorkspaces(...args);
   }
@@ -166,6 +197,11 @@ export class DataStore {
 
   createCodingMission(...args: Parameters<CodingMissionStore['createCodingMission']>) {
     return this.#codingMissions.createCodingMission(...args);
+  }
+  putConversationModelPreferences(
+    ...args: Parameters<ProjectModelPreferenceStore['putConversationModelPreferences']>
+  ) {
+    return this.#projectModelPreferences.putConversationModelPreferences(...args);
   }
   getProjectModelPreferences(
     ...args: Parameters<ProjectModelPreferenceStore['getProjectModelPreferences']>

@@ -306,9 +306,9 @@ run_as_agent() {
 # which breaks ordinary local tooling for no security benefit. The shell text is fixed and the
 # command arrives through "$@", so nothing from the caller is ever interpreted.
 spec_loader='
-import os, stat, sys
-network, process_tree, supervisor, spec, parent, asker, setpriv, unshare, uid, gid = sys.argv[1:11]
-landlock = sys.argv[11:]
+import json, os, re, stat, sys
+network, process_tree, supervisor, spec, parent, asker, setpriv, unshare, uid, gid, root = sys.argv[1:12]
+landlock = sys.argv[12:]
 
 def fail(message):
     sys.stderr.write("athanor-sandbox: %s\n" % message)
@@ -365,6 +365,50 @@ try:
     os.chdir(cwd)
 except OSError as error:
     fail("the working directory could not be entered: %s" % error.strerror)
+# The control plane writes membership; command output cannot extend this read-only grant.
+if landlock:
+    held = []
+    try:
+        target = os.open(root, directory_flags)
+        metadata = os.open(".athanor", directory_flags, dir_fd=target)
+        os.close(target)
+        meta_info = os.fstat(metadata)
+        if meta_info.st_uid != int(asker) or meta_info.st_mode & 0o022:
+            fail("project input metadata is not protected")
+        try:
+            inputs = os.open("project-inputs.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=metadata)
+        except FileNotFoundError:
+            inputs = None
+        os.close(metadata)
+        if inputs is not None:
+            info = os.fstat(inputs)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != int(asker) or info.st_nlink != 1 or info.st_mode & 0o077 or info.st_size > 262144:
+                fail("invalid project input membership")
+            with os.fdopen(inputs, "r") as handle:
+                membership = json.load(handle)
+            sources = membership.get("sources")
+            if not isinstance(sources, list) or len(sources) > 4096:
+                fail("invalid project input list")
+            parent_fd = os.open(parent, directory_flags)
+            for source in sources:
+                if not isinstance(source, str) or not re.fullmatch(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", source):
+                    fail("invalid project input identity")
+                try:
+                    source_fd = os.open(source, directory_flags, dir_fd=parent_fd)
+                    try:
+                        input_fd = os.open("workspace", directory_flags, dir_fd=source_fd)
+                    finally:
+                        os.close(source_fd)
+                except FileNotFoundError:
+                    continue
+                os.set_inheritable(input_fd, True)
+                held.append(input_fd)
+                landlock += ["--landlock-rule", "path-beneath:execute,read-file,read-dir:/proc/self/fd/%d" % input_fd]
+            os.close(parent_fd)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError, AttributeError):
+        fail("project inputs could not be verified")
 chain = [setpriv, "--reuid", uid, "--regid", gid, "--clear-groups", "--no-new-privs"]
 chain += landlock + ["--", "/usr/bin/env", "-i"] + words
 if network == "isolated":
@@ -434,7 +478,7 @@ case "$mode" in
     # $landlock_arguments is split on whitespace on purpose, for the reason run_as_agent gives.
     # shellcheck disable=SC2086
     exec /usr/bin/python3 -I -S -c "$spec_loader" "$network" "$confinement" "$mission_supervisor" "$spec" "$workspace_parent" \
-      "$asker_uid" /usr/bin/setpriv /usr/bin/unshare "$agent_uid" "$agent_gid" $landlock_arguments
+      "$asker_uid" /usr/bin/setpriv /usr/bin/unshare "$agent_uid" "$agent_gid" "$root" $landlock_arguments
     ;;
   shell)
     # The owner's interactive terminal. Separated from `run` only so the sudoers policy can give

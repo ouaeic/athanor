@@ -9,6 +9,7 @@ import { resolve, extname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { processFixture, checkProjectProcesses } from './browser-processes.mjs';
 import { directoryFixture, checkProjectDirectories } from './browser-directories.mjs';
+import { checkProjectConversations } from './browser-project-conversations.mjs';
 import { checkTaskRecovery } from './browser-task-recovery.mjs';
 
 // Local fixtures exercise browser interactions; API and runner suites own authorization and delivery.
@@ -82,6 +83,7 @@ const workspace = {
   updatedAt: time
 };
 const task = {
+  projectId: '20000000-0000-4000-8000-000000000002',
   id: '20000000-0000-4000-8000-000000000002',
   workspaceId: workspace.id,
   title:
@@ -173,10 +175,30 @@ const presentation = {
     updatedAt: time
   }
 };
+const project = {
+  id: task.projectId,
+  workspaceId: workspace.id,
+  parentWorkspaceId: workspace.id,
+  title: 'Maze project',
+  brief: 'Build a playable maze.',
+  securityMode: 'balanced',
+  revision: 1,
+  pinned: false,
+  archivedAt: null,
+  createdAt: time,
+  updatedAt: time,
+  conversationCount: 1,
+  activeCount: 0,
+  attentionCount: 0,
+  spentUsd: task.spentUsd,
+  latestTaskId: task.id
+};
 const bootstrap = {
   user: { id: '40000000-0000-4000-8000-000000000004', username: 'owner' },
   workspaces: [workspace],
   tasks: [task],
+  projects: [project],
+  projectsCursor: null,
   tasksCursor: null,
   scheduleRunCounts: {},
   schedules: [],
@@ -620,6 +642,19 @@ try {
     if (!path.startsWith('/v1/')) return route.continue();
     if (path === '/v1/bootstrap')
       return json({ ...bootstrap, models: modelCatalog, drafts: [...modelDrafts.values()] });
+    if (path.endsWith('/notes') && path.startsWith('/v1/projects/'))
+      return json({ notes: [], nextCursor: null });
+    if (path === '/v1/projects') return json({ projects: [project], nextCursor: null });
+    if (path === `/v1/projects/${project.id}`) {
+      if (route.request().method() === 'PATCH') {
+        const input = route.request().postDataJSON();
+        assert.equal(input.expectedRevision, project.revision);
+        Object.assign(project, input, { revision: project.revision + 1 });
+      }
+      return json(project);
+    }
+    if (path === `/v1/projects/${project.id}/conversations`)
+      return json({ tasks: [task], nextCursor: null });
     if (path === '/v1/drafts/device-key')
       return json({
         userId: bootstrap.user.id,
@@ -1060,6 +1095,18 @@ try {
     return route.fulfill({ status: 501, json: { error: { message: 'Unspecified UI fixture' } } });
   });
   if (process.env.GARDEN_UI_FOCUS !== 'drafts') {
+    await checkProjectConversations({
+      context,
+      origin,
+      bootstrap,
+      task,
+      workspace,
+      presentation,
+      models: modelCatalog,
+      modelSurface: () => modelSurface(true),
+      report,
+      errors
+    });
     await checkTaskRecovery({ context, origin, task, report, errors });
     await checkProjectDirectories({
       context,
@@ -1636,7 +1683,9 @@ try {
       document.querySelector('.run-summary')?.textContent.includes('Generating media')
     );
     assert.match(
-      await page.locator('.garden-project-list button').first().getAttribute('aria-label'),
+      await page
+        .locator('.project-conversation-links button[aria-current]')
+        .getAttribute('aria-label'),
       /Generating media/,
       'The project list must not announce pending output as complete'
     );
@@ -2381,7 +2430,7 @@ try {
     };
     await pick(advanced, 'Coding agents', 'openrouter/beta/model-79');
     failModelSave = true;
-    await advanced.getByRole('button', { name: 'Save project choices', exact: true }).click();
+    await advanced.getByRole('button', { name: 'Save conversation choices', exact: true }).click();
     await advanced
       .getByRole('alert')
       .filter({ hasText: 'Model storage is temporarily unavailable' })
@@ -2391,19 +2440,24 @@ try {
       await advanced.getByRole('region', { name: 'Coding agents', exact: true }).textContent(),
       /Research model 79/
     );
-    await advanced.getByRole('button', { name: 'Save project choices', exact: true }).click();
-    await advanced.getByText('Project model choices saved', { exact: true }).waitFor();
+    await advanced.getByRole('button', { name: 'Save conversation choices', exact: true }).click();
+    await advanced.getByText('Conversation model choices saved', { exact: true }).waitFor();
     assert.equal(projectChoices.coding.modelId, 'openrouter/beta/model-79');
     await modelsPage.screenshot({ path: resolve(report, 'models-project-desktop.png') });
     await advanced.getByRole('button', { name: 'Close Model choices', exact: true }).click();
     await modelsPage.reload();
     await modelsPage.getByText('Tools & activity', { exact: true }).click();
     await modelsPage.getByRole('button', { name: 'Models', exact: true }).click();
-    const projectModels = modelsPage.getByRole('dialog', { name: 'Project models', exact: true });
+    const projectModels = modelsPage.getByRole('dialog', {
+      name: 'Conversation models',
+      exact: true
+    });
     await projectModels
       .getByRole('button', { name: 'Coding agents: Research model 79', exact: true })
       .waitFor();
-    await projectModels.getByRole('button', { name: 'Close Project models', exact: true }).click();
+    await projectModels
+      .getByRole('button', { name: 'Close Conversation models', exact: true })
+      .click();
 
     await modelsPage.getByRole('button', { name: /^Model for this direction:/ }).click();
     const modelSearch = modelsPage.getByRole('combobox', { name: 'Search models', exact: true });

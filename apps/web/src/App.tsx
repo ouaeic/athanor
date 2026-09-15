@@ -4,7 +4,6 @@ import type { ReactNode } from 'react';
 import {
   ArrowUpRight,
   Bell,
-  FileText,
   FolderOpen,
   Grid2X2,
   Gauge,
@@ -20,7 +19,7 @@ import {
   Settings2,
   Sun
 } from 'lucide-react';
-import type { Artifact, Task, TaskPage, Workspace } from '@athanor/contracts';
+import type { Task, Workspace, Project, ConversationSource } from '@athanor/contracts';
 import { get, ApiError, post, isNativeClient } from './client';
 import type { NativeStatus } from './native';
 import { createTaskNotifier } from './native-notices';
@@ -40,11 +39,13 @@ import {
 } from './model';
 import { Button, Dialog, Empty, ErrorNotice, Spinner } from './ui';
 import DecisionQueue from './DecisionQueue';
-import { ProjectLink } from './ProjectLink';
+import ProjectCollection from './ProjectCollection';
 import './styles.css';
 import './garden.css';
 const Composer = lazy(() => import('./Composer'));
 const TaskSurface = lazy(() => import('./TaskSurface'));
+const ProjectSpace = lazy(() => import('./ProjectSpace'));
+const NewConversation = lazy(() => import('./NewConversation'));
 const Computer = lazy(() => import('./Computer'));
 const Library = lazy(() => import('./Library'));
 const Settings = lazy(() => import('./Settings'));
@@ -96,7 +97,6 @@ function WorkspaceApp() {
   const [authRequired, setAuthRequired] = useState(false);
   const [error, setError] = useState<unknown>(null);
   const [decisions, setDecisions] = useState<Decision[]>([]);
-  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [navigation, setNavigation] = useState(initialNavigation);
   const [workspaceId, setWorkspaceId] = useState('');
   const [taskWorkspaces, setTaskWorkspaces] = useState<{
@@ -161,14 +161,16 @@ function WorkspaceApp() {
     });
   }
   const [newWork, setNewWork] = useState(false);
+  const [newConversation, setNewConversation] = useState<{
+    project: Project;
+    source?: ConversationSource;
+  } | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
   const [tool, setTool] = useState<Tool>('files');
   const [computerOpened, setComputerOpened] = useState(initialNavigation().view === 'computer');
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
   const [filter, setFilter] = useState<'active' | 'running' | 'complete' | 'archived'>('active');
   const [search, setSearch] = useState('');
-  const [moreBusy, setMoreBusy] = useState(false);
-  const [archivedCursor, setArchivedCursor] = useState<string | null>(null);
   const activePaged = useRef(false);
   const deletedTasks = useRef(new Set<string>());
   const [offline, setOffline] = useState(!navigator.onLine);
@@ -284,16 +286,6 @@ function WorkspaceApp() {
     return () => clearInterval(timer);
   }, [Boolean(bootstrap), refresh, refreshDecisions]);
   useEffect(() => {
-    if (!workspaceId || !bootstrap) return;
-    const controller = new AbortController();
-    void get<Artifact[]>(`/v1/workspaces/${workspaceId}/artifacts`, { signal: controller.signal })
-      .then(setArtifacts)
-      .catch((err: unknown) => {
-        if (!controller.signal.aborted) setError(err);
-      });
-    return () => controller.abort();
-  }, [workspaceId, bootstrap?.tasks.map((task) => `${task.id}:${task.updatedAt}`).join('|')]);
-  useEffect(() => {
     document.documentElement.dataset.theme = theme;
     document.documentElement.style.colorScheme = theme;
     try {
@@ -385,12 +377,13 @@ function WorkspaceApp() {
     const timer = setInterval(heartbeat, 60000);
     return () => clearInterval(timer);
   }, [workspaceId, Boolean(bootstrap), authRequired]);
-  function navigate(view: View, taskId: string | null = null) {
+  function navigate(view: View, taskId: string | null = null, projectId: string | null = null) {
     if (mobile) setSidebarOpen(false);
     if (view === 'computer') setComputerOpened(true);
-    setNavigation({ view, taskId });
+    setNavigation({ view, taskId, projectId });
     const params = new URLSearchParams();
     if (taskId) params.set('task', taskId);
+    if (projectId) params.set('project', projectId);
     if (view !== 'work') params.set('view', view);
     history.pushState({}, '', `${location.pathname}${params.size ? '?' + params.toString() : ''}`);
     document.getElementById('main')?.scrollTo({ top: 0, behavior: 'instant' });
@@ -447,56 +440,10 @@ function WorkspaceApp() {
   function saveDraft(draft: Draft) {
     setDrafts((current) => ({ ...current, [draft.taskId ?? `new:${draft.workspaceId}`]: draft }));
   }
-  async function loadMore() {
-    const cursor = filter === 'archived' ? archivedCursor : bootstrap?.tasksCursor;
-    if (!cursor || moreBusy) return;
-    setMoreBusy(true);
-    try {
-      const page = await get<TaskPage>(
-        `/v1/tasks?cursor=${encodeURIComponent(cursor)}&include=${filter === 'archived' ? 'archived' : 'active'}`
-      );
-      if (filter === 'archived') setArchivedCursor(page.nextCursor);
-      else activePaged.current = true;
-      setBootstrap((current) =>
-        current
-          ? {
-              ...current,
-              tasks: Array.from(
-                new Map([...current.tasks, ...page.tasks].map((item) => [item.id, item])).values()
-              ),
-              tasksCursor: filter === 'archived' ? current.tasksCursor : page.nextCursor,
-              scheduleRunCounts: { ...current.scheduleRunCounts, ...page.scheduleRunCounts }
-            }
-          : current
-      );
-    } catch (err) {
-      setError(err);
-    } finally {
-      setMoreBusy(false);
-    }
-  }
-  async function changeFilter(value: typeof filter) {
+  function changeFilter(value: typeof filter) {
     setFilter(value);
-    if (value === 'archived') {
-      try {
-        const page = await get<TaskPage>('/v1/tasks?include=archived');
-        setArchivedCursor(page.nextCursor);
-        setBootstrap((current) =>
-          current
-            ? {
-                ...current,
-                tasks: [...current.tasks.filter((item) => !item.archivedAt), ...page.tasks],
-                tasksCursor: current.tasksCursor
-              }
-            : current
-        );
-      } catch (err) {
-        setError(err);
-      }
-    } else if (filter === 'archived') {
-      void refresh();
-    }
   }
+
   if (nativeState && !nativeState.connected)
     return (
       <Suspense fallback={<Spinner label="Opening connection setup…" />}>
@@ -694,7 +641,7 @@ function WorkspaceApp() {
           }}
         >
           <Grid2X2 size={15} />
-          Overview<span>{personalTasks.length}</span>
+          Overview<span>{bootstrap.projects?.length ?? 0}</span>
         </button>
         <label className="garden-sidebar-search">
           <Search size={14} />
@@ -706,17 +653,16 @@ function WorkspaceApp() {
           />
         </label>
         <nav className="garden-project-list" aria-label="Project work">
-          {personalTasks.map((item) => (
-            <ProjectLink
-              key={item.id}
-              task={item}
-              current={task?.id === item.id}
-              onOpen={openTask}
-            />
-          ))}
-          {!personalTasks.length && (
-            <p className="muted">Your ideas and ongoing work will live here.</p>
-          )}
+          <ProjectCollection
+            initial={bootstrap.projects ?? []}
+            cursor={bootstrap.projectsCursor ?? null}
+            currentProjectId={navigation.projectId ?? task?.projectId ?? null}
+            currentTaskId={task?.id ?? null}
+            workspaceId={workspaceId}
+            search={search}
+            onProject={(id) => navigate('work', null, id)}
+            onTask={openTask}
+          />
         </nav>
         <div className="garden-sidebar-bottom">
           <Button
@@ -742,26 +688,61 @@ function WorkspaceApp() {
         <ErrorNotice error={error} onRetry={requestRefresh} />
         <Suspense fallback={<Spinner label="Opening this surface…" />}>
           {navigation.view === 'work' &&
-            (navigation.taskId && (!task || !taskWorkspace) ? (
+            (navigation.projectId && !navigation.taskId ? (
+              <ProjectSpace
+                key={navigation.projectId}
+                projectId={navigation.projectId}
+                revision={
+                  bootstrap.projects?.find((p) => p.id === navigation.projectId)?.updatedAt ?? ''
+                }
+                onAllProjects={() => navigate('work')}
+                onOverview={() => navigate('work', null, navigation.projectId)}
+                onTask={openTask}
+                onNewConversation={(project, source) =>
+                  setNewConversation({ project, ...(source ? { source } : {}) })
+                }
+                onRefresh={requestRefresh}
+              />
+            ) : navigation.taskId && (!task || !taskWorkspace) ? (
               <Spinner label="Opening project…" />
             ) : task && taskWorkspace ? (
-              <TaskSurface
-                key={task.id}
-                task={task}
-                workspace={taskWorkspace}
-                bootstrap={bootstrap}
-                decisions={decisions}
-                {...(drafts[task.id] ? { draft: drafts[task.id] } : {})}
-                onDraft={saveDraft}
-                onTask={updateTask}
+              <ProjectSpace
+                key={task.projectId}
+                projectId={task.projectId!}
+                taskId={task.id}
+                currentTask={task}
+                revision={task.updatedAt}
+                onAllProjects={() => navigate('work')}
+                onOverview={() => navigate('work', null, task.projectId)}
+                onTask={openTask}
+                onNewConversation={(project, source) =>
+                  setNewConversation({ project, ...(source ? { source } : {}) })
+                }
                 onRefresh={requestRefresh}
-                onBack={() => navigate('work')}
-                onOpenTask={openTask}
-                onComputer={(nextTool) => {
-                  setTool(nextTool);
-                  navigate('computer', task.id);
-                }}
-              />
+              >
+                <TaskSurface
+                  key={task.id}
+                  task={task}
+                  workspace={taskWorkspace}
+                  bootstrap={bootstrap}
+                  decisions={decisions}
+                  {...(drafts[task.id] ? { draft: drafts[task.id] } : {})}
+                  onDraft={saveDraft}
+                  onTask={updateTask}
+                  onRefresh={requestRefresh}
+                  onBack={() => navigate('work', null, task.projectId)}
+                  onDiscuss={(source) => {
+                    void get<Project>(`/v1/projects/${task.projectId}`)
+                      .then((project) => setNewConversation({ project, source }))
+                      .catch(setError);
+                  }}
+                  onOpenTask={openTask}
+                  onComputer={(nextTool) => {
+                    setTool(nextTool);
+                    navigate('computer', task.id);
+                  }}
+                />
+              </ProjectSpace>
             ) : (
               <section className="overview">
                 <div className="overview-top">
@@ -827,7 +808,7 @@ function WorkspaceApp() {
                     )}
                   </div>
                 )}
-                {!personalTasks.length && filter === 'active' && !search && workspace && (
+                {!bootstrap.projects?.length && filter === 'active' && !search && workspace && (
                   <div className="first-intent">
                     <Composer
                       key={`new:${workspace.id}`}
@@ -887,21 +868,18 @@ function WorkspaceApp() {
                         />
                       </label>
                     </div>
-                    <div className="work-grid">
-                      {personalTasks.map((item) => (
-                        <WorkCard
-                          key={item.id}
-                          task={item}
-                          artifact={artifacts.find((artifact) => artifact.taskId === item.id)}
-                          onOpen={() => openTask(item.id)}
-                        />
-                      ))}
-                    </div>
-                    {personalTasks.length === 0 && (filter !== 'active' || Boolean(search)) && (
-                      <Empty title="No work in this view">
-                        Try another filter or begin something new.
-                      </Empty>
-                    )}
+                    <ProjectCollection
+                      initial={bootstrap.projects ?? []}
+                      cursor={bootstrap.projectsCursor ?? null}
+                      currentProjectId={null}
+                      currentTaskId={null}
+                      workspaceId={workspaceId}
+                      search={search}
+                      filter={filter}
+                      mode="grid"
+                      onProject={(id) => navigate('work', null, id)}
+                      onTask={openTask}
+                    />
                   </>
                 )}
                 {scheduleTasks.length > 0 && (
@@ -930,13 +908,6 @@ function WorkspaceApp() {
                       );
                     })}
                   </section>
-                )}
-                {(filter === 'archived' ? archivedCursor : bootstrap.tasksCursor) && (
-                  <div className="load-more">
-                    <Button onClick={loadMore} busy={moreBusy}>
-                      More work
-                    </Button>
-                  </div>
                 )}
               </section>
             ))}
@@ -1010,6 +981,25 @@ function WorkspaceApp() {
           )}
         </Suspense>
       </main>
+      {newConversation && (
+        <Suspense fallback={<Spinner />}>
+          <NewConversation
+            project={newConversation.project}
+            {...(newConversation.source ? { source: newConversation.source } : {})}
+            bootstrap={bootstrap}
+            {...(drafts[`new:${newConversation.project.workspaceId}`]
+              ? { draft: drafts[`new:${newConversation.project.workspaceId}`] }
+              : {})}
+            onDraft={saveDraft}
+            onClose={() => setNewConversation(null)}
+            onSent={(next) => {
+              setNewConversation(null);
+              updateTask(next);
+              requestRefresh();
+            }}
+          />
+        </Suspense>
+      )}
       {newWork && workspace && (
         <Dialog title="Begin something new" onClose={() => setNewWork(false)}>
           <Suspense fallback={<Spinner />}>
@@ -1132,44 +1122,5 @@ function ComputerStatus({
         );
       })}
     </div>
-  );
-}
-function WorkCard({
-  task,
-  artifact,
-  onOpen
-}: {
-  task: Task;
-  artifact?: Artifact | undefined;
-  onOpen: () => void;
-}) {
-  return (
-    <button
-      className={`garden-work-card ${hasOngoingWork(task) ? 'working' : ''}`}
-      onClick={onOpen}
-    >
-      <div className="card-top">
-        <span className="eyebrow">{task.pinned ? 'Pinned work' : taskStatusLabel(task)}</span>
-        <ArrowUpRight size={19} />
-      </div>
-      {artifact && (
-        <div className="garden-card-artifact">
-          <FileText size={20} />
-          <span>{artifact.name}</span>
-        </div>
-      )}
-      <div className="card-bottom">
-        <h2>{task.title}</h2>
-        <div className="row between">
-          <span className="status-line">
-            <i />
-            {taskStatusLabel(task)}
-          </span>
-          <small>
-            {money(task.spentUsd)} · {shortDate(task.updatedAt)}
-          </small>
-        </div>
-      </div>
-    </button>
   );
 }

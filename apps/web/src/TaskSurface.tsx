@@ -16,10 +16,11 @@ import {
   Terminal,
   X
 } from 'lucide-react';
-import type { Artifact, Task, TaskEvent, Workspace } from '@athanor/contracts';
+import type { Artifact, Task, TaskEvent, Workspace, ConversationSource } from '@athanor/contracts';
 import type { Bootstrap, Decision, Draft } from './model';
 import {
   activeQuestion,
+  conversationResultSource,
   data,
   date,
   duration,
@@ -48,6 +49,9 @@ import MessageAttachmentList from './MessageAttachmentList';
 import './presentation.css';
 import { effortLabel } from './reasoning-options';
 import { resourceWaitReason } from './resource-wait';
+const ProjectNoteEditor = lazy(() =>
+  import('./ProjectNotes').then((module) => ({ default: module.ProjectNoteEditor }))
+);
 const ProcessPanel = lazy(() => import('./ProcessPanel'));
 const DirectoryPanel = lazy(() => import('./DirectoryPanel'));
 const PlanEditor = lazy(() => import('./PlanEditor'));
@@ -77,6 +81,7 @@ export interface TaskSurfaceProps {
   onTask: (task: Task) => void;
   onRefresh: () => void;
   onBack: () => void;
+  onDiscuss?: (source: ConversationSource) => void;
   onOpenTask: (id: string) => void;
   onComputer: (
     tool: 'files' | 'terminal' | 'browser' | 'desktop' | 'previews' | 'processes' | 'checkpoints'
@@ -92,6 +97,7 @@ export default function TaskSurface({
   onTask,
   onRefresh,
   onBack,
+  onDiscuss,
   onOpenTask,
   onComputer
 }: TaskSurfaceProps) {
@@ -136,6 +142,7 @@ export default function TaskSurface({
   const [deliverAnswer] = useState(createQuestionAnswerSender);
   const [originalBrief, setOriginalBrief] = useState<TaskEvent | null>(null);
   const [briefLoading, setBriefLoading] = useState(false);
+  const [noteSource, setNoteSource] = useState<ConversationSource | null>(null);
   const [branchEvent, setBranchEvent] = useState<TaskEvent | null>(null);
   const presentation = currentWork(storedPresentation, events);
   const showComposer = !isFinished(task) || composerExpanded || Boolean(scope);
@@ -369,13 +376,17 @@ export default function TaskSurface({
     <section className="garden-task">
       <div className="garden-task-scroll">
         <div className="garden-work-navigation">
-          <Button
-            className="quiet-button"
-            onClick={() => (task.parentTaskId ? onOpenTask(task.parentTaskId) : onBack())}
-          >
-            <ArrowLeft size={16} />
-            {task.parentTaskId ? 'Return to parent work' : 'All work'}
-          </Button>
+          {onDiscuss && !task.parentTaskId ? (
+            <span className="eyebrow">Conversation</span>
+          ) : (
+            <Button
+              className="quiet-button"
+              onClick={() => (task.parentTaskId ? onOpenTask(task.parentTaskId) : onBack())}
+            >
+              <ArrowLeft size={16} />
+              {task.parentTaskId ? 'Return to parent work' : 'All work'}
+            </Button>
+          )}
           <div className="row">
             <span
               className={`connection ${connection}`}
@@ -410,7 +421,7 @@ export default function TaskSurface({
               {workspace.name}
               <ChevronRight size={12} /> {displayStatus}
             </div>
-            <h1>{task.title}</h1>
+            {onDiscuss ? <h2>{task.title}</h2> : <h1>{task.title}</h1>}
           </div>
           <div className="garden-heading-actions">
             <Button onClick={() => setPanel('share')} aria-label="Share this work">
@@ -593,6 +604,11 @@ export default function TaskSurface({
                   <Suspense fallback={null}>
                     <WorkDirections
                       surface={presentation.surface}
+                      {...(onDiscuss
+                        ? {
+                            onDiscuss: (eventId: string) => onDiscuss({ taskId: task.id, eventId })
+                          }
+                        : {})}
                       onRevisit={(eventId) => {
                         const event = events.find((item) => item.id === eventId);
                         if (event) setBranchEvent(event);
@@ -607,6 +623,17 @@ export default function TaskSurface({
               </Suspense>
               {presentation && (
                 <TaskOutputs
+                  {...(task.projectId
+                    ? {
+                        onRemember: (result) =>
+                          setNoteSource(conversationResultSource(task.id, result))
+                      }
+                    : {})}
+                  {...(onDiscuss
+                    ? {
+                        onDiscuss: (result) => onDiscuss(conversationResultSource(task.id, result))
+                      }
+                    : {})}
                   events={events}
                   artifacts={artifacts}
                   presentation={
@@ -648,6 +675,12 @@ export default function TaskSurface({
                   <details className="garden-previous-results">
                     <summary>Results from earlier directions</summary>
                     <TaskOutputs
+                      {...(onDiscuss
+                        ? {
+                            onDiscuss: (result) =>
+                              onDiscuss(conversationResultSource(task.id, result))
+                          }
+                        : {})}
                       autoPreview={false}
                       events={events}
                       artifacts={artifacts}
@@ -883,7 +916,7 @@ export default function TaskSurface({
         )}
       </div>
       {panel === 'models' && (
-        <Dialog title="Project models" onClose={() => setPanel(null)} wide>
+        <Dialog title="Conversation models" onClose={() => setPanel(null)} wide>
           <Suspense fallback={<Spinner />}>
             <ProjectModels taskId={task.id} onChange={onRefresh} />
           </Suspense>
@@ -1157,6 +1190,16 @@ export default function TaskSurface({
             <ArrowUpRight size={15} />
           </Button>
         </Dialog>
+      )}
+      {noteSource && task.projectId && (
+        <Suspense fallback={<Spinner />}>
+          <ProjectNoteEditor
+            projectId={task.projectId}
+            source={noteSource}
+            onClose={() => setNoteSource(null)}
+            onSaved={onRefresh}
+          />
+        </Suspense>
       )}
       {branchEvent && (
         <Dialog title="Continue from this point" wide onClose={() => setBranchEvent(null)}>

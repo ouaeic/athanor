@@ -20,14 +20,30 @@ export interface ProjectModelPreferenceRecord {
   revision: number;
   choicesCiphertext: EncryptedEnvelope | null;
 }
-const lineage = `WITH RECURSIVE lineage AS (
- SELECT id,parent_task_id,workspace_id,ARRAY[id] AS path FROM tasks WHERE id=$1 AND user_id=$2
- UNION ALL SELECT t.id,t.parent_task_id,t.workspace_id,l.path||t.id FROM tasks t
- JOIN lineage l ON t.id=l.parent_task_id WHERE t.user_id=$2 AND NOT t.id=ANY(l.path) AND cardinality(l.path)<64
-) SELECT id,workspace_id FROM lineage WHERE parent_task_id IS NULL`;
+const lineage = `SELECT p.id,p.workspace_id FROM projects p WHERE p.user_id=$2
+ AND (p.id=$1 OR p.id=(SELECT project_id FROM tasks WHERE id=$1 AND user_id=$2))`;
 
 export class ProjectModelPreferenceStore {
   constructor(private readonly database: Database) {}
+  async putConversationModelPreferences(input: {
+    userId: string;
+    taskId: string;
+    expectedRevision: number;
+    choicesCiphertext: EncryptedEnvelope;
+  }): Promise<void> {
+    const result = await this.database.query(
+      `UPDATE tasks SET model_choices_ciphertext=$3::jsonb,model_preferences_revision=model_preferences_revision+1,
+        model_override=FALSE,updated_at=NOW() WHERE id=$1 AND user_id=$2 AND model_preferences_revision=$4
+        AND parent_mission_id IS NULL RETURNING id`,
+      [input.taskId, input.userId, JSON.stringify(input.choicesCiphertext), input.expectedRevision]
+    );
+    if (!result.rows.length)
+      throw new AthanorError(
+        'conversation_preferences_changed',
+        'Conversation choices changed; reload and try again',
+        409
+      );
+  }
   async applyProjectMainModel(input: {
     userId: string;
     taskId: string;
@@ -92,7 +108,7 @@ export class ProjectModelPreferenceStore {
       const root = await tx.query(lineage, [input.taskId, input.userId]);
       if (root.rows[0]?.id !== input.projectTaskId)
         throw new AthanorError('project_changed', 'Project changed; reload its model choices', 409);
-      await tx.query('SELECT id FROM tasks WHERE id=$1 AND user_id=$2 FOR UPDATE', [
+      await tx.query('SELECT id FROM projects WHERE id=$1 AND user_id=$2 FOR UPDATE', [
         input.projectTaskId,
         input.userId
       ]);
@@ -172,3 +188,60 @@ export const mergeProjectModelChoices = (
   global: ProjectModelChoices,
   project: ProjectModelChoices
 ): ProjectModelChoices => ({ ...global, ...project });
+
+/** Conversation choices override project defaults without mutating sibling conversations. */
+export const readTaskModelPreferences = async (
+  store: Pick<PreferenceStore, 'getProjectModelPreferences'>,
+  masterKey: Uint8Array,
+  task: {
+    userId: string;
+    id: string;
+    projectId?: string;
+    modelChoicesCiphertext?: EncryptedEnvelope | null;
+    modelPreferencesRevision?: number;
+  }
+) => {
+  const record = await store.getProjectModelPreferences(task.userId, task.id);
+  const key = unwrapDataKey(record.wrappedKey, masterKey, record.workspaceId);
+  const project = record.choicesCiphertext
+    ? ProjectModelChoices.parse(
+        decryptJson(record.choicesCiphertext, key, projectModelPreferencesAad(record.projectTaskId))
+      )
+    : {};
+  const conversation = task.modelChoicesCiphertext
+    ? ProjectModelChoices.parse(
+        decryptJson(task.modelChoicesCiphertext, key, `conversation-models:${record.projectTaskId}`)
+      )
+    : {};
+  return {
+    projectTaskId: record.projectTaskId,
+    revision: record.revision,
+    conversationRevision: task.modelPreferencesRevision ?? 0,
+    projectChoices: project,
+    conversationChoices: conversation,
+    choices: { ...project, ...conversation }
+  };
+};
+
+export const writeConversationModelPreferences = async (
+  store: Pick<
+    ProjectModelPreferenceStore,
+    'getProjectModelPreferences' | 'putConversationModelPreferences'
+  >,
+  masterKey: Uint8Array,
+  task: { userId: string; id: string },
+  input: { expectedRevision: number; choices: ProjectModelChoices }
+) => {
+  const record = await store.getProjectModelPreferences(task.userId, task.id);
+  const key = unwrapDataKey(record.wrappedKey, masterKey, record.workspaceId);
+  await store.putConversationModelPreferences({
+    userId: task.userId,
+    taskId: task.id,
+    expectedRevision: input.expectedRevision,
+    choicesCiphertext: encryptJson(
+      ProjectModelChoices.parse(input.choices),
+      key,
+      `conversation-models:${record.projectTaskId}`
+    )
+  });
+};

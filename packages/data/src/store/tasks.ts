@@ -414,6 +414,10 @@ export class TaskStore {
   }
 
   async createTask(input: {
+    projectId?: string;
+    modelOverride?: boolean;
+    modelChoicesCiphertext?: EncryptedEnvelope;
+    conversationSourceCiphertext?: EncryptedEnvelope;
     userId: string;
     workspaceId: string;
     titleCiphertext: EncryptedEnvelope;
@@ -433,9 +437,9 @@ export class TaskStore {
     const result = await this.database.query(
       `INSERT INTO tasks(
         id,user_id,workspace_id,title,status,model_id,privacy_route,max_compute_credits,
-        prompt_ciphertext,security_mode,max_spend_usd,name_tsv,reasoning_effort,lifetime
+        prompt_ciphertext,security_mode,max_spend_usd,name_tsv,reasoning_effort,lifetime,project_id,model_override,conversation_source_ciphertext,model_choices_ciphertext
        ) VALUES ($1,$2,$3,$4,'queued',$5,$6,$7,$8::jsonb,$9,$10,${taskNameTsv(11, 12, 13)},$14,
-         COALESCE($15,'standard'))
+         COALESCE($15,'standard'),$16,$17,$18::jsonb,$19::jsonb)
        RETURNING *`,
       [
         id,
@@ -450,7 +454,13 @@ export class TaskStore {
         input.maxSpendUsd ?? null,
         ...taskNameTokens(input.nameIndex),
         input.reasoningEffort ?? 'auto',
-        input.lifetime ?? null
+        input.lifetime ?? null,
+        input.projectId ?? null,
+        input.modelOverride ?? false,
+        input.conversationSourceCiphertext
+          ? JSON.stringify(input.conversationSourceCiphertext)
+          : null,
+        input.modelChoicesCiphertext ? JSON.stringify(input.modelChoicesCiphertext) : null
       ]
     );
     const task = mapTask(result.rows[0]!);
@@ -486,10 +496,14 @@ export class TaskStore {
       `INSERT INTO tasks(
         id,user_id,workspace_id,parent_task_id,branched_from_event_id,title,status,model_id,
         privacy_route,max_compute_credits,prompt_ciphertext,agent_state_ciphertext,completed_at,
-        fork_kind,security_mode,max_spend_usd,rewind_scope,restored_checkpoint_id,name_tsv,reasoning_effort
+        fork_kind,security_mode,max_spend_usd,rewind_scope,restored_checkpoint_id,name_tsv,reasoning_effort,
+        model_override,model_choices_ciphertext,model_preferences_revision
        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,
         CASE WHEN $7='completed' THEN NOW() ELSE NULL END,$13,$14,$15,$16,$17,
-        ${taskNameTsv(18, 19, 20)},COALESCE($21,(SELECT reasoning_effort FROM tasks WHERE id=$4 AND user_id=$2),'auto'))
+        ${taskNameTsv(18, 19, 20)},COALESCE($21,(SELECT reasoning_effort FROM tasks WHERE id=$4 AND user_id=$2),'auto'),
+        (SELECT model_override OR model_id<>$8 FROM tasks WHERE id=$4 AND user_id=$2),
+        (SELECT model_choices_ciphertext FROM tasks WHERE id=$4 AND user_id=$2),
+        (SELECT model_preferences_revision FROM tasks WHERE id=$4 AND user_id=$2))
        RETURNING *`,
       [
         id,
@@ -522,6 +536,7 @@ export class TaskStore {
     id: string;
     userId: string;
     modelId: string;
+    modelOverride?: boolean;
     reasoningEffort?: TaskRecord['reasoningEffort'];
     securityMode?: TaskRecord['securityMode'];
     privacyRoute: string;
@@ -540,7 +555,7 @@ export class TaskStore {
         // ceiling is anchored to what the task has already spent rather than to zero - otherwise
         // asking for "$2 more" on a task that spent $5 would read as an instantly-breached cap.
         `UPDATE tasks t SET
-           status='queued', model_id=$3, privacy_route=$4, reasoning_effort=COALESCE($8,reasoning_effort), security_mode=COALESCE($9,security_mode),
+           status='queued', model_override=model_override OR $10 OR model_id<>$3, model_id=$3, privacy_route=$4, reasoning_effort=COALESCE($8,reasoning_effort), security_mode=COALESCE($9,security_mode),
            max_compute_credits=max_compute_credits+$5,
            max_spend_usd=CASE WHEN $7::double precision IS NULL THEN max_spend_usd ELSE
              COALESCE(max_spend_usd, (SELECT COALESCE(SUM(u.cost_usd),0) FROM usage_entries u
@@ -564,7 +579,8 @@ export class TaskStore {
           JSON.stringify(input.agentStateCiphertext),
           input.additionalSpendUsd ?? null,
           input.reasoningEffort ?? null,
-          input.securityMode ?? null
+          input.securityMode ?? null,
+          input.modelOverride ?? false
         ]
       );
       if (!updated.rows[0]) return null;
@@ -604,6 +620,7 @@ export class TaskStore {
     taskId: string;
     userId: string;
     modelId: string;
+    modelOverride?: boolean;
     reasoningEffort?: TaskRecord['reasoningEffort'];
     securityMode?: TaskRecord['securityMode'];
     privacyRoute: string;
@@ -633,8 +650,8 @@ export class TaskStore {
       await tx.query(
         `INSERT INTO task_message_queue(
            id,task_id,user_id,prompt_ciphertext,model_id,privacy_route,max_compute_credits,
-           resource_class,reservation_key,max_spend_usd,interrupt,reasoning_effort,security_mode
-         ) VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+           resource_class,reservation_key,max_spend_usd,interrupt,reasoning_effort,security_mode,model_override
+         ) VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
         [
           input.id,
           input.taskId,
@@ -648,7 +665,8 @@ export class TaskStore {
           input.maxSpendUsd ?? null,
           input.interrupt ?? false,
           input.reasoningEffort ?? optionalText(row.reasoning_effort) ?? 'auto',
-          input.securityMode ?? null
+          input.securityMode ?? null,
+          input.modelOverride ?? false
         ]
       );
       await tx.query(
@@ -836,7 +854,7 @@ export class TaskStore {
       );
       if (!locked.rows[0]) return false;
       const queued = await tx.query(
-        `SELECT id,reasoning_effort,security_mode,approval_id FROM task_message_queue
+        `SELECT id,reasoning_effort,security_mode,approval_id,model_override FROM task_message_queue
          WHERE id=$1 AND task_id=$2 AND status='queued' FOR UPDATE`,
         [input.messageId, input.taskId]
       );
@@ -860,6 +878,7 @@ export class TaskStore {
       await tx.query(
         `UPDATE tasks SET
            max_compute_credits=max_compute_credits+$3,
+           model_override=model_override OR (NOT $6 AND $10),
            reasoning_effort=CASE WHEN $6 THEN reasoning_effort ELSE $5 END,
            security_mode=CASE WHEN $6 THEN security_mode ELSE COALESCE($9,security_mode) END,
            agent_state_ciphertext=COALESCE($7::jsonb,agent_state_ciphertext),
@@ -879,7 +898,8 @@ export class TaskStore {
           denial,
           input.agentStateCiphertext ? JSON.stringify(input.agentStateCiphertext) : null,
           input.actualComputeCredits ?? null,
-          queued.rows[0].security_mode ?? null
+          queued.rows[0].security_mode ?? null,
+          queued.rows[0].model_override ?? false
         ]
       );
       await tx.query(
@@ -914,7 +934,7 @@ export class TaskStore {
       );
       if (!locked.rows[0]) return null;
       const queued = await tx.query(
-        `SELECT id,reasoning_effort,security_mode,approval_id FROM task_message_queue
+        `SELECT id,reasoning_effort,security_mode,approval_id,model_override FROM task_message_queue
          WHERE id=$1 AND task_id=$2 AND status='queued' FOR UPDATE`,
         [input.messageId, input.taskId]
       );
@@ -934,7 +954,7 @@ export class TaskStore {
       );
       const updated = await tx.query(
         `UPDATE tasks SET
-           status='queued',model_id=CASE WHEN $9 THEN model_id ELSE $3 END,
+           status='queued',model_override=model_override OR (NOT $9 AND ($11 OR model_id<>$3)),model_id=CASE WHEN $9 THEN model_id ELSE $3 END,
            privacy_route=CASE WHEN $9 THEN privacy_route ELSE $4 END,
            reasoning_effort=CASE WHEN $9 THEN reasoning_effort ELSE $8 END,
            security_mode=CASE WHEN $9 THEN security_mode ELSE COALESCE($10,security_mode) END,
@@ -959,7 +979,8 @@ export class TaskStore {
           denial ? null : (input.additionalSpendUsd ?? null),
           queued.rows[0].reasoning_effort ?? 'auto',
           denial,
-          queued.rows[0].security_mode ?? null
+          queued.rows[0].security_mode ?? null,
+          queued.rows[0].model_override ?? false
         ]
       );
       if (!updated.rows[0]) throw new Error('queued_message_promotion_conflict');
@@ -1061,18 +1082,18 @@ export class TaskStore {
   /** Owned execution roots and task lineage, including branches. */
   async projectExecutionMembers(
     userId: string,
-    taskId: string
+    scopeId: string,
+    kind: 'task' | 'project' = 'task'
   ): Promise<Array<{ taskId: string; workspaceId: string }>> {
     const result = await this.database.query(
-      `WITH RECURSIVE ancestors AS (
-        SELECT id,parent_task_id FROM tasks WHERE id=$2 AND user_id=$1
-        UNION SELECT t.id,t.parent_task_id FROM tasks t JOIN ancestors a ON t.id=a.parent_task_id WHERE t.user_id=$1
-      ), members AS (
-        SELECT t.id,t.workspace_id FROM tasks t JOIN ancestors a ON a.id=t.id
-        WHERE a.parent_task_id IS NULL AND t.user_id=$1
-        UNION SELECT t.id,t.workspace_id FROM tasks t JOIN members m ON t.parent_task_id=m.id WHERE t.user_id=$1
-      ) SELECT m.id,m.workspace_id FROM members m JOIN workspaces w ON w.id=m.workspace_id WHERE w.user_id=$1`,
-      [userId, taskId]
+      `WITH selected AS (
+      SELECT p.id FROM projects p WHERE p.user_id=$1 AND
+      (($3='project' AND p.id=$2) OR ($3='task' AND p.id=(SELECT project_id FROM tasks WHERE id=$2 AND user_id=$1)))
+    ) SELECT t.id,t.workspace_id FROM tasks t JOIN selected s ON s.id=t.project_id
+      JOIN workspaces w ON w.id=t.workspace_id AND w.user_id=t.user_id WHERE t.user_id=$1
+      UNION SELECT r.origin_task_id AS id,r.workspace_id FROM project_workspaces r JOIN selected s ON s.id=r.project_id
+      JOIN workspaces w ON w.id=r.workspace_id AND w.user_id=r.user_id WHERE r.user_id=$1`,
+      [userId, scopeId, kind]
     );
     return result.rows.map((row) => ({
       taskId: String(row.id),

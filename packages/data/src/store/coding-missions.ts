@@ -206,6 +206,7 @@ export class CodingMissionStore {
       ]);
       const child = await this.tasks.createTask({
         ...input.task,
+        projectId: String(parent.project_id),
         maxComputeCredits: input.allocatedCredits,
         maxSpendUsd: parent.max_spend_usd === null ? null : Number(parent.max_spend_usd)
       });

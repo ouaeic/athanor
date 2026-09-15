@@ -5,6 +5,8 @@ import { createDatabase, migrateDatabase } from './database.js';
 import { DataStore } from './store.js';
 import {
   readProjectModelPreferences,
+  readTaskModelPreferences,
+  writeConversationModelPreferences,
   writeProjectModelPreferences,
   resolvePurposeChoice
 } from './project-model-preferences.js';
@@ -38,7 +40,7 @@ const fixture = async () => {
     promptCiphertext: encryptJson({ prompt: 'Test' }, key)
   };
   const root = await store.createTask(input),
-    child = await store.createTask(input);
+    child = await store.createTask({ ...input, projectId: root.projectId! });
   await database.query('UPDATE tasks SET parent_task_id=$1 WHERE id=$2', [root.id, child.id]);
   return { user, root, child };
 };
@@ -99,4 +101,63 @@ it('refuses another owner and stale concurrent writes without overwriting curren
     revision: 2,
     choices: {}
   });
+});
+
+it('isolates conversation choices, retains them in a branch, and resets to project inheritance with revision checks', async () => {
+  const { root, child } = await fixture();
+  const pin = (modelId: string) => ({ automatic: false, preference: 'balanced' as const, modelId });
+  await writeProjectModelPreferences(store, masterKey, root, {
+    expectedRevision: 0,
+    choices: { main: pin('project'), image: pin('image') }
+  });
+  await writeConversationModelPreferences(store, masterKey, child, {
+    expectedRevision: 0,
+    choices: { main: pin('conversation') }
+  });
+  const current = (await store.getTask(child.userId, child.id))!;
+  expect(await readTaskModelPreferences(store, masterKey, current)).toMatchObject({
+    conversationRevision: 1,
+    choices: { main: pin('conversation'), image: pin('image') }
+  });
+  expect((await readTaskModelPreferences(store, masterKey, root)).choices.main).toEqual(
+    pin('project')
+  );
+  await expect(
+    writeConversationModelPreferences(store, masterKey, child, { expectedRevision: 0, choices: {} })
+  ).rejects.toMatchObject({ code: 'conversation_preferences_changed' });
+  const branch = await store.createTaskBranch({
+    userId: child.userId,
+    workspaceId: child.workspaceId,
+    parentTaskId: child.id,
+    titleCiphertext: child.titleCiphertext!,
+    nameIndex: { nameTokens: '', openingTokens: '' },
+    modelId: child.modelId,
+    privacyRoute: child.privacyRoute,
+    promptCiphertext: child.promptCiphertext,
+    agentStateCiphertext: null
+  });
+  expect(branch.projectId).toBe(root.projectId);
+  expect((await readTaskModelPreferences(store, masterKey, branch)).choices.main).toEqual(
+    pin('conversation')
+  );
+  await database.query('UPDATE tasks SET model_override=TRUE WHERE id=$1', [child.id]);
+  await writeConversationModelPreferences(store, masterKey, child, {
+    expectedRevision: 1,
+    choices: {}
+  });
+  const reset = (await store.getTask(child.userId, child.id))!;
+  expect(reset.modelOverride).toBe(false);
+  expect(await readTaskModelPreferences(store, masterKey, reset)).toMatchObject({
+    conversationRevision: 2,
+    conversationChoices: {},
+    choices: { main: pin('project') }
+  });
+  await expect(
+    writeConversationModelPreferences(
+      store,
+      masterKey,
+      { ...child, userId: randomUUID() },
+      { expectedRevision: 2, choices: {} }
+    )
+  ).rejects.toMatchObject({ code: 'project_not_found' });
 });

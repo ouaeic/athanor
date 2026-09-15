@@ -232,8 +232,10 @@ export default function Composer(props: ComposerProps) {
                 {
                   value: '',
                   label: task
-                    ? (projectModel?.displayName ?? 'Current project model')
-                    : 'Use global default'
+                    ? (projectModel?.displayName ?? 'Current conversation model')
+                    : props.project
+                      ? 'Use project default'
+                      : 'Use global default'
                 },
                 ...(!task ? [{ value: '__automatic', label: 'Automatic for this project' }] : [])
               ]}
@@ -356,6 +358,7 @@ export default function Composer(props: ComposerProps) {
         <Dialog title="Model choices" onClose={() => setAdvancedModels(false)} wide>
           <Suspense fallback={<p className="muted">Loading…</p>}>
             <PromptModelChoices
+              projectId={props.project?.id}
               {...(task ? { taskId: task.id } : { taskId: '' })}
               disabled={editingDisabled}
               choices={modelChoices}

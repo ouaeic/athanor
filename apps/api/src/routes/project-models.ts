@@ -8,6 +8,8 @@ import {
 import { AthanorError, selectPurposeModel } from '@athanor/core';
 import {
   readProjectModelPreferences,
+  readTaskModelPreferences,
+  writeConversationModelPreferences,
   writeProjectModelPreferences,
   resolvePurposeChoice,
   mergeProjectModelChoices,
@@ -96,11 +98,33 @@ const purposeSurface = async (
 export const projectModelSettings = async (
   context: RouteContext,
   user: UserRecord,
-  taskId: string
+  taskId: string,
+  scope: 'project' | 'conversation' = 'project'
 ): Promise<ProjectModelPreferences> => {
   const task = await context.store.getTask(user.id, taskId);
-  if (!task) throw new AthanorError('task_not_found', 'Task not found', 404);
-  const preferences = await readProjectModelPreferences(context.store, context.masterKey, task);
+  if (!task && !(await context.store.getProject(user.id, taskId)))
+    throw new AthanorError('project_not_found', 'Project not found', 404);
+  if (scope === 'conversation' && !task)
+    throw new AthanorError('task_not_found', 'Conversation not found', 404);
+  const local =
+    scope === 'conversation' && task
+      ? await readTaskModelPreferences(context.store, context.masterKey, task)
+      : null;
+  const preferences = local
+    ? {
+        projectTaskId: taskId,
+        revision: local.conversationRevision,
+        choices: {
+          ...local.conversationChoices,
+          ...(task?.modelOverride
+            ? { main: { automatic: false, preference: 'balanced' as const, modelId: task.modelId } }
+            : {})
+        }
+      }
+    : await readProjectModelPreferences(context.store, context.masterKey, {
+        userId: user.id,
+        id: taskId
+      });
   const owner = OwnerPreferences.parse(user.preferences);
   const { secret } = await context.inferenceCredential(user.id);
   const global: ProjectModelChoices = {
@@ -112,8 +136,11 @@ export const projectModelSettings = async (
     context,
     user,
     preferences.choices,
-    global,
-    task.privacyRoute === 'provider_zdr' ? 'provider_zdr' : 'external'
+    local ? mergeProjectModelChoices(global, local.projectChoices) : global,
+    (task?.privacyRoute ?? (secret.enforceZeroDataRetention ? 'provider_zdr' : 'external')) ===
+      'provider_zdr'
+      ? 'provider_zdr'
+      : 'external'
   );
   return {
     ...preferences,
@@ -144,9 +171,37 @@ const workspaceModelSettings = async (
 };
 
 export const registerProjectModelRoutes = (context: RouteContext): void => {
+  context.app.get<{ Params: { projectId: string } }>(
+    '/v1/projects/:projectId/model-preferences',
+    (request) => projectModelSettings(context, requireUser(request.user), request.params.projectId)
+  );
+  context.app.put<{ Params: { projectId: string } }>(
+    '/v1/projects/:projectId/model-preferences',
+    async (request, reply) => {
+      const user = requireUser(request.user);
+      return context.idempotent(request, reply, user, async () => {
+        const input = UpdateProjectModelPreferences.parse(request.body);
+        if (!(await context.store.getProject(user.id, request.params.projectId)))
+          throw new AthanorError('project_not_found', 'Project not found', 404);
+        await writeProjectModelPreferences(
+          context.store,
+          context.masterKey,
+          { id: request.params.projectId, userId: user.id },
+          input
+        );
+        return projectModelSettings(context, user, request.params.projectId);
+      });
+    }
+  );
   context.app.get<{ Params: { taskId: string } }>(
     '/v1/tasks/:taskId/model-preferences',
-    (request) => projectModelSettings(context, requireUser(request.user), request.params.taskId)
+    (request) =>
+      projectModelSettings(
+        context,
+        requireUser(request.user),
+        request.params.taskId,
+        'conversation'
+      )
   );
   context.app.get<{ Querystring: { privacyRoute?: string } }>(
     '/v1/workspace-model-preferences',
@@ -171,8 +226,8 @@ export const registerProjectModelRoutes = (context: RouteContext): void => {
         const input = UpdateProjectModelPreferences.parse(request.body);
         const task = await context.store.getTask(user.id, request.params.taskId);
         if (!task) throw new AthanorError('task_not_found', 'Task not found', 404);
-        await writeProjectModelPreferences(context.store, context.masterKey, task, input);
-        return projectModelSettings(context, user, task.id);
+        await writeConversationModelPreferences(context.store, context.masterKey, task, input);
+        return projectModelSettings(context, user, task.id, 'conversation');
       });
     }
   );

@@ -15,14 +15,18 @@ import './processes.css';
 
 export default function ProcessPanel({
   workspaceId,
-  taskId
+  taskId,
+  projectId
 }: {
   workspaceId: string;
   taskId?: string;
+  projectId?: string;
 }) {
-  const endpoint = taskId
-    ? `/v1/tasks/${taskId}/processes`
-    : `/v1/workspaces/${workspaceId}/processes`;
+  const endpoint = projectId
+    ? `/v1/projects/${projectId}/processes`
+    : taskId
+      ? `/v1/tasks/${taskId}/processes`
+      : `/v1/workspaces/${workspaceId}/processes`;
   const [list, setList] = useState<ProcessList | null>(null);
   const [error, setError] = useState<unknown>(null);
   const [loading, setLoading] = useState(false);
@@ -118,7 +122,7 @@ export default function ProcessPanel({
   return (
     <section
       className="project-processes"
-      aria-label={taskId ? 'Project processes' : 'Computer processes'}
+      aria-label={taskId || projectId ? 'Project processes' : 'Computer processes'}
     >
       <header className="process-panel-heading">
         <div>
@@ -127,7 +131,7 @@ export default function ProcessPanel({
             {list && <span className="process-count">{active.length} active</span>}
           </h2>
           <p>
-            {taskId
+            {taskId || projectId
               ? 'Jobs and services from this project and its branches.'
               : 'Background jobs and services on this computer.'}
           </p>

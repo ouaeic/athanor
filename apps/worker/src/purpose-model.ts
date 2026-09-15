@@ -1,7 +1,7 @@
 import { OwnerPreferences, type ModelRelease } from '@athanor/contracts';
 import { AthanorError, encryptJson, selectPurposeModel } from '@athanor/core';
 import {
-  readProjectModelPreferences,
+  readTaskModelPreferences,
   resolvePurposeChoice,
   type DataStore,
   type TaskRecord
@@ -17,10 +17,10 @@ type PurposeContext = {
 async function preferences(
   context: PurposeContext,
   task: TaskRecord,
-  existing?: Awaited<ReturnType<typeof readProjectModelPreferences>>
+  existing?: Awaited<ReturnType<typeof readTaskModelPreferences>>
 ) {
   const [project, user, limits] = await Promise.all([
-    existing ?? readProjectModelPreferences(context.store, context.masterKey, task),
+    existing ?? readTaskModelPreferences(context.store, context.masterKey, task),
     context.store.getUserById(task.userId),
     context.store.effectiveSpendLimits(task.userId)
   ]);
@@ -77,11 +77,14 @@ export async function applyProjectMainModel(
   key: Uint8Array,
   workerId: string
 ): Promise<void> {
-  if (task.parentMissionId) return;
-  const project = await readProjectModelPreferences(context.store, context.masterKey, task);
+  if (task.parentMissionId || task.modelOverride) return;
+  const project = await readTaskModelPreferences(context.store, context.masterKey, task);
   const main = project.choices.main;
-  if (!main && state.mainModelPreference === undefined) return;
-  const fingerprint = JSON.stringify(main ? [main.automatic, main.preference, main.modelId] : null);
+  if (!main && state.mainModelPreference === undefined && !project.conversationRevision) return;
+  const fingerprint = JSON.stringify([
+    project.conversationRevision,
+    main ? [main.automatic, main.preference, main.modelId] : null
+  ]);
   if (state.mainModelPreference === fingerprint) return;
   const { global, limits } = await preferences(context, task, project);
   const { choice } = resolvePurposeChoice('main', project.choices, global);

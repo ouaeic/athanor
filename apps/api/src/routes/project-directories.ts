@@ -6,24 +6,30 @@ import { requireUser } from '../http/auth-hook.js';
 import type { RouteContext } from '../http/server-context.js';
 
 export const registerProjectDirectoryRoutes = ({ app, store, runner }: RouteContext): void => {
-  app.get<{ Params: { taskId: string } }>('/v1/tasks/:taskId/directories', async (request) => {
-    const user = requireUser(request.user);
-    const members = await store.projectExecutionMembers(user.id, request.params.taskId);
-    const current = members.find((member) => member.taskId === request.params.taskId);
-    if (!current) throw new AthanorError('task_not_found', 'Project not found', 404);
-    const directories: ProjectDirectory[] = [];
-    for (const workspaceId of new Set(members.map((member) => member.workspaceId))) {
-      const workspace = await store.getWorkspace(user.id, workspaceId);
-      if (workspace)
-        directories.push({
-          workspaceId,
-          name: workspace.name,
-          path: 'workspace',
-          current: workspaceId === current.workspaceId
-        });
-    }
-    return { directories: directories.sort((a, b) => Number(b.current) - Number(a.current)) };
-  });
+  for (const kind of ['task', 'project'] as const)
+    app.get<{ Params: { taskId: string } }>(`/v1/${kind}s/:taskId/directories`, async (request) => {
+      const user = requireUser(request.user);
+      const members = await store.projectExecutionMembers(user.id, request.params.taskId, kind);
+      const project =
+        kind === 'project' ? await store.getProject(user.id, request.params.taskId) : null;
+      const current =
+        kind === 'project'
+          ? project
+          : members.find((member) => member.taskId === request.params.taskId);
+      if (!current) throw new AthanorError('task_not_found', 'Project not found', 404);
+      const directories: ProjectDirectory[] = [];
+      for (const workspaceId of new Set(members.map((member) => member.workspaceId))) {
+        const workspace = await store.getWorkspace(user.id, workspaceId);
+        if (workspace)
+          directories.push({
+            workspaceId,
+            name: workspace.name,
+            path: 'workspace',
+            current: workspaceId === current.workspaceId
+          });
+      }
+      return { directories: directories.sort((a, b) => Number(b.current) - Number(a.current)) };
+    });
   for (const operation of ['directory', 'directory.zip'] as const) {
     app.get<{ Params: { workspaceId: string }; Querystring: { path?: string; cursor?: string } }>(
       `/v1/workspaces/:workspaceId/${operation}`,

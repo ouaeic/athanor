@@ -7,14 +7,20 @@ import ModelChoiceFields from './ModelChoiceFields.js';
 
 export default function ProjectModels({
   taskId,
+  projectId,
   onChange,
   disabled
 }: {
-  taskId: string;
+  taskId?: string;
+  projectId?: string;
   onChange?: () => void;
   disabled?: boolean;
 }) {
-  const resource = useResource<ProjectModelPreferences>(`/v1/tasks/${taskId}/model-preferences`);
+  const scopeId = projectId ?? taskId!;
+  const endpoint = projectId
+    ? `/v1/projects/${projectId}/model-preferences`
+    : `/v1/tasks/${taskId}/model-preferences`;
+  const resource = useResource<ProjectModelPreferences>(endpoint);
   const [draft, setDraft] = useState<{
     taskId: string;
     revision: number;
@@ -23,43 +29,53 @@ export default function ProjectModels({
   const action = useAction();
   const operation = useRef<{ signature: string; key: string } | null>(null);
   const current = resource.value;
-  const editing = draft?.taskId === taskId ? draft : null;
+  const editing = draft?.taskId === scopeId ? draft : null;
   const choices = editing?.choices ?? current?.choices ?? {};
   const dirty = current && JSON.stringify(choices) !== JSON.stringify(current.choices);
-  const save = () => {
+  const save = (next = choices) => {
     if (!current) return;
-    const payload = { expectedRevision: editing?.revision ?? current.revision, choices };
-    const signature = JSON.stringify([taskId, payload]);
+    const payload = { expectedRevision: editing?.revision ?? current.revision, choices: next };
+    const signature = JSON.stringify([scopeId, payload]);
     if (operation.current?.signature !== signature)
       operation.current = { signature, key: crypto.randomUUID() };
     const idempotencyKey = operation.current.key;
-    void action.run(async () => {
-      const saved = await put<ProjectModelPreferences>(
-        `/v1/tasks/${taskId}/model-preferences`,
-        payload,
-        { idempotencyKey }
-      );
-      resource.setValue(saved);
-      setDraft(null);
-      window.dispatchEvent(new CustomEvent('garden-model-preferences', { detail: saved }));
-      onChange?.();
-    }, 'Project model choices saved');
+    void action.run(
+      async () => {
+        const saved = await put<ProjectModelPreferences>(endpoint, payload, { idempotencyKey });
+        resource.setValue(saved);
+        setDraft(null);
+        window.dispatchEvent(new CustomEvent('garden-model-preferences', { detail: saved }));
+        onChange?.();
+      },
+      projectId ? 'Project model choices saved' : 'Conversation model choices saved'
+    );
   };
   return (
-    <section className="stack" aria-label="Project models">
+    <section className="stack" aria-label={projectId ? 'Project models' : 'Conversation models'}>
       <p className="muted">
-        Saved choices apply to this project and its related work. Each purpose can follow your
-        global default or use its own model.
+        {projectId
+          ? 'Project defaults apply to conversations that follow them. Each purpose can follow your Settings or use its own model.'
+          : 'These choices apply to this conversation from its next turn. Each purpose can follow the project default or use its own model.'}
       </p>
       <ResourceState resource={resource} />
       {current && (
         <>
           <ModelChoiceFields
             purposes={current.purposes}
+            inheritLabel={projectId ? 'Use global choice' : 'Use project choice'}
+            inheritDetail={
+              projectId
+                ? 'Follow your defaults in Settings.'
+                : 'Follow the defaults in project settings.'
+            }
             choices={choices}
             disabled={disabled || action.busy}
             onChange={(next) =>
-              setDraft({ taskId, revision: editing?.revision ?? current.revision, choices: next })
+              setDraft({
+                taskId: scopeId,
+                revision: editing?.revision ?? current.revision,
+                choices: next
+              })
             }
           />
           <div className="model-choice-actions">
@@ -67,10 +83,15 @@ export default function ProjectModels({
               className="primary"
               busy={action.busy}
               disabled={disabled || !dirty}
-              onClick={save}
+              onClick={() => save()}
             >
-              Save project choices
+              {projectId ? 'Save project choices' : 'Save conversation choices'}
             </Button>
+            {!projectId && Object.keys(current.choices).length > 0 && (
+              <Button disabled={disabled || action.busy} onClick={() => save({})}>
+                Use project defaults
+              </Button>
+            )}
             {dirty && (
               <Button disabled={action.busy} onClick={() => setDraft(null)}>
                 Discard changes

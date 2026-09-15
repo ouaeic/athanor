@@ -1,3 +1,5 @@
+export * from './projects.js';
+import { ConversationSource } from './projects.js';
 import { z } from 'zod';
 import { TaskOutputIntents } from './output-intent.js';
 import { WorkSurfaceReport } from './work-surface.js';
@@ -580,6 +582,8 @@ export const TASK_TITLE_MAX_LENGTH = 1024;
 
 export const Task = z.object({
   id: Id,
+  projectId: Id.optional(),
+  modelOverride: z.boolean().optional(),
   workspaceId: Id,
   parentWorkspaceId: Id.optional(),
   parentTaskId: Id.nullable().optional(),
@@ -1659,6 +1663,9 @@ export type MessageAttachments = z.infer<typeof MessageAttachments>;
 
 export const CreateTaskRequest = z.object({
   workspaceId: Id,
+  projectId: Id.optional(),
+  execution: z.enum(['independent', 'shared']).optional(),
+  source: ConversationSource.optional(),
   prompt: z.string().min(1).max(200_000),
   title: z.string().min(1).max(TASK_TITLE_MAX_LENGTH).optional(),
   modelId: z.string().optional(),
@@ -2215,6 +2222,13 @@ export const SaveDraftRequest = z.object({
   controls: z
     .object({
       modelId: z.string().max(300),
+      conversation: z
+        .object({
+          projectId: Id,
+          execution: z.enum(['independent', 'shared']),
+          source: ConversationSource.optional()
+        })
+        .optional(),
       modelChoices: ProjectModelChoices.optional(),
       lifetime: TaskLifetime.optional(),
       reasoningEffort: TaskReasoningEffort,

@@ -52,6 +52,7 @@ async function fixture() {
   });
   const context = { database, store, masterKey, runner };
   const call = vi.spyOn(runner, 'request').mockImplementation(async (input) => {
+    if (input.path.endsWith('/project-inputs')) return { sources: [] };
     if (typeof input.body !== 'string') throw Error('Expected a JSON preparation request');
     const body = JSON.parse(input.body) as { workspaceId: string; taskId: string };
     return {

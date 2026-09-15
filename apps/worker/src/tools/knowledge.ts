@@ -76,7 +76,10 @@ export async function executeKnowledgeTool(
         const spent = state.memoryReaches ?? 0;
         state.memoryReaches = spent + 1;
         try {
-          return await reachMemoryEvidence({
+          const reached = await reachMemoryEvidence({
+            ...(task.projectId && !task.parentMissionId
+              ? { project: { userId: task.userId, projectId: task.projectId } }
+              : {}),
             store: context.store,
             workspaceId: task.workspaceId,
             dataKey: key,
@@ -86,6 +89,9 @@ export async function executeKnowledgeTool(
             messages: state.messages,
             spent
           });
+          return task.projectId && !task.parentMissionId
+            ? { ...reached, trust: 'untrusted', origin: `project history ${task.projectId}` }
+            : reached;
         } catch (error) {
           state.memoryReaches = Math.max(0, (state.memoryReaches ?? 1) - 1);
           throw error;
@@ -112,7 +118,10 @@ export async function executeKnowledgeTool(
        * purpose, so it answers with silence and lets the store's ceiling stand.
        */
       const maxResults = finiteNumber(call.arguments.maxResults);
-      return searchMemorySessions({
+      const found = await searchMemorySessions({
+        ...(task.projectId && !task.parentMissionId
+          ? { project: { userId: task.userId, projectId: task.projectId } }
+          : {}),
         store: context.store,
         workspaceId: task.workspaceId,
         dataKey: key,
@@ -124,6 +133,9 @@ export async function executeKnowledgeTool(
         ...(maxResults === null ? {} : { maxResults }),
         ...(textValue(call.arguments.taskId) ? { taskId: textValue(call.arguments.taskId) } : {})
       });
+      return task.projectId && !task.parentMissionId
+        ? { ...found, trust: 'untrusted', origin: `project history ${task.projectId}` }
+        : found;
     }
     /**
      * The read path's second half. The pack is chosen once from the opening request and frozen so

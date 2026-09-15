@@ -91,11 +91,13 @@ export function projectSourcePaths(
 export async function beginProjectExecution(
   context: Context,
   task: TaskRecord,
-  attachments?: string[]
+  attachments?: string[],
+  independent = false
 ): Promise<ProjectExecutionRecord | null> {
   const workspace = await context.store.getWorkspace(task.userId, task.workspaceId);
   if (!workspace?.wrappedKey) throw new AthanorError('workspace_not_found', 'Workspace not found');
-  if (workspace.parentWorkspaceId || task.parentMissionId) return null;
+  const prior = await context.store.getProjectExecution(task.userId, task.id);
+  if ((workspace.parentWorkspaceId && !independent && !prior) || task.parentMissionId) return null;
   const key = unwrapDataKey(workspace.wrappedKey, context.masterKey, workspace.id);
   if (task.agentStateCiphertext) {
     const state = decryptJson<{ pending?: { approvalId?: string } }>(
@@ -108,7 +110,6 @@ export async function beginProjectExecution(
     )
       return null;
   }
-  const prior = await context.store.getProjectExecution(task.userId, task.id);
   const manifest: Manifest = prior
     ? decryptJson(prior.sourceManifestCiphertext, key, aad(task.id))
     : {
@@ -126,7 +127,30 @@ export async function beginProjectExecution(
     workspaceId,
     wrappedKey: wrapDataKey(key, context.masterKey, workspaceId),
     seedKind: manifest.kind,
+    independent,
     sourceManifestCiphertext: encryptJson(manifest, key, aad(task.id))
+  });
+}
+
+export async function configureConversationInputs(
+  context: Context,
+  task: TaskRecord,
+  workspaceId = task.workspaceId
+) {
+  if (!task.projectId) return;
+  // Only dedicated project roots are shared; host and specialist state stay outside the input grant.
+  const sources = (await context.store.projectInputWorkspaceIds(task.userId, task.id)).filter(
+    (id) => id !== workspaceId
+  );
+  await context.runner.request({
+    workspaceId,
+    userId: task.userId,
+    role: 'control',
+    scopes: ['workspace.manage'],
+    method: 'PUT',
+    path: `/v1/workspaces/${workspaceId}/project-inputs`,
+    contentType: 'application/json',
+    body: JSON.stringify({ sources })
   });
 }
 
@@ -135,8 +159,15 @@ export async function completeProjectExecution(
   task: TaskRecord,
   execution: ProjectExecutionRecord | null
 ): Promise<TaskRecord> {
-  if (!execution) return task;
-  if (execution.status === 'ready') return (await context.store.getTask(task.userId, task.id))!;
+  if (!execution) {
+    await configureConversationInputs(context, task);
+    return task;
+  }
+  if (execution.status === 'ready') {
+    const current = (await context.store.getTask(task.userId, task.id))!;
+    await configureConversationInputs(context, current);
+    return current;
+  }
   const source = await context.store.getWorkspace(task.userId, execution.sourceWorkspaceId);
   if (!source?.wrappedKey) throw new AthanorError('workspace_not_found', 'Workspace not found');
   const key = unwrapDataKey(source.wrappedKey, context.masterKey, source.id);
@@ -167,6 +198,8 @@ export async function completeProjectExecution(
       !['ready', 'shared'].includes(receipt.status)
     )
       throw new Error('Project preparation returned a mismatched receipt');
+    if (receipt.status === 'ready')
+      await configureConversationInputs(context, task, execution.workspaceId);
     const finished = await context.store.finishProjectExecution({
       userId: task.userId,
       taskId: task.id,
@@ -236,7 +269,12 @@ export async function ensureProjectExecution(
   context: Context,
   task: TaskRecord
 ): Promise<TaskRecord> {
-  return completeProjectExecution(context, task, await beginProjectExecution(context, task));
+  const updated = await completeProjectExecution(
+    context,
+    task,
+    await beginProjectExecution(context, task)
+  );
+  return updated;
 }
 
 export async function recoverProjectExecutions(context: Context): Promise<void> {

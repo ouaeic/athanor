@@ -20,12 +20,16 @@ export function TaskOutputs({
   events = [],
   artifacts = [],
   onArtifact,
+  onDiscuss,
+  onRemember,
   autoPreview = true
 }: {
   presentation: TaskPresentation;
   events?: TaskEvent[];
   artifacts?: Artifact[];
   onArtifact: (id: string) => void;
+  onDiscuss?: (result: TaskPresentation['results'][number]) => void;
+  onRemember?: (result: TaskPresentation['results'][number]) => void;
   autoPreview?: boolean;
 }) {
   const [opened, setOpened] = useState<{ id: string; url: string } | null>(null);
@@ -372,6 +376,8 @@ export function TaskOutputs({
                 </small>
                 {item.detail && <small>{item.detail}</small>}
               </div>
+              {onDiscuss && <Button onClick={() => onDiscuss(item)}>Discuss</Button>}
+              {onRemember && <Button onClick={() => onRemember(item)}>Keep a note</Button>}
               {item.artifactId && (
                 <Button onClick={() => onArtifact(item.artifactId!)}>View</Button>
               )}

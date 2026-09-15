@@ -161,9 +161,14 @@ describe('finished message reservation upgrades', () => {
 
     await migrateDatabase(database);
     const after = await snapshot();
-    expect(after).toEqual(
-      before.map((row) => ({ ...row, state: expected.get(row.idempotency_key) }))
-    );
+    expect(after).toHaveLength(before.length);
+    expect(
+      after.map((row) =>
+        Object.fromEntries(
+          Object.keys(before[0]!).map((field) => [field, row[field as keyof typeof row]])
+        )
+      )
+    ).toEqual(before.map((row) => ({ ...row, state: expected.get(row.idempotency_key) })));
     expect(after.filter((row) => row.state === 'reserved')).toHaveLength(6);
     // Later migrations can add columns; every historical field must retain its value.
     const historicalFields = (

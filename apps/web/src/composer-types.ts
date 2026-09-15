@@ -1,9 +1,12 @@
 import type { ReactNode } from 'react';
-import type { Task, Workspace } from '@athanor/contracts';
+import type { Task, Workspace, Project, ConversationSource } from '@athanor/contracts';
 import type { Bootstrap, Draft } from './model';
 
 export interface ComposerProps {
   workspace: Workspace;
+  project?: Project;
+  execution?: 'independent' | 'shared';
+  source?: ConversationSource;
   task?: Task | null;
   bootstrap: Bootstrap;
   initialDraft?: Draft;

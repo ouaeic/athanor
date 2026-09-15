@@ -70,6 +70,47 @@ async function finish(
   });
 }
 describe('project execution transactions', () => {
+  it('runs conversations in one project concurrently with separate leases and preserved membership', async () => {
+    const { user, a } = await seed();
+    const first = await begin(user.id, a.id);
+    await finish(user.id, a.id, first.workspaceId);
+    const root = (await store.getTask(user.id, a.id))!;
+    const child = await store.createTask({
+      userId: user.id,
+      workspaceId: root.workspaceId,
+      projectId: root.projectId!,
+      titleCiphertext: envelope,
+      nameIndex: { nameTokens: '', openingTokens: '' },
+      modelId: 'chosen',
+      privacyRoute: 'provider_zdr',
+      securityMode: 'autonomous',
+      maxComputeCredits: 4,
+      promptCiphertext: envelope
+    });
+    const next = (await store.beginProjectExecution({
+      userId: user.id,
+      taskId: child.id,
+      workspaceId: randomUUID(),
+      wrappedKey: 'same-key-rewrapped',
+      sourceManifestCiphertext: envelope,
+      seedKind: 'new',
+      independent: true
+    }))!;
+    await finish(user.id, child.id, next.workspaceId);
+    const leases = [
+      await store.leaseNextTask('project-root'),
+      await store.leaseNextTask('project-conversation'),
+      await store.leaseNextTask('unrelated')
+    ].filter((task) => task?.projectId === root.projectId);
+    expect(new Set(leases.map((task) => task?.id))).toEqual(new Set([root.id, child.id]));
+    expect(new Set(leases.map((task) => task?.workspaceId)).size).toBe(2);
+    const members = await store.projectExecutionMembers(user.id, child.id);
+    expect(new Set(members.map((member) => member.taskId))).toEqual(new Set([root.id, child.id]));
+    expect(new Set(members.map((member) => member.workspaceId))).toEqual(
+      new Set([root.workspaceId, next.workspaceId])
+    );
+  });
+
   it('leases independent ordinary projects concurrently while a correction to B keeps A’s live lease', async () => {
     const { user, workspace, a, b } = await seed();
     const ea = await begin(user.id, a.id),

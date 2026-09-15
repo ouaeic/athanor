@@ -1,3 +1,4 @@
+import { projectMemorySourceSearchSql } from './sql/memory.js';
 import { randomUUID } from 'node:crypto';
 import {
   AthanorError,
@@ -466,7 +467,13 @@ export interface RecallMemoryInput {
   order?: 'stable' | 'relevance';
 }
 
+export interface ProjectMemoryScope {
+  userId: string;
+  projectId: string;
+}
+
 export interface SearchMemorySourcesInput {
+  project?: ProjectMemoryScope;
   workspaceId: string;
   /** Built by `planMemoryQuery`, exactly as for item recall: same tokenizer, same key. */
   plan: MemoryQueryPlan;
@@ -2245,7 +2252,11 @@ export class MemoryStore {
     if (lexemes.length === 0) return [];
     const limit = Math.trunc(input.limit ?? 20);
     const result = await this.database.query(
-      input.reach === 'archived' ? MEMORY_SOURCE_ARCHIVE_SEARCH_SQL : MEMORY_SOURCE_SEARCH_SQL,
+      input.project
+        ? projectMemorySourceSearchSql(input.reach ?? 'indexed')
+        : input.reach === 'archived'
+          ? MEMORY_SOURCE_ARCHIVE_SEARCH_SQL
+          : MEMORY_SOURCE_SEARCH_SQL,
       [
         input.workspaceId,
         lexemes,
@@ -2258,10 +2269,17 @@ export class MemoryStore {
         Math.max(
           1,
           Math.trunc(input.perTask ?? (input.taskId ? limit : MEMORY_SOURCE_SEARCH_PER_TASK))
-        )
+        ),
+        ...(input.project ? [input.project.userId, input.project.projectId] : [])
       ]
     );
     const own = result.rows.map((row) => ({ ...mapMemorySource(row), score: Number(row.score) }));
+    if (input.project)
+      return own.map((source) =>
+        source.workspaceId === input.workspaceId
+          ? source
+          : { ...source, sharedForWorkspaceId: input.workspaceId }
+      );
     const shared = await this.#sharedWorkspace(input.workspaceId);
     if (!shared) return own;
     const inherited = (await this.searchMemorySources({ ...input, workspaceId: shared })).map(
@@ -2287,7 +2305,10 @@ export class MemoryStore {
    * one statement over one scan rather than two queries, because it is asked on the path where the
    * agent is about to tell the owner something about their own history from an absence.
    */
-  async memorySourceCoverage(workspaceId: string): Promise<{
+  async memorySourceCoverage(
+    workspaceId: string,
+    project?: ProjectMemoryScope
+  ): Promise<{
     turns: number;
     conversations: number;
     earliest: string | null;
@@ -2306,8 +2327,8 @@ export class MemoryStore {
               count(*) FILTER (WHERE NOT indexed AND body_tokens <> '') AS archived_turns,
               min(occurred_at) FILTER (WHERE NOT indexed AND body_tokens <> '')
                 AS archived_earliest
-       FROM mem.source WHERE workspace_id IN ($1,(SELECT p.id FROM workspaces w JOIN workspaces p ON p.id=w.parent_workspace_id AND p.user_id=w.user_id WHERE w.id=$1))`,
-      [workspaceId]
+       FROM mem.source WHERE ${project ? 'user_id=$2 AND EXISTS(SELECT 1 FROM tasks t WHERE t.id=mem.source.task_id AND t.user_id=$2 AND t.project_id=$3) AND $1::uuid IS NOT NULL' : 'workspace_id IN ($1,(SELECT p.id FROM workspaces w JOIN workspaces p ON p.id=w.parent_workspace_id AND p.user_id=w.user_id WHERE w.id=$1))'}`,
+      [workspaceId, ...(project ? [project.userId, project.projectId] : [])]
     );
     const row = result.rows[0];
     return {
@@ -2328,8 +2349,27 @@ export class MemoryStore {
   async listMemorySourceWindow(
     workspaceId: string,
     sourceId: string,
-    window: { before?: number; after?: number } = {}
+    window: { before?: number; after?: number; project?: ProjectMemoryScope } = {}
   ): Promise<MemorySourceRecord[]> {
+    if (window.project) {
+      const origin = await this.database.query(
+        `SELECT s.workspace_id FROM mem.source s JOIN tasks t ON t.id=s.task_id
+        WHERE s.id=$1 AND s.user_id=$2 AND t.user_id=$2 AND t.project_id=$3`,
+        [sourceId, window.project.userId, window.project.projectId]
+      );
+      if (!origin.rows.length) return [];
+      const scope = String(origin.rows[0]!.workspace_id);
+      const result = await this.database.query(MEMORY_SOURCE_WINDOW_SQL, [
+        scope,
+        sourceId,
+        Math.max(0, Math.trunc(window.before ?? 2)),
+        Math.max(0, Math.trunc(window.after ?? 2))
+      ]);
+      return result.rows.map((row) => ({
+        ...mapMemorySource(row),
+        sharedForWorkspaceId: workspaceId
+      }));
+    }
     const result = await this.database.query(MEMORY_SOURCE_WINDOW_SQL, [
       workspaceId,
       sourceId,

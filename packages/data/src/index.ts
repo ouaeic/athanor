@@ -11,3 +11,5 @@ export * from './task-delivery.js';
 export * from './project-model-preferences.js';
 
 export * from './owner-search.js';
+
+export * from './projects.js';

@@ -7280,11 +7280,12 @@ describe('the upgrade path onto rows an older athanor wrote', () => {
    */
   const backfills = (sql: string) =>
     sql
-      .replace(/CREATE OR REPLACE FUNCTION[\s\S]*?\$ath\$;/g, '')
+      .replace(/CREATE OR REPLACE FUNCTION[\s\S]*?(\$[a-zA-Z_]*\$)[\s\S]*?\1;/g, '')
       .split(';')
       .filter(
         (statement) =>
           /^\s*(UPDATE|DELETE\s+FROM|INSERT\s+INTO)\b/i.test(statement) ||
+          /^\s*WITH\s+RECURSIVE[\s\S]*\)\s*UPDATE\b/i.test(statement) ||
           /\bsetval\s*\(/i.test(statement)
       );
 
@@ -7310,8 +7311,36 @@ describe('the upgrade path onto rows an older athanor wrote', () => {
     78: 1,
     84: 1,
     95: 1,
-    98: 1
+    98: 1,
+    105: 5
   };
+
+  it('migration 105 groups conversations explicitly and keeps project identity after its first conversation is deleted', async () => {
+    await migrateBelow(105);
+    await seedOwner();
+    const root = randomUUID(),
+      child = randomUUID(),
+      unrelated = randomUUID();
+    await addTask(root, 'external');
+    await addTask(child, 'external');
+    await addTask(unrelated, 'external');
+    await database.query('UPDATE tasks SET parent_task_id=$1 WHERE id=$2', [root, child]);
+    expect(await hasColumn('tasks', 'project_id')).toBe(false);
+    await apply(105);
+    expect(
+      (await database.query('SELECT project_id FROM tasks WHERE id=$1', [child])).rows[0]
+        ?.project_id
+    ).toBe(root);
+    expect((await database.query('SELECT id FROM projects')).rows).toHaveLength(2);
+    await database.query('DELETE FROM tasks WHERE id=$1', [root]);
+    expect((await database.query('SELECT id FROM projects WHERE id=$1', [root])).rows).toHaveLength(
+      1
+    );
+    expect(
+      (await database.query('SELECT project_id FROM tasks WHERE id=$1', [child])).rows[0]
+        ?.project_id
+    ).toBe(root);
+  });
 
   /**
    * Migration 76 gives an archived verbatim row back the vector that finds it.

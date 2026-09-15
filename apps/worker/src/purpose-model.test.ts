@@ -1,3 +1,5 @@
+import { conversationContext } from './conversation-context.js';
+import { AgentRunnerClient } from './runner-client.js';
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, expect, it, vi } from 'vitest';
 import type { ModelRelease } from '@athanor/contracts';
@@ -13,7 +15,8 @@ import {
   createDatabase,
   DataStore,
   migrateDatabase,
-  writeProjectModelPreferences
+  writeProjectModelPreferences,
+  writeConversationModelPreferences
 } from '@athanor/data';
 import {
   applyProjectMainModel,
@@ -242,4 +245,124 @@ it('distinguishes an automatic auxiliary route from an unreadable or unavailable
   await expect(
     pinnedPurposeModel({ ...f.context, masterKey: generateDataKey() }, f.task, 'summarise', models)
   ).rejects.toThrow();
+});
+
+it('shares bounded source-linked context and corrections without importing other projects or mission authority', async () => {
+  const f = await fixture();
+  const source = await store.appendTaskEvent({
+    taskId: f.task.id,
+    kind: 'assistant_message',
+    summary: 'Assembly result',
+    payloadCiphertext: encryptJson(
+      { markdown: 'The selected assembly passed QC.' },
+      key,
+      `task-event:${f.task.id}`
+    )
+  });
+  const selected = {
+    taskId: f.task.id,
+    eventId: source.id,
+    result: {
+      id: 'assembly-v1',
+      kind: 'file',
+      title: 'Assembly',
+      version: 1,
+      sha256: 'a'.repeat(64)
+    }
+  };
+  const create = (projectId?: string) =>
+    store.createTask({
+      userId: f.user.id,
+      workspaceId: f.task.workspaceId,
+      ...(projectId
+        ? {
+            projectId,
+            conversationSourceCiphertext: encryptJson(
+              selected,
+              key,
+              `conversation-source:${projectId}`
+            )
+          }
+        : {}),
+      titleCiphertext: encryptJson(
+        { title: projectId ? 'Figures' : 'Unrelated private work' },
+        key
+      ),
+      promptCiphertext: encryptJson({ prompt: 'Independent direction' }, key),
+      nameIndex: { nameTokens: '', openingTokens: '' },
+      modelId: 'main',
+      privacyRoute: 'provider_zdr',
+      maxComputeCredits: 1
+    });
+  const child = await create(f.task.projectId);
+  await create();
+  const old = await store.addProjectNote(
+    f.user.id,
+    f.task.projectId!,
+    { kind: 'finding', body: 'Superseded assembly claim' },
+    masterKey
+  );
+  await store.addProjectNote(
+    f.user.id,
+    f.task.projectId!,
+    {
+      kind: 'finding',
+      body: 'Use the verified assembly',
+      replacesId: old.id,
+      source: { taskId: f.task.id, eventId: source.id }
+    },
+    masterKey
+  );
+  const runner = new AgentRunnerClient('http://runner.invalid', 'x'.repeat(32));
+  vi.spyOn(runner, 'call').mockResolvedValue({
+    sources: [
+      { workspaceId: f.task.workspaceId, path: `/home/athanor/${f.task.workspaceId}/workspace` }
+    ]
+  });
+  const result = await conversationContext({ ...f.context, runner }, child, key);
+  expect(result).toContain('The selected assembly passed QC.');
+  expect(result).toContain(source.id);
+  expect(result).toContain('a'.repeat(64));
+  expect(result).toContain('Use the verified assembly');
+  expect(result).not.toContain('Superseded assembly claim');
+  expect(result).not.toContain('Unrelated private work');
+  expect(result.length).toBeLessThan(24000);
+  expect(
+    await conversationContext(
+      { ...f.context, runner },
+      { ...child, parentMissionId: randomUUID() },
+      key
+    )
+  ).toBe('');
+});
+
+it('keeps a manual conversation model until its owner saves preferences, then applies inheritance on the next leased turn', async () => {
+  const f = await fixture();
+  const state: AgentState = { messages: [], step: 0, credits: 0 };
+  await writeProjectModelPreferences(store, masterKey, f.task, {
+    expectedRevision: 0,
+    choices: { main: pin('specialist') }
+  });
+  await applyProjectMainModel(f.context, f.task, state, models, key, 'worker');
+  await database.query('UPDATE tasks SET model_id=$2,model_override=TRUE WHERE id=$1', [
+    f.task.id,
+    'main'
+  ]);
+  let current = (await store.getTask(f.user.id, f.task.id))!;
+  await applyProjectMainModel(f.context, current, state, models, key, 'worker');
+  expect(current.modelId).toBe('main');
+  await writeConversationModelPreferences(store, masterKey, current, {
+    expectedRevision: 0,
+    choices: {}
+  });
+  current = (await store.getTask(f.user.id, f.task.id))!;
+  await applyProjectMainModel(f.context, current, state, models, key, 'worker');
+  expect(current.modelId).toBe('specialist');
+  await writeConversationModelPreferences(store, masterKey, current, {
+    expectedRevision: 1,
+    choices: { main: pin('coding') }
+  });
+  current = (await store.getTask(f.user.id, f.task.id))!;
+  await applyProjectMainModel(f.context, current, state, models, key, 'worker');
+  expect(current.modelId).toBe('coding');
 });

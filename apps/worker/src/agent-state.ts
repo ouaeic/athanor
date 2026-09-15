@@ -32,6 +32,7 @@ import type { MediaGenerationApproval } from './media-approval.js';
 export interface AgentState {
   /** Last applied project main choice; subsequent explicit turn choices remain authoritative. */
   mainModelPreference?: string;
+  projectContextFingerprint?: string;
   /**
    * The providers this task has already been walled by, so a re-route does not return to one.
    *

@@ -643,6 +643,35 @@ fi
 rm -f "$spec" "$spec_parent/fedcba9876543210fedcba9876543210.spec"
 printf 'ok  a spec the asking account does not own, or with a second name, is refused before it is removed\n'
 
+# A project read grant names held directory descriptors, never its parent or a writable rule.
+input_id=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee
+mkdir -p "$workspaces/$input_id/workspace"
+chmod 0700 "$root/.athanor"
+printf '{"sources":["%s"]}' "$input_id" > "$root/.athanor/project-inputs.json"
+chmod 0600 "$root/.athanor/project-inputs.json"
+output=$(run_sandbox run network confine "$root" /bin/sh -c 'printf project-input')
+test "$output" = project-input
+grep -Eq -- 'path-beneath:execute,read-file,read-dir:/proc/self/fd/[0-9]+' "$records/setpriv"
+if grep -Eq -- 'path-beneath:[a-z,-]*(write|remove|make|truncate)[a-z,-]*:/proc/self/fd/' "$records/setpriv"; then
+  printf 'project inputs acquired write access\n' >&2
+  exit 1
+fi
+chmod 0644 "$root/.athanor/project-inputs.json"
+if run_sandbox run network confine "$root" /bin/sh -c 'printf should-not-run' > "$records/input-refusal" 2>&1; then
+  printf 'unprotected project membership was accepted\n' >&2
+  exit 1
+fi
+grep -q 'invalid project input membership' "$records/input-refusal"
+chmod 0600 "$root/.athanor/project-inputs.json"
+printf '{"sources":["../private"]}' > "$root/.athanor/project-inputs.json"
+if run_sandbox run network confine "$root" /bin/sh -c 'printf should-not-run' > "$records/input-refusal" 2>&1; then
+  printf 'invalid project input identity was accepted\n' >&2
+  exit 1
+fi
+grep -q 'invalid project input identity' "$records/input-refusal"
+rm "$root/.athanor/project-inputs.json"
+printf 'ok  protected project inputs grant only reads and reject tampered membership\n'
+
 # Without root the helper cannot drop privilege at all, so it must not pretend to have.
 make_fake id 'case "$*" in "-u") printf "1000\n" ;; *) printf "4321\n" ;; esac'
 if run_sandbox run network open - /bin/sh -c : >/dev/null 2>&1; then

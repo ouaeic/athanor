@@ -44,7 +44,7 @@ describe('project process scope', () => {
         headers: { 'x-owner': 'owner' }
       });
       expect(response.statusCode).toBe(200);
-      expect(store.projectExecutionMembers).toHaveBeenCalledWith('owner', 'branch');
+      expect(store.projectExecutionMembers).toHaveBeenCalledWith('owner', 'branch', 'task');
       expect(response.json<ProcessList>().processes).toEqual(
         expect.arrayContaining([
           { sessionId: 'job-one', ownerTaskId: 'root', workspaceId: 'one' },

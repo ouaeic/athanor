@@ -615,6 +615,7 @@ export interface MemorySessionSearchResult {
 }
 
 export interface MemorySessionSearchInput {
+  readonly project?: { userId: string; projectId: string };
   readonly store: MemorySessionSearchStore;
   readonly workspaceId: string;
   readonly dataKey: Uint8Array;
@@ -682,6 +683,7 @@ export const searchMemorySessions = async (
   const ask = async (reach: 'indexed' | 'archived') =>
     input.store.searchMemorySources({
       workspaceId: input.workspaceId,
+      ...(input.project ? { project: input.project } : {}),
       plan: planMemoryQuery(query, memoryIndexKey(input.dataKey)),
       limit,
       reach,
@@ -730,6 +732,7 @@ export const searchMemorySessions = async (
     // of thirty results each surrounded by its context is a transcript rather than a search result.
     if (matches.length < MEMORY_SESSION_SEARCH_CONTEXT_HITS) {
       const window = await input.store.listMemorySourceWindow(input.workspaceId, hit.id, {
+        ...(input.project ? { project: input.project } : {}),
         before: MEMORY_SESSION_SEARCH_CONTEXT_ROWS,
         after: MEMORY_SESSION_SEARCH_CONTEXT_ROWS
       });
@@ -779,7 +782,7 @@ export const searchMemorySessions = async (
     // tier too, so "nothing found" is a statement about the whole record rather than about the
     // half of it the fast index still holds.
     ...(matches.length === 0
-      ? { searchable: await input.store.memorySourceCoverage(input.workspaceId) }
+      ? { searchable: await input.store.memorySourceCoverage(input.workspaceId, input.project) }
       : {})
   };
 };
@@ -998,6 +1001,7 @@ const reachRefused = (): AthanorError =>
   );
 
 export interface MemoryReachInput {
+  readonly project?: { userId: string; projectId: string };
   readonly store: MemoryReachStore;
   readonly workspaceId: string;
   readonly dataKey: Uint8Array;
@@ -1051,6 +1055,7 @@ export const reachMemoryEvidence = async (
   };
 
   const [turn] = await input.store.listMemorySourceWindow(input.workspaceId, id, {
+    ...(input.project ? { project: input.project } : {}),
     before: 0,
     after: 0
   });

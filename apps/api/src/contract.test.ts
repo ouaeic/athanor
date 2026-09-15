@@ -97,6 +97,7 @@ const stubUpstreams = (holdModel?: { reached: () => void; release: Promise<void>
         });
       if (url.includes('workspace-manager.test')) {
         const path = new URL(url).pathname;
+        if (path.endsWith('/project-inputs')) return json({ sources: [] });
         if (path.endsWith('/project-execution')) {
           if (init?.method !== 'POST' || typeof init.body !== 'string')
             throw Error('Expected a JSON project preparation request');

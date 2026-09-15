@@ -80,6 +80,11 @@ export interface WorkspaceRecord {
 }
 
 export interface TaskRecord {
+  projectId?: string;
+  modelOverride?: boolean;
+  modelPreferencesRevision?: number;
+  modelChoicesCiphertext?: EncryptedEnvelope | null;
+  conversationSourceCiphertext?: EncryptedEnvelope | null;
   /** Current delivery read model, populated in one aggregate for a requested task page. */
   deliveryStatus?: 'pending' | 'ready' | 'incomplete' | null;
   pendingDeliveryCount?: number;

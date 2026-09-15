@@ -1,3 +1,4 @@
+import { conversationContext } from './conversation-context.js';
 /**
  * The window itself: what goes in front of the trajectory, what is refreshed at the tail on every
  * step, and how the owner's plan gets back into it when they republish one.
@@ -413,6 +414,21 @@ export const assemblePreamble = async (deps: WindowDeps, input: PreambleInput): 
     } catch {
       briefPath = '';
     }
+  }
+  const sharedContext = await conversationContext(deps, task, key);
+  if (sharedContext) {
+    const fingerprint = createHash('sha256').update(sharedContext).digest('hex');
+    if (state.projectContextFingerprint !== fingerprint) {
+      await event(deps.store, task, key, 'notice', 'Shared project context', {
+        headline: 'Shared project context',
+        detail: sharedContext,
+        projectId: task.projectId,
+        fingerprint
+      });
+      state.projectContextFingerprint = fingerprint;
+    }
+    brief = `${sharedContext}\n\nLocal workspace brief (${briefPath || 'none'}):\n${brief}`;
+    briefPath = `project ${task.projectId}`;
   }
   const knowledgeMarker = 'CURATED ENCRYPTED KNOWLEDGE';
   const memoryRecords = await deps.store.listWorkspaceMemories(task.userId, task.workspaceId);

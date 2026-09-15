@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { ensureProjectExecution } from './project-execution.js';
+import { ensureProjectExecution, configureConversationInputs } from './project-execution.js';
 import { z } from 'zod';
 import { ContinueTaskRequest } from '@athanor/contracts';
 import {
@@ -207,11 +207,14 @@ async function performContinuation(
       : (input.reasoningEffort ?? task.reasoningEffort ?? 'auto'),
     selected
   );
-  if (!retained && !workspace.parentWorkspaceId && !task.parentMissionId) {
-    task = await ensureProjectExecution(context, task);
-    workspace = await store.getWorkspace(user.id, task.workspaceId);
-    if (!workspace?.wrappedKey)
-      throw new AthanorError('workspace_not_found', 'Workspace not found');
+  if (!retained && !task.parentMissionId) {
+    if (workspace.parentWorkspaceId) await configureConversationInputs(context, task);
+    else {
+      task = await ensureProjectExecution(context, task);
+      workspace = await store.getWorkspace(user.id, task.workspaceId);
+      if (!workspace?.wrappedKey)
+        throw new AthanorError('workspace_not_found', 'Workspace not found');
+    }
   }
   if (activeTask) {
     const messageId = retained?.messageId ?? randomUUID();
@@ -220,6 +223,7 @@ async function performContinuation(
       taskId: task.id,
       userId: user.id,
       modelId: selected.id,
+      modelOverride: !retained && input.modelId !== undefined,
       reasoningEffort,
       ...(!retained && input.securityMode ? { securityMode: input.securityMode } : {}),
       privacyRoute,
@@ -290,6 +294,7 @@ async function performContinuation(
     id: task.id,
     userId: user.id,
     modelId: selected.id,
+    modelOverride: !retained && input.modelId !== undefined,
     reasoningEffort,
     ...(!retained && input.securityMode ? { securityMode: input.securityMode } : {}),
     privacyRoute,

@@ -3758,5 +3758,139 @@ CREATE TABLE IF NOT EXISTS model_throughput_ceiling (
       CREATE TRIGGER task_approval_grants_expire AFTER UPDATE OF status,security_mode ON tasks
         FOR EACH ROW EXECUTE FUNCTION revoke_ended_task_approvals();
     `
+  },
+  {
+    version: 105,
+    name: 'projects_and_conversations',
+    sql: `
+      CREATE TABLE IF NOT EXISTS projects (
+        id UUID PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        security_mode TEXT NOT NULL DEFAULT 'balanced' CHECK(security_mode IN ('review','balanced','autonomous')),
+        brief_ciphertext JSONB NOT NULL,
+        title_source TEXT NOT NULL DEFAULT 'prompt',
+        revision INTEGER NOT NULL DEFAULT 1 CHECK(revision>0),
+        pinned BOOLEAN NOT NULL DEFAULT FALSE,
+        archived_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(id,user_id)
+      );
+      CREATE TABLE IF NOT EXISTS project_workspaces (
+        project_id UUID NOT NULL,workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL,origin_task_id UUID NOT NULL,
+        PRIMARY KEY(project_id,workspace_id,origin_task_id),
+        FOREIGN KEY(project_id,user_id) REFERENCES projects(id,user_id) ON DELETE CASCADE
+      );
+      CREATE TABLE IF NOT EXISTS project_notes (
+        id UUID PRIMARY KEY,project_id UUID NOT NULL,user_id UUID NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('finding','decision','question')),
+        body_ciphertext JSONB NOT NULL,source_ciphertext JSONB,
+        replaces_id UUID REFERENCES project_notes(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),removed_at TIMESTAMPTZ,
+        FOREIGN KEY(project_id,user_id) REFERENCES projects(id,user_id) ON DELETE CASCADE
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS project_note_correction_idx ON project_notes(replaces_id) WHERE replaces_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS project_notes_order_idx ON project_notes(project_id,created_at DESC,id DESC);
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS project_id UUID;
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS model_override BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS model_choices_ciphertext JSONB;
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS model_preferences_revision INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE task_message_queue ADD COLUMN IF NOT EXISTS model_override BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE tasks ADD COLUMN IF NOT EXISTS conversation_source_ciphertext JSONB;
+      WITH RECURSIVE membership AS (
+        SELECT id,user_id,id AS project_id FROM tasks WHERE parent_task_id IS NULL
+        UNION ALL
+        SELECT t.id,t.user_id,m.project_id FROM tasks t JOIN membership m
+          ON t.parent_task_id=m.id AND t.user_id=m.user_id
+      ) UPDATE tasks t SET project_id=m.project_id FROM membership m WHERE t.id=m.id AND t.project_id IS NULL;
+      DO $projects$
+      BEGIN
+        IF EXISTS(SELECT 1 FROM tasks WHERE project_id IS NULL) THEN
+          RAISE EXCEPTION 'Project migration found cyclic or cross-owner conversation ancestry';
+        END IF;
+      END;
+      $projects$;
+      INSERT INTO projects(id,user_id,workspace_id,title,brief_ciphertext,security_mode,title_source,pinned,archived_at,created_at,updated_at)
+        SELECT id,user_id,workspace_id,title,prompt_ciphertext,security_mode,title_source,pinned,archived_at,created_at,updated_at
+        FROM tasks WHERE id=project_id ON CONFLICT(id) DO NOTHING;
+      INSERT INTO project_workspaces(project_id,workspace_id,user_id,origin_task_id)
+        SELECT t.project_id,t.workspace_id,t.user_id,t.id
+        FROM tasks t JOIN workspaces w ON w.id=t.workspace_id AND w.user_id=t.user_id
+        WHERE w.parent_workspace_id IS NOT NULL ORDER BY t.project_id,t.workspace_id,t.created_at,t.id
+        ON CONFLICT DO NOTHING;
+      ALTER TABLE usage_entries ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE SET NULL;
+      ALTER TABLE coding_family_calls ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id) ON DELETE SET NULL;
+      UPDATE usage_entries u SET project_id=t.project_id FROM tasks t WHERE u.task_id=t.id AND u.user_id=t.user_id AND u.project_id IS NULL;
+      UPDATE coding_family_calls c SET project_id=t.project_id FROM tasks t WHERE c.original_task_id=t.id AND c.user_id=t.user_id AND c.project_id IS NULL;
+      CREATE INDEX IF NOT EXISTS usage_project_idx ON usage_entries(project_id) WHERE project_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS coding_call_project_idx ON coding_family_calls(project_id) WHERE project_id IS NOT NULL;
+      CREATE OR REPLACE FUNCTION retain_usage_project() RETURNS trigger LANGUAGE plpgsql AS $projects$
+      BEGIN
+        SELECT project_id INTO NEW.project_id FROM tasks WHERE id=NEW.task_id AND user_id=NEW.user_id;
+        RETURN NEW;
+      END;
+      $projects$;
+      DROP TRIGGER IF EXISTS usage_assign_project ON usage_entries;
+      CREATE TRIGGER usage_assign_project BEFORE INSERT ON usage_entries FOR EACH ROW EXECUTE FUNCTION retain_usage_project();
+      CREATE OR REPLACE FUNCTION retain_coding_project() RETURNS trigger LANGUAGE plpgsql AS $projects$
+      BEGIN
+        SELECT project_id INTO NEW.project_id FROM tasks WHERE id=NEW.original_task_id AND user_id=NEW.user_id;
+        RETURN NEW;
+      END;
+      $projects$;
+      DROP TRIGGER IF EXISTS coding_assign_project ON coding_family_calls;
+      CREATE TRIGGER coding_assign_project BEFORE INSERT ON coding_family_calls FOR EACH ROW EXECUTE FUNCTION retain_coding_project();
+      ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_project_owner_fk;
+      ALTER TABLE tasks ADD CONSTRAINT tasks_project_owner_fk FOREIGN KEY(project_id,user_id)
+        REFERENCES projects(id,user_id) ON DELETE CASCADE;
+      ALTER TABLE tasks ALTER COLUMN project_id SET NOT NULL;
+      CREATE INDEX IF NOT EXISTS tasks_project_activity_idx ON tasks(project_id,created_at DESC,id DESC);
+      CREATE INDEX IF NOT EXISTS projects_owner_activity_idx ON projects(user_id,updated_at DESC,id DESC);
+      ALTER TABLE project_model_preferences DROP CONSTRAINT IF EXISTS project_model_preferences_project_task_id_fkey;
+      ALTER TABLE project_model_preferences DROP CONSTRAINT IF EXISTS project_model_preferences_project_fk;
+      ALTER TABLE project_model_preferences ADD CONSTRAINT project_model_preferences_project_fk
+        FOREIGN KEY(project_task_id) REFERENCES projects(id) ON DELETE CASCADE;
+      CREATE OR REPLACE FUNCTION assign_conversation_project() RETURNS trigger LANGUAGE plpgsql AS $projects$
+      BEGIN
+        IF NEW.project_id IS NULL AND NEW.parent_task_id IS NOT NULL THEN
+          SELECT project_id INTO NEW.project_id FROM tasks WHERE id=NEW.parent_task_id AND user_id=NEW.user_id;
+          IF NEW.project_id IS NULL THEN RAISE EXCEPTION 'Conversation parent is unavailable'; END IF;
+        END IF;
+        IF NEW.project_id IS NULL THEN
+          NEW.project_id:=NEW.id;
+          INSERT INTO projects(id,user_id,workspace_id,title,brief_ciphertext,security_mode,title_source,created_at,updated_at)
+            VALUES(NEW.id,NEW.user_id,NEW.workspace_id,NEW.title,NEW.prompt_ciphertext,NEW.security_mode,NEW.title_source,NEW.created_at,NEW.updated_at);
+        END IF;
+        RETURN NEW;
+      END;
+      $projects$;
+      DROP TRIGGER IF EXISTS tasks_assign_project ON tasks;
+      CREATE TRIGGER tasks_assign_project BEFORE INSERT ON tasks FOR EACH ROW EXECUTE FUNCTION assign_conversation_project();
+      CREATE OR REPLACE FUNCTION update_conversation_project() RETURNS trigger LANGUAGE plpgsql AS $projects$
+      BEGIN
+        INSERT INTO project_workspaces(project_id,workspace_id,user_id,origin_task_id)
+          SELECT NEW.project_id,NEW.workspace_id,NEW.user_id,NEW.id FROM workspaces w
+          WHERE w.id=NEW.workspace_id AND w.user_id=NEW.user_id AND w.parent_workspace_id IS NOT NULL
+          ON CONFLICT DO NOTHING;
+        IF TG_OP='INSERT' OR NEW.status IS DISTINCT FROM OLD.status THEN
+          UPDATE projects SET updated_at=GREATEST(updated_at,NEW.updated_at) WHERE id=NEW.project_id;
+        END IF;
+        IF TG_OP='UPDATE' AND NEW.id=NEW.project_id AND NEW.title_source='generated' AND OLD.title_source='prompt' THEN
+          UPDATE projects SET title=NEW.title,title_source='generated',revision=revision+1
+            WHERE id=NEW.project_id AND title_source='prompt';
+        END IF;
+        IF TG_OP='UPDATE' AND NEW.id=NEW.project_id AND NEW.workspace_id IS DISTINCT FROM OLD.workspace_id THEN
+          UPDATE projects SET workspace_id=NEW.workspace_id WHERE id=NEW.project_id AND workspace_id=OLD.workspace_id;
+        END IF;
+        RETURN NEW;
+      END;
+      $projects$;
+      DROP TRIGGER IF EXISTS tasks_update_project ON tasks;
+      CREATE TRIGGER tasks_update_project AFTER INSERT OR UPDATE OF status,title,workspace_id ON tasks
+        FOR EACH ROW EXECUTE FUNCTION update_conversation_project();
+    `
   }
 ] as const;

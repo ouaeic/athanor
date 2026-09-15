@@ -142,6 +142,15 @@ export const mapTask = (row: Record<string, unknown>): TaskRecord => {
     id: String(row.id),
     userId: String(row.user_id),
     workspaceId: String(row.workspace_id),
+    ...(typeof row.project_id === 'string' ? { projectId: row.project_id } : {}),
+    modelOverride: Boolean(row.model_override),
+    modelPreferencesRevision: Number(row.model_preferences_revision ?? 0),
+    modelChoicesCiphertext: row.model_choices_ciphertext
+      ? json(row.model_choices_ciphertext)
+      : null,
+    conversationSourceCiphertext: row.conversation_source_ciphertext
+      ? json(row.conversation_source_ciphertext)
+      : null,
     parentTaskId: optionalText(row.parent_task_id),
     parentMissionId: optionalText(row.parent_mission_id),
     hasCodingFamily: Boolean(row.has_coding_family),

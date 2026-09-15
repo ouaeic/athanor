@@ -502,7 +502,7 @@ describe('model choices across settings, drafts and the first prompt', () => {
     expect(task.modelId).toBe(MIDDLE);
     const read = await harness.app.inject({
       method: 'GET',
-      url: `/v1/tasks/${task.id}/model-preferences`,
+      url: `/v1/projects/${task.id}/model-preferences`,
       headers
     });
     expect(read.statusCode, read.body).toBe(200);
@@ -510,6 +510,45 @@ describe('model choices across settings, drafts and the first prompt', () => {
       revision: 1,
       choices: modelChoices
     });
+    const localRead = await harness.app.inject({
+      method: 'GET',
+      url: `/v1/tasks/${task.id}/model-preferences`,
+      headers
+    });
+    expect(ProjectModelPreferences.parse(localRead.json())).toMatchObject({
+      revision: 0,
+      choices: {}
+    });
+    const localSaved = await harness.app.inject({
+      method: 'PUT',
+      url: `/v1/tasks/${task.id}/model-preferences`,
+      headers: { ...headers, 'idempotency-key': crypto.randomUUID() },
+      payload: {
+        expectedRevision: 0,
+        choices: { main: { automatic: true, preference: 'fast', modelId: '' } }
+      }
+    });
+    expect(localSaved.statusCode, localSaved.body).toBe(200);
+    expect(ProjectModelPreferences.parse(localSaved.json())).toMatchObject({
+      revision: 1,
+      choices: { main: { automatic: true, preference: 'fast', modelId: '' } }
+    });
+    const localReload = await harness.app.inject({
+      method: 'GET',
+      url: `/v1/tasks/${task.id}/model-preferences`,
+      headers
+    });
+    expect(localReload.json()).toMatchObject({
+      projectTaskId: task.id,
+      revision: localSaved.json<{ revision: number }>().revision,
+      choices: localSaved.json<{ choices: unknown }>().choices
+    });
+    const projectReload = await harness.app.inject({
+      method: 'GET',
+      url: `/v1/projects/${task.id}/model-preferences`,
+      headers
+    });
+    expect(ProjectModelPreferences.parse(projectReload.json()).choices).toEqual(modelChoices);
     const retried = await harness.app.inject({
       method: 'POST',
       url: '/v1/tasks',
@@ -521,14 +560,14 @@ describe('model choices across settings, drafts and the first prompt', () => {
 
     const conflict = await harness.app.inject({
       method: 'PUT',
-      url: `/v1/tasks/${task.id}/model-preferences`,
+      url: `/v1/projects/${task.id}/model-preferences`,
       headers: { ...headers, 'idempotency-key': 'model-choice-conflict-0001' },
       payload: { expectedRevision: 0, choices: {} }
     });
     expect(conflict.statusCode, conflict.body).toBe(409);
     const retained = await harness.app.inject({
       method: 'GET',
-      url: `/v1/tasks/${task.id}/model-preferences`,
+      url: `/v1/projects/${task.id}/model-preferences`,
       headers
     });
     expect(ProjectModelPreferences.parse(retained.json()).choices).toEqual(modelChoices);

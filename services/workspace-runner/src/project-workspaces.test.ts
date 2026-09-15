@@ -177,3 +177,31 @@ describe('independent project preparation', () => {
     ).rejects.toThrow('identity changed');
   });
 });
+
+it('shares protected input paths without copying data and replaces membership atomically', async () => {
+  const f = await fixture(),
+    manager = new ProjectWorkspaces(f.root, { ownedWriters: () => [] });
+  await ensureWorkspace(workspacePath(f.root, f.workspaceId));
+  const receipt = await manager.setInputs(f.workspaceId, {
+    sources: [f.sourceWorkspaceId, f.sourceWorkspaceId, f.workspaceId]
+  });
+  expect(receipt.sources).toEqual([
+    { workspaceId: f.sourceWorkspaceId, path: path.join(f.source, 'workspace') }
+  ]);
+  expect(await manager.inputs(f.workspaceId)).toEqual(receipt);
+  expect(await readdir(path.join(f.root, f.workspaceId, 'workspace'))).toEqual([]);
+  await manager.setInputs(f.workspaceId, { sources: [] });
+  expect(await manager.inputs(f.workspaceId)).toEqual({ sources: [] });
+});
+it('refuses symlinked input roots and never replaces membership with an invalid source', async () => {
+  const f = await fixture(),
+    manager = new ProjectWorkspaces(f.root, { ownedWriters: () => [] });
+  await manager.setInputs(f.workspaceId, { sources: [f.sourceWorkspaceId] });
+  const foreign = randomUUID();
+  await symlink(f.source, path.join(f.root, foreign));
+  await expect(manager.setInputs(f.workspaceId, { sources: [foreign] })).rejects.toThrow();
+  expect((await manager.inputs(f.workspaceId)).sources.map((source) => source.workspaceId)).toEqual(
+    [f.sourceWorkspaceId]
+  );
+  await expect(manager.setInputs(f.workspaceId, { sources: ['../private'] })).rejects.toThrow();
+});

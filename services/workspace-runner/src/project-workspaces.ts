@@ -104,6 +104,90 @@ export class ProjectWorkspaces {
     private readonly root: string,
     private readonly dependencies: Dependencies
   ) {}
+  async inputs(workspaceId: string) {
+    const target = workspacePath(this.root, workspaceId);
+    try {
+      const file = await open(
+        path.join(target, '.athanor', 'project-inputs.json'),
+        constants.O_RDONLY | constants.O_NOFOLLOW
+      );
+      try {
+        await assertOpenedInPlace(
+          target,
+          path.join(target, '.athanor', 'project-inputs.json'),
+          file
+        );
+        const info = await file.stat();
+        if (info.size > 262144 || !info.isFile()) throw Error('Invalid project input metadata');
+        const data = z
+          .object({ sources: z.array(z.uuid()).max(4096) })
+          .parse(JSON.parse(await file.readFile('utf8')));
+        return {
+          sources: data.sources.map((id) => ({
+            workspaceId: id,
+            path: path.join(this.root, id, 'workspace')
+          }))
+        };
+      } finally {
+        await file.close();
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { sources: [] };
+      throw error;
+    }
+  }
+  async setInputs(workspaceId: string, raw: unknown) {
+    const input = z
+      .object({ sources: z.array(z.uuid()).max(4096) })
+      .strict()
+      .parse(raw);
+    const target = workspacePath(this.root, workspaceId);
+    await ensureWorkspace(target);
+    const sources = [...new Set(input.sources)].filter((id) => id !== workspaceId).sort();
+    for (const id of sources) {
+      const source = workspacePath(this.root, id);
+      const directory = await open(
+        path.join(source, 'workspace'),
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
+      );
+      try {
+        await assertOpenedInPlace(this.root, path.join(source, 'workspace'), directory);
+      } finally {
+        await directory.close();
+      }
+    }
+    const metadata = path.join(target, '.athanor');
+    const directory = await open(
+      metadata,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
+    );
+    const temporary = path.join(metadata, `project-inputs-${randomUUID()}.json`);
+    try {
+      await assertOpenedInPlace(target, metadata, directory);
+      const output = await open(
+        temporary,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        0o600
+      );
+      try {
+        await output.writeFile(JSON.stringify({ sources }));
+        await output.sync();
+      } finally {
+        await output.close();
+      }
+      await assertOpenedInPlace(target, metadata, directory);
+      await rename(temporary, path.join(metadata, 'project-inputs.json'));
+    } finally {
+      await directory.close();
+      await rm(temporary, { force: true });
+    }
+    return {
+      sources: sources.map((workspaceId) => ({
+        workspaceId,
+        path: path.join(this.root, workspaceId, 'workspace')
+      }))
+    };
+  }
   prepare(sourceWorkspaceId: string, raw: unknown): Promise<ProjectWorkspaceReceipt> {
     const input = Request.parse(raw);
     this.#assertActive(sourceWorkspaceId, input.workspaceId);
@@ -376,6 +460,22 @@ export function registerProjectWorkspaceRoutes(
   app: FastifyInstance,
   manager: ProjectWorkspaces
 ): void {
+  app.get<{ Params: { workspaceId: string } }>(
+    '/v1/workspaces/:workspaceId/project-inputs',
+    async (request) => {
+      requireScope(request, 'files.read');
+      return manager.inputs(request.params.workspaceId);
+    }
+  );
+  app.put<{ Params: { workspaceId: string } }>(
+    '/v1/workspaces/:workspaceId/project-inputs',
+    async (request) => {
+      requireScope(request, 'workspace.manage');
+      if (request.capability.role !== 'control')
+        throw Error('Project input access requires the control plane');
+      return manager.setInputs(request.params.workspaceId, request.body);
+    }
+  );
   app.post<{ Params: { workspaceId: string } }>(
     '/v1/workspaces/:workspaceId/project-execution',
     async (request) => {

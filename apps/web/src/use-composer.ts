@@ -26,6 +26,9 @@ import type { ComposerProps } from './composer-types';
 /** Owns draft persistence, delivery recovery and input operations for one composer scope. */
 export function useComposer({
   workspace,
+  project,
+  execution,
+  source,
   task = null,
   bootstrap,
   initialDraft,
@@ -58,7 +61,10 @@ export function useComposer({
     initialDraft?.controls?.lifetime ?? 'standard'
   );
   const [securityMode, setSecurityMode] = useState<Task['securityMode']>(
-    initialDraft?.controls?.securityMode ?? task?.securityMode ?? workspace.securityMode
+    initialDraft?.controls?.securityMode ??
+      task?.securityMode ??
+      project?.securityMode ??
+      workspace.securityMode
   );
   const [cap, setCap] = useState(initialDraft?.controls?.spendCap ?? '');
   const [interrupt, setInterrupt] = useState(true);
@@ -136,7 +142,7 @@ export function useComposer({
     return () => window.removeEventListener('online', sync);
   }, [draftWrites]);
   useEffect(() => {
-    if (!task) return;
+    if (!task && !project) return;
     const controller = new AbortController();
     let currentPreferences: ProjectModelPreferences | null = null;
     const apply = (current: ProjectModelPreferences) => {
@@ -144,26 +150,27 @@ export function useComposer({
         return;
       currentPreferences = current;
       setProjectMain(
-        current.choices.main
-          ? (current.purposes.find((item) => item.purpose === 'main')?.effective?.id ?? null)
-          : null
+        current.purposes.find((item) => item.purpose === 'main')?.effective?.id ?? null
       );
     };
     const load = () => {
-      void get<ProjectModelPreferences>(`/v1/tasks/${task.id}/model-preferences`, {
-        signal: controller.signal
-      })
+      void get<ProjectModelPreferences>(
+        project
+          ? `/v1/projects/${project.id}/model-preferences`
+          : `/v1/tasks/${task!.id}/model-preferences`,
+        {
+          signal: controller.signal
+        }
+      )
         .then(apply)
         .catch(() => undefined);
     };
     const updated = (event: Event) => {
       const next = (event as CustomEvent<ProjectModelPreferences>).detail;
-      if (next.projectTaskId !== (currentPreferences?.projectTaskId ?? task.id)) return;
-      if (JSON.stringify(next.choices.main) !== JSON.stringify(currentPreferences?.choices.main)) {
-        changed.current = true;
-        setModelId('');
-        setReasoningEffort('auto');
-      }
+      if (
+        next.projectTaskId !== (currentPreferences?.projectTaskId ?? project?.id ?? task!.projectId)
+      )
+        return;
       apply(next);
     };
     load();
@@ -172,7 +179,23 @@ export function useComposer({
       controller.abort();
       window.removeEventListener('garden-model-preferences', updated);
     };
-  }, [task?.id]);
+  }, [task?.id, project?.id]);
+  const conversationDraft: NonNullable<Draft['controls']>['conversation'] =
+    !task && project
+      ? {
+          projectId: project.id,
+          execution: execution ?? 'independent',
+          ...(source ? { source } : {})
+        }
+      : undefined;
+  const conversationSignature = JSON.stringify(conversationDraft);
+  const previousConversation = useRef(conversationSignature);
+  useEffect(() => {
+    if (previousConversation.current !== conversationSignature) {
+      changed.current = true;
+      previousConversation.current = conversationSignature;
+    }
+  }, [conversationSignature]);
   useEffect(() => {
     if (!changed.current || sending.current || busy) return;
     const draft: Draft = {
@@ -186,6 +209,7 @@ export function useComposer({
         securityMode,
         privacyRoute,
         spendCap: cap,
+        ...(conversationDraft ? { conversation: conversationDraft } : {}),
         ...(!task ? { modelChoices, lifetime } : {})
       }
     };
@@ -217,6 +241,7 @@ export function useComposer({
     };
   }, [
     body,
+    conversationSignature,
     attachments,
     modelId,
     modelChoices,
@@ -355,7 +380,10 @@ export function useComposer({
           draft.controls?.privacyRoute ?? task?.privacyRoute ?? defaultPrivacy(bootstrap)
         );
         setSecurityMode(
-          draft.controls?.securityMode ?? task?.securityMode ?? workspace.securityMode
+          draft.controls?.securityMode ??
+            task?.securityMode ??
+            project?.securityMode ??
+            workspace.securityMode
         );
         setLifetime(draft.controls?.lifetime ?? 'standard');
         setCap(draft.controls?.spendCap ?? '');
@@ -410,7 +438,14 @@ export function useComposer({
       // Only on a new conversation, and only when it is not the default: a follow-up inherits the
       // lifetime the run already has, and sending `standard` explicitly would say nothing.
       ...(task || lifetime === 'standard' ? {} : { lifetime }),
-      ...(task ? { interrupt } : { workspaceId: workspace.id })
+      ...(task ? { interrupt } : { workspaceId: workspace.id }),
+      ...(!task && project
+        ? {
+            projectId: project.id,
+            execution: execution ?? 'independent',
+            ...(source ? { source } : {})
+          }
+        : {})
     };
     const previous = draftWrites.pendingSubmission;
     const signature = previous?.signature ?? JSON.stringify(payload);
@@ -431,7 +466,8 @@ export function useComposer({
             reasoningEffort,
             securityMode,
             privacyRoute,
-            spendCap: cap
+            spendCap: cap,
+            ...(conversationDraft ? { conversation: conversationDraft } : {})
           }
         }
       );
