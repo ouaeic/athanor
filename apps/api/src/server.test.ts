@@ -32,6 +32,7 @@ import {
 import { agentNotificationAad, MAX_APPROVAL_PAGE } from '@athanor/data';
 import { seedModels } from '@athanor/model-gateway';
 import type { ApiConfig } from './config.js';
+import * as apiContext from './context.js';
 import { createLogger, silentLogger } from './log.js';
 import { RelaySupervisor } from './relay.js';
 import { buildServer, idempotencyRequestHash, UNREADABLE_AGENT_MESSAGE } from './server.js';
@@ -4927,6 +4928,10 @@ describe('authentication posture', () => {
    * owner found out when every device refused at once - with a shell as the only way to ask why.
    */
   test('reports what the box wrote down about its own failures', async () => {
+    const timers = vi.spyOn(apiContext, 'timerState').mockResolvedValue('unknown');
+    disposers.push(async () => {
+      timers.mockRestore();
+    });
     const directory = await mkdtemp(join(tmpdir(), 'athanor-api-diagnostics-'));
     disposers.push(() => rm(directory, { recursive: true, force: true }));
     const { app } = await buildServer(isolatedConfig(directory));
@@ -4946,14 +4951,7 @@ describe('authentication posture', () => {
     // this has to start with, and it is the only way to read it without a terminal.
     const { build } = healthy.json<{ build: { version: string; commit: string | null } }>();
     expect(build.version).toMatch(/^\d+\.\d+\.\d+$/);
-    /*
-     * The two timers are reported alongside the two error files, and reported as `unknown` off a
-     * systemd host - which a test run is. The Updates and Backups rows used to be static copy
-     * telling an owner who switched weekly updates on a year ago to go and switch them on, and the
-     * Backups row could only show the last run, which says nothing about whether a next one is
-     * coming. `unknown` is a state the screen has to be able to say; reporting `off` for a box this
-     * process cannot ask would send the owner to enable a timer that is already running.
-     */
+    // An unavailable system service is unknown; it must not be reported as off.
     expect(healthy.json()).toEqual({
       certificate: null,
       dynamicDns: null,
@@ -4962,6 +4960,8 @@ describe('authentication posture', () => {
       backupTimer: 'unknown',
       build
     });
+    expect(timers).toHaveBeenCalledWith('athanor-auto-update.timer');
+    expect(timers).toHaveBeenCalledWith('athanor-backup.timer');
 
     await writeFile(
       join(directory, 'certificate.error'),

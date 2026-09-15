@@ -1858,6 +1858,7 @@ try {
       'Computer controls must remain scoped to the selected specialist workspace'
     );
     await page.goBack();
+    await page.getByRole('button', { name: 'Return to parent work', exact: true }).waitFor();
     assert.equal(
       await page.getByRole('combobox', { name: 'Model reasoning effort' }).count(),
       0,
